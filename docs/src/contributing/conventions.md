@@ -52,8 +52,9 @@
    `match track.format` arms in `reader::HeaderCache::resolve`
    (`musefs-core/src/reader.rs`) and into `scan.rs` (extension list, probe
    dispatch). `Format` is `#[non_exhaustive]`, so the compiler will not point
-   at a missing arm in another crate: `every_format_has_a_synthesis_arm` fails
-   instead, and is the second place to add the variant.
+   at a missing arm in another crate. `a_new_format_must_be_wired_into_the_dispatch`
+   (in `reader.rs`) fails instead; it only sees its own list of variants, so
+   add the new one there once the arm exists.
 3. Extend the test surface: a `fuzz_check::fixtures::<fmt>()` minimal file,
    a `fuzz/fuzz_targets/<fmt>.rs` target with a seed in `generate_seeds`, a
    `musefs-format/tests/proptest_<fmt>.rs`, and a manifest row in

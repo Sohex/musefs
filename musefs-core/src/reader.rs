@@ -341,8 +341,8 @@ impl HeaderCache {
                     }
                     // `Format` is `#[non_exhaustive]` (#708), so the compiler no
                     // longer flags a format this dispatch forgot. A stored format
-                    // with no arm is a bug here, not in the file, and
-                    // `every_format_has_a_synthesis_arm` exists to catch it first.
+                    // with no arm is a bug here, not in the file;
+                    // `a_new_format_must_be_wired_into_the_dispatch` fails first.
                     _ => {
                         return Err(musefs_format::FormatError::ProducerBug(
                             "stored format has no synthesis arm",
@@ -677,12 +677,14 @@ mod format_dispatch_tests {
     use musefs_db::Format;
     use strum::IntoEnumIterator;
 
-    /// The compiler's check that `HeaderCache::resolve` handles every format,
-    /// restored by hand now that `Format` is `#[non_exhaustive]` (#708) and the
-    /// dispatch needs a wildcard. A new variant fails here, naming the place to
-    /// wire it, instead of reaching a mount as an unservable track.
+    /// A tripwire standing in for the check the compiler made before `Format`
+    /// became `#[non_exhaustive]` (#708) and `HeaderCache::resolve`'s dispatch
+    /// took a wildcard. It cannot see the dispatch: what it checks is that every
+    /// variant is one this list names, so a new variant fails here — naming the
+    /// dispatch to wire it into — rather than reaching a mount as an unservable
+    /// track. The list is only as honest as whoever extends it.
     #[test]
-    fn every_format_has_a_synthesis_arm() {
+    fn a_new_format_must_be_wired_into_the_dispatch() {
         for format in Format::iter() {
             assert!(
                 matches!(

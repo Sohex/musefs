@@ -177,8 +177,9 @@ see the [Release notes](release-notes.md).
   `Mp4ScanError`, which the scanner and reader translate variant by variant; and
   `WarnDecision`, which `serve_warn!` matches inside other crates. Where the
   workspace itself lost an exhaustive check across a crate boundary, it has a
-  stand-in: `every_format_has_a_synthesis_arm` fails when a `Format` has no
-  synthesis arm, and `musefs-fuse` maps a `CoreError` it has not placed to
+  stand-in: a test fails as soon as `Format` gains a variant, naming the
+  synthesis dispatch to add it to, and `musefs-fuse` maps a `CoreError` it has
+  not placed to
   `EIO`, the collapse it already documents for structural errors.
 
 - **`tracks` is rebuilt by the 2.0.0 store migration.** This is the step that
