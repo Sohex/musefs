@@ -1017,6 +1017,7 @@ dependencies = [
  "libc",
  "log",
  "metaflac",
+ "musefs-core",
  "musefs-db",
  "musefs-format",
  "musefs-latencyfs",
@@ -1038,6 +1039,7 @@ version = "1.3.0"
 dependencies = [
  "base16ct",
  "log",
+ "musefs-db",
  "rusqlite",
  "sha2",
  "strum",

@@ -22,6 +22,7 @@ pub use facade::{Attr, Fh, Mode, MountConfig, Musefs, PassthroughFd, TreeSnapsho
 pub use musefs_db::convert;
 pub use readahead::{BackingReader, ReadAhead, ReadAheadPool};
 pub use reader::{HeaderCache, ResolvedFile, read_at, read_at_with_file};
+#[cfg(any(test, feature = "test-support"))]
 pub use scan::scan_directory_full_oracle;
 pub use scan::{
     ChecksumTier, MatchStrictness, ProgressSink, RevalidateStats, ScanOptions, ScanProgress,

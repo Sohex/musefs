@@ -464,6 +464,7 @@ fn is_supported_audio(path: &Path) -> bool {
 
 /// Walk `root` with a throwaway failure tally — the callers that do not
 /// aggregate walk errors (the legacy oracle scan, unit tests).
+#[cfg(any(test, feature = "test-support"))]
 fn collect_audio(
     root: &Path,
     out: &mut Vec<PathBuf>,
@@ -2114,6 +2115,7 @@ fn ingest_unit(
 /// Upsert a track from a probed backing file through a direct `&Db`. Thin
 /// wrapper over [`ingest_into`]; the `oracle`/non-bulk scan path. Computes no
 /// checksums, so both columns are left exactly as they are.
+#[cfg(any(test, feature = "test-support"))]
 fn ingest(db: &Db, abs_path: &Path, meta: &std::fs::Metadata, probed: Probed) -> Result<()> {
     ingest_into(
         db,
@@ -2596,7 +2598,7 @@ fn run_pipeline(
 
 /// Test/oracle only: scan using the legacy whole-file probe (`probe_full`). The
 /// equivalence property compares this against the bounded `scan_directory`.
-#[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn scan_directory_full_oracle(db: &Db, root: &Path) -> Result<ScanStats> {
     let mut files = Vec::new();
     let mut skipped = 0u64;

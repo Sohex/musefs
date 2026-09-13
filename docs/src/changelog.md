@@ -567,6 +567,19 @@ see the [Release notes](release-notes.md).
   confirmed. `musefs_cli::run_scan` takes a `MatchMode` in place of the two
   booleans.
 
+- **Test scaffolding is no longer published API**
+  ([#710](https://github.com/Sohex/musefs/issues/710)).
+  `musefs_core::scan_directory_full_oracle`, the `*_for_test` methods on
+  `Musefs` and `Db`, and `musefs_format::ogg::page_test_support` were `pub` so
+  the crates' own integration tests could reach them — most of them behind
+  `#[doc(hidden)]`, which keeps a symbol out of rustdoc but not out of semver,
+  and `Musefs::refresh_for_test` not even that. They are compiled for tests
+  only now: `musefs-core` and `musefs-db` each gain a `test-support` feature
+  their own test builds switch on, `page_test_support` joins `fuzz_check`
+  behind `musefs-format`'s `fuzzing`, and the five helpers only a crate's own
+  unit tests call are `pub(crate)`. Nothing outside the test suites called any
+  of them.
+
 ### Fixed
 
 - **A synthesized file's mtime now moves whenever its bytes do, and a pre-epoch

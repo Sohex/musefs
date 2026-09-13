@@ -11,6 +11,16 @@ gated on the `fuzzing` feature, which `musefs-format`'s self-dev-dependency
 enables for all of its own test builds — so a plain
 `cargo test -p musefs-format` runs them.
 
+The same pattern keeps the rest of the test scaffolding out of the published
+API. `musefs-core` and `musefs-db` each have a `test-support` feature gating the
+hooks their integration tests reach across the crate boundary — the whole-file
+oracle scan, the `*_for_test` methods — and switched on by a self-dev-dependency
+(plus `musefs-core`'s dev-dependency on `musefs-db`), so no flag is needed. A new
+test hook goes behind that feature when an integration test needs it, and is
+`#[cfg(test)] pub(crate)` when only the crate's own unit tests do. A plain
+`cargo build` does not compile any of it; check such a change with
+`cargo clippy --workspace` as well as `--all-targets`.
+
 ### Coverage-guided fuzzing
 
 The `fuzz/` crate is **excluded from the workspace**: workspace-wide build,

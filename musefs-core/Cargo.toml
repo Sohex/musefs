@@ -9,6 +9,12 @@ repository.workspace = true
 
 [features]
 metrics = []
+# Test-only: compiles the scaffolding this crate's own integration tests reach
+# across the crate boundary — the whole-file oracle scan and the `Musefs`
+# `*_for_test` hooks. Enabled by the self-dev-dependency below, so `cargo test`
+# needs no flag; never part of the published API. Mirrors musefs-format's
+# `fuzzing` feature.
+test-support = []
 
 [dependencies]
 arc-swap = "1"
@@ -36,6 +42,9 @@ criterion = "0.8"
 proptest = "1"
 rusqlite = { version = "0.40", features = ["bundled", "blob"] }
 musefs-format = { path = "../musefs-format", features = ["fuzzing"] }
+musefs-db = { path = "../musefs-db", features = ["test-support"] }
+# Self-dependency: turns `test-support` on for this crate's own test builds.
+musefs-core = { path = ".", features = ["test-support"] }
 ogg = "0.9"
 crc = "3"
 base64 = "0.23"
