@@ -513,7 +513,18 @@ CREATE TABLE tracks (
     -- The inode, for backing filesystems that do not store sub-second
     -- timestamps (#674). Zero is the sentinel for `not yet known`, matching the
     -- backing_ctime_ns precedent: an upgraded store starts every row unknown,
-    -- and each scan arms the guard for the rows it touches.
+    -- and each scan arms the guard for the rows it touches. Linux never hands
+    -- out inode 0 for a file, so the sentinel cannot collide with a real value;
+    -- the Rust model still says `Option<u64>` rather than making every reader
+    -- remember that. `musefs scan --revalidate` re-probes exactly the rows
+    -- still holding the sentinel, which is what makes it the repopulation path
+    -- for an upgraded store.
+    --
+    -- Stored as the inode's two's-complement bit pattern, so a value above
+    -- i64::MAX reads back negative: `st_ino` is a u64 and SQLite has no
+    -- unsigned 64-bit integer. Compared only for equality (the `<>` in
+    -- `tracks_geometry_au`, and the Rust freshness stamp), never ordered or
+    -- summed, so the encoding costs nothing it is used for.
     backing_ino      INTEGER NOT NULL DEFAULT 0,
     CHECK (typeof(backing_path) = 'blob'
            AND length(backing_path) > 0
@@ -531,7 +542,12 @@ CREATE TABLE tracks (
     -- Rust side reads both as i64.
     CHECK (typeof(backing_mtime_ns) = 'integer'),
     CHECK (typeof(backing_ctime_ns) = 'integer'),
-    CHECK (typeof(backing_ino) = 'integer' AND backing_ino >= 0),
+    -- No lower bound: the column holds the inode's two's-complement bit
+    -- pattern, so an inode above i64::MAX is stored negative. SQLite INTEGER is
+    -- signed 64-bit and `st_ino` is a full u64, so the encoding is forced --
+    -- see `models::ino_to_col`. The storage class is still pinned, which is the
+    -- half that stops a Rust-side conversion failure.
+    CHECK (typeof(backing_ino) = 'integer'),
     CHECK (typeof(content_version) = 'integer' AND content_version >= 0),
     CHECK (typeof(updated_at) = 'integer' AND updated_at >= 0),
     CHECK (audio_offset + audio_length <= backing_size),
@@ -802,8 +818,10 @@ END;
 -- The one non-verbatim recreation: `backing_ino` joins the geometry set. A
 -- changed inode means the backing file was replaced, which is the whole reason
 -- the column exists, so it belongs in the WHEN guard that keeps
--- content_version a true superset of served-byte inputs. Inert until the Rust
--- half starts writing the column, since every row is the 0 sentinel until then.
+-- content_version a true superset of served-byte inputs. That includes the
+-- sentinel-to-real transition a revalidate performs on a migrated row: nothing
+-- about the served bytes changed, but the row's identity now covers a field it
+-- did not, so invalidating once is the conservative call.
 CREATE TRIGGER tracks_geometry_au
 AFTER UPDATE ON tracks
 WHEN NEW.format        <> OLD.format

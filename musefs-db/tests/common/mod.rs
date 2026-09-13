@@ -11,6 +11,7 @@ pub fn new_track(path: &str) -> NewTrack {
         backing_size: 1100,
         backing_mtime_ns: 1_700_000_000_000_000_000,
         backing_ctime_ns: 1_700_000_000_000_000_000,
+        backing_ino: None,
     }
 }
 

@@ -71,6 +71,7 @@ impl BulkWriter<'_> {
         backing_size: u64,
         backing_mtime_ns: i64,
         backing_ctime_ns: i64,
+        backing_ino: Option<u64>,
         audio_offset: u64,
         audio_length: u64,
         fingerprint: ChecksumWrite<'_>,
@@ -83,6 +84,7 @@ impl BulkWriter<'_> {
             backing_size,
             backing_mtime_ns,
             backing_ctime_ns,
+            backing_ino,
             audio_offset,
             audio_length,
             fingerprint,
@@ -184,6 +186,7 @@ mod tests {
                         backing_size: 300,
                         backing_mtime_ns: 1,
                         backing_ctime_ns: 0,
+                        backing_ino: None,
                     })
                     .unwrap();
                 bw.replace_tags(id, &[Tag::new("title", &format!("t{i}"), 0)])
@@ -250,6 +253,7 @@ mod tests {
             backing_size: 0,
             backing_mtime_ns: 0,
             backing_ctime_ns: 0,
+            backing_ino: None,
         }
     }
 
@@ -378,6 +382,7 @@ mod tests {
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         db.set_binary_tags(
@@ -420,6 +425,7 @@ mod tests {
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         {
@@ -462,6 +468,7 @@ mod tests {
                     backing_size: 1,
                     backing_mtime_ns: 0,
                     backing_ctime_ns: 0,
+                    backing_ino: None,
                 })
                 .unwrap();
             bw.set_structural_blocks(
@@ -503,6 +510,7 @@ mod tests {
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
             // Dropped here without `commit()` → Transaction rolls back.

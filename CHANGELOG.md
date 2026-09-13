@@ -324,6 +324,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- The freshness guard no longer passes on changed bytes when the backing
+  filesystem has no sub-second timestamps
+  ([#674](https://github.com/Sohex/musefs/issues/674)). `tracks.backing_ino`
+  gained a column in the 2.0.0 migration; the scanner now writes it and every
+  serve compares it. On FAT32, ext3, HFS+ and some SMB and NFS mounts a
+  same-size *replacement* inside the timestamp granularity left size, mtime and
+  ctime all identical to what was scanned, and the reader was served new bytes
+  against a header synthesized for the old ones. A true in-place rewrite is
+  still a POSIX timestamp limit rather than something musefs can fix; the
+  replacement shape is what almost every tagger produces, writing a temporary
+  file and renaming over the original.
+
+  The column stores the inode's two's-complement bit pattern, so an inode above
+  `i64::MAX` reads back negative: SQLite has no unsigned 64-bit integer and
+  `st_ino` is a full `u64`. It is compared only for equality, never ordered, so
+  the encoding costs nothing it is used for.
+
+  A row with no recorded inode — every row in a store upgraded to 2.0.0 —
+  is compared on the other three fields alone rather than failing closed on a
+  field the store has nothing to say about, so an upgrade does not take a
+  library dark. `musefs scan --revalidate` re-probes exactly those rows and
+  fills the inode in.
+
 - Two files holding byte-identical cover art no longer serve each other's
   picture metadata ([#716](https://github.com/Sohex/musefs/issues/716)). `art`
   is deduplicated on the image bytes but owned the MIME type and dimensions, so

@@ -261,6 +261,7 @@ mod guard_tests {
                 backing_size: 1,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         let art = db.upsert_art(&NewArt { data: vec![0u8] }).unwrap();

@@ -2,20 +2,38 @@
 //! its backing file, compared on every serve to detect an on-disk change that
 //! no database write covers. Strengthened past size + whole-second mtime to
 //! nanosecond mtime + ctime (#276) so a same-size in-place rewrite — including
-//! an adversarial one that resets mtime — cannot evade the guard.
+//! an adversarial one that resets mtime — cannot evade the guard, and then with
+//! the inode (#674) for backing filesystems that store no sub-second timestamps
+//! at all, where those three can agree across a replacement.
 use std::os::unix::fs::MetadataExt;
 
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 
-/// `(size, mtime_ns, ctime_ns)` captured from one `fstat`. `mtime_ns`/`ctime_ns`
-/// are nanoseconds since the Unix epoch (good until ~2262). `ctime` is the
-/// adversarial backstop: a writer can reset mtime with `utimensat`, but ctime
-/// is bumped by any write and cannot be set backward.
+/// `(size, mtime_ns, ctime_ns, ino)` captured from one `fstat`.
+/// `mtime_ns`/`ctime_ns` are nanoseconds since the Unix epoch (good until
+/// ~2262). `ctime` is the adversarial backstop: a writer can reset mtime with
+/// `utimensat`, but ctime is bumped by any write and cannot be set backward.
+///
+/// `ino` closes the one case the other three cannot see (#674): a backing
+/// filesystem with no sub-second timestamps — FAT32's two-second mtime and no
+/// ctime at all, or ext3/HFS+/some SMB and NFS mounts truncating the nanosecond
+/// fields — where a same-size replacement inside the granularity window leaves
+/// all three identical. It does not help against a true in-place rewrite, which
+/// is a POSIX timestamp limitation rather than something musefs can fix; it
+/// catches the *replacement* shape, where a tagger writes a temporary file and
+/// renames over the original, which is what almost every tagger does.
+///
+/// `None` means "not recorded", not "no inode": a row written before #674, or
+/// one V4 migrated. [`BackingStamp::matches_live`] is what knows that an
+/// unrecorded inode cannot discriminate — which is why `PartialEq` is *not* the
+/// freshness question. Equality here is ordinary structural equality, and stays
+/// transitive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackingStamp {
     pub size: u64,
     pub mtime_ns: i64,
     pub ctime_ns: i64,
+    pub ino: Option<u64>,
 }
 
 impl BackingStamp {
@@ -30,6 +48,15 @@ impl BackingStamp {
                 .ctime()
                 .saturating_mul(NANOS_PER_SEC)
                 .saturating_add(meta.ctime_nsec()),
+            // The `!= 0` guard is for the round trip: this is the value the
+            // store will hold, and 0 is how the column spells "not recorded",
+            // so a stat reporting 0 must not be written back as a real inode.
+            // Linux hands out no inode 0 for a file on an ordinary filesystem,
+            // but a FUSE server can return whatever it likes under `use_ino`,
+            // so this is not a branch that provably never runs — which is
+            // exactly why `matches_live` treats a *live* `None` as a failure
+            // rather than as a wildcard.
+            ino: (meta.ino() != 0).then_some(meta.ino()),
         }
     }
 
@@ -38,6 +65,7 @@ impl BackingStamp {
             size: t.backing_size,
             mtime_ns: t.backing_mtime_ns,
             ctime_ns: t.backing_ctime_ns,
+            ino: t.backing_ino,
         }
     }
 
@@ -46,7 +74,46 @@ impl BackingStamp {
             size: i.backing_size,
             mtime_ns: i.backing_mtime_ns,
             ctime_ns: i.backing_ctime_ns,
+            ino: i.backing_ino,
         }
+    }
+
+    /// Does `live` — a stamp just taken from the file on disk — describe the
+    /// same backing bytes this stored stamp was recorded for?
+    ///
+    /// Asymmetric on purpose, and deliberately not `==`. The question is not
+    /// "are these equal" but "has anything the *stored* side actually knows
+    /// about changed". A stored stamp with no recorded inode has nothing to say
+    /// about that field, and treating that as a mismatch would fail every row
+    /// in a just-migrated store on its first serve.
+    ///
+    /// The wildcard is one-directional, and only the stored side gets it. A
+    /// *live* stat that cannot supply an inode is a failure, not a pass: the
+    /// stored side knowing a value the live side cannot produce is a
+    /// disagreement about the file, and the whole point of this guard is to
+    /// fail closed on anything it cannot rule out. Making the rule symmetric —
+    /// `self.ino.zip(live.ino).is_none_or(...)` reads neatly and does exactly
+    /// that — would let a replaced file pass on equal size and timestamps
+    /// whenever the new stat reported inode 0, which a FUSE server can do.
+    ///
+    /// Written as a method rather than a `PartialEq` impl because the rule is
+    /// not an equivalence relation — a stored stamp with no inode matches two
+    /// live stamps that do not match each other — and an `==` that is not
+    /// transitive is a trap for the next reader. Fill a missing inode by
+    /// running `musefs scan --revalidate`, which re-probes exactly the rows
+    /// whose inode is missing.
+    pub fn matches_live(&self, live: &BackingStamp) -> bool {
+        self.size == live.size
+            && self.mtime_ns == live.mtime_ns
+            && self.ctime_ns == live.ctime_ns
+            && match self.ino {
+                // Nothing recorded: this field cannot decide either way.
+                None => true,
+                // Recorded: the live stat has to produce the same value. `None`
+                // here is a live stat that could not supply one at all, and
+                // that is a failure like any other mismatch.
+                Some(stored) => live.ino == Some(stored),
+            }
     }
 
     /// Whole-second mtime for the FUSE `getattr` display surface (never the raw
@@ -77,6 +144,9 @@ mod tests {
 
         let s = BackingStamp::from_metadata(&meta);
         assert_eq!(s.size, 5);
+        // A live stat always knows the inode, which is what lets `matches_live`
+        // treat an absent one as the *stored* side having nothing to say (#674).
+        assert_eq!(s.ino, Some(meta.ino()));
         assert_eq!(s.mtime_ns, meta.mtime() * 1_000_000_000 + meta.mtime_nsec());
         assert_eq!(s.ctime_ns, meta.ctime() * 1_000_000_000 + meta.ctime_nsec());
         // Display is whole-second mtime, never the raw nanosecond value.
@@ -93,6 +163,7 @@ mod tests {
                 size: 0,
                 mtime_ns,
                 ctime_ns: 0,
+                ino: None,
             }
             .display_secs()
         };
@@ -117,13 +188,15 @@ mod tests {
             size: 1,
             mtime_ns: 2,
             ctime_ns: 3,
+            ino: None,
         };
         assert_eq!(
             a,
             BackingStamp {
                 size: 1,
                 mtime_ns: 2,
-                ctime_ns: 3
+                ctime_ns: 3,
+                ino: None,
             }
         );
         assert_ne!(
@@ -131,8 +204,124 @@ mod tests {
             BackingStamp {
                 size: 1,
                 mtime_ns: 2,
-                ctime_ns: 4
+                ctime_ns: 4,
+                ino: None,
             }
         );
+    }
+
+    fn stamp(size: u64, ino: Option<u64>) -> BackingStamp {
+        BackingStamp {
+            size,
+            mtime_ns: 2,
+            ctime_ns: 3,
+            ino,
+        }
+    }
+
+    /// The case #674 exists for. On a filesystem with no sub-second timestamps
+    /// a same-size replacement inside the granularity window leaves size, mtime
+    /// and ctime identical — every field the stamp had before the inode.
+    #[test]
+    fn a_replacement_the_timestamps_cannot_see_is_caught_by_the_inode() {
+        let stored = stamp(10, Some(111));
+        // Byte-for-byte identical on the three old fields.
+        assert_eq!(
+            (stored.size, stored.mtime_ns, stored.ctime_ns),
+            (stamp(10, Some(222)).size, 2, 3)
+        );
+        assert!(
+            !stored.matches_live(&stamp(10, Some(222))),
+            "a fresh inode is a replaced file"
+        );
+        assert!(stored.matches_live(&stamp(10, Some(111))));
+    }
+
+    /// An unrecorded inode is a field with nothing to say, not a mismatch.
+    /// Without this every row in a just-migrated store would fail its first
+    /// serve — the store carries the 0 sentinel until a revalidate fills it in.
+    #[test]
+    fn an_unrecorded_inode_does_not_fail_the_stamp() {
+        assert!(stamp(10, None).matches_live(&stamp(10, Some(999))));
+        // And it is still only the inode that is excused: the other three
+        // fields decide as they always did.
+        assert!(!stamp(11, None).matches_live(&stamp(10, Some(999))));
+    }
+
+    /// Each of the four fields must be able to refuse on its own — an `||`
+    /// slipped into the chain would let three agreeing fields vouch for a
+    /// fourth that does not.
+    #[test]
+    fn every_field_can_refuse_alone() {
+        let stored = BackingStamp {
+            size: 1,
+            mtime_ns: 2,
+            ctime_ns: 3,
+            ino: Some(4),
+        };
+        assert!(stored.matches_live(&stored));
+        for (what, live) in [
+            ("size", BackingStamp { size: 9, ..stored }),
+            (
+                "mtime",
+                BackingStamp {
+                    mtime_ns: 9,
+                    ..stored
+                },
+            ),
+            (
+                "ctime",
+                BackingStamp {
+                    ctime_ns: 9,
+                    ..stored
+                },
+            ),
+            (
+                "inode",
+                BackingStamp {
+                    ino: Some(9),
+                    ..stored
+                },
+            ),
+        ] {
+            assert!(
+                !stored.matches_live(&live),
+                "a changed {what} must fail the stamp on its own"
+            );
+        }
+    }
+
+    /// The wildcard belongs to the stored side alone. A live stat that cannot
+    /// supply an inode — `st_ino == 0`, which a FUSE server can return under
+    /// `use_ino` — must not excuse a stored inode that is known: equal size and
+    /// timestamps would then let a replaced file serve different backing bytes,
+    /// which is the exact failure #674 exists to close.
+    #[test]
+    fn a_live_stat_with_no_inode_does_not_excuse_a_recorded_one() {
+        assert!(
+            !stamp(10, Some(111)).matches_live(&stamp(10, None)),
+            "a live stat that cannot produce the recorded inode fails closed"
+        );
+        // The stored-side wildcard is untouched, so the two directions really
+        // are different rather than both being excused.
+        assert!(stamp(10, None).matches_live(&stamp(10, Some(111))));
+    }
+
+    /// Why this is a method and not a `PartialEq` impl: the sentinel rule is
+    /// not transitive, so spelling it `==` would hand the next reader an
+    /// equality that breaks the `Eq` contract.
+    #[test]
+    fn the_sentinel_rule_is_not_an_equivalence_relation() {
+        let unrecorded = stamp(10, None);
+        let one = stamp(10, Some(1));
+        let two = stamp(10, Some(2));
+        assert!(unrecorded.matches_live(&one));
+        assert!(unrecorded.matches_live(&two));
+        assert!(
+            !one.matches_live(&two),
+            "transitivity would demand these match; they must not"
+        );
+        // Structural equality, meanwhile, stays honest about all four fields.
+        assert_ne!(unrecorded, one);
     }
 }

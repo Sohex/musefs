@@ -280,6 +280,7 @@ mod tags_for_tracks_tests {
             backing_size: 1,
             backing_mtime_ns: 0,
             backing_ctime_ns: 0,
+            backing_ino: None,
         }
     }
 

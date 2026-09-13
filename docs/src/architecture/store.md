@@ -17,8 +17,9 @@ The store is the **interface external tools write to** — the beets and Picard
 plugins under `contrib/` write tags and art here out-of-band.
 
 - The **baseline schema** (`MIGRATION_V1`): the core tables — `tracks` (one row
-  per backing file: path, format, audio byte range, size/nanosecond-mtime/ctime
-  stamps, `content_version`), `tags` (multi-value key/value rows ordered by
+  per backing file: path, format, audio byte range, the
+  size/nanosecond-mtime/ctime freshness stamp — joined by the inode in v4 —
+  and `content_version`), `tags` (multi-value key/value rows ordered by
   `ordinal`, with an optional `value_blob` for binary tags), `art`
   (content-addressed, deduplicated image blobs), `track_art` (per-track art
   links with picture type and ordering), and `structural_blocks` (read-only,
@@ -84,6 +85,17 @@ the binary.
 `backing_mtime_ns`, `backing_ctime_ns`, `backing_ino`, `content_version`,
 `updated_at`) and all of `structural_blocks`: those are derived from probing
 the file, and external tools must run `musefs scan` rather than compute them.
+
+**`backing_ino` is a bit pattern, not a magnitude.** From schema v4 `tracks`
+records the backing file's inode as part of the freshness stamp, stored as the
+inode's two's-complement `i64` bit pattern — so a file whose inode is above
+`i64::MAX` has a *negative* value in the column. SQLite has no unsigned 64-bit
+integer and `st_ino` is a full `u64`, so some encoding is forced; this one is a
+bijection, and the column is only ever compared for equality (the invalidation
+trigger, and the Rust freshness stamp), never ordered or summed. Zero is the
+sentinel for "not recorded", which every row in a store upgraded to v4 carries
+until a scan fills it in. A reader decoding this column must cast the bit
+pattern back rather than treat a negative value as invalid.
 
 **`backing_path` is bytes, not text.** From schema v4 it is a `BLOB`, because a
 filesystem path is a byte string and the lossy text round-trip collapsed two
@@ -302,8 +314,8 @@ read shape stays on it.
 
 **What musefs defends at serve time.** CHECKs cannot catch a scanner-owned
 field mutated to a *well-formed* value that no longer matches the real file
-on disk: `backing_size` or `backing_mtime_ns`/`backing_ctime_ns` that drift
-from the actual file's stat, or audio bounds that fit the stored
+on disk: `backing_size`, `backing_mtime_ns`/`backing_ctime_ns` or
+`backing_ino` that drift from the actual file's stat, or audio bounds that fit the stored
 `backing_size` but overrun the file once it has shrunk. musefs re-stats the
 backing file on every resolve and treats such rows as untrusted input,
 degrading to a controlled

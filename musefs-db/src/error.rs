@@ -342,6 +342,7 @@ mod classification_tests {
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         let insert = "INSERT INTO tags (track_id, key, ordinal, value) \

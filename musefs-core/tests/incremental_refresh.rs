@@ -499,7 +499,8 @@ proptest! {
                         backing_path: format!("/virt/added-{add_seq}.flac"),
                         format: musefs_db::Format::Flac,
                         audio_offset: 0, audio_length: 1, backing_size: 1, backing_mtime_ns: 0, backing_ctime_ns: 0,
-                    };
+                        backing_ino: None,
+};
                     // Surface DB errors instead of vacuously skipping the op.
                     let id = writer.upsert_track(&new).unwrap();
                     writer
@@ -548,6 +549,62 @@ fn revalidate_reprobes_on_ctime_only_change() {
     let db = Db::open(&db_path).unwrap();
     let stats = musefs_core::revalidate(&db, dir.path()).unwrap();
     assert_eq!(stats.updated, 1, "ctime-only change must be re-probed");
+}
+
+/// #674's repopulation path. A store migrated into V4 has no recorded inode on
+/// any row, and `matches_live` has to ignore the field for those — so the stamp
+/// passes on three columns where it should pass on four. Revalidate is what
+/// closes that gap, alongside the structural and checksum backfills it already
+/// covered, so it must re-probe a row whose inode is missing even though every
+/// other field says the file is unchanged.
+#[test]
+fn revalidate_reprobes_a_row_with_no_recorded_inode() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("a.flac");
+    common::write_flac(&src, &["TITLE=T"], &[0xAB; 4096]);
+    let db_path = dir.path().join("m.db");
+    {
+        let db = Db::open(&db_path).unwrap();
+        scan_directory(&db, dir.path()).unwrap();
+    }
+
+    let db = Db::open(&db_path).unwrap();
+    let id = db.list_tracks().unwrap()[0].id;
+    assert!(
+        db.get_track(id).unwrap().unwrap().backing_ino.is_some(),
+        "a fresh scan records the inode"
+    );
+
+    // Rewind the column to the sentinel by upserting the row as a build older
+    // than #674 would have written it — which is the shape V4 leaves every
+    // existing row in, reached through the public writer rather than by
+    // standing up a migrated store.
+    let before = db.get_track(id).unwrap().unwrap();
+    db.upsert_track(&musefs_db::NewTrack {
+        backing_path: before.backing_path.clone(),
+        format: before.format,
+        audio_offset: before.bounds.audio_offset(),
+        audio_length: before.bounds.audio_length(),
+        backing_size: before.backing_size,
+        backing_mtime_ns: before.backing_mtime_ns,
+        backing_ctime_ns: before.backing_ctime_ns,
+        backing_ino: None,
+    })
+    .unwrap();
+    assert_eq!(db.get_track(id).unwrap().unwrap().backing_ino, None);
+
+    // Nothing about the file changed, so only the missing inode can make this
+    // re-probe.
+    let stats = musefs_core::revalidate(&db, dir.path()).unwrap();
+    assert_eq!(stats.updated, 1, "a row with no inode must be re-probed");
+    assert!(
+        db.get_track(id).unwrap().unwrap().backing_ino.is_some(),
+        "and the re-probe must fill it in"
+    );
+
+    // Idempotent: with the inode recorded, the same file is skipped again.
+    let stats = musefs_core::revalidate(&db, dir.path()).unwrap();
+    assert_eq!(stats.updated, 0, "a complete row is unchanged");
 }
 
 #[test]

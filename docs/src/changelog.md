@@ -544,6 +544,56 @@ see the [Release notes](release-notes.md).
 
 ### Fixed
 
+- The freshness guard no longer passes on changed bytes when the backing
+  filesystem has no sub-second timestamps
+  ([#674](https://github.com/Sohex/musefs/issues/674)). The column landed in
+  the 2.0.0 migration above; this is the half that writes and reads it.
+
+  `BackingStamp` was `(size, mtime_ns, ctime_ns)`. #276 had already strengthened
+  it past size plus whole-second mtime, with `ctime` as the adversarial backstop
+  a writer cannot set backward. The residual hole was filesystems that store no
+  sub-second times at all — FAT32's two-second granularity and no ctime, ext3,
+  HFS+, some SMB and NFS mounts truncating the nanosecond fields — where a
+  same-size replacement inside the granularity window leaves all three fields
+  identical to what was scanned. The guard passed, and the reader was served a
+  mix of new audio bytes and a metadata region synthesized for the old content.
+
+  The inode closes the *replacement* shape: a new file moved over the old one
+  gets a fresh one. It does not close a true in-place rewrite, which is a POSIX
+  timestamp limitation rather than something musefs can fix — but the
+  replacement shape is what almost every tagger actually does, writing a
+  temporary file and renaming over the original. The false-positive cost is
+  nil: an inode changes when a file is copied, restored from backup or moved
+  across devices, and all three already invalidate the stamp today, because
+  `ctime` cannot be preserved by `cp -a` or rsync either.
+
+  **A stored inode of zero means "not recorded", not "inode zero"** — the state
+  every row in an upgraded store starts in — and such a row is compared on the
+  other three fields alone. Failing closed on a field the store has nothing to
+  say about would take an entire library offline on the first serve after an
+  upgrade. `musefs scan --revalidate` re-probes exactly the rows still holding
+  the sentinel and fills it in, which makes it the complete repopulation path
+  for an upgraded store alongside the structural-block and checksum backfills it
+  already covered.
+
+  The column stores the inode's **two's-complement bit pattern**, so a file
+  whose inode is above `i64::MAX` records a negative value. SQLite has no
+  unsigned 64-bit integer and `st_ino` is a full `u64`, so an encoding is
+  forced — and the alternative is not a lost guard but a failed scan: rusqlite
+  refuses the bind, and a bind failure is not a constraint violation, so the
+  scanner classifies it as fatal and the whole run aborts. That range is not
+  theoretical; FUSE and network filesystems synthesize inode numbers freely,
+  and several pooling and cloud-mount filesystems hash to produce them. The
+  encoding is a bijection and the column is only ever compared for equality, so
+  it costs nothing it is used for. The v4 `CHECK` therefore pins the storage
+  class without a lower bound.
+
+  The comparison is a named, asymmetric method rather than `==`: one side is
+  stored and may know nothing, the other is live and always knows, and the
+  sentinel rule is not transitive — a stamp with no recorded inode matches two
+  live files that do not match each other. Spelling that as equality would hand
+  the next reader an `==` that breaks the `Eq` contract.
+
 - Chained Ogg is now detected and skipped at scan time, and refused at serve
   time ([#722](https://github.com/Sohex/musefs/issues/722)). A chain is complete
   logical bitstreams concatenated end to end, which RFC 3533 allows and the docs

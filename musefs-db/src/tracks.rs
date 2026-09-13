@@ -19,7 +19,8 @@ macro_rules! track_select {
         concat!(
             "SELECT id, CAST(backing_path AS TEXT) AS backing_path, format, \
              audio_offset, audio_length, \
-             backing_size, backing_mtime_ns, backing_ctime_ns, content_version, updated_at, \
+             backing_size, backing_mtime_ns, backing_ctime_ns, backing_ino, \
+             content_version, updated_at, \
              fingerprint, content_hash \
              FROM tracks ",
             $tail
@@ -60,6 +61,7 @@ fn row_to_track(r: &Row) -> rusqlite::Result<Track> {
         backing_size,
         backing_mtime_ns: r.get("backing_mtime_ns")?,
         backing_ctime_ns: r.get("backing_ctime_ns")?,
+        backing_ino: crate::models::ino_from_col(r.get("backing_ino")?),
         content_version: r.get("content_version")?,
         updated_at: r.get("updated_at")?,
         fingerprint: r.get("fingerprint")?,
@@ -73,13 +75,14 @@ fn row_to_track(r: &Row) -> rusqlite::Result<Track> {
 pub(crate) fn upsert_track_in(conn: &rusqlite::Connection, t: &NewTrack) -> Result<i64> {
     Ok(conn.query_row(
         "INSERT INTO tracks
-            (backing_path, format, audio_offset, audio_length, backing_size, backing_mtime_ns, backing_ctime_ns, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, CAST(strftime('%s','now') AS INTEGER))
+            (backing_path, format, audio_offset, audio_length, backing_size, backing_mtime_ns, backing_ctime_ns, backing_ino, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, CAST(strftime('%s','now') AS INTEGER))
          ON CONFLICT(backing_path) DO UPDATE SET
             format=excluded.format, audio_offset=excluded.audio_offset,
             audio_length=excluded.audio_length, backing_size=excluded.backing_size,
             backing_mtime_ns=excluded.backing_mtime_ns,
             backing_ctime_ns=excluded.backing_ctime_ns,
+            backing_ino=excluded.backing_ino,
             updated_at=CAST(strftime('%s','now') AS INTEGER)
          RETURNING id",
         params![
@@ -90,6 +93,7 @@ pub(crate) fn upsert_track_in(conn: &rusqlite::Connection, t: &NewTrack) -> Resu
             t.backing_size,
             t.backing_mtime_ns,
             t.backing_ctime_ns,
+            crate::models::ino_to_col(t.backing_ino),
         ],
         |r| r.get(0),
     )?)
@@ -147,6 +151,7 @@ pub(crate) fn retarget_track_in(
     backing_size: u64,
     backing_mtime_ns: i64,
     backing_ctime_ns: i64,
+    backing_ino: Option<u64>,
     audio_offset: u64,
     audio_length: u64,
     fingerprint: ChecksumWrite<'_>,
@@ -160,10 +165,11 @@ pub(crate) fn retarget_track_in(
             backing_size     = ?3,
             backing_mtime_ns = ?4,
             backing_ctime_ns = ?5,
-            audio_offset     = ?6,
-            audio_length     = ?7,
-            fingerprint      = CASE WHEN ?8  THEN ?9  ELSE fingerprint  END,
-            content_hash     = CASE WHEN ?10 THEN ?11 ELSE content_hash END,
+            backing_ino      = ?6,
+            audio_offset     = ?7,
+            audio_length     = ?8,
+            fingerprint      = CASE WHEN ?9  THEN ?10 ELSE fingerprint  END,
+            content_hash     = CASE WHEN ?11 THEN ?12 ELSE content_hash END,
             updated_at       = CAST(strftime('%s','now') AS INTEGER)
          WHERE id = ?1",
         params![
@@ -172,6 +178,7 @@ pub(crate) fn retarget_track_in(
             backing_size,
             backing_mtime_ns,
             backing_ctime_ns,
+            crate::models::ino_to_col(backing_ino),
             audio_offset,
             audio_length,
             fp_set,
@@ -252,7 +259,7 @@ impl<M> Db<M> {
         crate::query_optional(
             &self.conn,
             "SELECT content_version, CAST(backing_path AS TEXT), backing_size, \
-             backing_mtime_ns, backing_ctime_ns FROM tracks WHERE id = ?1",
+             backing_mtime_ns, backing_ctime_ns, backing_ino FROM tracks WHERE id = ?1",
             params![id],
             |r| {
                 Ok(crate::TrackIdentity {
@@ -261,6 +268,7 @@ impl<M> Db<M> {
                     backing_size: r.get(2)?,
                     backing_mtime_ns: r.get(3)?,
                     backing_ctime_ns: r.get(4)?,
+                    backing_ino: crate::models::ino_from_col(r.get(5)?),
                 })
             },
         )
@@ -412,8 +420,11 @@ impl Db<ReadWrite> {
     /// [`ChecksumWrite`] intent as `set_track_checksums`: a retarget that could
     /// not confirm the new file's full hash passes `Clear`, never `Keep`, so
     /// the row cannot keep the departed file's hash. `updated_at` is refreshed;
-    /// `content_version` is left to the geometry trigger (it bumps only if `backing_mtime_ns`
-    /// actually changed — a pure move preserves mtime, so no bump).
+    /// `content_version` is left to the geometry trigger, which bumps only if
+    /// something the served bytes depend on changed. A rename within a
+    /// filesystem preserves both mtime and inode, so it does not bump; a move
+    /// that was really a copy gets a fresh inode and does, which is the case
+    /// #674 added the column for.
     #[allow(clippy::too_many_arguments)]
     pub fn retarget_track(
         &self,
@@ -422,6 +433,7 @@ impl Db<ReadWrite> {
         backing_size: u64,
         backing_mtime_ns: i64,
         backing_ctime_ns: i64,
+        backing_ino: Option<u64>,
         audio_offset: u64,
         audio_length: u64,
         fingerprint: ChecksumWrite<'_>,
@@ -434,6 +446,7 @@ impl Db<ReadWrite> {
             backing_size,
             backing_mtime_ns,
             backing_ctime_ns,
+            backing_ino,
             audio_offset,
             audio_length,
             fingerprint,
@@ -482,6 +495,7 @@ mod negative_audio_bounds_tests {
                 backing_size: 1,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         // Simulate a malformed external write to a contract column. The V4
@@ -515,6 +529,7 @@ mod negative_audio_bounds_tests {
                 backing_size: 1,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         // Plant offset+length > backing_size past the V4 CHECK (layer 1) so we can
@@ -553,6 +568,7 @@ mod render_key_tests {
             backing_size: 1,
             backing_mtime_ns: 0,
             backing_ctime_ns: 0,
+            backing_ino: None,
         }
     }
 
@@ -696,6 +712,7 @@ mod checksum_tests {
             backing_size: 10,
             backing_mtime_ns: 0,
             backing_ctime_ns: 0,
+            backing_ino: None,
         }
     }
 
@@ -792,6 +809,7 @@ mod checksum_tests {
             99,
             1234,
             5678,
+            Some(7),
             42,
             50,
             ChecksumWrite::Keep,
@@ -804,11 +822,114 @@ mod checksum_tests {
         assert_eq!(t.backing_size, 99);
         assert_eq!(t.backing_mtime_ns, 1234);
         assert_eq!(t.backing_ctime_ns, 5678);
+        assert_eq!(t.backing_ino, Some(7));
         assert_eq!(t.bounds.audio_offset(), 42);
         assert_eq!(t.bounds.audio_length(), 50);
         assert_eq!(t.fingerprint.as_deref(), Some(&"a".repeat(64)[..])); // Keep preserves
         assert_eq!(t.content_hash.as_deref(), Some(&"e".repeat(64)[..]));
         assert!(db.get_track_by_path("/old.flac").unwrap().is_none());
+    }
+
+    /// `tracks.backing_ino` is NOT NULL with a 0 sentinel and the model is
+    /// `Option<u64>` (#674), so the translation has to survive a round trip in
+    /// both directions — and the sentinel has to read back as "not recorded"
+    /// rather than as inode zero.
+    #[test]
+    fn backing_ino_round_trips_through_the_sentinel() {
+        let db = Db::open_in_memory().unwrap();
+
+        let known = db
+            .upsert_track(&NewTrack {
+                backing_ino: Some(4242),
+                ..new_track("/known.flac")
+            })
+            .unwrap();
+        assert_eq!(
+            db.get_track(known).unwrap().unwrap().backing_ino,
+            Some(4242)
+        );
+        assert_eq!(
+            db.track_identity(known).unwrap().unwrap().backing_ino,
+            Some(4242),
+            "the identity read `getattr` uses must carry it too"
+        );
+
+        let unknown = db.upsert_track(&new_track("/unknown.flac")).unwrap();
+        assert_eq!(db.get_track(unknown).unwrap().unwrap().backing_ino, None);
+        // Stored as the sentinel, not as NULL: the column is NOT NULL and the
+        // invalidation trigger compares it with `<>`.
+        let raw: i64 = db
+            .conn
+            .query_row(
+                "SELECT backing_ino FROM tracks WHERE id = ?1",
+                [unknown],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw, 0);
+    }
+
+    /// An inode above `i64::MAX` must reach the store. `st_ino` is a full
+    /// `u64` and FUSE and network filesystems synthesize inode numbers freely,
+    /// so this is a range real backing filesystems reach — and rusqlite's `u64`
+    /// binding refuses it outright (`ToSqlConversionFailure(PosOverflow)`).
+    /// Worse than losing the guard: a bind failure is not a constraint
+    /// violation, so the scanner treats it as fatal and the whole run aborts.
+    #[test]
+    fn an_inode_past_i64_max_is_stored_and_read_back() {
+        let db = Db::open_in_memory().unwrap();
+        let huge = u64::try_from(i64::MAX).unwrap() + 1;
+        let id = db
+            .upsert_track(&NewTrack {
+                backing_ino: Some(huge),
+                ..new_track("/huge.flac")
+            })
+            .expect("an inode past i64::MAX must not fail the write");
+        assert_eq!(db.get_track(id).unwrap().unwrap().backing_ino, Some(huge));
+        assert_eq!(
+            db.track_identity(id).unwrap().unwrap().backing_ino,
+            Some(huge)
+        );
+        // Stored negative, which is what the dropped `>= 0` CHECK was in the
+        // way of: the column holds the bit pattern, not the magnitude.
+        let raw: i64 = db
+            .conn
+            .query_row("SELECT backing_ino FROM tracks WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(raw < 0, "expected a negative bit pattern, got {raw}");
+
+        // And `u64::MAX` — the value whose bit pattern is -1 — is still not the
+        // sentinel, so the busiest edge case does not read back as unrecorded.
+        let max = db
+            .upsert_track(&NewTrack {
+                backing_ino: Some(u64::MAX),
+                ..new_track("/max.flac")
+            })
+            .unwrap();
+        assert_eq!(
+            db.get_track(max).unwrap().unwrap().backing_ino,
+            Some(u64::MAX)
+        );
+    }
+
+    /// The upsert half of the same round trip: a re-scan that now knows the
+    /// inode must overwrite the sentinel rather than leave the row unrecorded.
+    #[test]
+    fn upsert_fills_in_an_inode_the_row_did_not_have() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db.upsert_track(&new_track("/a.flac")).unwrap();
+        assert_eq!(db.get_track(id).unwrap().unwrap().backing_ino, None);
+
+        let again = db
+            .upsert_track(&NewTrack {
+                backing_ino: Some(77),
+                ..new_track("/a.flac")
+            })
+            .unwrap();
+        assert_eq!(again, id, "same path, same row");
+        assert_eq!(db.get_track(id).unwrap().unwrap().backing_ino, Some(77));
     }
 
     /// A retarget that could not confirm the new file must not carry the
@@ -829,6 +950,7 @@ mod checksum_tests {
             10,
             1,
             2,
+            None,
             0,
             10,
             ChecksumWrite::Set(&"b".repeat(64)),
@@ -876,6 +998,7 @@ mod checksum_tests {
                 10,
                 1,
                 2,
+                Some(9),
                 0,
                 10,
                 ChecksumWrite::Keep,

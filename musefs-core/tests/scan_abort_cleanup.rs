@@ -85,6 +85,7 @@ fn failed_flush_does_not_strand_budget_blocked_workers() {
         backing_size: 1,
         backing_mtime_ns: 0,
         backing_ctime_ns: 0,
+        backing_ino: None,
     })
     .unwrap();
 

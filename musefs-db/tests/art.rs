@@ -144,6 +144,7 @@ fn gc_orphan_art_removes_unreferenced_rows() {
             backing_size: 0,
             backing_mtime_ns: 0,
             backing_ctime_ns: 0,
+            backing_ino: None,
         })
         .unwrap();
     let referenced = db

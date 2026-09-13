@@ -522,6 +522,7 @@ fn records_same_bytes_needs_every_field_to_agree() {
         backing_size: stamp.size,
         backing_mtime_ns: stamp.mtime_ns,
         backing_ctime_ns: stamp.ctime_ns,
+        backing_ino: stamp.ino,
         content_version: 0,
         updated_at: 0,
         fingerprint: None,
@@ -582,6 +583,7 @@ fn unit_with(abs_path: &str, fingerprint: Option<String>) -> Unit {
             size: 10,
             mtime_ns: 1,
             ctime_ns: 2,
+            ino: None,
         },
         probed: empty_probed(),
         weight: 0,
@@ -626,6 +628,7 @@ fn ingest_unit_db_path_retargets_orphan() {
             backing_size: 10,
             backing_mtime_ns: 0,
             backing_ctime_ns: 0,
+            backing_ino: None,
         })
         .unwrap();
     db.set_track_checksums(id, ChecksumWrite::Set(&fp), ChecksumWrite::Keep)
@@ -683,6 +686,7 @@ fn ingest_unit_db_path_skips_unstatable_candidate() {
             backing_size: 10,
             backing_mtime_ns: 0,
             backing_ctime_ns: 0,
+            backing_ino: None,
         })
         .unwrap();
     db.set_track_checksums(id, ChecksumWrite::Set(&fp), ChecksumWrite::Keep)
@@ -706,6 +710,7 @@ fn refresh_structural_into_preserves_tags_and_art() {
         size: 10,
         mtime_ns: 1,
         ctime_ns: 1,
+        ino: None,
     };
     let seeded = Probed {
         format: Format::Flac,
@@ -764,6 +769,7 @@ fn refresh_structural_into_preserves_tags_and_art() {
         size: 20,
         mtime_ns: 2,
         ctime_ns: 2,
+        ino: None,
     };
     refresh_structural_into(
         &db,
@@ -961,6 +967,7 @@ fn ingest_unit_db_path_keeps_the_hash_of_unchanged_bytes() {
             backing_size: unit.stamp.size,
             backing_mtime_ns: unit.stamp.mtime_ns,
             backing_ctime_ns: unit.stamp.ctime_ns,
+            backing_ino: None,
         })
         .unwrap();
     db.set_track_checksums(id, ChecksumWrite::Keep, ChecksumWrite::Set(&hash))

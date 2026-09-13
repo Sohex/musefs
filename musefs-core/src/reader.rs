@@ -127,7 +127,7 @@ impl HeaderCache {
         let stamp = BackingStamp::from_track(&track);
         let meta = std::fs::metadata(&track.backing_path)
             .map_err(|e| CoreError::backing_io(&track.backing_path, e))?;
-        if BackingStamp::from_metadata(&meta) != stamp {
+        if !stamp.matches_live(&BackingStamp::from_metadata(&meta)) {
             return Err(CoreError::BackingChanged(track.backing_path.clone()));
         }
 
@@ -139,6 +139,9 @@ impl HeaderCache {
         // verbatim (#679).
         if let Some(hit) = self.cache.get(&track_id)
             && hit.content_version == track.content_version
+            // Stored against stored (the cache entry and the row it was built
+            // from), so ordinary equality — see the note in `facade`'s
+            // size-cache hit.
             && hit.stamp == stamp
             && hit.backing_path.as_os_str() == std::ffi::OsStr::new(&track.backing_path)
         {
@@ -427,7 +430,10 @@ pub fn read_at_into<M>(
         let f_meta = f
             .metadata()
             .map_err(|e| CoreError::backing_io(&resolved.backing_path, e))?;
-        if BackingStamp::from_metadata(&f_meta) != resolved.stamp {
+        if !resolved
+            .stamp
+            .matches_live(&BackingStamp::from_metadata(&f_meta))
+        {
             return Err(CoreError::BackingChanged(
                 resolved.backing_path.to_string_lossy().into_owned(),
             ));
@@ -766,6 +772,7 @@ mod resolve_ogg_tests {
                 backing_size: meta.len(),
                 backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
                 backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                backing_ino: None,
             })
             .unwrap();
         db.replace_tags(track_id, &[Tag::new("title", "Telephasic Workshop", 0)])
@@ -821,6 +828,7 @@ mod resolve_ogg_tests {
                 backing_size: meta.len(),
                 backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
                 backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                backing_ino: None,
             })
             .unwrap();
         // `a=b` passes the DB floor but is not a valid Vorbis field name. Without the
@@ -864,6 +872,7 @@ mod resolve_ogg_tests {
                 backing_size: meta.len(),
                 backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
                 backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                backing_ino: None,
             })
             .unwrap();
         let cache = HeaderCache::new(Mode::Synthesis);
@@ -926,6 +935,7 @@ mod resolve_ogg_tests {
                 backing_size: meta.len(),
                 backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
                 backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                backing_ino: None,
             })
             .unwrap();
         db.replace_tags(track_id, &[Tag::new("title", "Wave One", 0)])
@@ -966,6 +976,7 @@ mod resolve_ogg_tests {
                 backing_size: meta.len(),
                 backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
                 backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                backing_ino: None,
             })
             .unwrap();
         let cache = HeaderCache::new(Mode::Synthesis);
@@ -1033,6 +1044,7 @@ mod ogg_art_serve_tests {
                 size: 0,
                 mtime_ns: 0,
                 ctime_ns: 0,
+                ino: None,
             },
             mtime_secs: 0,
             last_page: Mutex::new(None),
@@ -1082,6 +1094,7 @@ mod ogg_art_serve_tests {
                 size: 0,
                 mtime_ns: 0,
                 ctime_ns: 0,
+                ino: None,
             },
             mtime_secs: 0,
             last_page: Mutex::new(None),
@@ -1128,6 +1141,7 @@ mod cache_bound_tests {
                     backing_size: meta.len(),
                     backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
                     backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                    backing_ino: None,
                 })
                 .unwrap(),
             );
@@ -1157,6 +1171,7 @@ mod cache_bound_tests {
                 size: 0,
                 mtime_ns: 0,
                 ctime_ns: 0,
+                ino: None,
             },
             mtime_secs: 0,
             last_page: Mutex::new(None),
@@ -1181,6 +1196,7 @@ mod cache_bound_tests {
                 backing_size: meta.len(),
                 backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
                 backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                backing_ino: None,
             })
             .unwrap();
         let cache = HeaderCache::new(Mode::Synthesis); // NOTE: not `mut` — resolve is &self now
@@ -1210,6 +1226,7 @@ mod cache_bound_tests {
                 backing_size: meta.len(),
                 backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
                 backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                backing_ino: None,
             })
             .unwrap()
         };
@@ -1247,6 +1264,7 @@ mod cache_bound_tests {
                 backing_size: meta.len(),
                 backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
                 backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                backing_ino: None,
             })
             .unwrap()
         };
@@ -1280,6 +1298,7 @@ mod cache_bound_tests {
                 backing_size: meta.len(),
                 backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
                 backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                backing_ino: None,
             })
             .unwrap()
         };
@@ -1328,6 +1347,7 @@ mod cache_bound_tests {
                 backing_size: meta.len(),
                 backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
                 backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                backing_ino: None,
             })
             .unwrap();
         (db, id)
@@ -1351,6 +1371,7 @@ mod cache_bound_tests {
             backing_size: meta.len(),
             backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
             backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+            backing_ino: None,
         });
         assert!(
             rejected.is_err(),
@@ -1533,6 +1554,7 @@ mod binary_tag_serve_tests {
                 backing_size: meta.len(),
                 backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
                 backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                backing_ino: None,
             })
             .unwrap();
         db.set_binary_tags(
@@ -1566,6 +1588,7 @@ mod binary_tag_serve_tests {
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         db.set_binary_tags(
@@ -1595,6 +1618,7 @@ mod binary_tag_serve_tests {
                 size: 0,
                 mtime_ns: 0,
                 ctime_ns: 0,
+                ino: None,
             },
             mtime_secs: 0,
             last_page: Mutex::new(None),
@@ -1658,6 +1682,7 @@ mod binary_tag_serve_tests {
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         let art_id = db
@@ -1681,6 +1706,7 @@ mod binary_tag_serve_tests {
                 size: 0,
                 mtime_ns: 0,
                 ctime_ns: 0,
+                ino: None,
             },
             mtime_secs: 0,
             last_page: Mutex::new(None),
@@ -1727,6 +1753,7 @@ mod serve_cap_tests {
             backing_size: meta.len(),
             backing_mtime_ns: stamp.mtime_ns,
             backing_ctime_ns: stamp.ctime_ns,
+            backing_ino: None,
         })
         .unwrap()
     }
@@ -1861,6 +1888,7 @@ mod readahead_differential_tests {
                 backing_size: meta.len(),
                 backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
                 backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                backing_ino: None,
             })
             .unwrap();
         let cache = HeaderCache::new(Mode::Synthesis);

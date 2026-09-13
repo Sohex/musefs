@@ -32,6 +32,7 @@ fn scanner_owned_bounds_mutation_is_rejected_by_the_contract() {
             backing_size: bytes.len() as u64,
             backing_mtime_ns: real_mtime_ns(&audio_path),
             backing_ctime_ns: real_ctime_ns(&audio_path),
+            backing_ino: None,
         })
         .unwrap();
 

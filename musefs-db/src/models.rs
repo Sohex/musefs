@@ -122,6 +122,95 @@ impl TrackBounds {
     }
 }
 
+/// `tracks.backing_ino` is `INTEGER NOT NULL DEFAULT 0`, and 0 is the column's
+/// "not recorded" value: every row V4 migrated carries it, as does every row a
+/// build older than #674 wrote. Linux never assigns inode 0 to a file, so the
+/// sentinel cannot collide with a real one — but the *model* says `Option<u64>`
+/// rather than making every reader remember that, the same translation
+/// `track_art`'s geometry does at its own boundary.
+///
+/// The stored value is the inode's **two's-complement bit pattern**, so an
+/// inode above `i64::MAX` reads back as a negative column value. SQLite has no
+/// unsigned 64-bit integer — `INTEGER` is signed 64-bit — so a `u64` has to be
+/// encoded somehow, and rusqlite's `u64` binding simply refuses anything past
+/// `i64::MAX` (`ToSqlConversionFailure(PosOverflow)`). That is not a
+/// theoretical range: `st_ino` is a full `u64`, and FUSE and network
+/// filesystems synthesize inode numbers freely — several pooling and
+/// cloud-mount filesystems hash to produce them, which spreads them across the
+/// whole range. Refusing would not even skip the one file: a bind failure is
+/// not a constraint violation, so the scanner classifies it as fatal and the
+/// whole run aborts.
+///
+/// The encoding is lossless for every use this column has, which is the only
+/// reason it is acceptable. Nothing orders, sums, or displays a `backing_ino`:
+/// the invalidation trigger compares it with `<>` and [`BackingStamp`] compares
+/// it for equality, and a bijection preserves both.
+///
+/// [`BackingStamp`]: https://docs.rs/musefs-core
+pub(crate) fn ino_from_col(stored: i64) -> Option<u64> {
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "the column holds the inode's two's-complement bit pattern; \
+                  this is the decode half of that bijection, not a narrowing"
+    )]
+    (stored != 0).then_some(stored as u64)
+}
+
+/// The inverse. An unknown inode stores as the sentinel, never as NULL: the
+/// column is NOT NULL and the invalidation trigger compares it with `<>`.
+pub(crate) fn ino_to_col(ino: Option<u64>) -> i64 {
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "deliberate: SQLite INTEGER is signed 64-bit, so a u64 inode is \
+                  stored as its bit pattern and decoded by `ino_from_col`"
+    )]
+    {
+        ino.unwrap_or(0) as i64
+    }
+}
+
+#[cfg(test)]
+mod ino_tests {
+    use super::{ino_from_col, ino_to_col};
+
+    /// The bijection, at the values that matter: the sentinel, an ordinary
+    /// small inode, and the range rusqlite's `u64` binding refuses outright.
+    #[test]
+    fn the_inode_encoding_round_trips_across_the_whole_u64_range() {
+        assert_eq!(ino_to_col(None), 0);
+        assert_eq!(ino_from_col(0), None, "0 is `not recorded`, not inode zero");
+
+        for ino in [
+            1u64,
+            42,
+            4_294_967_295, // a 32-bit filesystem's ceiling
+            u64::try_from(i64::MAX).unwrap(),
+            u64::try_from(i64::MAX).unwrap() + 1, // the first value `u64` binding refuses
+            u64::MAX - 1,
+            u64::MAX,
+        ] {
+            assert_eq!(
+                ino_from_col(ino_to_col(Some(ino))),
+                Some(ino),
+                "{ino} must survive the round trip"
+            );
+        }
+    }
+
+    /// Distinct inodes must stay distinct through the encoding, or the stamp
+    /// would call two different backing files the same one.
+    #[test]
+    fn the_encoding_is_injective_across_the_sign_boundary() {
+        let high = u64::try_from(i64::MAX).unwrap() + 1;
+        assert_ne!(ino_to_col(Some(high)), ino_to_col(Some(high + 1)));
+        assert_ne!(ino_to_col(Some(1)), ino_to_col(Some(u64::MAX)));
+        // And nothing but the sentinel encodes to the sentinel.
+        for ino in [1u64, u64::try_from(i64::MAX).unwrap() + 1, u64::MAX] {
+            assert_ne!(ino_to_col(Some(ino)), 0, "{ino} must not look unrecorded");
+        }
+    }
+}
+
 #[cfg_attr(feature = "mutants", derive(Default))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Track {
@@ -132,6 +221,9 @@ pub struct Track {
     pub backing_size: u64,
     pub backing_mtime_ns: i64,
     pub backing_ctime_ns: i64,
+    /// The backing file's inode, or `None` for a row written before #674 or
+    /// migrated into V4. See [`ino_from_col`]: the column spells it 0.
+    pub backing_ino: Option<u64>,
     pub content_version: i64,
     pub updated_at: i64,
     pub fingerprint: Option<String>,
@@ -236,6 +328,7 @@ pub struct TrackIdentity {
     pub backing_size: u64,
     pub backing_mtime_ns: i64,
     pub backing_ctime_ns: i64,
+    pub backing_ino: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -247,6 +340,7 @@ pub struct NewTrack {
     pub backing_size: u64,
     pub backing_mtime_ns: i64,
     pub backing_ctime_ns: i64,
+    pub backing_ino: Option<u64>,
 }
 
 #[derive(Debug, Clone)]

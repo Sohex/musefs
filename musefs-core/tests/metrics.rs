@@ -245,6 +245,7 @@ fn layout_cache_survives_unrelated_refresh() {
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         db2.replace_tags(
