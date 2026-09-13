@@ -13,7 +13,7 @@ fn corrupt_db_header_errors_instead_of_panicking() {
     {
         let db = Db::open(&db_path).unwrap();
         db.upsert_track(&musefs_db::NewTrack {
-            backing_path: "/nonexistent/a.flac".into(),
+            backing_path: std::path::PathBuf::from("/nonexistent/a.flac"),
             format: musefs_db::Format::Flac,
             audio_offset: 0,
             audio_length: 1,

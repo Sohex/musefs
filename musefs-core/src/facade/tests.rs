@@ -979,7 +979,7 @@ fn full_rebuild_gives_bare_colliding_name_to_lower_id() {
     // Insertion order fixes ascending ids: id_a < id_b.
     let id_a = db
         .upsert_track(&NewTrack {
-            backing_path: "/a.flac".into(),
+            backing_path: std::path::PathBuf::from("/a.flac"),
             format: Format::Flac,
             audio_offset: 0,
             audio_length: 1,
@@ -991,7 +991,7 @@ fn full_rebuild_gives_bare_colliding_name_to_lower_id() {
         .unwrap();
     let id_b = db
         .upsert_track(&NewTrack {
-            backing_path: "/b.flac".into(),
+            backing_path: std::path::PathBuf::from("/b.flac"),
             format: Format::Flac,
             audio_offset: 0,
             audio_length: 1,

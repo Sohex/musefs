@@ -137,7 +137,7 @@ fn gc_orphan_art_removes_unreferenced_rows() {
     let db = Db::open_in_memory().unwrap();
     let track = db
         .upsert_track(&musefs_db::NewTrack {
-            backing_path: "/x/a.flac".to_string(),
+            backing_path: std::path::PathBuf::from("/x/a.flac"),
             format: musefs_db::Format::Flac,
             audio_offset: 0,
             audio_length: 0,

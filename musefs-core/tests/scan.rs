@@ -606,7 +606,7 @@ fn scan_fails_only_the_file_with_oversized_art() {
     assert!(
         tracks[0].backing_path.ends_with("b.flac"),
         "only the clean file is stored, got {}",
-        tracks[0].backing_path
+        tracks[0].backing_path.display()
     );
     // No partial row for the failed file, and no orphan art from it either.
     let ta = db.get_track_art(tracks[0].id).unwrap();
@@ -703,4 +703,68 @@ fn two_files_sharing_one_blob_keep_their_own_picture_metadata() {
     // Depth and colours too: the FLAC parser used to read and discard both.
     assert_eq!((a.depth, a.colors), (24, 0));
     assert_eq!((b.depth, b.colors), (8, 256));
+}
+
+/// #680: a filename is an arbitrary byte string on Unix, and the scanner used
+/// to store `to_string_lossy()` as the row's identity.
+///
+/// Two failures came out of that, and the second is the serious one. The stored
+/// path did not exist on disk, so the track could never be served. And two
+/// distinct byte paths converged on one `U+FFFD`-bearing string, where
+/// `ON CONFLICT(backing_path) DO UPDATE` silently merged them into a single row
+/// — one file's identity carrying the other's metadata, with nothing in the
+/// skipped or failed counts to say so.
+#[test]
+fn two_paths_differing_only_in_invalid_utf8_stay_two_tracks() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    // `bad\x80name.flac` and `bad\x81name.flac`: distinct byte strings, and
+    // both render as the same `bad<U+FFFD>name.flac` once converted lossily.
+    let a = dir.path().join(OsStr::from_bytes(b"bad\x80name.flac"));
+    let b = dir.path().join(OsStr::from_bytes(b"bad\x81name.flac"));
+    assert_ne!(a, b);
+    assert_eq!(
+        a.to_string_lossy(),
+        b.to_string_lossy(),
+        "the fixture only tests anything if these collide lossily"
+    );
+    common::write_flac(&a, &["TITLE=A"], &[0xAA; 512]);
+    common::write_flac(&b, &["TITLE=B"], &[0xBB; 512]);
+
+    let db = Db::open_in_memory().unwrap();
+    let stats = scan_directory(&db, dir.path()).unwrap();
+    assert_eq!(stats.scanned, 2, "both files must be stored: {stats:?}");
+    assert_eq!(stats.failed, 0, "{stats:?}");
+
+    let tracks = db.list_tracks().unwrap();
+    assert_eq!(tracks.len(), 2, "one row each, not one row total");
+
+    // Each row's path is the bytes that were on disk, so it still names a real
+    // file — the half that made a mangled row unservable.
+    for t in &tracks {
+        assert!(
+            t.backing_path.exists(),
+            "stored path must exist on disk: {:?}",
+            t.backing_path
+        );
+    }
+    let mut stored: Vec<_> = tracks.iter().map(|t| t.backing_path.clone()).collect();
+    stored.sort();
+    let mut expected = vec![a.clone(), b.clone()];
+    expected.sort();
+    assert_eq!(stored, expected);
+
+    // And the two rows kept their own tags rather than one overwriting the other.
+    let title = |p: &std::path::Path| {
+        let t = db.get_track_by_path(p).unwrap().expect("row by byte path");
+        db.get_tags(t.id)
+            .unwrap()
+            .into_iter()
+            .find(|tag| tag.key == "title")
+            .map(|tag| tag.value)
+    };
+    assert_eq!(title(&a).as_deref(), Some("A"));
+    assert_eq!(title(&b).as_deref(), Some("B"));
 }

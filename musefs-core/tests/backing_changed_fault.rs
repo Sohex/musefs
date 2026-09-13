@@ -15,7 +15,7 @@ fn shrinking_the_backing_file_after_scan_yields_backing_changed() {
     let db = Db::open_in_memory().unwrap();
     let id = db
         .upsert_track(&musefs_db::NewTrack {
-            backing_path: src.to_string_lossy().into_owned(),
+            backing_path: src.clone(),
             format: musefs_db::Format::Flac,
             audio_offset,
             audio_length,
@@ -59,7 +59,7 @@ fn same_size_subsecond_rewrite_yields_backing_changed() {
     let meta = std::fs::metadata(&src).unwrap();
     let id = db
         .upsert_track(&musefs_db::NewTrack {
-            backing_path: src.to_string_lossy().into_owned(),
+            backing_path: src.clone(),
             format: musefs_db::Format::Flac,
             audio_offset,
             audio_length,
@@ -99,7 +99,7 @@ fn forged_mtime_is_caught_by_ctime() {
     let original_modified = meta.modified().unwrap();
     let id = db
         .upsert_track(&musefs_db::NewTrack {
-            backing_path: src.to_string_lossy().into_owned(),
+            backing_path: src.clone(),
             format: musefs_db::Format::Flac,
             audio_offset,
             audio_length,
@@ -140,7 +140,7 @@ fn displayed_mtime_is_whole_seconds() {
     let meta = std::fs::metadata(&src).unwrap();
     let id = db
         .upsert_track(&musefs_db::NewTrack {
-            backing_path: src.to_string_lossy().into_owned(),
+            backing_path: src.clone(),
             format: musefs_db::Format::Flac,
             audio_offset,
             audio_length,
@@ -173,7 +173,7 @@ fn a_replacement_the_timestamps_cannot_see_yields_backing_changed() {
     let meta = std::fs::metadata(&src).unwrap();
     let id = db
         .upsert_track(&musefs_db::NewTrack {
-            backing_path: src.to_string_lossy().into_owned(),
+            backing_path: src.clone(),
             format: musefs_db::Format::Flac,
             audio_offset,
             audio_length,
@@ -207,7 +207,7 @@ fn a_row_with_no_recorded_inode_still_serves() {
     let db = Db::open_in_memory().unwrap();
     let id = db
         .upsert_track(&musefs_db::NewTrack {
-            backing_path: src.to_string_lossy().into_owned(),
+            backing_path: src.clone(),
             format: musefs_db::Format::Flac,
             audio_offset,
             audio_length,

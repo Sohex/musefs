@@ -10,7 +10,7 @@ use musefs_db::Db;
 /// art)`, with tags as `(key, value, ordinal)` and art as
 /// `(sha256, picture_type, description, ordinal)`.
 type NormalizedTrack = (
-    String,
+    std::path::PathBuf,
     u64,
     u64,
     Vec<(String, String, u64)>,

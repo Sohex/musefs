@@ -290,7 +290,7 @@ fn poll_refresh_picks_up_external_db_edits() {
         let db = musefs_db::Db::open(&db_path).unwrap();
         let id = db
             .upsert_track(&NewTrack {
-                backing_path: "/x/a.flac".to_string(),
+                backing_path: std::path::PathBuf::from("/x/a.flac"),
                 format: Format::Flac,
                 audio_offset: 0,
                 audio_length: 0,
@@ -316,7 +316,7 @@ fn poll_refresh_picks_up_external_db_edits() {
         let db2 = musefs_db::Db::open(&db_path).unwrap();
         let id = db2
             .upsert_track(&NewTrack {
-                backing_path: "/x/b.flac".to_string(),
+                backing_path: std::path::PathBuf::from("/x/b.flac"),
                 format: Format::Flac,
                 audio_offset: 0,
                 audio_length: 0,
@@ -419,7 +419,7 @@ fn poll_refresh_keeps_unchanged_entries_and_prunes_vanished() {
         let db2 = musefs_db::Db::open(&db_path).unwrap();
         let id = db2
             .upsert_track(&NewTrack {
-                backing_path: "/x/ghost.mp3".to_string(),
+                backing_path: std::path::PathBuf::from("/x/ghost.mp3"),
                 format: Format::Mp3,
                 audio_offset: 0,
                 audio_length: 0,
@@ -451,7 +451,7 @@ fn poll_refresh_debounces_within_interval() {
         let db = musefs_db::Db::open(&db_path).unwrap();
         let id = db
             .upsert_track(&NewTrack {
-                backing_path: "/x/a.flac".to_string(),
+                backing_path: std::path::PathBuf::from("/x/a.flac"),
                 format: Format::Flac,
                 audio_offset: 0,
                 audio_length: 0,
@@ -476,7 +476,7 @@ fn poll_refresh_debounces_within_interval() {
         let db2 = musefs_db::Db::open(&db_path).unwrap();
         let id = db2
             .upsert_track(&NewTrack {
-                backing_path: "/x/b.flac".to_string(),
+                backing_path: std::path::PathBuf::from("/x/b.flac"),
                 format: Format::Flac,
                 audio_offset: 0,
                 audio_length: 0,
@@ -505,7 +505,7 @@ fn unchanged_refresh_poll_consumes_debounce_window() {
         let db = musefs_db::Db::open(&db_path).unwrap();
         let id = db
             .upsert_track(&NewTrack {
-                backing_path: "/x/a.flac".to_string(),
+                backing_path: std::path::PathBuf::from("/x/a.flac"),
                 format: Format::Flac,
                 audio_offset: 0,
                 audio_length: 0,
@@ -535,7 +535,7 @@ fn unchanged_refresh_poll_consumes_debounce_window() {
         let db2 = musefs_db::Db::open(&db_path).unwrap();
         let id = db2
             .upsert_track(&NewTrack {
-                backing_path: "/x/b.flac".to_string(),
+                backing_path: std::path::PathBuf::from("/x/b.flac"),
                 format: Format::Flac,
                 audio_offset: 0,
                 audio_length: 0,
@@ -568,7 +568,7 @@ fn failed_refresh_retries_after_backoff_not_every_call() {
         let db = musefs_db::Db::open(&db_path).unwrap();
         let id = db
             .upsert_track(&NewTrack {
-                backing_path: "/x/a.flac".to_string(),
+                backing_path: std::path::PathBuf::from("/x/a.flac"),
                 format: Format::Flac,
                 audio_offset: 0,
                 audio_length: 0,
@@ -594,7 +594,7 @@ fn failed_refresh_retries_after_backoff_not_every_call() {
         let db2 = musefs_db::Db::open(&db_path).unwrap();
         let id = db2
             .upsert_track(&NewTrack {
-                backing_path: "/x/b.flac".to_string(),
+                backing_path: std::path::PathBuf::from("/x/b.flac"),
                 format: Format::Flac,
                 audio_offset: 0,
                 audio_length: 0,
@@ -630,7 +630,7 @@ fn poll_refresh_single_flights_concurrent_callers() {
         let db = musefs_db::Db::open(&db_path).unwrap();
         let id = db
             .upsert_track(&NewTrack {
-                backing_path: "/x/a.flac".into(),
+                backing_path: std::path::PathBuf::from("/x/a.flac"),
                 format: Format::Flac,
                 audio_offset: 0,
                 audio_length: 0,
@@ -655,7 +655,7 @@ fn poll_refresh_single_flights_concurrent_callers() {
         let db2 = musefs_db::Db::open(&db_path).unwrap();
         let id = db2
             .upsert_track(&NewTrack {
-                backing_path: "/x/b.flac".into(),
+                backing_path: std::path::PathBuf::from("/x/b.flac"),
                 format: Format::Flac,
                 audio_offset: 0,
                 audio_length: 0,
@@ -693,7 +693,7 @@ fn inode_is_stable_across_refresh() {
         let db = musefs_db::Db::open(&db_path).unwrap();
         let id = db
             .upsert_track(&NewTrack {
-                backing_path: "/x/a.flac".into(),
+                backing_path: std::path::PathBuf::from("/x/a.flac"),
                 format: Format::Flac,
                 audio_offset: 0,
                 audio_length: 0,
@@ -720,7 +720,7 @@ fn inode_is_stable_across_refresh() {
         let db2 = musefs_db::Db::open(&db_path).unwrap();
         let id = db2
             .upsert_track(&NewTrack {
-                backing_path: "/x/b.flac".into(),
+                backing_path: std::path::PathBuf::from("/x/b.flac"),
                 format: Format::Flac,
                 audio_offset: 0,
                 audio_length: 0,
@@ -1100,7 +1100,7 @@ fn refresh_picks_up_externally_added_track() {
         let db = musefs_db::Db::open(&db_path).unwrap();
         let id = db
             .upsert_track(&NewTrack {
-                backing_path: "/x/a.flac".into(),
+                backing_path: std::path::PathBuf::from("/x/a.flac"),
                 format: Format::Flac,
                 audio_offset: 0,
                 audio_length: 0,
@@ -1122,7 +1122,7 @@ fn refresh_picks_up_externally_added_track() {
         let db2 = musefs_db::Db::open(&db_path).unwrap();
         let id = db2
             .upsert_track(&NewTrack {
-                backing_path: "/x/b.flac".into(),
+                backing_path: std::path::PathBuf::from("/x/b.flac"),
                 format: Format::Flac,
                 audio_offset: 0,
                 audio_length: 0,
@@ -1321,7 +1321,7 @@ fn forced_refresh_and_poll_refresh_never_publish_stale_tree() {
     fn insert(db: &musefs_db::Db, n: usize) {
         let id = db
             .upsert_track(&NewTrack {
-                backing_path: format!("/x/track{n}.flac"),
+                backing_path: std::path::PathBuf::from(format!("/x/track{n}.flac")),
                 format: Format::Flac,
                 audio_offset: 0,
                 audio_length: 0,

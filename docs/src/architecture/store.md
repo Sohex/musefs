@@ -97,9 +97,10 @@ sentinel for "not recorded", which every row in a store upgraded to v4 carries
 until a scan fills it in. A reader decoding this column must cast the bit
 pattern back rather than treat a negative value as invalid.
 
-**`backing_path` is bytes, not text.** From schema v4 it is a `BLOB`, because a
-filesystem path is a byte string and the lossy text round-trip collapsed two
-distinct files onto one row. This matters to a *reader* as much as a writer:
+**`backing_path` is bytes, not text.** From schema v4 it is a `BLOB` and the
+Rust model is a `PathBuf`, because a filesystem path is a byte string and the
+lossy text round-trip collapsed two distinct files onto one row. This matters to
+a *reader* as much as a writer:
 SQLite never compares a `TEXT` value equal to a `BLOB`, so a lookup that binds a
 string matches nothing at all rather than failing, and a `CHECK` pins the
 storage class so the two spellings cannot become two rows for one file. The

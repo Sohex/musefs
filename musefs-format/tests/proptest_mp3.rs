@@ -98,7 +98,7 @@ proptest! {
         // Step 2: DB round-trip.
         let db = musefs_db::Db::open_in_memory().unwrap();
         let tid = db.upsert_track(&musefs_db::NewTrack {
-            backing_path: "/a.mp3".into(),
+            backing_path: std::path::PathBuf::from("/a.mp3"),
             format: musefs_db::Format::Mp3,
             audio_offset: 0,
             audio_length: 0,

@@ -1,3 +1,7 @@
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
+
 use strum::{EnumIter, EnumString, IntoStaticStr};
 
 /// The DB text representation (the `tracks.format` column) is derived:
@@ -122,6 +126,29 @@ impl TrackBounds {
     }
 }
 
+/// `tracks.backing_path` is a `BLOB` from schema v4 (#680), because a filesystem
+/// path on Unix is an arbitrary byte string and not text.
+///
+/// Storing it as lossily-converted text did two things: the stored path did not
+/// exist on disk, so the track could never be served, and — the serious half —
+/// two distinct byte paths converged on one `U+FFFD`-bearing string, where
+/// `ON CONFLICT(backing_path) DO UPDATE` silently merged them into a single row
+/// carrying one file's identity and the other's metadata. Neither showed up in
+/// the scan's skipped or failed counts.
+///
+/// `PathBuf` rather than `Vec<u8>` in the model: it is the type every consumer
+/// wants (`File::open`, `metadata`, the virtual tree), it *is* bytes on Unix,
+/// and it keeps the lossy conversion confined to the places that genuinely
+/// render a path for a human to read.
+pub(crate) fn path_from_col(stored: Vec<u8>) -> PathBuf {
+    PathBuf::from(OsString::from_vec(stored))
+}
+
+/// The inverse, borrowed: what every path predicate and write binds.
+pub(crate) fn path_to_col(path: &Path) -> &[u8] {
+    <OsStr as OsStrExt>::as_bytes(path.as_os_str())
+}
+
 /// `tracks.backing_ino` is `INTEGER NOT NULL DEFAULT 0`, and 0 is the column's
 /// "not recorded" value: every row V4 migrated carries it, as does every row a
 /// build older than #674 wrote. Linux never assigns inode 0 to a file, so the
@@ -215,7 +242,7 @@ mod ino_tests {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Track {
     pub id: i64,
-    pub backing_path: String,
+    pub backing_path: PathBuf,
     pub format: Format,
     pub bounds: TrackBounds,
     pub backing_size: u64,
@@ -324,7 +351,7 @@ mod checksum_write_tests {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrackIdentity {
     pub content_version: i64,
-    pub backing_path: String,
+    pub backing_path: PathBuf,
     pub backing_size: u64,
     pub backing_mtime_ns: i64,
     pub backing_ctime_ns: i64,
@@ -333,7 +360,7 @@ pub struct TrackIdentity {
 
 #[derive(Debug, Clone)]
 pub struct NewTrack {
-    pub backing_path: String,
+    pub backing_path: PathBuf,
     pub format: Format,
     pub audio_offset: u64,
     pub audio_length: u64,

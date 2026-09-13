@@ -496,7 +496,9 @@ proptest! {
                     // DB-only track: tree-building never reads the backing file, and
                     // both fs and reference read the same DB, so equivalence holds.
                     let new = musefs_db::NewTrack {
-                        backing_path: format!("/virt/added-{add_seq}.flac"),
+                        backing_path: std::path::PathBuf::from(format!(
+                            "/virt/added-{add_seq}.flac"
+                        )),
                         format: musefs_db::Format::Flac,
                         audio_offset: 0, audio_length: 1, backing_size: 1, backing_mtime_ns: 0, backing_ctime_ns: 0,
                         backing_ino: None,

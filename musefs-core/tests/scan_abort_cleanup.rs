@@ -78,7 +78,7 @@ fn failed_flush_does_not_strand_budget_blocked_workers() {
     let blocker = Db::open(&db_path).unwrap();
     let mut hold = blocker.bulk_writer().unwrap();
     hold.upsert_track(&NewTrack {
-        backing_path: "/blocker.flac".into(),
+        backing_path: std::path::PathBuf::from("/blocker.flac"),
         format: Format::Flac,
         audio_offset: 0,
         audio_length: 1,

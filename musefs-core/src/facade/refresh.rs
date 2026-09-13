@@ -180,7 +180,7 @@ impl Musefs {
     /// no-concurrent-rebuild contract.
     fn rebuild_full(&self) -> Result<HashMap<i64, TrackRenderState>> {
         if self.force_rebuild_error.load(Ordering::Acquire) {
-            return Err(CoreError::BackingChanged(
+            return Err(CoreError::DerivedStateStale(
                 "forced refresh failure".to_string(),
             ));
         }
@@ -253,7 +253,7 @@ impl Musefs {
     /// scan path. The tree is published here on success.
     fn rebuild_incremental(&self) -> Result<Option<IncrementalOutcome>> {
         if self.force_rebuild_error.load(Ordering::Acquire) {
-            return Err(CoreError::BackingChanged(
+            return Err(CoreError::DerivedStateStale(
                 "forced refresh failure".to_string(),
             ));
         }
@@ -499,7 +499,7 @@ impl Musefs {
         // connection re-dispatches a fast-failing poll on every metadata op, never
         // arming the backoff the rebuild-error paths below rely on (#369).
         let version_read = if self.force_poll_read_error.load(Ordering::Acquire) {
-            Err(CoreError::BackingChanged(
+            Err(CoreError::DerivedStateStale(
                 "forced poll-read failure".to_string(),
             ))
         } else {
