@@ -563,8 +563,11 @@ CREATE TABLE tracks (
 -- a rescan, while carrying a value the new CHECK rejects would abort the whole
 -- upgrade over a column that rebuilds itself. The other tightened columns are
 -- NOT sanitized here -- they are either structural or NOT NULL, so a row that
--- violates them fails the migration, which is what the row-rejection pre-flight
--- and its repair flag exist to report ahead of time.
+-- violates them fails the migration. That failure is atomic: every step runs in
+-- one transaction, so nothing is half-applied and the store is exactly as it
+-- was. Repairing such a row, or reporting it before the run starts, is the
+-- command's business rather than this SQL's -- rewriting a value an external
+-- writer chose is precisely what must not happen without being asked.
 INSERT INTO tracks (id, backing_path, format, audio_offset, audio_length,
                     backing_size, backing_mtime_ns, content_version, updated_at,
                     backing_ctime_ns, fingerprint, content_hash, backing_ino)
@@ -677,7 +680,7 @@ CREATE TABLE track_art (
 -- The refill is straight: `art` carries no scanner-owned column a rescan could
 -- recompute, so there is nothing here that the sanitize-only-under-a-flag
 -- policy would let this step null on its own. A row the tightened constraints
--- reject fails the migration, which is what the row-rejection pre-flight is for.
+-- reject fails the migration, atomically, the way it does for the rebuilds above.
 CREATE TABLE art_hold_v4 (
     id INTEGER, sha256 TEXT, mime TEXT, width INTEGER, height INTEGER,
     byte_len INTEGER, data BLOB

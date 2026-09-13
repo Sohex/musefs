@@ -195,9 +195,9 @@ see the [Release notes](release-notes.md).
   `content_hash` is the one column the refill sanitizes rather than aborting on:
   it is scanner-owned and a rescan recomputes it, which is the case the
   sanitize-only-under-a-flag policy carves out. Every other tightened column is
-  structural or `NOT NULL`, so a row violating one fails the migration — which
-  is what the row-rejection pre-flight, landing with the `art` rebuild, exists
-  to report before the upgrade starts rather than during it.
+  structural or `NOT NULL`, so a row violating one fails the migration. The
+  failure is atomic — every step runs in one transaction, so nothing is
+  half-applied and the store is exactly as it was.
 
   **External writers break here.** The path column changes type under every
   query, and because SQLite never compares `TEXT` equal to `BLOB` the failure is
@@ -305,8 +305,8 @@ see the [Release notes](release-notes.md).
   The refill is straight rather than sanitizing: `art` carries no scanner-owned
   column a rescan could recompute, so there is nothing the
   sanitize-only-under-a-flag policy would let this step null on its own. A row
-  the tightened constraints reject fails the migration, which is what the
-  row-rejection pre-flight exists to report before it starts.
+  the tightened constraints reject fails the migration, atomically, the way it
+  does for the rebuilds above.
 
   `mime`, `width` and `height` **stay** on `art` for now. #716 moves them to the
   link, and the link has carried them since the previous step, but the readers do
