@@ -322,11 +322,18 @@ see the [Release notes](release-notes.md).
   rather than nearly true. It
   was the one table V4 would otherwise have left alone — its shape does not
   change — and so the last place a schema-valid row could still reach the reader
-  as a `rusqlite` conversion failure: a blob `kind`, a real `ordinal` or a text
-  `body` is exactly what affinity will not convert, and each surfaced as a
-  store-wide error rather than as the malformed row it is. The value checks were
-  always there and still are; what was missing was the storage class that lets
-  them be the thing that fires.
+  as a `rusqlite` conversion failure: a non-integral `REAL` `ordinal` or a `TEXT`
+  `body` is what affinity will not convert, and each surfaced as a store-wide
+  error rather than as the malformed row it is. (`kind` needs no such check: its
+  `IN` list is strictly stronger, since no non-`TEXT` value compares equal to
+  either name.) The value checks were always there and still are; what was
+  missing was the storage class that lets them be the thing that fires.
+
+  "Non-integral" is the whole of it, and worth saying: `INTEGER` affinity
+  converts an exactly-integral `REAL` — `1.0` is stored as the integer 1 and is
+  not a violation at all. A storage-class `CHECK` earns its keep only on what
+  affinity cannot convert, which is precisely the set that reaches Rust as a
+  conversion failure rather than as a wrong value.
 
   Low severity on its own — `structural_blocks` is outside the editable
   contract, so reaching it needs a writer that ignores that. It is here on

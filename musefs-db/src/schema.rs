@@ -2749,12 +2749,13 @@ mod v4_art_rebuild_tests {
     /// #718 for this table. `byte_len = length(data)` was always there; what is
     /// new is that the columns must be the storage class the Rust model reads.
     ///
-    /// Note what a `typeof` CHECK does *not* catch: column affinity converts a
-    /// numeric-looking string on the way in, so `byte_len = '1'` is stored as
-    /// the integer 1 and is not a violation at all. The constraint is there for
-    /// what affinity cannot convert — text that is not a number, and blobs,
-    /// which are exactly the values that reach the Rust side as a conversion
-    /// failure rather than as a wrong number.
+    /// Note what a `typeof` CHECK does *not* catch: column affinity converts
+    /// what it can on the way in. `byte_len = '1'` is stored as the integer 1,
+    /// and so is an exactly-integral `REAL` like `1.0` — neither is a violation
+    /// at all. The constraint is there for what affinity cannot convert — text
+    /// that is not a number, a `REAL` with a fractional part, and blobs — which
+    /// is exactly the set that reaches the Rust side as a conversion failure
+    /// rather than as a wrong number.
     #[test]
     fn storage_classes_are_pinned() {
         let conn = migrated();
@@ -2880,7 +2881,10 @@ mod v4_structural_blocks_rebuild_tests {
         let conn = migrated_with_a_block();
         for (what, sql) in [
             (
-                "a real ordinal",
+                // Non-integral deliberately: INTEGER affinity converts an
+                // exactly-integral REAL, so `1.0` is stored as the integer 1
+                // and is correctly not a violation.
+                "a non-integral real ordinal",
                 "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
                  VALUES (1, 'SEEKTABLE', 0.5, X'00')",
             ),
