@@ -182,6 +182,35 @@ see the [Release notes](release-notes.md).
   not placed to
   `EIO`, the collapse it already documents for structural errors.
 
+- **Public structs that grow are `#[non_exhaustive]` too**
+  ([#743](https://github.com/Sohex/musefs/issues/743)). #708 did it for enums,
+  but adding a field to a public struct with public fields was just as breaking.
+  A non-exhaustive struct cannot be built with a literal outside its crate at
+  all — not even with `..Default::default()` — so the split follows who builds
+  each one. Outside its crate, build a marked configuration struct with
+  `default()` and assign the fields you change.
+  - Configuration a caller fills in from defaults: `ScanOptions`, `MountConfig`
+    (which gains a `Default` matching a bare `musefs mount`, pinned by a test),
+    `FuseConfig`, and `musefs-cli`'s `Cli`, `MountArgs` and `MigrateArgs`.
+  - Results no other crate builds: `ScanStats`, `RevalidateStats`,
+    `CoreTelemetry`, `ProcessStats`, `metrics::Snapshot` and the tree's `Node`;
+    `Track`, `TrackIdentity`, `Tag`, `Art`, `ArtMeta`, `BinaryTagRow`,
+    `ChangelogRead` and `PendingStep`; and the format scanners' results —
+    `FlacScan`, `FlacMeta`, `Mp3Bounds`, `Mp4Bounds`, `Mp4Scan`, `BoxHeader`,
+    `OversizeDrop`, `OggHeader`, `OggScan`, `PageHeader`, `PictureDrop`,
+    `B64Window` and `WavBounds`.
+
+  Deliberately left exhaustive: the structs another crate builds field by field
+  in production — the store's write inputs (`NewTrack`, `NewArt`, `TrackArt`,
+  `BinaryTag`, `StructuralBlock`), the synthesis inputs (`ArtInput`,
+  `BinaryTagInput`, `TagInput`, `MetadataBlock`, `OggArt`), and the telemetry
+  `musefs-fuse` and the binary fill in. A new field on one of those is a value
+  every producer must supply, and the compile error is what makes each one do
+  it — the reason `Segment` stayed exhaustive. So a new store column remains a
+  breaking change for Rust code that writes rows. Also left: the value types
+  tests build directly (`Attr`, `VirtualMtime`, `BackingStamp`, `ResolvedFile`,
+  `WavScan`, `EmbeddedPicture`, `EmbeddedBinaryTag`).
+
 - **`tracks` is rebuilt by the 2.0.0 store migration.** This is the step that
   makes the upgrade gated: `musefs migrate` runs it, and afterwards the store no
   longer opens with an older musefs. It is one rebuild because SQLite can add
@@ -567,7 +596,7 @@ see the [Release notes](release-notes.md).
 
 ### Removed
 
-- **`scan --revalidate`**, deprecated since 1.1.0 in favour of the `revalidate`
+- **`scan --revalidate`**, deprecated since 1.2.0 in favour of the `revalidate`
   subcommand, and its `MUSEFS_REVALIDATE` variable
   ([#707](https://github.com/Sohex/musefs/issues/707)). The flag is now a usage
   error. The variable is refused rather than ignored: clap never reads an
@@ -575,7 +604,7 @@ see the [Release notes](release-notes.md).
   have gone on running a full scan where it used to revalidate, and said
   nothing. `scan` stops with a message naming the subcommand instead.
   `musefs_cli::run_scan` loses its `revalidate` parameter. The `contrib`
-  packages have called the subcommand since their 1.1.0, so only a copy older
+  packages have called the subcommand since their 1.2.0, so only a copy older
   than that is affected.
 
 - **`scan --fast` and `--strict`, replaced by `--match=auto|fast|strict`**, and

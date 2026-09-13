@@ -55,16 +55,10 @@ fn pipeline_completes_under_art_backpressure() {
     let root = dir.path().to_path_buf();
     let handle = std::thread::spawn(move || {
         let db = Db::open_in_memory().unwrap();
-        scan_directory_with(
-            &db,
-            &root,
-            &ScanOptions {
-                jobs: 4,
-                batch_bytes: 8,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let mut options = ScanOptions::default();
+        options.jobs = 4;
+        options.batch_bytes = 8;
+        scan_directory_with(&db, &root, &options).unwrap();
         db.list_tracks().unwrap().len()
     });
 

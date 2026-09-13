@@ -9,7 +9,6 @@ use musefs_core::{
     ChecksumTier, MountConfig, Musefs, ScanOptions, VirtualTree, metrics, scan_directory,
     scan_directory_with,
 };
-use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 /// Serialise every test that calls `metrics::reset()` / `metrics::snapshot()`.
@@ -20,25 +19,17 @@ static METRICS_LOCK: Mutex<()> = Mutex::new(());
 /// Scan options that compute no checksums, so a read-count assertion measures
 /// only the probe itself.
 fn no_checksum_opts() -> ScanOptions {
-    ScanOptions {
-        checksum: ChecksumTier::None,
-        ..Default::default()
-    }
+    let mut options = ScanOptions::default();
+    options.checksum = ChecksumTier::None;
+    options
 }
 
 fn config() -> MountConfig {
-    MountConfig {
-        template: "$artist/$title".to_string(),
-        fallbacks: BTreeMap::new(),
-        default_fallback: "Unknown".to_string(),
-        mode: musefs_core::Mode::Synthesis,
-        poll_interval: std::time::Duration::ZERO,
-        case_insensitive: false,
-        read_ahead_budget: 64 * 1024 * 1024,
-        read_ahead_prefetch: false,
-        skip_on_missing: false,
-        trust_backing_mtime: false,
-    }
+    let mut config = MountConfig::default();
+    config.template = "$artist/$title".to_string();
+    config.poll_interval = std::time::Duration::ZERO;
+    config.case_insensitive = false;
+    config
 }
 
 /// Scan `dir`, mount, read the single track end-to-end in 16 KiB chunks under

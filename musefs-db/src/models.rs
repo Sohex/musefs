@@ -241,6 +241,7 @@ mod ino_tests {
 
 #[cfg_attr(feature = "mutants", derive(Default))]
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Track {
     pub id: i64,
     pub backing_path: PathBuf,
@@ -350,6 +351,7 @@ mod checksum_write_tests {
 /// the former alone, so a cache holding a locator must compare both (#679).
 #[cfg_attr(feature = "mutants", derive(Default))]
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TrackIdentity {
     pub content_version: i64,
     pub backing_path: PathBuf,
@@ -378,6 +380,7 @@ pub struct NewArt {
 
 #[cfg_attr(feature = "mutants", derive(Default))]
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Tag {
     pub key: String,
     pub value: String,
@@ -396,6 +399,7 @@ impl Tag {
 
 #[cfg_attr(feature = "mutants", derive(Default))]
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Art {
     pub id: i64,
     pub sha256: String,
@@ -405,6 +409,7 @@ pub struct Art {
 
 #[cfg_attr(feature = "mutants", derive(Default))]
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ArtMeta {
     pub byte_len: u64,
 }
@@ -448,6 +453,7 @@ pub struct BinaryTag {
 /// key, and the payload length — the bytes themselves stream at read time.
 #[cfg_attr(feature = "mutants", derive(Default))]
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BinaryTagRow {
     pub rowid: i64,
     pub key: String,

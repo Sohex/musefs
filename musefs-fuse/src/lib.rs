@@ -44,6 +44,7 @@ thread_local! {
 /// every entry. Distinct from `musefs_core::MountConfig`, which governs how the
 /// virtual tree is rendered.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FuseConfig {
     /// Entry/attr cache lifetime the kernel may trust before re-validating.
     /// Longer cuts `lookup`/`getattr` traffic but bounds how fast external DB
@@ -1946,21 +1947,13 @@ mod tests {
     }
 
     fn test_fs() -> (tempfile::TempDir, MusefsFs) {
-        use musefs_core::{Mode, MountConfig, Musefs};
+        use musefs_core::{MountConfig, Musefs};
         let dir = tempfile::tempdir().unwrap();
-        let cfg = MountConfig {
-            template: "$artist/$title".to_string(),
-            fallbacks: std::collections::BTreeMap::new(),
-            default_fallback: "Unknown".to_string(),
-            mode: Mode::Synthesis,
-            // Zero interval => poll_due() is always true, isolating the gate.
-            poll_interval: std::time::Duration::ZERO,
-            case_insensitive: false,
-            read_ahead_budget: 64 * 1024 * 1024,
-            read_ahead_prefetch: false,
-            skip_on_missing: false,
-            trust_backing_mtime: false,
-        };
+        let mut cfg = MountConfig::default();
+        cfg.template = "$artist/$title".to_string();
+        // Zero interval => poll_due() is always true, isolating the gate.
+        cfg.poll_interval = std::time::Duration::ZERO;
+        cfg.case_insensitive = false;
         let core =
             Musefs::open(musefs_db::Db::open(dir.path().join("m.db")).unwrap(), cfg).unwrap();
         (dir, MusefsFs::new(core, FuseConfig::default()))
@@ -1968,20 +1961,12 @@ mod tests {
 
     #[test]
     fn explicit_workers_sets_pool_size() {
-        use musefs_core::{Mode, MountConfig, Musefs};
+        use musefs_core::{MountConfig, Musefs};
         let dir = tempfile::tempdir().unwrap();
-        let cfg = MountConfig {
-            template: "$artist/$title".to_string(),
-            fallbacks: std::collections::BTreeMap::new(),
-            default_fallback: "Unknown".to_string(),
-            mode: Mode::Synthesis,
-            poll_interval: std::time::Duration::ZERO,
-            case_insensitive: false,
-            read_ahead_budget: 64 * 1024 * 1024,
-            read_ahead_prefetch: false,
-            skip_on_missing: false,
-            trust_backing_mtime: false,
-        };
+        let mut cfg = MountConfig::default();
+        cfg.template = "$artist/$title".to_string();
+        cfg.poll_interval = std::time::Duration::ZERO;
+        cfg.case_insensitive = false;
         let core =
             Musefs::open(musefs_db::Db::open(dir.path().join("w.db")).unwrap(), cfg).unwrap();
         let fs = MusefsFs::new(

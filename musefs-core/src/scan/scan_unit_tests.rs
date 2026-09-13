@@ -514,19 +514,31 @@ fn audio_sample_reads_three_bounded_windows() {
 #[test]
 fn records_same_bytes_needs_every_field_to_agree() {
     let unit = unit_with("/m/a.flac", Some("a".repeat(64)));
-    let row = |stamp: BackingStamp, format, offset, length| musefs_db::Track {
-        id: 1,
-        backing_path: unit.abs_path.clone(),
-        format,
-        bounds: musefs_db::TrackBounds::new(offset, length, stamp.size).unwrap(),
-        backing_size: stamp.size,
-        backing_mtime_ns: stamp.mtime_ns,
-        backing_ctime_ns: stamp.ctime_ns,
-        backing_ino: stamp.ino,
-        content_version: 0,
-        updated_at: 0,
-        fingerprint: None,
-        content_hash: None,
+    // A real row to vary: `Track` is `#[non_exhaustive]`, so outside musefs-db
+    // one comes from the store rather than a literal.
+    let db = Db::open_in_memory().unwrap();
+    let id = db
+        .upsert_track(&NewTrack {
+            backing_path: unit.abs_path.clone(),
+            format: Format::Flac,
+            audio_offset: 0,
+            audio_length: 0,
+            backing_size: unit.stamp.size,
+            backing_mtime_ns: unit.stamp.mtime_ns,
+            backing_ctime_ns: unit.stamp.ctime_ns,
+            backing_ino: unit.stamp.ino,
+        })
+        .unwrap();
+    let stored = db.get_track(id).unwrap().expect("the row just written");
+    let row = |stamp: BackingStamp, format, offset, length| {
+        let mut track = stored.clone();
+        track.format = format;
+        track.bounds = musefs_db::TrackBounds::new(offset, length, stamp.size).unwrap();
+        track.backing_size = stamp.size;
+        track.backing_mtime_ns = stamp.mtime_ns;
+        track.backing_ctime_ns = stamp.ctime_ns;
+        track.backing_ino = stamp.ino;
+        track
     };
     let same = row(unit.stamp, Format::Flac, 0, 0);
     assert!(

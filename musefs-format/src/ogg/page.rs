@@ -18,6 +18,7 @@ pub const FLAG_EOS: u8 = 0x04;
 /// A parsed Ogg page header (the 27 fixed bytes + the segment table) plus the
 /// derived payload length. Multi-byte fields are little-endian on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PageHeader {
     pub header_type: u8,
     pub granule: u64,

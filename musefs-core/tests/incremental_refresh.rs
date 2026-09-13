@@ -3,7 +3,7 @@ mod common;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use musefs_core::{Mode, MountConfig, Musefs, scan_directory};
+use musefs_core::{MountConfig, Musefs, scan_directory};
 use musefs_db::{Db, Tag};
 
 use common::corpus::{CorpusParams, Format, Target, prepare};
@@ -16,37 +16,28 @@ fn small_corpus(n: usize) -> Target {
 }
 
 fn config() -> MountConfig {
-    MountConfig {
-        template: "$artist/$album/$title".into(),
-        fallbacks: BTreeMap::new(),
-        default_fallback: "Unknown".into(),
-        mode: Mode::Synthesis,
-        poll_interval: Duration::ZERO,
-        case_insensitive: false,
-        read_ahead_budget: 64 * 1024 * 1024,
-        read_ahead_prefetch: false,
-        skip_on_missing: false,
-        trust_backing_mtime: false,
-    }
+    let mut config = MountConfig::default();
+    config.template = "$artist/$album/$title".into();
+    config.poll_interval = Duration::ZERO;
+    config.case_insensitive = false;
+    config
 }
 
 fn config_ci() -> MountConfig {
-    MountConfig {
-        case_insensitive: true,
-        read_ahead_budget: 64 * 1024 * 1024,
-        read_ahead_prefetch: false,
-        skip_on_missing: false,
-        trust_backing_mtime: false,
-        ..config()
-    }
+    let mut new_config = config();
+    new_config.case_insensitive = true;
+    new_config.read_ahead_budget = 64 * 1024 * 1024;
+    new_config.read_ahead_prefetch = false;
+    new_config.skip_on_missing = false;
+    new_config.trust_backing_mtime = false;
+    new_config
 }
 
 fn config_skip() -> MountConfig {
-    MountConfig {
-        skip_on_missing: true,
-        trust_backing_mtime: false,
-        ..config()
-    }
+    let mut new_config = config();
+    new_config.skip_on_missing = true;
+    new_config.trust_backing_mtime = false;
+    new_config
 }
 
 /// (rendered tree path -> inode) for every FILE, walking from root. Tests compare
@@ -656,10 +647,8 @@ fn revalidate_prunes_only_with_flag() {
     assert_eq!(stats.pruned, 0);
     assert_eq!(db.list_tracks().unwrap().len(), 1);
 
-    let opts = musefs_core::ScanOptions {
-        prune: true,
-        ..Default::default()
-    };
+    let mut opts = musefs_core::ScanOptions::default();
+    opts.prune = true;
     let stats = musefs_core::revalidate_with(&db, dir.path(), &opts).unwrap();
     assert_eq!(stats.pruned, 1);
     assert_eq!(db.list_tracks().unwrap().len(), 0);

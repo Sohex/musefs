@@ -175,6 +175,7 @@ type Name = Arc<str>;
 type RenderedPath = Arc<str>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Node {
     pub parent: u64,
     pub name: Name,          // disambiguated name

@@ -125,6 +125,7 @@ fn oggflac_header_packets(data: &[u8], mapping: &[u8]) -> Result<Vec<page::ReadP
 /// The parsed Ogg header region: codec, serial, the reassembled header packets,
 /// the number of header pages, and where audio begins.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct OggHeader {
     pub codec: Codec,
     pub serial: u32,
@@ -242,6 +243,7 @@ pub fn read_pictures(data: &[u8]) -> Result<Vec<EmbeddedPicture>> {
 /// the caller can log the lossy drop (the format layer has no logging facade).
 /// Carries only a reason and the skipped value's encoded size — never the bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PictureDrop {
     /// Why the picture was skipped.
     pub reason: &'static str,
@@ -339,6 +341,7 @@ fn decode_picture_base64(value: &str) -> Option<Vec<u8>> {
 
 /// Audio bounds + codec from a complete file, for the scanner.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct OggScan {
     pub codec: Codec,
     pub audio_offset: u64,

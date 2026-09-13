@@ -17,7 +17,7 @@ the full list so far.
 something different, so a script or unit that needs updating will tell you:
 
 - **`scan --revalidate` is gone**, with its `MUSEFS_REVALIDATE` variable
-  ([#707]). It has been a deprecated alias since v1.1.0. Run
+  ([#707]). It has been a deprecated alias since v1.2.0. Run
   `musefs revalidate` instead — the alias never pruned, so neither does the
   replacement unless you add `--prune`. The flag is now a usage error (exit `2`).
 - **`scan --fast` and `--strict` are replaced by `--match`** ([#709]):
@@ -38,7 +38,7 @@ these variables and is unaffected, so an environment file shared by the mount
 and scan units only matters to the scan.
 
 **External writers.** No update is needed for these changes: the `contrib/`
-packages have called the `revalidate` subcommand since their 1.1.0 and pass
+packages have called the `revalidate` subcommand since their 1.2.0 and pass
 neither `--fast` nor `--strict`.
 
 **Rust crate API.** This only affects code depending on the musefs crates
@@ -56,11 +56,20 @@ directly.
   `musefs_core::scan_directory_full_oracle`, the `*_for_test` methods on `Musefs`
   and `Db`, and `musefs_format::ogg::page_test_support`. No production code
   called any of them.
+- The configuration and result structs follow the enums ([#743]):
+  `ScanOptions`, `MountConfig`, `FuseConfig`, `musefs-cli`'s argument structs and
+  the crates' result types are `#[non_exhaustive]`, so outside their crate they
+  can no longer be built with a struct literal, `..Default::default()` included.
+  Start from `default()` — new for `MountConfig`, matching a bare `musefs mount`
+  — and assign the fields you change. The store-row and synthesis input structs
+  (`NewTrack`, `TrackArt`, `ArtInput` and the like) are unchanged, so a new store
+  column is still a breaking change for code that writes rows.
 
 [#707]: https://github.com/Sohex/musefs/issues/707
 [#708]: https://github.com/Sohex/musefs/issues/708
 [#709]: https://github.com/Sohex/musefs/issues/709
 [#710]: https://github.com/Sohex/musefs/issues/710
+[#743]: https://github.com/Sohex/musefs/issues/743
 
 ## v1.3.0
 

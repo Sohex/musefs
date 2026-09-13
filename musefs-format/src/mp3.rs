@@ -13,6 +13,7 @@ use crate::size;
 /// ID3v2 tag is regenerated from the DB, and the Xing/LAME info frame lives
 /// inside the first audio frame, carried by the backing-audio segment.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Mp3Bounds {
     pub audio_offset: u64,
     pub audio_length: u64,

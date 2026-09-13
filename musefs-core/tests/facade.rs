@@ -2,21 +2,13 @@ mod common;
 use common::make_flac;
 use common::{streaminfo_body, vorbis_comment_body};
 use musefs_core::{CoreError, MountConfig, Musefs, VirtualTree, scan_directory};
-use std::collections::BTreeMap;
 
 fn config() -> MountConfig {
-    MountConfig {
-        template: "$artist/$title".to_string(),
-        fallbacks: BTreeMap::new(),
-        default_fallback: "Unknown".to_string(),
-        mode: musefs_core::Mode::Synthesis,
-        poll_interval: std::time::Duration::ZERO,
-        case_insensitive: false,
-        read_ahead_budget: 64 * 1024 * 1024,
-        read_ahead_prefetch: false,
-        skip_on_missing: false,
-        trust_backing_mtime: false,
-    }
+    let mut config = MountConfig::default();
+    config.template = "$artist/$title".to_string();
+    config.poll_interval = std::time::Duration::ZERO;
+    config.case_insensitive = false;
+    config
 }
 
 fn scanned_db(dir: &std::path::Path) -> musefs_db::Db {
@@ -467,10 +459,8 @@ fn poll_refresh_debounces_within_interval() {
         )
         .unwrap();
     }
-    let cfg = MountConfig {
-        poll_interval: std::time::Duration::from_hours(1),
-        ..config()
-    };
+    let mut cfg = config();
+    cfg.poll_interval = std::time::Duration::from_hours(1);
     let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
     {
         let db2 = musefs_db::Db::open(&db_path).unwrap();
@@ -524,10 +514,8 @@ fn unchanged_refresh_poll_consumes_debounce_window() {
     // A generous interval keeps the DB-mutation gap below reliably within the
     // debounce window; the window is crossed via the test hook, not a sleep, so
     // the assertions don't race wall-clock jitter on a loaded CI runner.
-    let cfg = MountConfig {
-        poll_interval: std::time::Duration::from_secs(30),
-        ..config()
-    };
+    let mut cfg = config();
+    cfg.poll_interval = std::time::Duration::from_secs(30);
     let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
     fs.expire_poll_debounce_for_test();
     assert!(!fs.poll_refresh().unwrap());
@@ -584,10 +572,8 @@ fn failed_refresh_retries_after_backoff_not_every_call() {
         )
         .unwrap();
     }
-    let cfg = MountConfig {
-        poll_interval: std::time::Duration::from_millis(20),
-        ..config()
-    };
+    let mut cfg = config();
+    cfg.poll_interval = std::time::Duration::from_millis(20);
     let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(25));
     {
@@ -646,10 +632,8 @@ fn poll_refresh_single_flights_concurrent_callers() {
         )
         .unwrap();
     }
-    let cfg = MountConfig {
-        poll_interval: std::time::Duration::ZERO,
-        ..config()
-    };
+    let mut cfg = config();
+    cfg.poll_interval = std::time::Duration::ZERO;
     let fs = Arc::new(Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap());
     {
         let db2 = musefs_db::Db::open(&db_path).unwrap();
@@ -709,10 +693,8 @@ fn inode_is_stable_across_refresh() {
         )
         .unwrap();
     }
-    let cfg = MountConfig {
-        poll_interval: std::time::Duration::ZERO,
-        ..config()
-    };
+    let mut cfg = config();
+    cfg.poll_interval = std::time::Duration::ZERO;
     let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
     let alice = fs.lookup(VirtualTree::ROOT, "Alice").unwrap();
     let (_, song_before, _) = fs.readdir(alice).unwrap().into_iter().next().unwrap();

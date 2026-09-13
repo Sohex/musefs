@@ -7,6 +7,7 @@ use std::collections::HashSet;
 
 /// The served audio bounds of a WAV: the `data` chunk's payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct WavBounds {
     pub audio_offset: u64,
     pub audio_length: u64,

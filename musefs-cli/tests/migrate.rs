@@ -7,7 +7,8 @@
 
 use std::path::{Path, PathBuf};
 
-use musefs_cli::{MigrateArgs, run_migrate};
+use clap::Parser;
+use musefs_cli::{Cli, Command, MigrateArgs, run_migrate};
 use musefs_db::{Db, LATEST_VERSION};
 
 /// A store an older musefs build would have left behind: the earlier steps, run
@@ -25,17 +26,15 @@ fn user_version(path: &Path) -> i64 {
         .unwrap()
 }
 
+/// Migrate args as the parser produces them from a command line: confirmed, one
+/// probe worker, and both offers left unanswered so they decline off a terminal.
 fn args(db: &Path) -> MigrateArgs {
-    MigrateArgs {
-        db: db.to_path_buf(),
-        yes: true,
-        repair: false,
-        snapshot: None,
-        no_snapshot: false,
-        vacuum: None,
-        revalidate: None,
-        jobs: 1,
-    }
+    let db = db.to_str().expect("tempdir paths are UTF-8");
+    let cli = Cli::parse_from(["musefs", "migrate", "--db", db, "--yes", "--jobs", "1"]);
+    let Command::Migrate(args) = cli.command else {
+        panic!("expected migrate");
+    };
+    args
 }
 
 #[test]
@@ -60,11 +59,9 @@ fn no_snapshot_skips_the_copy_and_still_upgrades() {
     let dir = tempfile::tempdir().unwrap();
     let db = gated_store(dir.path());
 
-    run_migrate(&MigrateArgs {
-        no_snapshot: true,
-        ..args(&db)
-    })
-    .unwrap();
+    let mut migrate_args = args(&db);
+    migrate_args.no_snapshot = true;
+    run_migrate(&migrate_args).unwrap();
 
     assert_eq!(user_version(&db), LATEST_VERSION);
     let default = dir
@@ -79,11 +76,9 @@ fn a_named_snapshot_goes_where_it_was_asked_to() {
     let db = gated_store(dir.path());
     let dest = dir.path().join("keep-me.db");
 
-    run_migrate(&MigrateArgs {
-        snapshot: Some(dest.clone()),
-        ..args(&db)
-    })
-    .unwrap();
+    let mut migrate_args = args(&db);
+    migrate_args.snapshot = Some(dest.clone());
+    run_migrate(&migrate_args).unwrap();
 
     assert_eq!(user_version(&dest), LATEST_VERSION - 1);
 }
@@ -97,12 +92,9 @@ fn an_occupied_snapshot_destination_is_refused_before_anything_changes() {
     let dest = dir.path().join("taken.db");
     std::fs::write(&dest, b"not a database").unwrap();
 
-    let err = run_migrate(&MigrateArgs {
-        snapshot: Some(dest.clone()),
-        ..args(&db)
-    })
-    .unwrap_err()
-    .to_string();
+    let mut migrate_args = args(&db);
+    migrate_args.snapshot = Some(dest.clone());
+    let err = run_migrate(&migrate_args).unwrap_err().to_string();
 
     assert!(err.contains("already exists"), "{err}");
     assert!(err.contains("--no-snapshot"), "{err}");
@@ -117,12 +109,9 @@ fn without_yes_and_without_a_terminal_it_refuses_and_names_the_flag() {
     let dir = tempfile::tempdir().unwrap();
     let db = gated_store(dir.path());
 
-    let err = run_migrate(&MigrateArgs {
-        yes: false,
-        ..args(&db)
-    })
-    .unwrap_err()
-    .to_string();
+    let mut migrate_args = args(&db);
+    migrate_args.yes = false;
+    let err = run_migrate(&migrate_args).unwrap_err().to_string();
 
     assert!(err.contains("--yes"), "{err}");
     assert_eq!(user_version(&db), LATEST_VERSION - 1, "store untouched");
@@ -240,11 +229,9 @@ fn a_store_with_a_refused_row_is_not_upgraded_without_repair() {
 fn repair_deletes_the_refused_row_and_upgrades() {
     let dir = tempfile::tempdir().unwrap();
     let db = store_with_a_refused_row(dir.path());
-    run_migrate(&MigrateArgs {
-        repair: true,
-        ..args(&db)
-    })
-    .unwrap();
+    let mut migrate_args = args(&db);
+    migrate_args.repair = true;
+    run_migrate(&migrate_args).unwrap();
 
     assert_eq!(user_version(&db), LATEST_VERSION);
     let store = Db::open(&db).unwrap();

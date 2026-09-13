@@ -22,6 +22,7 @@ pub struct MetadataBlock {
 
 /// Result of scanning a FLAC file: where audio begins/ends and the structural blocks to preserve.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FlacScan {
     pub audio_offset: u64,
     pub audio_length: u64,
@@ -32,6 +33,7 @@ pub struct FlacScan {
 /// blocks to carry over. Unlike `FlacScan`, this does not include `audio_length`
 /// (which requires the full file size), so it can be computed from the front alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FlacMeta {
     pub audio_offset: u64,
     pub preserved: Vec<MetadataBlock>,
