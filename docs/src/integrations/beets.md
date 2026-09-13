@@ -176,15 +176,19 @@ source .venv/bin/activate
 uv pip install -e ../python-musefs        # shared library (editable, from the working tree)
 uv pip install -r requirements.txt        # beets + pytest
 
-python -m pytest                          # unit + integration (no Rust binary)
-python -m pytest -m musefs_bin            # path-matching gate vs the real `musefs` binary
+python -m pytest                          # unit + integration + the binary gate
 python -m pytest -m e2e                   # full beets -> mount -> playback end-to-end
 ```
 
 The `musefs_bin` gate shells out to the real `musefs` binary, so build it first
-from the repo root (`cargo build`) and run it against a fresh build. The `e2e`
-tier additionally needs `ffmpeg` and `/dev/fuse` + `fusermount3`: it generates
-audio, imports it with beets, retags, syncs, mounts via FUSE, and verifies the
-mount's tags and byte-identical audio (including a move-reconcile case). Both
-tiers are deselected from the default run and skip cleanly if their tools are
-absent.
+from the repo root (`cargo build`) and run it against a fresh build — it warns
+if the binary is older than the Rust sources. It **runs by default**: it is the
+only tier that sees the real schema rather than a fixture's, so a store-shape
+change breaks it and nothing else. Where the binary is absent it skips cleanly,
+so a Rust toolchain is not required to work on the plugin.
+
+The `e2e` tier stays opt-in: it needs `ffmpeg` and `/dev/fuse` + `fusermount`,
+and it generates audio, imports it with beets, retags, syncs, mounts via FUSE,
+and verifies the mount's tags and byte-identical audio (including a
+move-reconcile case) — not what a default `pytest` should do. It also skips
+cleanly if its tools are absent.

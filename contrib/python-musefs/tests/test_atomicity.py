@@ -9,6 +9,7 @@ from musefs_common import (
     SyncStats,
     connect,
     merge_tags,
+    path_param,
     replace_tags,
     replace_track_art,
     sync_files,
@@ -174,7 +175,7 @@ def test_sync_files_deferred_batch_commits_atomically(db_path):
             path: check.execute(
                 "SELECT value FROM tags t JOIN tracks tr ON tr.id = t.track_id "
                 "WHERE tr.backing_path = ? AND t.key = 'title'",
-                (path,),
+                (path_param(path),),
             ).fetchone()[0]
             for path in ("/m/a.flac", "/m/b.flac")
         }

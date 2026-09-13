@@ -117,6 +117,94 @@ see the [Release notes](release-notes.md).
 
 ### Changed
 
+- **`tracks` is rebuilt by the 2.0.0 store migration.** This is the step that
+  makes the upgrade gated: `musefs migrate` runs it, and afterwards the store no
+  longer opens with an older musefs. It is one rebuild because SQLite can add
+  neither `AUTOINCREMENT` nor a column type nor a changed `CHECK` in place, and
+  `tracks` is the only table with children — three tables reference it
+  `ON DELETE CASCADE` and thirteen triggers are on it or name it — so it is the
+  expensive, once-only event every `tracks` schema change in this release rides.
+
+  The rebuild keeps foreign keys enforced throughout. With enforcement on,
+  `DROP TABLE` performs an implicit `DELETE` that cascades into the children and
+  fires their delete triggers, so the migration drops all thirteen triggers up
+  front, copies the parent and the three children into holding tables, recreates
+  `tracks` under its final name (no `ALTER TABLE ... RENAME`, whose schema
+  reparse is what V3's `art_ad` dance existed for), refills, and recreates the
+  index and the triggers. `content_version` is carried across rather than
+  bumped — every cache keys on it, and from this release the served virtual
+  mtime derives from it, so an accidental bump would be visible outside musefs
+  for a migration that changed no audio.
+
+  What rides it:
+
+  - `tracks.id` becomes `INTEGER PRIMARY KEY AUTOINCREMENT`
+    ([#678](https://github.com/Sohex/musefs/issues/678)), which is what forces
+    the rebuild. Without it SQLite's default allocator hands a deleted rowid
+    back out, and the incremental refresh treats a track id as a persistent
+    identity: a pruned track and a freshly ingested replacement collided on the
+    reused id, the format *and* the initial `content_version` (a fresh ingest
+    bumps a fixed number of times for two files of the same shape), so
+    `partition_changelog` classified the whole substitution as unchanged. The
+    mount kept listing the pruned track and never showed the new one until it
+    was remounted. Reading the ghost returned `EIO` rather than the wrong audio,
+    because the backing stamp guard still failed closed.
+  - `tracks.backing_path` becomes a `BLOB`
+    ([#680](https://github.com/Sohex/musefs/issues/680)); the Rust model stays a
+    `String` for now, encoding and decoding at the DB boundary, and moves to
+    bytes in a later step. The refill casts, which is what preserves identity:
+    SQLite never compares a `TEXT` value equal to a `BLOB`, so a refill that
+    copied the column unchanged would leave every existing row unreachable to a
+    byte-binding reader while the unique index failed to fire, silently giving
+    each track a second row. A `typeof` `CHECK` pins the storage class, since
+    declaring the column `BLOB` is an affinity and would still accept `TEXT`
+    through the same door
+    ([#718](https://github.com/Sohex/musefs/issues/718)).
+  - `tracks.backing_ino` is added
+    ([#674](https://github.com/Sohex/musefs/issues/674)). On filesystems that
+    truncate sub-second timestamps — FAT32, ext3, HFS+, some SMB and NFS mounts
+    — a same-size in-place rewrite inside the granularity window left all three
+    stamp fields identical and the freshness guard passed on changed bytes. The
+    inode catches the *replacement* shape, which is what almost every tagger
+    actually does (write a temporary file, rename over the original). Zero is
+    the sentinel for "not yet known", matching the `backing_ctime_ns`
+    precedent, so an upgraded store is not taken dark and the guard arms per row
+    as scans happen. It joins `tracks_geometry_au`'s bump set, since a changed
+    inode means the backing file was replaced.
+  - The lower bounds on `backing_mtime_ns` and `backing_ctime_ns` are dropped
+    ([#696](https://github.com/Sohex/musefs/issues/696)), so a file dated before
+    1970 — an archival rip, a restored backup, anything whose mtime came from
+    the original media's metadata — reaches the mount instead of probing
+    cleanly and then dying at a `CHECK` as a failed file.
+  - Storage-class constraints land on every column
+    ([#718](https://github.com/Sohex/musefs/issues/718)). SQLite's declared
+    types are affinities, so a row satisfying every `CHECK` could still be a
+    Rust conversion failure — which surfaces as a store-wide error rather than
+    as the malformed row it is.
+  - Both checksum columns ban an embedded NUL
+    ([#693](https://github.com/Sohex/musefs/issues/693)). `length()` on `TEXT`
+    counts characters only up to the first NUL, so 64 valid hex characters
+    followed by NUL and any amount of anything satisfied `length() = 64` while
+    storing something that is not a 64-character identity.
+  - Every fingerprint is retired
+    ([#691](https://github.com/Sohex/musefs/issues/691)), folded into the refill
+    rather than run as a statement of its own — the refill rewrites every row
+    anyway. `musefs migrate` reports how many rows are owed a rescan and offers
+    to run one.
+
+  `content_hash` is the one column the refill sanitizes rather than aborting on:
+  it is scanner-owned and a rescan recomputes it, which is the case the
+  sanitize-only-under-a-flag policy carves out. Every other tightened column is
+  structural or `NOT NULL`, so a row violating one fails the migration — which
+  is what the row-rejection pre-flight, landing with the `art` rebuild, exists
+  to report before the upgrade starts rather than during it.
+
+  **External writers break here.** The path column changes type under every
+  query, and because SQLite never compares `TEXT` equal to `BLOB` the failure is
+  silent: a lookup binding a string matches nothing instead of erroring. The
+  `contrib` helpers gained `path_param`/`path_value` and encode at the boundary;
+  third-party writers must do the same.
+
 - Directory handles on the same directory share one listing instead of copying
   it each. `opendir` took a private snapshot per handle, so the table's memory
   was the directory's width times the handle count: on a template that

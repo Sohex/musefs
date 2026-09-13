@@ -389,8 +389,282 @@ PRAGMA user_version = 3;
 -- upgrade and the next scan is not move-recovered (it inserts fresh, as an
 -- unfingerprinted row always has). Leaving the old values in place would not
 -- recover it either -- they cannot match a new-algorithm fingerprint -- so this
--- trades nothing away for an honest column.
-UPDATE tracks SET fingerprint = NULL;
+-- trades nothing away for an honest column. It is folded into the rebuild's
+-- refill below rather than run as a statement of its own: the refill rewrites
+-- every row anyway, so a separate UPDATE would rewrite them all twice.
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Rebuild `tracks` (#686). This is the expensive, once-only event of the 2.0.0
+-- migration: `tracks` is the only table with children, and SQLite cannot add
+-- AUTOINCREMENT, change a column's type, or alter a CHECK in place. Everything
+-- wanting a `tracks` schema change therefore rides this one rebuild:
+--
+--   #678  id -> INTEGER PRIMARY KEY AUTOINCREMENT   (what forces the rebuild)
+--   #674  add backing_ino
+--   #680  backing_path TEXT -> BLOB
+--   #696  drop the lower bounds on backing_mtime_ns and backing_ctime_ns
+--   #693  NUL-proof the two checksum columns
+--   #718  storage-class constraints, backing_path above all
+--   #691  the fingerprint reset above, folded into the refill
+--
+-- Foreign keys stay enforced throughout (the pragma is a no-op inside the
+-- migration's transaction in any case), which is what dictates the shape below:
+-- with enforcement on, DROP TABLE performs an implicit DELETE, and that DELETE
+-- cascades into the three child tables. So the children are copied out first
+-- and restored afterwards, rather than the pragma being weakened for the run.
+
+-- 1. Every trigger that is on `tracks` or names it in its body: thirteen, not
+-- the twelve the V4 plan counted -- `art_ad` names `tracks` too, not only
+-- `track_art`. Dropping the eight on the child tables is not tidiness: the
+-- cascade from DROP TABLE below fires the children's AFTER DELETE triggers,
+-- and those UPDATE a `tracks` that is in the middle of being dropped. The
+-- refill would likewise fire the AFTER INSERT triggers and bump
+-- `content_version` on every row in the store -- which the served virtual mtime
+-- now derives from (#725), so an accidental bump is visible outside musefs.
+DROP TRIGGER tracks_changelog_ai;
+DROP TRIGGER tracks_changelog_au;
+DROP TRIGGER tracks_changelog_ad;
+DROP TRIGGER tracks_geometry_au;
+DROP TRIGGER tags_ai;
+DROP TRIGGER tags_au;
+DROP TRIGGER tags_ad;
+DROP TRIGGER track_art_ai;
+DROP TRIGGER track_art_au;
+DROP TRIGGER track_art_ad;
+DROP TRIGGER structural_blocks_ai;
+DROP TRIGGER structural_blocks_ad;
+DROP TRIGGER art_ad;
+
+-- 2. Hold the parent and the three children. The holding tables carry no
+-- constraints and no foreign keys, so nothing in them can abort on the shape
+-- being replaced, and the values round-trip by storage class rather than by
+-- affinity.
+CREATE TABLE tracks_hold_v4 (
+    id               INTEGER,
+    backing_path     TEXT,
+    format           TEXT,
+    audio_offset     INTEGER,
+    audio_length     INTEGER,
+    backing_size     INTEGER,
+    backing_mtime_ns INTEGER,
+    content_version  INTEGER,
+    updated_at       INTEGER,
+    backing_ctime_ns INTEGER,
+    content_hash     TEXT
+);
+INSERT INTO tracks_hold_v4
+    SELECT id, backing_path, format, audio_offset, audio_length, backing_size,
+           backing_mtime_ns, content_version, updated_at, backing_ctime_ns,
+           content_hash
+    FROM tracks;
+
+CREATE TABLE tags_hold_v4 (
+    track_id INTEGER, key TEXT, value TEXT, ordinal INTEGER, value_blob BLOB
+);
+INSERT INTO tags_hold_v4
+    SELECT track_id, key, value, ordinal, value_blob FROM tags;
+
+CREATE TABLE track_art_hold_v4 (
+    track_id INTEGER, art_id INTEGER, picture_type INTEGER,
+    description TEXT, ordinal INTEGER
+);
+INSERT INTO track_art_hold_v4
+    SELECT track_id, art_id, picture_type, description, ordinal FROM track_art;
+
+CREATE TABLE structural_blocks_hold_v4 (
+    track_id INTEGER, kind TEXT, ordinal INTEGER, body BLOB
+);
+INSERT INTO structural_blocks_hold_v4
+    SELECT track_id, kind, ordinal, body FROM structural_blocks;
+
+-- 3. Drop and recreate. The new table is created under its final name rather
+-- than built beside the old one and renamed: ALTER TABLE ... RENAME reparses
+-- the whole schema, and the thirteen triggers above would have to be absent for
+-- that to succeed anyway (the `art_ad` problem V3 hit, at `tracks` scale).
+DROP TABLE tracks;
+
+CREATE TABLE tracks (
+    -- AUTOINCREMENT so a deleted id is never handed back out (#678). The
+    -- incremental refresh treats the id as a persistent identity, and the
+    -- default allocator's max(rowid)+1 let a pruned track and its replacement
+    -- collide on id, format and content_version -- a substitution the refresh
+    -- then blessed as a no-op.
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- BLOB, not TEXT (#680): a filesystem path is bytes, and the lossy
+    -- String round-trip collapsed two distinct files onto one row. The
+    -- typeof CHECK is what makes the column's type a guarantee rather than an
+    -- affinity (#718): SQLite would otherwise accept TEXT here, and UNIQUE
+    -- does not compare a TEXT path equal to the same bytes as a BLOB, so the
+    -- one path could occupy two rows through a second door.
+    backing_path     BLOB NOT NULL UNIQUE,
+    format           TEXT NOT NULL,
+    audio_offset     INTEGER NOT NULL,
+    audio_length     INTEGER NOT NULL,
+    backing_size     INTEGER NOT NULL,
+    backing_mtime_ns INTEGER NOT NULL,
+    content_version  INTEGER NOT NULL DEFAULT 0,
+    updated_at       INTEGER NOT NULL,
+    backing_ctime_ns INTEGER NOT NULL DEFAULT 0,
+    fingerprint      TEXT,
+    content_hash     TEXT,
+    -- The inode, for backing filesystems that do not store sub-second
+    -- timestamps (#674). Zero is the sentinel for `not yet known`, matching the
+    -- backing_ctime_ns precedent: an upgraded store starts every row unknown,
+    -- and each scan arms the guard for the rows it touches.
+    backing_ino      INTEGER NOT NULL DEFAULT 0,
+    CHECK (typeof(backing_path) = 'blob'
+           AND length(backing_path) > 0
+           AND instr(backing_path, x'00') = 0),
+    -- The IN list is strictly stronger than a typeof CHECK would be: no
+    -- non-TEXT value compares equal to any of these, so the storage class is
+    -- already pinned.
+    CHECK (format IN ('flac','mp3','m4a','opus','vorbis','oggflac','wav')),
+    CHECK (typeof(audio_offset) = 'integer' AND audio_offset >= 0),
+    CHECK (typeof(audio_length) = 'integer' AND audio_length >= 0),
+    CHECK (typeof(backing_size) = 'integer' AND backing_size >= 0),
+    -- No lower bound on either stamp (#696): a backing file dated before 1970
+    -- carries a negative nanosecond offset, and rejecting it here kept the file
+    -- out of the mount entirely. The storage class is still pinned, because the
+    -- Rust side reads both as i64.
+    CHECK (typeof(backing_mtime_ns) = 'integer'),
+    CHECK (typeof(backing_ctime_ns) = 'integer'),
+    CHECK (typeof(backing_ino) = 'integer' AND backing_ino >= 0),
+    CHECK (typeof(content_version) = 'integer' AND content_version >= 0),
+    CHECK (typeof(updated_at) = 'integer' AND updated_at >= 0),
+    CHECK (audio_offset + audio_length <= backing_size),
+    -- instr(..., char(0)) = 0 alongside the character cap (#693): SQLite's
+    -- length() on TEXT stops at the first NUL, so `<64 hex chars>` + NUL +
+    -- anything satisfied a bare length() = 64 while storing something else
+    -- entirely. Banning NUL keeps the documented `64 characters` meaning rather
+    -- than quietly converting the field to a byte cap.
+    CHECK (fingerprint IS NULL
+           OR (typeof(fingerprint) = 'text'
+               AND length(fingerprint) = 64
+               AND instr(fingerprint, char(0)) = 0)),
+    CHECK (content_hash IS NULL
+           OR (typeof(content_hash) = 'text'
+               AND length(content_hash) = 64
+               AND instr(content_hash, char(0)) = 0))
+);
+
+-- 4. Refill. CAST(backing_path AS BLOB) is what preserves identity across the
+-- type change: the bytes are unchanged, and without the cast every existing row
+-- would be unreachable to a byte-binding reader while the unique index failed
+-- to fire, silently giving each track a second row.
+--
+-- `fingerprint` is dropped on the floor here -- that is #691's reset, folded in.
+--
+-- `content_hash` is sanitized rather than carried blindly. It is a
+-- scanner-owned derived column that the next scan recomputes, which is exactly
+-- the case the sanitize-only-under-a-flag policy carves out: nulling one costs
+-- a rescan, while carrying a value the new CHECK rejects would abort the whole
+-- upgrade over a column that rebuilds itself. The other tightened columns are
+-- NOT sanitized here -- they are either structural or NOT NULL, so a row that
+-- violates them fails the migration, which is what the row-rejection pre-flight
+-- and its repair flag exist to report ahead of time.
+INSERT INTO tracks (id, backing_path, format, audio_offset, audio_length,
+                    backing_size, backing_mtime_ns, content_version, updated_at,
+                    backing_ctime_ns, fingerprint, content_hash, backing_ino)
+    SELECT id, CAST(backing_path AS BLOB), format, audio_offset, audio_length,
+           backing_size, backing_mtime_ns, content_version, updated_at,
+           backing_ctime_ns,
+           NULL,
+           CASE WHEN typeof(content_hash) = 'text'
+                     AND length(content_hash) = 64
+                     AND instr(content_hash, char(0)) = 0
+                THEN content_hash END,
+           0
+    FROM tracks_hold_v4;
+
+INSERT INTO tags (track_id, key, value, ordinal, value_blob)
+    SELECT track_id, key, value, ordinal, value_blob FROM tags_hold_v4;
+INSERT INTO track_art (track_id, art_id, picture_type, description, ordinal)
+    SELECT track_id, art_id, picture_type, description, ordinal
+    FROM track_art_hold_v4;
+INSERT INTO structural_blocks (track_id, kind, ordinal, body)
+    SELECT track_id, kind, ordinal, body FROM structural_blocks_hold_v4;
+
+DROP TABLE tracks_hold_v4;
+DROP TABLE tags_hold_v4;
+DROP TABLE track_art_hold_v4;
+DROP TABLE structural_blocks_hold_v4;
+
+-- 5. DROP TABLE tracks took its index and its four triggers with it. Recreate
+-- the index, and all thirteen triggers verbatim -- with one deliberate
+-- exception, noted on tracks_geometry_au below.
+CREATE INDEX tracks_fingerprint_idx ON tracks(fingerprint);
+
+CREATE TRIGGER tracks_changelog_ai AFTER INSERT ON tracks BEGIN
+    INSERT INTO track_changes (track_id) VALUES (NEW.id);
+END;
+CREATE TRIGGER tracks_changelog_au AFTER UPDATE ON tracks BEGIN
+    INSERT INTO track_changes (track_id) VALUES (NEW.id);
+END;
+CREATE TRIGGER tracks_changelog_ad AFTER DELETE ON tracks BEGIN
+    INSERT INTO track_changes (track_id) VALUES (OLD.id);
+END;
+
+-- The one non-verbatim recreation: `backing_ino` joins the geometry set. A
+-- changed inode means the backing file was replaced, which is the whole reason
+-- the column exists, so it belongs in the WHEN guard that keeps
+-- content_version a true superset of served-byte inputs. Inert until the Rust
+-- half starts writing the column, since every row is the 0 sentinel until then.
+CREATE TRIGGER tracks_geometry_au
+AFTER UPDATE ON tracks
+WHEN NEW.format        <> OLD.format
+  OR NEW.audio_offset  <> OLD.audio_offset
+  OR NEW.audio_length  <> OLD.audio_length
+  OR NEW.backing_size  <> OLD.backing_size
+  OR NEW.backing_mtime_ns <> OLD.backing_mtime_ns
+  OR NEW.backing_ino   <> OLD.backing_ino
+BEGIN
+    UPDATE tracks SET content_version = content_version + 1 WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER tags_ai AFTER INSERT ON tags BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = NEW.track_id;
+END;
+CREATE TRIGGER tags_au AFTER UPDATE ON tags BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = NEW.track_id;
+END;
+CREATE TRIGGER tags_ad AFTER DELETE ON tags BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = OLD.track_id;
+END;
+
+CREATE TRIGGER track_art_ai AFTER INSERT ON track_art BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = NEW.track_id;
+END;
+CREATE TRIGGER track_art_au AFTER UPDATE ON track_art BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = NEW.track_id;
+END;
+CREATE TRIGGER track_art_ad AFTER DELETE ON track_art BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = OLD.track_id;
+END;
+
+CREATE TRIGGER structural_blocks_ai AFTER INSERT ON structural_blocks BEGIN
+    UPDATE tracks SET content_version = content_version + 1 WHERE id = NEW.track_id;
+END;
+CREATE TRIGGER structural_blocks_ad AFTER DELETE ON structural_blocks BEGIN
+    UPDATE tracks SET content_version = content_version + 1 WHERE id = OLD.track_id;
+END;
+
+CREATE TRIGGER art_ad AFTER DELETE ON art BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id IN (SELECT track_id FROM track_art WHERE art_id = OLD.id);
+END;
 PRAGMA user_version = 4;
 """
 

@@ -471,16 +471,12 @@ fn scan_stores_a_tag_value_the_old_cap_rejected() {
 /// original media's metadata can carry one, and `tar`/`rsync` preserve it, so
 /// this is legitimate input rather than a crafted one.
 ///
-/// It probes cleanly and produces a valid unit, then dies at the store's
-/// `CHECK (backing_mtime_ns >= 0)`. `is_store_rejection` classifies that
-/// constraint violation as belonging to the file, so the scan counts it under
-/// `failed` and carries on — and the track is simply absent from the mount.
-///
-/// This pins the current behaviour rather than endorsing it. Dropping the lower
-/// bound rides the `tracks` rebuild in #711, at which point this test flips to
-/// asserting the track is stored with its negative stamp intact.
+/// It used to probe cleanly, produce a valid unit, and then die at the store's
+/// `CHECK (backing_mtime_ns >= 0)` — counted under `failed` and absent from the
+/// mount. The `tracks` rebuild drops that lower bound (#696), so the file now
+/// reaches the store with its negative stamp intact, which is what this asserts.
 #[test]
-fn pre_epoch_backing_mtime_is_rejected_by_the_stamp_check() {
+fn a_pre_epoch_backing_mtime_reaches_the_store_intact() {
     let dir = tempfile::tempdir().unwrap();
     let old = dir.path().join("archival.flac");
     write_flac(&old, &["TITLE=Archival"], &[0xAA; 30]);
@@ -511,18 +507,18 @@ fn pre_epoch_backing_mtime_is_rejected_by_the_stamp_check() {
     let db = Db::open_in_memory().unwrap();
     let stats = scan_directory(&db, dir.path()).unwrap();
 
-    assert_eq!(stats.scanned, 1, "only the modern file reaches the store");
-    assert_eq!(stats.failed, 1, "the pre-epoch file fails as its own file");
+    assert_eq!(stats.scanned, 2, "both files reach the store");
+    assert_eq!(stats.failed, 0);
 
-    let paths: Vec<String> = db
+    let archival = db
         .list_tracks()
         .unwrap()
         .into_iter()
-        .map(|t| t.backing_path)
-        .collect();
-    assert!(
-        paths.iter().all(|p| !p.ends_with("archival.flac")),
-        "the pre-epoch file is absent from the store: {paths:?}"
+        .find(|t| t.backing_path.ends_with("archival.flac"))
+        .expect("the pre-epoch file is stored, not rejected");
+    assert_eq!(
+        archival.backing_mtime_ns, -1_500_000_000,
+        "stored verbatim: the stamp is the file's, not a clamped stand-in"
     );
 }
 

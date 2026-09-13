@@ -34,6 +34,5 @@ where = ["src"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 markers = [
-    "musefs_bin: tests that shell out to the real `musefs` Rust binary (opt-in)",
+    "musefs_bin: tests that shell out to the real `musefs` Rust binary",
 ]
-addopts = "-m 'not musefs_bin'"

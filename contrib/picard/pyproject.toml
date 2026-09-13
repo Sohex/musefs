@@ -35,7 +35,5 @@ testpaths = ["tests"]
 # So `import musefs._core` resolves to contrib/picard/musefs without an install.
 pythonpath = ["."]
 markers = [
-    "musefs_bin: tests that shell out to the real `musefs` Rust binary (opt-in)",
+    "musefs_bin: tests that shell out to the real `musefs` Rust binary",
 ]
-# Skip the opt-in binary gate by default; run it explicitly with `-m musefs_bin`.
-addopts = "-m 'not musefs_bin'"

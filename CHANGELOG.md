@@ -212,6 +212,53 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Full tree rebuilds and the head of every scan read only the columns they use
   instead of materializing whole track rows.
 
+### Changed
+
+- **The store's `tracks` table is rebuilt** by the 2.0.0 migration, which is
+  what makes the upgrade gated: `musefs migrate` runs it, and the store then no
+  longer opens with an older musefs. One rebuild carries every `tracks` schema
+  change this release wanted, because SQLite cannot add `AUTOINCREMENT`, change
+  a column's type or alter a `CHECK` in place:
+
+  - `tracks.id` is `INTEGER PRIMARY KEY AUTOINCREMENT`, so a deleted id is never
+    handed out again ([#678](https://github.com/Sohex/musefs/issues/678)). The
+    incremental refresh reads an id as a persistent identity, and the default
+    allocator let a pruned track and a freshly ingested replacement collide on
+    id, format *and* `content_version` — a substitution the refresh then blessed
+    as a no-op, leaving the mount listing a track that was gone and hiding one
+    that was there until it was remounted.
+  - `tracks.backing_path` is a `BLOB`
+    ([#680](https://github.com/Sohex/musefs/issues/680)). A filesystem path is
+    bytes; the lossy text round-trip could collapse two distinct files onto one
+    row. **This breaks external writers**, including the `contrib` plugins:
+    SQLite never compares a `TEXT` value equal to a `BLOB`, so a lookup binding
+    a string now matches nothing rather than failing. The plugins encode and
+    decode at the boundary (`path_param`/`path_value`); third-party writers must
+    do the same.
+  - `tracks.backing_ino` is added
+    ([#674](https://github.com/Sohex/musefs/issues/674)), for backing
+    filesystems that store no sub-second timestamps and where a same-size
+    replacement could otherwise pass the freshness guard. Zero means *not yet
+    known*, so an upgraded store is not taken dark; each scan arms the guard for
+    the rows it touches.
+  - A backing file dated before 1970 is no longer refused
+    ([#696](https://github.com/Sohex/musefs/issues/696)). The lower bounds on
+    `backing_mtime_ns` and `backing_ctime_ns` are gone, so an archival rip
+    reaches the mount instead of being counted as a failed file.
+  - Constraints now pin storage classes rather than declaring affinities
+    ([#718](https://github.com/Sohex/musefs/issues/718)), and the checksum
+    columns ban an embedded NUL
+    ([#693](https://github.com/Sohex/musefs/issues/693)) — `length()` on `TEXT`
+    stops at the first one, so 64 valid characters followed by NUL and anything
+    at all satisfied a `length() = 64` identity check.
+
+  Every row, id and child row is carried across the rebuild, and
+  `content_version` is preserved rather than bumped: it is what every cache
+  keys on, so a bump would invalidate every layout in the store for a migration
+  that changed no audio. Fingerprints are retired in the same pass
+  ([#691](https://github.com/Sohex/musefs/issues/691)), which `musefs migrate`
+  already reports and offers a `revalidate` for.
+
 ### Fixed
 
 - Chained Ogg — complete logical bitstreams concatenated end to end, which

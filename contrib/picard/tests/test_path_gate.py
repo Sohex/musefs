@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from musefs._common import connect, realpath_key, track_id_for_path
+from musefs._common import connect, path_value, realpath_key, track_id_for_path
 
 pytestmark = pytest.mark.musefs_bin
 
@@ -61,7 +61,7 @@ def _scan(tmp_path, tree):
 def _stored_paths(db):
     conn = sqlite3.connect(db)
     try:
-        return [r[0] for r in conn.execute("SELECT backing_path FROM tracks")]
+        return [path_value(r[0]) for r in conn.execute("SELECT backing_path FROM tracks")]
     finally:
         conn.close()
 
