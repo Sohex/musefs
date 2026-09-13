@@ -106,18 +106,21 @@ def path_param(key):
     the lossy ``str`` round-trip collapsed two distinct files onto one row.
     SQLite never compares a ``TEXT`` value equal to a ``BLOB``, so a ``str``
     bound as-is matches nothing at all rather than failing — which is why this
-    is a helper and not four inline ``.encode()`` calls. The library's own type
-    stays ``str`` until the byte-honest move; ``surrogateescape`` is what makes
-    the round trip through it lossless in the meantime.
+    is a helper and not four inline ``.encode()`` calls.
+
+    The library's own type is ``str``, carrying undecodable bytes as surrogates
+    the way Python spells an OS path everywhere else. ``os.fsencode`` and
+    ``os.fsdecode`` are exact inverses, so the round trip is lossless and — the
+    part that matters — injective: two distinct files cannot become one key.
+    Using them rather than a hardcoded ``utf-8`` keeps both directions on the
+    same codec, so a filesystem encoding that is not UTF-8 cannot split them.
     """
-    return key.encode("utf-8", "surrogateescape") if isinstance(key, str) else key
+    return os.fsencode(key)
 
 
 def path_value(raw):
     """Decode a ``backing_path`` read back out. The inverse of `path_param`."""
-    if isinstance(raw, (bytes, bytearray)):
-        return bytes(raw).decode("utf-8", "surrogateescape")
-    return raw
+    return os.fsdecode(bytes(raw) if isinstance(raw, (bytes, bytearray)) else raw)
 
 
 def track_id_for_path(conn, key):

@@ -260,11 +260,11 @@ def _read_album_art(item, cache, stats):
     key = realpath_key(artpath)
     if key in cache:
         return cache[key]
-    # Use the raw realpath, not realpath_key's lossy U+FFFD form: the file is
-    # only opened and extension-sniffed, not matched against the DB.
-    real = os.path.realpath(artpath)
+    # `key` is the canonical path itself now, not a lossy rendering of it
+    # (#680), so it opens the file directly — there is no second realpath to
+    # keep in step with it.
     try:
-        with open(real, "rb") as fh:
+        with open(key, "rb") as fh:
             data = fh.read()
     except OSError:
         stats.skipped_art += 1
@@ -274,7 +274,7 @@ def _read_album_art(item, cache, stats):
         stats.skipped_art += 1
         cache[key] = None
         return None
-    art = (data, sniff_mime(data, os.fsdecode(real)))
+    art = (data, sniff_mime(data, key))
     cache[key] = art
     return art
 
@@ -283,9 +283,11 @@ def _computed_path(item):
     """Beets' library-relative path for ``item``, decoded to a SQLite-safe str
     with the file extension removed (musefs re-appends it at render time).
 
-    Mirrors ``realpath_key``'s lossy normalization (U+FFFD for undecodable
-    bytes) so the value is always valid UTF-8, but without realpath's on-disk
-    resolution. Returns "" when beets yields no usable path.
+    This one *stays* lossy, and deliberately: it is a template value written to
+    a ``TEXT`` tag column, not a path used to find a file. It names no row and
+    opens nothing, so `U+FFFD` for an undecodable byte is the right answer —
+    unlike `realpath_key`, which had to stop doing that once the store began
+    holding real path bytes (#680). Returns "" when beets yields no usable path.
     """
     raw = item.destination(relative_to_libdir=True)
     decoded = os.fsdecode(raw)
