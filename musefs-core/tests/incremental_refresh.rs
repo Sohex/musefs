@@ -443,12 +443,7 @@ fn empty_ring_with_zero_watermark_polls_incremental() {
     // ring stays empty.
     let writer = Db::open(&db_path).unwrap();
     writer
-        .upsert_art(&musefs_db::NewArt {
-            mime: "image/png".into(),
-            width: None,
-            height: None,
-            data: vec![0u8; 8],
-        })
+        .upsert_art(&musefs_db::NewArt { data: vec![0u8; 8] })
         .unwrap();
 
     assert!(fs.poll_refresh().unwrap());

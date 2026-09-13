@@ -52,6 +52,8 @@ fn synthesizes_apic_with_streamed_image_bytes() {
         picture_type: PictureType::new(3).unwrap(), // front cover
         width: 0,
         height: 0,
+        depth: 0,
+        colors: 0,
         data_len: BlobLen::new(art_bytes.len() as u64).unwrap(),
     }];
     let layout = synthesize_layout(0, audio.len() as u64, &tags, &[], &arts).unwrap();
@@ -94,6 +96,8 @@ fn embedded_size_field_matches_the_frame_region() {
         picture_type: PictureType::new(3).unwrap(),
         width: 0,
         height: 0,
+        depth: 0,
+        colors: 0,
         data_len: BlobLen::new(art_bytes.len() as u64).unwrap(),
     }];
     let layout = synthesize_layout(0, audio.len() as u64, &tags, &[], &arts).unwrap();
@@ -201,6 +205,8 @@ fn multiple_art_frames_keep_order() {
             picture_type: PictureType::new(3).unwrap(),
             width: 0,
             height: 0,
+            depth: 0,
+            colors: 0,
             data_len: BlobLen::new(art1.len() as u64).unwrap(),
         },
         ArtInput {
@@ -210,6 +216,8 @@ fn multiple_art_frames_keep_order() {
             picture_type: PictureType::new(4).unwrap(),
             width: 0,
             height: 0,
+            depth: 0,
+            colors: 0,
             data_len: BlobLen::new(art2.len() as u64).unwrap(),
         },
     ];
@@ -251,6 +259,8 @@ fn synthesize_errors_on_oversized_frame() {
         picture_type: PictureType::new(3).unwrap(),
         width: 0,
         height: 0,
+        depth: 0,
+        colors: 0,
         data_len: BlobLen::new(0x1000_0000).unwrap(), // 256 MiB, over the per-frame limit
     }];
     assert_eq!(
@@ -271,6 +281,8 @@ fn synthesize_errors_when_frames_sum_past_the_tag_limit() {
         picture_type: PictureType::new(u32::try_from(id).unwrap()).unwrap(),
         width: 0,
         height: 0,
+        depth: 0,
+        colors: 0,
         data_len: BlobLen::new(0x0800_0000).unwrap(), // 128 MiB each; two sum past the 256 MiB tag limit
     };
     let arts = vec![art(1), art(2)];

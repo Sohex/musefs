@@ -251,6 +251,14 @@ one-way step for existing data and logs at `info` only, and the common case — 
 store already at the latest version — stays silent, since that path runs on
 every open and every mount.
 
+**`art` holds bytes; `track_art` describes the embedding.** The MIME type,
+dimensions, colour depth and indexed-colour count live on the link, because they
+describe one file's picture block rather than the image every file shares. While
+`art` owned them, two files holding byte-identical art served whichever one the
+scan reached first — including its declared MIME type. The columns still exist on
+`art` and are vestigial: nothing reads or writes them, and they go when the
+`contrib` plugins stop inserting them.
+
 **Art is immutable once written.** `art` rows are content-addressed by
 `sha256`; a trigger rejects any in-place `UPDATE` of an art row's **key or**
 content columns (`id`, `data`, `sha256`, `mime`, `byte_len`, `width`, `height`)

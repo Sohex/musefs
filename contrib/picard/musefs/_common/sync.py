@@ -94,7 +94,12 @@ def sync_one(conn, record, stats, *, dry_run=False, merge=False):
                     replace_tags(conn, track_id, record.pairs)
                 if will_link_art:
                     arts = [
-                        (upsert_art(conn, img.data, img.mime), img.picture_type, img.description)
+                        (
+                            upsert_art(conn, img.data, img.mime),
+                            img.picture_type,
+                            img.description,
+                            img.mime,
+                        )
                         for img in kept
                     ]
                     replace_track_art(conn, track_id, arts)

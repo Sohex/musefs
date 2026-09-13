@@ -12,6 +12,15 @@ and these packages adhere to [Semantic Versioning](https://semver.org/spec/v2.0.
 
 ### Changed
 
+- **`replace_track_art` takes a fourth element per row: the mime.** Rows are now
+  `(art_id, picture_type, description, mime)`. From schema v4 the MIME type
+  lives on the `track_art` link rather than on the deduplicated `art` row,
+  because it describes one file's picture block and not the bytes every file
+  shares — and it is the value musefs writes into the synthesized picture block,
+  so a link stored without one produces art whose declared type is the empty
+  string. `sync_files` passes each `ArtImage`'s own mime, so callers using it are
+  unaffected; a caller driving `replace_track_art` directly must add the field.
+
 - **A text-tag sync can no longer collide with a scanner-written binary tag.**
   Schema v4 replaces `tags`' primary key with a unique index that folds the
   row class in as a fourth column, so the text rows these helpers rewrite and

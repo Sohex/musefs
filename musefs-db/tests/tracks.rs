@@ -34,6 +34,11 @@ fn track_identity_returns_content_version_and_backing_identity() {
             art_id,
             picture_type: 3,
             description: String::new(),
+            mime: "image/png".into(),
+            width: None,
+            height: None,
+            depth: 0,
+            colors: 0,
             ordinal: 0,
         }],
     )
@@ -129,9 +134,6 @@ fn delete_track_cascades_tags_and_track_art() {
     db.replace_tags(id, &[Tag::new("artist", "A", 0)]).unwrap();
     let art_id = db
         .upsert_art(&NewArt {
-            mime: "image/png".to_string(),
-            width: None,
-            height: None,
             data: vec![1, 2, 3],
         })
         .unwrap();
@@ -141,6 +143,11 @@ fn delete_track_cascades_tags_and_track_art() {
             art_id,
             picture_type: 3,
             description: String::new(),
+            mime: "image/png".into(),
+            width: None,
+            height: None,
+            depth: 0,
+            colors: 0,
             ordinal: 0,
         }],
     )

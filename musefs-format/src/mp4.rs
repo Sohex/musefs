@@ -591,8 +591,12 @@ pub fn read_pictures_reporting(
                 mime: mime.to_string(),
                 picture_type: PictureType::new(3).expect("3 is in range"),
                 description: String::new(),
+                // `covr` is the image bytes and a type flag; it declares no
+                // geometry, so these are all "not stated" as with `APIC`.
                 width: 0,
                 height: 0,
+                depth: 0,
+                colors: 0,
                 data: dp[8..].to_vec(),
             });
         }

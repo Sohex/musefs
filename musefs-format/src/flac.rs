@@ -398,7 +398,7 @@ pub fn split_preserved(
 }
 
 /// Serialize a FLAC PICTURE block *body* for `art`: type, mime, description,
-/// dimensions, depth+colors placeholders, and the declared image-data length.
+/// dimensions, depth, colours, and the declared image-data length.
 /// The image bytes themselves are not appended. `description` is taken as a
 /// parameter (rather than `art.description`) so the OGG path can pass a
 /// space-padded variant for incremental base64 — see [`crate::ogg`].
@@ -419,8 +419,11 @@ pub(crate) fn picture_body_framing(art: &ArtInput, description: &str) -> Result<
     out.extend_from_slice(description.as_bytes());
     out.extend_from_slice(&art.width.to_be_bytes());
     out.extend_from_slice(&art.height.to_be_bytes());
-    out.extend_from_slice(&0u32.to_be_bytes()); // color depth (unknown)
-    out.extend_from_slice(&0u32.to_be_bytes()); // number of colors (non-indexed)
+    // Round-tripped rather than zeroed (#716): the parser reads both, the link
+    // stores them, and 0 already means "not stated" to the format — so a file
+    // that declared neither is unchanged, and one that declared them keeps them.
+    out.extend_from_slice(&art.depth.to_be_bytes());
+    out.extend_from_slice(&art.colors.to_be_bytes());
     out.extend_from_slice(
         &u32::try_from(art.data_len.get())
             .map_err(|_| FormatError::TooLarge)?
@@ -585,9 +588,9 @@ pub(crate) fn parse_picture_block(body: &[u8]) -> Result<EmbeddedPicture> {
     pos += 4;
     let height = read_u32_be(body, pos)?;
     pos += 4;
-    let _depth = read_u32_be(body, pos)?;
+    let depth = read_u32_be(body, pos)?;
     pos += 4;
-    let _colors = read_u32_be(body, pos)?;
+    let colors = read_u32_be(body, pos)?;
     pos += 4;
     let data_len = read_u32_be(body, pos)? as usize;
     pos += 4;
@@ -601,6 +604,8 @@ pub(crate) fn parse_picture_block(body: &[u8]) -> Result<EmbeddedPicture> {
         description,
         width,
         height,
+        depth,
+        colors,
         data: body[pos..data_end].to_vec(),
     })
 }
@@ -1201,6 +1206,8 @@ mod tests {
             picture_type: PictureType::new(3).unwrap(),
             width: 0,
             height: 0,
+            depth: 0,
+            colors: 0,
             data_len: BlobLen::new(data_len).unwrap(),
         };
         // Derive the exact framing length from production rather than hardcoding it
@@ -1253,6 +1260,8 @@ mod tests {
             picture_type: PictureType::new(3).unwrap(),
             width: 0,
             height: 0,
+            depth: 0,
+            colors: 0,
             data_len: BlobLen::new(data_len).unwrap(),
         };
         assert_eq!(

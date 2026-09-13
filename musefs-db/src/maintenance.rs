@@ -105,9 +105,6 @@ mod tests {
         // Allocate many pages: 16 distinct 256 KiB art blobs (~4 MiB).
         for i in 0..16u8 {
             db.upsert_art(&NewArt {
-                mime: "image/png".into(),
-                width: None,
-                height: None,
                 data: vec![i; 256 * 1024],
             })
             .unwrap();

@@ -19,6 +19,10 @@ CONTRACT_TITLE = "Contract Roundtrip Title"
 CONTRACT_ARTIST = "Contract Roundtrip Artist"
 # A small payload; content is opaque to the contract (we only assert art exists).
 CONTRACT_ART = b"\xff\xd8\xff\xe0contract-roundtrip-cover-bytes"
+# Declared per link, not per blob (#716). The harness asserts the synthesized
+# picture block carries it back, which is the end of the contract that would
+# otherwise only be checked as "some art is present".
+CONTRACT_ART_MIME = "image/jpeg"
 
 
 def main(db_path):
@@ -29,9 +33,9 @@ def main(db_path):
             raise SystemExit("contract_writer: no tracks in DB (did scan run?)")
         for tid in track_ids:
             replace_tags(conn, tid, [("title", CONTRACT_TITLE), ("artist", CONTRACT_ARTIST)])
-            art_id = upsert_art(conn, CONTRACT_ART, "image/jpeg")
+            art_id = upsert_art(conn, CONTRACT_ART, CONTRACT_ART_MIME)
             # picture_type 3 == front cover (valid range 0..=20).
-            replace_track_art(conn, tid, [(art_id, 3, "front cover")])
+            replace_track_art(conn, tid, [(art_id, 3, "front cover", CONTRACT_ART_MIME)])
         conn.commit()
     finally:
         conn.close()

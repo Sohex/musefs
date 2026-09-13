@@ -355,8 +355,15 @@ def upsert_art(conn, data, mime):
 
 def replace_track_art(conn, track_id, arts):
     """Replace the track's art rows. ``arts`` is an ordered list of
-    ``(art_id, picture_type, description)``; each row's ``ordinal`` is its
+    ``(art_id, picture_type, description, mime)``; each row's ``ordinal`` is its
     list index.
+
+    ``mime`` describes *this* link, not the image bytes. From schema v4 it lives
+    on ``track_art`` rather than ``art``, because two files can hold
+    byte-identical art and declare it differently — and while ``art`` owned it,
+    whichever file was ingested first chose it for every track sharing the blob.
+    It is what musefs writes into the synthesized picture block, so a link
+    without one serves an empty MIME type.
 
     Atomic via an internal savepoint (see ``_savepoint``): the DELETE and the
     re-insert either both land or neither does, even on an autocommit
@@ -365,9 +372,9 @@ def replace_track_art(conn, track_id, arts):
         conn.execute("DELETE FROM track_art WHERE track_id = ?", (track_id,))
         conn.executemany(
             "INSERT INTO track_art (track_id, art_id, picture_type, description, "
-            "ordinal) VALUES (?, ?, ?, ?, ?)",
+            "mime, ordinal) VALUES (?, ?, ?, ?, ?, ?)",
             [
-                (track_id, art_id, picture_type, description, i)
-                for i, (art_id, picture_type, description) in enumerate(arts)
+                (track_id, art_id, picture_type, description, mime, i)
+                for i, (art_id, picture_type, description, mime) in enumerate(arts)
             ],
         )

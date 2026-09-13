@@ -38,6 +38,8 @@ fn full_roundtrip_preserved_blocks_multivalue_tags_and_two_pictures() {
             picture_type: PictureType::new(3).unwrap(),
             width: 600,
             height: 600,
+            depth: 24,
+            colors: 0,
             data_len: BlobLen::new(front.len() as u64).unwrap(),
         },
         ArtInput {
@@ -47,6 +49,8 @@ fn full_roundtrip_preserved_blocks_multivalue_tags_and_two_pictures() {
             picture_type: PictureType::new(4).unwrap(),
             width: 600,
             height: 600,
+            depth: 8,
+            colors: 256,
             data_len: BlobLen::new(back.len() as u64).unwrap(),
         },
     ];
@@ -94,6 +98,12 @@ fn full_roundtrip_preserved_blocks_multivalue_tags_and_two_pictures() {
     assert_eq!(pics[0].data, front);
     assert_eq!(pics[1].description, "back");
     assert_eq!(pics[1].data, back);
+    // Depth and colours round-trip rather than being zeroed on the way out
+    // (#716): the parser reads them, the store keeps them per embedding, and
+    // synthesis writes back what it was given. Read here by `metaflac` rather
+    // than by our own parser, so the assertion is about the served bytes.
+    assert_eq!((pics[0].depth, pics[0].num_colors), (24, 0));
+    assert_eq!((pics[1].depth, pics[1].num_colors), (8, 256));
 
     let si_read = tag.get_streaminfo().expect("streaminfo");
     assert_eq!(si_read.sample_rate, 44100);

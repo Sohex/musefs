@@ -148,7 +148,7 @@ exclude_re = [
     # run_pipeline sync_channel capacity `jobs * 2`: pure throughput/blocking knob;
     # the persisted track set is identical for any positive capacity.
     # guard: op="*" fn="run_pipeline" rows=2
-'musefs-core/src/scan\.rs:2282:46:',
+'musefs-core/src/scan\.rs:2287:46:',
     # probe_body's tail-read predicate
     # `has_ext(mp3) || (has_ext(flac) && has_leading_id3(prefix))`, the inner `&&`
     # (col 66) -> `||`: widening it makes every .flac pay the 128-byte tail read,
@@ -174,30 +174,30 @@ exclude_re = [
     # safely description-anchored. Re-verify these coordinates (via
     # `cargo mutants --list`) after any change that reformats scan.rs.
     # guard: op="+=" fn="run_pipeline" rows=2
-'musefs-core/src/scan\.rs:2406:22:',
+'musefs-core/src/scan\.rs:2411:22:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2497:33:',
+'musefs-core/src/scan\.rs:2502:33:',
     # guard: op="||" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2497:48:',
+'musefs-core/src/scan\.rs:2502:48:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2497:63:',
+'musefs-core/src/scan\.rs:2502:63:',
     # guard: op="+=" fn="run_pipeline" rows=2
-'musefs-core/src/scan\.rs:2511:37:',
+'musefs-core/src/scan\.rs:2516:37:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2513:41:',
+'musefs-core/src/scan\.rs:2518:41:',
     # guard: op="||" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2513:56:',
+'musefs-core/src/scan\.rs:2518:56:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2513:71:',
+'musefs-core/src/scan\.rs:2518:71:',
     # Same cadence class, one level up: each threshold flush is a let-chain
     # (`(len >= BATCH_FILES || batch_bytes >= cap) && let Err(e) = flush(..)`), so
     # `&&`->`||` short-circuits past the mid-loop flush exactly when the threshold
     # IS met — deferring the commit to the flush-on-empty / final flush, which
     # persist the identical track set and still surface a flush error (#618).
     # guard: op="&&" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2498:21:',
+'musefs-core/src/scan\.rs:2503:21:',
     # guard: op="&&" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2514:29:',
+'musefs-core/src/scan\.rs:2519:29:',
     # `ByteBudget::acquire`'s wait guard (`!st.closed && in_flight != 0 && ...`),
     # the FIRST `&&`->`||`. `&&` binds tighter than `||`, so the guard becomes
     # `!closed || (in_flight != 0 && over_cap)` and every reservation against an
@@ -218,11 +218,11 @@ exclude_re = [
     # scan.failed + skip_failed` sum is also insensitive to `+`->`-` (the `+`->`*`
     # variant IS caught, so only `-` is excluded here).
     # guard: op="+=" fn="revalidate_with" rows=2
-'musefs-core/src/scan\.rs:2691:29:',
+'musefs-core/src/scan\.rs:2696:29:',
     # guard: op="+=" fn="revalidate_with" rows=2
-'musefs-core/src/scan\.rs:2703:33:',
+'musefs-core/src/scan\.rs:2708:33:',
     # guard: op="+" fn="revalidate_with" rows=1
-'musefs-core/src/scan\.rs:2760:29: replace \+ with -',
+'musefs-core/src/scan\.rs:2765:29: replace \+ with -',
     # Phase 2 ID3 binary tags: classify_binary_frame's POPM counter fold
     # `(a << 8) | b` -> `(a << 8) ^ b`. The accumulator is left-shifted by 8 before
     # each combine, so its low byte is always zero where `b` lands; `|` and `^` are
@@ -689,9 +689,9 @@ exclude_re = [
     # IS behavioral (a picture whose data fills the body exactly is valid) and stays
     # IN scope, so these two are pinned by line:col.
     # guard: op=">" fn="parse_picture_block" rows=1
-    'musefs-format/src/flac\.rs:571:17: replace > with >= in parse_picture_block',
+    'musefs-format/src/flac\.rs:574:17: replace > with >= in parse_picture_block',
     # guard: op=">" fn="parse_picture_block" rows=1
-    'musefs-format/src/flac\.rs:579:17: replace > with >= in parse_picture_block',
+    'musefs-format/src/flac\.rs:582:17: replace > with >= in parse_picture_block',
     # lace_chunks_to_segments `header_len = 27 + seg_count`, `+`->`*`: header_len
     # only sizes a `Vec::with_capacity` hint; the header is built by `extend`, so
     # any capacity is behavior-identical (the CACHE_ESTIMATED_ITEMS precedent). The

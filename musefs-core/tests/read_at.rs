@@ -78,12 +78,7 @@ fn read_at_streams_art_image_segments() {
     let db = Db::open_in_memory().unwrap();
     let art = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
     let art_id = db
-        .upsert_art(&musefs_db::NewArt {
-            mime: "image/png".to_string(),
-            width: None,
-            height: None,
-            data: art.clone(),
-        })
+        .upsert_art(&musefs_db::NewArt { data: art.clone() })
         .unwrap();
 
     let layout = RegionLayout::validated(vec![

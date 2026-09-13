@@ -342,7 +342,7 @@ def test_delete_tracks_removes_rows_and_cascades(db_path):
         # Use the public helpers so the inserts match the real art/track_art schema
         # (content-addressed sha256 + byte_len + data; track_art references art_id).
         art_id = upsert_art(conn, b"coverbytes", "image/jpeg")
-        replace_track_art(conn, a, [(art_id, 3, "")])
+        replace_track_art(conn, a, [(art_id, 3, "", "image/png")])
         conn.commit()
 
         deleted = delete_tracks(conn, [a])

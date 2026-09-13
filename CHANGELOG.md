@@ -321,6 +321,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Two files holding byte-identical cover art no longer serve each other's
+  picture metadata ([#716](https://github.com/Sohex/musefs/issues/716)). `art`
+  is deduplicated on the image bytes but owned the MIME type and dimensions, so
+  whichever copy was scanned first chose them for every track using that image
+  — a file whose own block said JPEG could be served one declaring PNG. Those
+  now live on the `track_art` link, where they describe the embedding rather
+  than the bytes. FLAC's colour depth and indexed-colour count are stored and
+  round-tripped for the first time; the parser had always read them and thrown
+  them away, and synthesis wrote zeroes.
+
+  **An existing store keeps the shared values until a rescan**, because the
+  migration can only copy what survived ingest — the true per-file ones were
+  discarded when the art was first stored. `musefs migrate` offers that rescan.
+
 - Chained Ogg — complete logical bitstreams concatenated end to end, which
   RFC 3533 allows — is now detected and skipped at scan time, and refused at
   serve time ([#722](https://github.com/Sohex/musefs/issues/722)). The old

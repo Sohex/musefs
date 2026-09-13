@@ -613,3 +613,94 @@ fn scan_fails_only_the_file_with_oversized_art() {
     assert_eq!(ta.len(), 1);
     assert_eq!(db.get_art_meta(ta[0].art_id).unwrap().unwrap().byte_len, 50);
 }
+
+/// Two files holding byte-identical art that describe it differently.
+///
+/// This is #716's reproduction. `art` is deduplicated on `sha256(data)`, and it
+/// used to own the mime, the dimensions and (in the format, but nowhere in the
+/// store) the depth and colour count. `upsert_art` is `ON CONFLICT DO NOTHING`,
+/// so whichever occurrence was scanned first chose all of them for every track
+/// referencing that blob — including the *declared MIME type*, so a file whose
+/// own block said JPEG could be served one saying PNG. Scan order decided it.
+///
+/// The blob is still shared; the description of it is not.
+#[test]
+fn two_files_sharing_one_blob_keep_their_own_picture_metadata() {
+    /// A FLAC `PICTURE` block declaring its own mime, geometry, depth and colours.
+    fn picture_block(mime: &str, w: u32, h: u32, depth: u32, colors: u32, data: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&3u32.to_be_bytes()); // front cover
+        b.extend_from_slice(&u32::try_from(mime.len()).unwrap().to_be_bytes());
+        b.extend_from_slice(mime.as_bytes());
+        b.extend_from_slice(&0u32.to_be_bytes()); // description
+        b.extend_from_slice(&w.to_be_bytes());
+        b.extend_from_slice(&h.to_be_bytes());
+        b.extend_from_slice(&depth.to_be_bytes());
+        b.extend_from_slice(&colors.to_be_bytes());
+        b.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
+        b.extend_from_slice(data);
+        b
+    }
+
+    // One image, two descriptions of it.
+    let image = [0xABu8; 64];
+    let dir = tempfile::tempdir().unwrap();
+    for (name, title, block) in [
+        (
+            "a.flac",
+            "TITLE=A",
+            picture_block("image/jpeg", 1200, 1200, 24, 0, &image),
+        ),
+        (
+            "b.flac",
+            "TITLE=B",
+            picture_block("image/png", 64, 64, 8, 256, &image),
+        ),
+    ] {
+        let bytes = make_flac(
+            &[
+                (0, streaminfo_body()),
+                (4, vorbis_comment_body("v", &[title])),
+                (6, block),
+            ],
+            &[0xCC; 30],
+        );
+        std::fs::write(dir.path().join(name), bytes).unwrap();
+    }
+
+    let db = Db::open_in_memory().unwrap();
+    let stats = scan_directory(&db, dir.path()).unwrap();
+    assert_eq!(stats.scanned, 2);
+
+    let link_of = |file: &str| {
+        let track = db
+            .list_tracks()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.backing_path.ends_with(file))
+            .expect("both tracks stored");
+        db.get_track_art(track.id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("each track links its own picture")
+    };
+    let a = link_of("a.flac");
+    let b = link_of("b.flac");
+
+    // One blob: the deduplication that made this a problem still happens.
+    assert_eq!(a.art_id, b.art_id, "byte-identical art is still one row");
+
+    // Two descriptions of it, each its own.
+    assert_eq!(
+        (a.mime.as_str(), a.width, a.height),
+        ("image/jpeg", Some(1200), Some(1200))
+    );
+    assert_eq!(
+        (b.mime.as_str(), b.width, b.height),
+        ("image/png", Some(64), Some(64))
+    );
+    // Depth and colours too: the FLAC parser used to read and discard both.
+    assert_eq!((a.depth, a.colors), (24, 0));
+    assert_eq!((b.depth, b.colors), (8, 256));
+}

@@ -1006,9 +1006,6 @@ mod ogg_art_serve_tests {
         let db = musefs_db::Db::open_in_memory().unwrap();
         let art_id = db
             .upsert_art(&musefs_db::NewArt {
-                mime: "image/png".to_string(),
-                width: Some(1),
-                height: Some(1),
                 data: image.clone(),
             })
             .unwrap();
@@ -1063,9 +1060,6 @@ mod ogg_art_serve_tests {
         let db = musefs_db::Db::open_in_memory().unwrap();
         let art_id = db
             .upsert_art(&musefs_db::NewArt {
-                mime: "image/png".to_string(),
-                width: None,
-                height: None,
                 data: image.clone(),
             })
             .unwrap();
@@ -1668,9 +1662,6 @@ mod binary_tag_serve_tests {
             .unwrap();
         let art_id = db
             .upsert_art(&musefs_db::NewArt {
-                mime: "image/png".into(),
-                width: None,
-                height: None,
                 data: vec![1, 2, 3, 4],
             })
             .unwrap();

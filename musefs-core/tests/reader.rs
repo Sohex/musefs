@@ -91,9 +91,6 @@ fn resolve_includes_art_image_segments() {
     let (_dir, db, id) = setup();
     let art_id = db
         .upsert_art(&NewArt {
-            mime: "image/png".to_string(),
-            width: None,
-            height: None,
             data: vec![0x9u8; 80],
         })
         .unwrap();
@@ -103,6 +100,11 @@ fn resolve_includes_art_image_segments() {
             art_id,
             picture_type: 3,
             description: String::new(),
+            mime: "image/png".into(),
+            width: None,
+            height: None,
+            depth: 0,
+            colors: 0,
             ordinal: 0,
         }],
     )

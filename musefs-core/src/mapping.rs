@@ -76,13 +76,18 @@ pub(crate) fn track_art_to_inputs<M>(db: &Db<M>, track_id: i64) -> Result<Vec<Ar
                 value: ta.picture_type,
             });
         };
+        // Every one of these but `data_len` now comes from the link (#716).
+        // They describe this file's picture block; only the length belongs to
+        // the deduplicated blob.
         inputs.push(ArtInput {
             art_id: ta.art_id,
-            mime: meta.mime,
+            mime: ta.mime,
             description: ta.description,
             picture_type,
-            width: meta.width.unwrap_or(0),
-            height: meta.height.unwrap_or(0),
+            width: ta.width.unwrap_or(0),
+            height: ta.height.unwrap_or(0),
+            depth: ta.depth,
+            colors: ta.colors,
             data_len,
         });
     }
@@ -195,20 +200,10 @@ mod tests {
             .unwrap();
         let nonempty = db
             .upsert_art(&NewArt {
-                mime: "image/png".into(),
-                width: None,
-                height: None,
                 data: vec![1, 2, 3],
             })
             .unwrap();
-        let empty = db
-            .upsert_art(&NewArt {
-                mime: "image/png".into(),
-                width: None,
-                height: None,
-                data: vec![],
-            })
-            .unwrap();
+        let empty = db.upsert_art(&NewArt { data: vec![] }).unwrap();
         db.set_track_art(
             tid,
             &[
@@ -216,12 +211,22 @@ mod tests {
                     art_id: nonempty,
                     picture_type: 3,
                     description: String::new(),
+                    mime: "image/png".into(),
+                    width: None,
+                    height: None,
+                    depth: 0,
+                    colors: 0,
                     ordinal: 0,
                 },
                 TrackArt {
                     art_id: empty,
                     picture_type: 3,
                     description: String::new(),
+                    mime: "image/png".into(),
+                    width: None,
+                    height: None,
+                    depth: 0,
+                    colors: 0,
                     ordinal: 1,
                 },
             ],
@@ -321,9 +326,6 @@ mod tests {
             .unwrap();
         let good = db
             .upsert_art(&NewArt {
-                mime: "image/png".into(),
-                width: None,
-                height: None,
                 data: vec![1, 2, 3, 4],
             })
             .unwrap();
@@ -365,12 +367,22 @@ mod tests {
                     art_id: good,
                     picture_type: 3,
                     description: String::new(),
+                    mime: "image/png".into(),
+                    width: None,
+                    height: None,
+                    depth: 0,
+                    colors: 0,
                     ordinal: 0,
                 },
                 TrackArt {
                     art_id: bad,
                     picture_type: 3,
                     description: String::new(),
+                    mime: "image/png".into(),
+                    width: None,
+                    height: None,
+                    depth: 0,
+                    colors: 0,
                     ordinal: 1,
                 },
             ],
@@ -403,9 +415,6 @@ mod tests {
             .unwrap();
         let orphan_id = db
             .upsert_art(&NewArt {
-                mime: "image/png".into(),
-                width: None,
-                height: None,
                 data: vec![1, 2, 3, 4],
             })
             .unwrap();
@@ -415,6 +424,11 @@ mod tests {
                 art_id: orphan_id,
                 picture_type: 3,
                 description: String::new(),
+                mime: "image/png".into(),
+                width: None,
+                height: None,
+                depth: 0,
+                colors: 0,
                 ordinal: 0,
             }],
         )
@@ -497,6 +511,11 @@ mod tests {
                 art_id: at_cap,
                 picture_type: 3,
                 description: String::new(),
+                mime: "image/png".into(),
+                width: None,
+                height: None,
+                depth: 0,
+                colors: 0,
                 ordinal: 0,
             }],
         )
@@ -511,6 +530,11 @@ mod tests {
                 art_id: over,
                 picture_type: 3,
                 description: String::new(),
+                mime: "image/png".into(),
+                width: None,
+                height: None,
+                depth: 0,
+                colors: 0,
                 ordinal: 0,
             }],
         )
@@ -535,9 +559,6 @@ mod tests {
         let db = Db::open(dir.path().join("src.db")).unwrap();
         let art_id = db
             .upsert_art(&NewArt {
-                mime: "image/png".into(),
-                width: None,
-                height: None,
                 data: vec![10, 20, 30, 40, 50],
             })
             .unwrap();

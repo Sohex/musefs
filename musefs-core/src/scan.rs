@@ -1879,17 +1879,22 @@ fn ingest_into(
 
     let mut track_arts = Vec::new();
     for (ordinal, pic) in probed.pictures.into_iter().enumerate() {
-        let art_id = w.upsert_art(&NewArt {
-            mime: pic.mime,
-            width: (pic.width != 0).then_some(pic.width),
-            height: (pic.height != 0).then_some(pic.height),
-            data: pic.data,
-        })?;
+        let art_id = w.upsert_art(&NewArt { data: pic.data })?;
         let picture_type = pic.picture_type.get();
+        // The picture metadata goes on the link, where it describes this file's
+        // block rather than the bytes every file sharing the blob holds (#716).
+        // Zero stays the "not declared" sentinel the formats themselves use:
+        // `None` for the dimensions, which the model makes nullable, and 0 for
+        // depth and colours, which the FLAC block spells that way.
         track_arts.push(TrackArt {
             art_id,
             picture_type,
             description: pic.description,
+            mime: pic.mime,
+            width: (pic.width != 0).then_some(pic.width),
+            height: (pic.height != 0).then_some(pic.height),
+            depth: pic.depth,
+            colors: pic.colors,
             ordinal: ordinal as u64,
         });
     }
