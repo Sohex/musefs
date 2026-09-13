@@ -170,3 +170,53 @@ def test_path_under_different_tree_is_skipped_not_mismatched(tmp_path):
         assert track_id_for_path(conn, key) is None  # skipped, never a wrong hit
     finally:
         conn.close()
+
+
+def test_non_utf8_paths_match_and_stay_distinct(tmp_path):
+    """The gate this file exists for, at the case that used to break it (#680).
+
+    Two filenames differing only in a byte that is not valid UTF-8. The scanner
+    stores those bytes verbatim from schema v4 on, so the plugin's key has to
+    encode back to them — and the two must stay two.
+
+    Before #680's plugin half, `realpath_key` normalized both to the same
+    `U+FFFD` form. That matched the scanner while *it* was lossy too, and the
+    pair collapsed onto one row; once the scanner stored real bytes it matched
+    nothing at all, and the plugin skipped such files without saying so.
+    """
+    tree = tmp_path / "music"
+    tree.mkdir(parents=True, exist_ok=True)
+    a = os.fsencode(str(tree)) + b"/bad\x80name.flac"
+    b = os.fsencode(str(tree)) + b"/bad\x81name.flac"
+    try:
+        for raw in (a, b):
+            with open(raw, "wb") as fh:
+                fh.write(MINIMAL_FLAC)
+    except OSError as e:
+        # APFS and HFS+ enforce valid UTF-8 and refuse the create with EILSEQ.
+        # A filesystem that will not host the name cannot reach the defect
+        # either, so there is nothing to assert here.
+        pytest.skip(f"filesystem will not accept a non-UTF-8 filename: {e}")
+
+    # The precondition the whole test rests on: these two collide under the old
+    # lossy rendering, so a key that still used it would confuse them.
+    assert os.fsdecode(a) != os.fsdecode(b)
+    assert a.decode("utf-8", "replace") == b.decode("utf-8", "replace")
+
+    db = _scan(tmp_path, tree)
+    stored = _stored_paths(db)
+    assert len(stored) == 2, f"two files, two rows: {stored!r}"
+
+    conn = connect(db)
+    try:
+        ids = set()
+        for raw in (a, b):
+            key = realpath_key(raw)
+            assert key in stored, f"{key!r} not in {stored!r}"
+            assert os.fsencode(key) == os.path.realpath(raw)
+            track_id = track_id_for_path(conn, key)
+            assert track_id is not None, f"no row for {key!r}"
+            ids.add(track_id)
+        assert len(ids) == 2, "the two files must not resolve to one row"
+    finally:
+        conn.close()

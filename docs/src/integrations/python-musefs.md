@@ -203,8 +203,12 @@ Everything in `__all__`, imported from the top-level `musefs_common` package.
 - `Record(key, pairs=[], art=None, delete_keys=None)` — one file's sync inputs
   (see *The `Record` shape*).
 - `ArtImage(data, mime, picture_type=3, description="")` — one embedded picture.
-- `realpath_key(path)` — canonical path string matching the scanner's
-  `backing_path`; accepts `str`/`bytes`, returns `str`.
+- `realpath_key(path)` — canonical path matching the scanner's `backing_path`;
+  accepts `str`/`bytes`, returns `str`. The resolution runs on bytes and is
+  decoded with `surrogateescape`, so a filename that is not valid UTF-8 is
+  carried as surrogates and `os.fsencode` turns the key back into the exact
+  path on disk — which is what the store holds from schema v4 (#680). Two files
+  differing only in undecodable bytes therefore give two different keys.
 
 **Writing**
 

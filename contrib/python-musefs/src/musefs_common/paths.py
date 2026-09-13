@@ -2,15 +2,20 @@ import os
 
 
 def realpath_key(path):
-    """Canonical absolute path string matching musefs scan's stored
-    ``backing_path`` (``std::fs::canonicalize`` + ``to_string_lossy``).
+    """Canonical absolute path matching musefs scan's stored ``backing_path``.
 
     Accepts ``str`` or ``bytes`` and always returns ``str``.
+
+    The resolution is done on *bytes* and decoded with ``surrogateescape``, so
+    the key round-trips back to the exact path on disk through ``os.fsencode``
+    — which is what `path_param` binds. A filename on Unix is an arbitrary byte
+    string, and from schema v4 the store holds those bytes verbatim (#680).
+
+    This helper used to normalize undecodable bytes to ``U+FFFD``, matching what
+    the scanner itself stored back when it wrote ``to_string_lossy()``. Both
+    sides agreed, and both were wrong: that mapping is not injective, so two
+    distinct files collapsed onto one key — and onto one row. Now that the
+    scanner stores real bytes, reproducing the old form would simply fail to
+    match, and a plugin would skip such a file without saying so.
     """
-    real = os.path.realpath(path)
-    if isinstance(real, bytes):
-        real = os.fsdecode(real)
-    # os.fsdecode uses surrogateescape; Rust's to_string_lossy uses U+FFFD for
-    # undecodable bytes. Normalize so a non-UTF-8 path component produces the
-    # same key string on both sides instead of silently mismatching.
-    return real.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+    return os.fsdecode(os.path.realpath(os.fsencode(path)))

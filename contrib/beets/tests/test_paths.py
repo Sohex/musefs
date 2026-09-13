@@ -33,12 +33,16 @@ def test_symlink_resolved(tmp_path):
     assert realpath_key(str(link)) == os.path.realpath(str(real))
 
 
-def test_non_utf8_bytes_replaced_like_rust(tmp_path):
-    # A non-UTF-8 filename: Rust's to_string_lossy yields U+FFFD. We must match
-    # that, not surrogate-escape it (\udcff), or the key would silently mismatch.
+def test_non_utf8_bytes_round_trip_rather_than_being_replaced(tmp_path):
+    # A non-UTF-8 filename. From schema v4 the store holds the real bytes
+    # (#680), so the key has to carry them too — as surrogates, which
+    # `os.fsencode` turns back into the exact path. The old form normalized them
+    # to U+FFFD to match the scanner's `to_string_lossy()`; that agreed with the
+    # scanner but collapsed two distinct files onto one key.
     raw = os.fsencode(str(tmp_path)) + b"/\xff.flac"
     with open(raw, "wb") as fh:
         fh.write(b"x")
     key = realpath_key(raw)
-    assert "�" in key
-    assert "\udcff" not in key
+    assert "�" not in key
+    assert "\udcff" in key
+    assert os.fsencode(key) == os.path.realpath(raw)

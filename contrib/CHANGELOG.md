@@ -10,6 +10,26 @@ and these packages adhere to [Semantic Versioning](https://semver.org/spec/v2.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A backing path that is not valid UTF-8 now resolves to the right track, and
+  two such files stay two.** `realpath_key` used to normalize undecodable bytes
+  to `U+FFFD`, reproducing what the scanner itself stored back when it wrote a
+  lossy conversion. Both sides agreed, and both were wrong: that mapping is not
+  injective, so two files differing only in such a byte collapsed onto one key —
+  and onto one row. From musefs 2.0.0 the scanner stores the real bytes, so the
+  old form matched nothing at all and a plugin skipped those files silently.
+
+  The key now resolves on bytes and decodes with `surrogateescape`, so
+  `os.fsencode(realpath_key(p))` is exactly the path on disk. `path_param` and
+  `path_value` use `os.fsencode`/`os.fsdecode` rather than a hardcoded `utf-8`,
+  which keeps both directions on one codec.
+
+  **This changes what `realpath_key` returns** for a non-UTF-8 path: surrogates
+  (`\udc80`) where it used to give `U+FFFD`. A caller that stores or compares
+  keys across the upgrade should recompute them. Callers that pass the key
+  straight to `sync_files` need no change.
+
 ### Changed
 
 - **`upsert_art` no longer takes a mime.** It is `upsert_art(conn, data)` now.
