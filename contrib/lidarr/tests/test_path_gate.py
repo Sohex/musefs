@@ -6,7 +6,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from musefs_common import connect, realpath_key
+from musefs_common import connect, path_value, realpath_key
 
 pytestmark = pytest.mark.musefs_bin
 
@@ -53,8 +53,10 @@ def test_symlink_scan_matches_real_backing_path(tmp_path):
 
     conn = connect(str(db_path))
     try:
-        rows = conn.execute("SELECT backing_path FROM tracks").fetchall()
+        # `backing_path` is a BLOB from schema v4 on; decode at the boundary the
+        # way the library's own readers do.
+        paths = [path_value(r[0]) for r in conn.execute("SELECT backing_path FROM tracks")]
     finally:
         conn.close()
 
-    assert rows == [(realpath_key(source),)]
+    assert paths == [realpath_key(source)]
