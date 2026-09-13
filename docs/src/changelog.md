@@ -314,7 +314,8 @@ see the [Release notes](release-notes.md).
   `upsert_art(conn, data, mime)` is now `upsert_art(conn, data)`. The argument
   was already ignored whenever the image had been seen before — that is what
   `ON CONFLICT(sha256) DO NOTHING` means — and there is no longer a column for
-  it to write. `replace_track_art` is where the mime goes, and always was.
+  it to write. `replace_track_art`, which gained the mime in the previous step of
+  this same release, is now where it goes.
 
   **And both tables gain the constraint work**: storage classes pinned
   ([#718](https://github.com/Sohex/musefs/issues/718)) — including upper bounds

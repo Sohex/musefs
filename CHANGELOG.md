@@ -338,7 +338,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `upsert_art(conn, data, mime)` is now `upsert_art(conn, data)`. The argument
   was already being ignored whenever the image had been seen before — the stored
   row won the conflict — and there is no longer a column for it to write.
-  `replace_track_art` is where the mime goes, and always was.
+  `replace_track_art`, which gained the mime earlier in this same release, is now
+  where it goes.
 
   **An existing store keeps the shared values until a rescan**, because the
   migration can only copy what survived ingest — the true per-file ones were

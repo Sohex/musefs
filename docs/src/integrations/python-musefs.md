@@ -162,7 +162,17 @@ that bite plugin authors:
   change a track's art, insert a new content-addressed row via `upsert_art` and
   relink it via `replace_track_art`. From schema v4 the row is the content and
   nothing else: everything describing one file's embedding of it — the mime, the
-  dimensions, the colour depth — lives on the `track_art` link.
+  dimensions, the colour depth and the indexed-colour count — lives on the
+  `track_art` link.
+- **You supply the mime; the scanner supplies the rest.** `replace_track_art`
+  takes a mime per row because that is the value musefs writes into the
+  synthesized picture block, and a link stored without one produces art whose
+  declared type is the empty string. It does **not** take `width`, `height`,
+  `depth` or `colors`: reading those means decoding the image, which this
+  library does not do, so it leaves them unset — `NULL` dimensions and 0 for the
+  other two, which is how both the FLAC picture block and musefs spell "not
+  stated". A scan of a file that declares them fills them in from the file's own
+  picture block.
 - **Path layout is just a tag.** To drive a reorganized mount, write your
   computed relative path into a custom tag (e.g. `beets_path`) and mount with
   `--template '$!{beets_path}'`. musefs sanitizes each path segment, so a writer
