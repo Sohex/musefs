@@ -29,7 +29,9 @@ pub struct ResolvedFile {
     pub content_version: i64,
     pub backing_path: PathBuf,
     pub stamp: BackingStamp,
-    pub mtime_secs: i64,
+    /// The timestamp this file reports, both halves derived together in
+    /// `build`'s `match self.mode` so they cannot describe different things.
+    pub mtime: crate::VirtualMtime,
     /// One-entry memo of the last patched Ogg page, so consecutive reads skip
     /// re-patching the page straddling a chunk boundary. Empty for non-Ogg files
     /// and reset whenever this resolved entry is rebuilt. (Concrete type spelled
@@ -158,7 +160,7 @@ impl HeaderCache {
         track: &musefs_db::Track,
         meta: &std::fs::Metadata,
     ) -> Result<Arc<ResolvedFile>> {
-        let (layout, total_len, mtime_secs_val) = match self.mode {
+        let (layout, total_len, mtime) = match self.mode {
             Mode::StructureOnly => {
                 // Pure passthrough: the synthesized "file" is the backing file itself.
                 // The stored audio bounds are irrelevant here — the whole file is served
@@ -171,7 +173,17 @@ impl HeaderCache {
                 (
                     layout,
                     meta.len(),
-                    BackingStamp::from_track(track).display_secs(),
+                    crate::VirtualMtime {
+                        secs: BackingStamp::from_track(track).display_secs(),
+                        // No sub-second signal in passthrough, and deliberately
+                        // not `content_version` (#725). These bytes *are* the
+                        // backing file, so a tag or art edit does not change
+                        // them — reporting a moved mtime for one would tell
+                        // every size-plus-mtime consumer to re-copy a file that
+                        // is byte-identical. The version is the right answer
+                        // only where the served bytes are synthesized from it.
+                        content_version: 0,
+                    },
                 )
             }
             Mode::Synthesis => {
@@ -332,9 +344,12 @@ impl HeaderCache {
                 (
                     layout,
                     total,
-                    BackingStamp::from_track(track)
-                        .display_secs()
-                        .max(track.updated_at),
+                    crate::VirtualMtime {
+                        secs: BackingStamp::from_track(track)
+                            .display_secs()
+                            .max(track.updated_at),
+                        content_version: track.content_version,
+                    },
                 )
             }
         };
@@ -372,7 +387,7 @@ impl HeaderCache {
             // guaranteed-intended one. Documented, not enforced (#551).
             backing_path: PathBuf::from(&track.backing_path),
             stamp: BackingStamp::from_track(track),
-            mtime_secs: mtime_secs_val,
+            mtime,
             last_page: Mutex::new(None),
             cache_bytes,
             streams_db_rowid,
@@ -691,7 +706,10 @@ mod ogg_serve_tests {
             // Stamp the real file so the fallback's backing-fd re-validation
             // (#503) passes; a dummy stamp would now read as a changed backing.
             stamp: BackingStamp::from_metadata(&std::fs::metadata(&path).unwrap()),
-            mtime_secs: 0,
+            mtime: crate::VirtualMtime {
+                secs: 0,
+                content_version: 0,
+            },
             last_page: Mutex::new(None),
             cache_bytes: 8,
             streams_db_rowid: false,
@@ -1042,7 +1060,10 @@ mod ogg_art_serve_tests {
                 ctime_ns: 0,
                 ino: None,
             },
-            mtime_secs: 0,
+            mtime: crate::VirtualMtime {
+                secs: 0,
+                content_version: 0,
+            },
             last_page: Mutex::new(None),
             cache_bytes: 0,
             streams_db_rowid: false,
@@ -1092,7 +1113,10 @@ mod ogg_art_serve_tests {
                 ctime_ns: 0,
                 ino: None,
             },
-            mtime_secs: 0,
+            mtime: crate::VirtualMtime {
+                secs: 0,
+                content_version: 0,
+            },
             last_page: Mutex::new(None),
             cache_bytes: 0,
             streams_db_rowid: false,
@@ -1169,7 +1193,10 @@ mod cache_bound_tests {
                 ctime_ns: 0,
                 ino: None,
             },
-            mtime_secs: 0,
+            mtime: crate::VirtualMtime {
+                secs: 0,
+                content_version: 0,
+            },
             last_page: Mutex::new(None),
             cache_bytes: inline_len as u64,
             streams_db_rowid: false,
@@ -1616,7 +1643,10 @@ mod binary_tag_serve_tests {
                 ctime_ns: 0,
                 ino: None,
             },
-            mtime_secs: 0,
+            mtime: crate::VirtualMtime {
+                secs: 0,
+                content_version: 0,
+            },
             last_page: Mutex::new(None),
             cache_bytes: 0,
             streams_db_rowid: true,
@@ -1650,7 +1680,10 @@ mod binary_tag_serve_tests {
             content_version: 0,
             backing_path: path.clone(),
             stamp: BackingStamp::from_metadata(&std::fs::metadata(&path).unwrap()),
-            mtime_secs: 0,
+            mtime: crate::VirtualMtime {
+                secs: 0,
+                content_version: 0,
+            },
             last_page: Mutex::new(None),
             cache_bytes: 3,
             streams_db_rowid: false,
@@ -1704,7 +1737,10 @@ mod binary_tag_serve_tests {
                 ctime_ns: 0,
                 ino: None,
             },
-            mtime_secs: 0,
+            mtime: crate::VirtualMtime {
+                secs: 0,
+                content_version: 0,
+            },
             last_page: Mutex::new(None),
             cache_bytes: 0,
             streams_db_rowid: true,

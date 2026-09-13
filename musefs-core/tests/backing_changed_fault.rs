@@ -154,7 +154,7 @@ fn displayed_mtime_is_whole_seconds() {
         .unwrap();
     let resolved = HeaderCache::new(Mode::Synthesis).resolve(&db, id).unwrap();
     // Plausible epoch-seconds (this millennium), never ~10^18.
-    assert!(resolved.mtime_secs >= meta.mtime() && resolved.mtime_secs < 32_503_680_000);
+    assert!(resolved.mtime.secs >= meta.mtime() && resolved.mtime.secs < 32_503_680_000);
 }
 
 /// The case the inode was added for (#674): a backing filesystem with no

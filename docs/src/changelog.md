@@ -544,6 +544,36 @@ see the [Release notes](release-notes.md).
 
 ### Fixed
 
+- **A synthesized file's mtime now moves whenever its bytes do, and a pre-epoch
+  backing file is served as one.** Two fixes in the same type, because both are
+  about what the mount reports as a timestamp
+  ([#696](https://github.com/Sohex/musefs/issues/696),
+  [#725](https://github.com/Sohex/musefs/issues/725)).
+
+  The reported second is the later of the backing file's and the row's
+  `updated_at`, which triggers stamp in whole seconds. So two metadata edits
+  inside one wall-clock second left the same second behind, and a same-length
+  tag rewrite looked untouched to anything comparing size and mtime — rsync
+  without `--checksum`, Syncthing, media scanners. A backing mtime in the future
+  was worse: `max` meant it masked *every* metadata edit for as long as the skew
+  lasted. musefs itself was never wrong, because its caches key on
+  `content_version`; the contract presented outward was. The mount now reports
+  that same counter as the timestamp's nanoseconds, so a store change that
+  changes the synthesized bytes always moves the mtime. Nothing in the store
+  holds nanoseconds — the precision is derived where the timestamp is built, and
+  only in synthesis mode: `--mode structure-only` serves the backing file
+  verbatim, where a tag edit changes nothing and must not claim to.
+
+  Separately, `Attr`'s `mtime_secs` was a bare `i64` in which zero meant both
+  "synthetic directory" and "the Unix epoch", and the mount substituted the
+  mount time for anything at or below zero. A file whose mtime really was the
+  epoch therefore reported the wrong time, and every pre-epoch file would have
+  once v4 stopped refusing one. The field is an `Option` now, so the fallback
+  fires for the synthetic case and nothing else.
+
+  What the virtual mtime promises is written down for the first time, in
+  [the serving model](architecture/serving.md).
+
 - Two audio files whose names differ only in bytes that are not valid UTF-8 are
   no longer silently merged into one track
   ([#680](https://github.com/Sohex/musefs/issues/680)). A filename on Unix is an

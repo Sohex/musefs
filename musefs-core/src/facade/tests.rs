@@ -32,7 +32,10 @@ fn validate_opened_backing_rejects_mismatched_descriptor_metadata() {
         content_version: 1,
         backing_path: expected_path,
         stamp: crate::freshness::BackingStamp::from_metadata(&expected_meta),
-        mtime_secs: crate::freshness::BackingStamp::from_metadata(&expected_meta).display_secs(),
+        mtime: crate::VirtualMtime {
+            secs: crate::freshness::BackingStamp::from_metadata(&expected_meta).display_secs(),
+            content_version: 0,
+        },
         last_page: std::sync::Mutex::new(None),
         cache_bytes: 0,
         streams_db_rowid: false,
@@ -1580,4 +1583,45 @@ fn drain_prefetch_reports_the_pool_state() {
         on.drain_prefetch(Duration::from_secs(30)),
         "the pool drains once the job finishes"
     );
+}
+
+/// `VirtualMtime::nanos` is the whole of #725's mechanism: the sub-second part
+/// a `stat` reports, derived from the store's change counter.
+///
+/// Tested here rather than only through the FUSE conversion that consumes it.
+/// A public method whose only coverage lives in a downstream crate is a method
+/// this crate's own mutation gate cannot see — and it did not: both mutants on
+/// this function survived a `musefs-core`-scoped run until these landed.
+#[test]
+fn nanos_is_the_content_version_folded_into_the_sub_second_range() {
+    let at = |content_version| {
+        VirtualMtime {
+            secs: 0,
+            content_version,
+        }
+        .nanos()
+    };
+
+    // It is the counter itself while the counter fits.
+    assert_eq!(at(0), 0);
+    assert_eq!(at(1), 1);
+    assert_eq!(at(999_999_999), 999_999_999);
+
+    // Past a billion it wraps, which is the documented collision.
+    assert_eq!(at(1_000_000_000), 0);
+    assert_eq!(at(1_000_000_007), 7);
+
+    // The property that actually matters: consecutive versions differ, so a
+    // bump always moves the reported timestamp.
+    for v in [0, 1, 42, 999_999_998, 1_000_000_000, i64::MAX - 1] {
+        assert_ne!(at(v), at(v + 1), "version {v} and {} collide", v + 1);
+    }
+
+    // And the result is always a legal `tv_nsec`, including for a negative
+    // version the column's CHECK is supposed to forbid — `rem_euclid`, not `%`,
+    // so a reader that trusted the CHECK and was wrong still produces something
+    // the kernel accepts.
+    for v in [i64::MIN, -1, 0, i64::MAX] {
+        assert!(at(v) < 1_000_000_000, "version {v} -> {}", at(v));
+    }
 }

@@ -144,3 +144,51 @@ fn structure_only_resolves_to_whole_backing_file() {
     let whole = read_at(&resolved, &db, 0, resolved.total_len).unwrap();
     assert_eq!(whole, original);
 }
+
+/// #725 puts the store's `content_version` in the reported timestamp's
+/// nanoseconds so a metadata edit moves the mtime. That is right only where the
+/// served bytes are synthesized from the store.
+///
+/// In `StructureOnly` the served bytes *are* the backing file, so a tag edit
+/// changes nothing about them — and signalling a change would send every
+/// size-plus-mtime consumer to re-copy a byte-identical file. The inverse of the
+/// bug #725 fixes, and just as wrong.
+#[test]
+fn a_tag_edit_does_not_move_the_passthrough_mtime() {
+    let (dir, db, id) = setup();
+    let _ = dir;
+
+    let before = HeaderCache::new(Mode::StructureOnly)
+        .resolve(&db, id)
+        .unwrap()
+        .mtime;
+
+    // A real edit: it bumps content_version, which is what Synthesis reports.
+    db.replace_tags(id, &[musefs_db::Tag::new("title", "Edited", 0)])
+        .unwrap();
+    let bumped = db.get_track(id).unwrap().unwrap().content_version;
+    assert!(bumped > 0, "the edit must have bumped content_version");
+
+    let after = HeaderCache::new(Mode::StructureOnly)
+        .resolve(&db, id)
+        .unwrap()
+        .mtime;
+    assert_eq!(
+        after, before,
+        "passthrough bytes did not change, so the timestamp must not either"
+    );
+    assert_eq!(
+        after.content_version, 0,
+        "no sub-second signal in passthrough"
+    );
+
+    // And the same edit *does* move it under synthesis, where the bytes really
+    // are rebuilt from the store — so this is a mode distinction, not a dead
+    // mechanism.
+    let synth = HeaderCache::new(Mode::Synthesis)
+        .resolve(&db, id)
+        .unwrap()
+        .mtime;
+    assert_eq!(synth.content_version, bumped);
+    assert_ne!(synth.nanos(), after.nanos());
+}
