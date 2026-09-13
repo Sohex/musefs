@@ -18,6 +18,38 @@ use crate::{Db, Result, maintenance, schema};
 /// The present participle every refusal raised through this module reports.
 const OP: &str = "migrating";
 
+/// How many rows of one rebuilt table the migrated schema would refuse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableRejections {
+    /// The table as the store names it.
+    pub table: &'static str,
+    /// Rows that would not survive the rebuild.
+    pub rejected: u64,
+}
+
+/// What the migrated schema would refuse, per table. Empty is the normal case.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Rejections {
+    tables: Vec<TableRejections>,
+}
+
+impl Rejections {
+    /// Every table with at least one refused row.
+    pub fn tables(&self) -> &[TableRejections] {
+        &self.tables
+    }
+
+    /// Refused rows across every table.
+    pub fn total(&self) -> u64 {
+        self.tables.iter().map(|t| t.rejected).sum()
+    }
+
+    /// Whether the store migrates as it stands.
+    pub fn is_empty(&self) -> bool {
+        self.tables.is_empty()
+    }
+}
+
 /// A store opened for a gated schema upgrade, before the upgrade runs.
 ///
 /// Deliberately not a [`Db`]: the schema on disk is by definition not the one
@@ -121,6 +153,187 @@ impl PendingMigration {
         maintenance::snapshot_into(&self.conn, dest, OP)
     }
 
+    /// The tables V4 rebuilds, in the order a repair must delete from them, with
+    /// the projection the migration's own refill uses.
+    ///
+    /// `tracks` is the one whose source shape depends on the version being
+    /// upgraded from: the checksum columns arrived in V2, so a V1 store has no
+    /// such columns to select.
+    fn probe_projections(&self) -> [(&'static str, String); 4] {
+        let checksums = self.current >= 2;
+        let content_hash = if checksums {
+            "CASE WHEN typeof(content_hash) = 'text' \
+                       AND length(content_hash) = 64 \
+                       AND instr(content_hash, char(0)) = 0 \
+                  THEN content_hash END"
+        } else {
+            "NULL"
+        };
+        [
+            (
+                "tracks",
+                format!(
+                    "(rowid, id, backing_path, format, audio_offset, audio_length, \
+                      backing_size, backing_mtime_ns, content_version, updated_at, \
+                      backing_ctime_ns, fingerprint, content_hash, backing_ino) \
+                     SELECT rowid, id, CAST(backing_path AS BLOB), format, audio_offset, \
+                      audio_length, backing_size, backing_mtime_ns, content_version, \
+                      updated_at, backing_ctime_ns, NULL, {content_hash}, 0 \
+                     FROM main.tracks"
+                ),
+            ),
+            (
+                "art",
+                "(rowid, id, sha256, mime, width, height, byte_len, data) \
+                 SELECT rowid, id, sha256, mime, width, height, byte_len, data \
+                 FROM main.art"
+                    .to_string(),
+            ),
+            (
+                "tags",
+                "(rowid, track_id, key, value, ordinal, value_blob) \
+                 SELECT rowid, track_id, key, value, ordinal, value_blob \
+                 FROM main.tags"
+                    .to_string(),
+            ),
+            (
+                "track_art",
+                "(rowid, track_id, art_id, picture_type, description, \
+                  mime, width, height, depth, colors, ordinal) \
+                 SELECT h.rowid, h.track_id, h.art_id, h.picture_type, h.description, \
+                  a.mime, a.width, a.height, 0, 0, h.ordinal \
+                 FROM main.track_art h LEFT JOIN main.art a ON a.id = h.art_id"
+                    .to_string(),
+            ),
+        ]
+    }
+
+    /// Build the target shapes in an attached scratch database and run the
+    /// store's rows at them, returning the rowids each table would refuse.
+    ///
+    /// The reference schema is produced by the migration itself rather than
+    /// described a second time here — a scratch store migrated to the target is
+    /// exactly what this one is about to become — so there is no second copy of
+    /// the constraints to drift. `INSERT OR IGNORE` then skips precisely the
+    /// rows a `CHECK`, `NOT NULL` or `UNIQUE` would refuse, and what did not
+    /// arrive is the answer.
+    ///
+    /// Foreign keys are off for the pass. The question is per row and per table
+    /// — a child whose parent is refused would otherwise be counted for a
+    /// reason of its own that it does not have.
+    fn probe(&self) -> Result<Vec<(&'static str, Vec<i64>)>> {
+        let reference = {
+            let mut scratch = Connection::open_in_memory()?;
+            schema::migrate_all(&mut scratch)?;
+            let mut stmt = scratch.prepare(
+                "SELECT name, sql FROM sqlite_master \
+                 WHERE type = 'table' AND name IN ('tracks','tags','track_art','art')",
+            )?;
+            let rows =
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        self.conn.pragma_update(None, "foreign_keys", false)?;
+        let out = self.probe_inner(&reference);
+        // Restore the pragma whatever happened: the caller's next move may be
+        // the migration, which relies on enforcement being on.
+        let restored = self.conn.pragma_update(None, "foreign_keys", true);
+        let out = out?;
+        restored?;
+        Ok(out)
+    }
+
+    fn probe_inner(&self, reference: &[(String, String)]) -> Result<Vec<(&'static str, Vec<i64>)>> {
+        // An empty filename is SQLite's temporary on-disk database: it lives
+        // beside the store's own temp files and is deleted on DETACH, so a
+        // store far too large to probe in memory still works.
+        self.conn.execute_batch("ATTACH DATABASE '' AS probe")?;
+        let result = (|| -> Result<Vec<(&'static str, Vec<i64>)>> {
+            for (name, sql) in reference {
+                self.conn
+                    .execute_batch(&sql.replacen("CREATE TABLE ", "CREATE TABLE probe.", 1))
+                    .map_err(|e| {
+                        crate::DbError::Sqlite(rusqlite::Error::SqliteFailure(
+                            rusqlite::ffi::Error::new(1),
+                            Some(format!("building the probe shape for {name}: {e}")),
+                        ))
+                    })?;
+            }
+            let mut out = Vec::new();
+            for (table, projection) in self.probe_projections() {
+                self.conn
+                    .execute_batch(&format!("INSERT OR IGNORE INTO probe.{table} {projection}"))?;
+                let mut stmt = self.conn.prepare(&format!(
+                    "SELECT rowid FROM main.{table} \
+                     WHERE rowid NOT IN (SELECT rowid FROM probe.{table})"
+                ))?;
+                let rowids: Vec<i64> = stmt
+                    .query_map([], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                out.push((table, rowids));
+            }
+            Ok(out)
+        })();
+        let detached = self.conn.execute_batch("DETACH DATABASE probe");
+        let out = result?;
+        detached?;
+        Ok(out)
+    }
+
+    /// Report the rows the migrated schema would refuse, without changing
+    /// anything.
+    ///
+    /// A row reaches this state by being written before the constraint that
+    /// now refuses it, or by a writer that turned the constraints off. The
+    /// migration would abort on the first one it met — atomically, so nothing
+    /// would be half-applied — but aborting part-way through a long upgrade
+    /// with a raw `CHECK constraint failed` is a poor way to learn that.
+    pub fn inspect_rejections(&self) -> Result<Rejections> {
+        Ok(Rejections {
+            tables: self
+                .probe()?
+                .into_iter()
+                .map(|(table, rowids)| TableRejections {
+                    table,
+                    rejected: rowids.len() as u64,
+                })
+                .filter(|t| t.rejected > 0)
+                .collect(),
+        })
+    }
+
+    /// Delete every row the migrated schema would refuse, and report what went.
+    ///
+    /// Dropping a row an external writer chose is exactly the class of thing
+    /// that must not happen without being asked for, so nothing calls this
+    /// except a command the user has told to repair.
+    ///
+    /// Deletes run parent-first, so a refused `tracks` row takes its tags and
+    /// art links with it through the cascade rather than leaving them to be
+    /// deleted for a reason they do not have. The counts reported are the rows
+    /// named by the probe; the cascade may take more.
+    pub fn repair(&self) -> Result<Rejections> {
+        let found = self.probe()?;
+        let tx = self.conn.unchecked_transaction()?;
+        let mut tables = Vec::new();
+        for (table, rowids) in found {
+            if rowids.is_empty() {
+                continue;
+            }
+            let mut stmt = tx.prepare(&format!("DELETE FROM {table} WHERE rowid = ?1"))?;
+            for rowid in &rowids {
+                stmt.execute([rowid])?;
+            }
+            tables.push(TableRejections {
+                table,
+                rejected: rowids.len() as u64,
+            });
+        }
+        tx.commit()?;
+        Ok(Rejections { tables })
+    }
+
     /// Run every pending step, gated ones included, and hand back the migrated
     /// store. The identity check runs here, against the shape the migration was
     /// supposed to produce.
@@ -151,6 +364,192 @@ impl Db {
             path: Some(path),
             _mode: PhantomData,
         }
+    }
+}
+
+#[cfg(test)]
+mod rejection_tests {
+    use super::PendingMigration;
+    use rusqlite::Connection;
+
+    /// A V3 store with one clean track, one tag, one art row and one link.
+    fn store_at_v3(path: &std::path::Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        for (target, migration) in (1i64..).zip(crate::schema::migration_sql()).take(3) {
+            conn.execute_batch(migration).unwrap();
+            conn.pragma_update(None, "user_version", target).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime_ns, backing_ctime_ns, updated_at) \
+             VALUES ('/lib/a.flac', 'flac', 0, 0, 0, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
+             VALUES (?1, 'image/png', 1, 1, 1, X'00')",
+            [&"a".repeat(64)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1, 'artist', 'A', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO track_art (track_id, art_id, picture_type, description, ordinal) \
+             VALUES (1, 1, 3, 'cover', 0)",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Write a row the pre-V4 schema accepts and V4 does not.
+    fn plant_hostile(conn: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql]) {
+        conn.pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
+        conn.execute(sql, params).unwrap();
+        conn.pragma_update(None, "ignore_check_constraints", false)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_clean_store_has_nothing_to_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.db");
+        drop(store_at_v3(&path));
+        let pending = PendingMigration::open(&path).unwrap();
+        let found = pending.inspect_rejections().unwrap();
+        assert!(found.is_empty(), "{found:?}");
+        assert_eq!(found.total(), 0);
+        // And it still migrates, which is the claim the report is making.
+        pending.apply().unwrap();
+    }
+
+    #[test]
+    fn a_nul_bearing_tag_key_is_reported_then_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.db");
+        let conn = store_at_v3(&path);
+        plant_hostile(
+            &conn,
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1, ?1, 'v', 1)",
+            &[&format!("k{}junk", '\0')],
+        );
+        drop(conn);
+
+        let pending = PendingMigration::open(&path).unwrap();
+        let found = pending.inspect_rejections().unwrap();
+        assert_eq!(found.total(), 1);
+        assert_eq!(found.tables()[0].table, "tags");
+
+        // Without repair the migration is exactly as bad as the report says.
+        let err = pending.apply().unwrap_err().to_string();
+        assert!(err.contains("CHECK constraint failed"), "{err}");
+
+        // With it, the row goes and the upgrade runs.
+        let pending = PendingMigration::open(&path).unwrap();
+        let removed = pending.repair().unwrap();
+        assert_eq!(removed.total(), 1);
+        assert!(pending.inspect_rejections().unwrap().is_empty());
+        let db = pending.apply().unwrap();
+        assert_eq!(db.get_tags(1).unwrap().len(), 1, "the clean tag survived");
+    }
+
+    /// The probe must not blame a child for its parent. Foreign keys are off
+    /// for the pass precisely so a tag under a refused track is not counted for
+    /// a reason of its own that it does not have.
+    #[test]
+    fn a_refused_track_does_not_also_indict_its_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.db");
+        let conn = store_at_v3(&path);
+        plant_hostile(
+            &conn,
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime_ns, backing_ctime_ns, updated_at) \
+             VALUES ('', 'flac', 0, 0, 0, 0, 0, 0)",
+            &[],
+        );
+        let bad = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?1, 'artist', 'B', 0)",
+            [bad],
+        )
+        .unwrap();
+        drop(conn);
+
+        let pending = PendingMigration::open(&path).unwrap();
+        let found = pending.inspect_rejections().unwrap();
+        assert_eq!(found.total(), 1, "only the track itself: {found:?}");
+        assert_eq!(found.tables()[0].table, "tracks");
+
+        // Repairing it takes the child through the cascade, which is what
+        // deleting a track means -- so the report undercounts the rows that go,
+        // deliberately, rather than blaming the child for the parent.
+        let removed = pending.repair().unwrap();
+        assert_eq!(removed.total(), 1);
+        let db = pending.apply().unwrap();
+        assert_eq!(db.list_tracks().unwrap().len(), 1);
+        assert_eq!(db.get_tags(1).unwrap().len(), 1);
+    }
+
+    /// The geometry bound #718 added, reached through the link's backfill: the
+    /// value lives on `art` but the constraint that refuses it is on
+    /// `track_art`, so the probe has to run the refill's own join to see it.
+    #[test]
+    fn geometry_past_u32_is_reported_against_both_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.db");
+        let conn = store_at_v3(&path);
+        // Inserted rather than updated: `art_reject_content_update` is a
+        // trigger, and `ignore_check_constraints` does not bypass triggers --
+        // which is the immutability guard doing its job.
+        plant_hostile(
+            &conn,
+            "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
+             VALUES (?1, 'image/png', 1099511627776, 1, 1, X'00')",
+            &[&"b".repeat(64)],
+        );
+        conn.execute(
+            "INSERT INTO track_art (track_id, art_id, picture_type, description, ordinal) \
+             VALUES (1, 2, 3, 'back', 1)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let pending = PendingMigration::open(&path).unwrap();
+        let found = pending.inspect_rejections().unwrap();
+        let named: Vec<&str> = found.tables().iter().map(|t| t.table).collect();
+        assert_eq!(named, vec!["art", "track_art"], "{found:?}");
+    }
+
+    /// A V1 store has no checksum columns at all, so the probe's `tracks`
+    /// projection cannot name them. Upgrading from the oldest released shape is
+    /// the arm that catches a projection written against the newest one.
+    #[test]
+    fn a_v1_store_probes_without_the_checksum_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(crate::schema::migration_sql()[0])
+            .unwrap();
+        conn.pragma_update(None, "user_version", 1i64).unwrap();
+        conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime_ns, updated_at) \
+             VALUES ('/lib/a.flac', 'flac', 0, 0, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let pending = PendingMigration::open(&path).unwrap();
+        assert!(pending.inspect_rejections().unwrap().is_empty());
+        pending.apply().unwrap();
     }
 }
 

@@ -975,6 +975,13 @@ impl Migration {
     }
 }
 
+/// Every migration's SQL, for tests that need to build a store at a released
+/// version rather than the current one.
+#[cfg(test)]
+pub(crate) fn migration_sql() -> Vec<&'static str> {
+    MIGRATIONS.iter().map(|m| m.sql).collect()
+}
+
 const MIGRATIONS: &[Migration] = &[
     Migration::new(
         MIGRATION_V1,

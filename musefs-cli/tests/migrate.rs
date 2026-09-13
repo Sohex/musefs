@@ -33,6 +33,7 @@ fn args(db: &Path) -> MigrateArgs {
     MigrateArgs {
         db: db.to_path_buf(),
         yes: true,
+        repair: false,
         snapshot: None,
         no_snapshot: false,
         vacuum: None,
@@ -184,4 +185,74 @@ fn a_store_another_connection_is_using_is_refused() {
             .exists(),
         "the refusal must come before the snapshot"
     );
+}
+
+/// A gated store holding one clean tag and one the upgraded schema refuses.
+/// The hostile row goes in with the constraints off, which is the only way it
+/// can exist: the shape on disk here is already the target's.
+fn store_with_a_refused_row(dir: &Path) -> PathBuf {
+    let path = gated_store(dir);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute(
+        "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+         backing_size, backing_mtime_ns, backing_ctime_ns, updated_at) \
+         VALUES (CAST('/lib/a.flac' AS BLOB), 'flac', 0, 0, 0, 0, 0, 0)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1, 'artist', 'A', 0)",
+        [],
+    )
+    .unwrap();
+    conn.pragma_update(None, "ignore_check_constraints", true)
+        .unwrap();
+    conn.execute(
+        "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1, ?1, 'v', 1)",
+        [&format!("k{}junk", '\0')],
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn a_store_with_a_refused_row_is_not_upgraded_without_repair() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = store_with_a_refused_row(dir.path());
+    let before = user_version(&db);
+
+    let err = run_migrate(&args(&db)).unwrap_err().to_string();
+    assert!(
+        err.contains("--repair"),
+        "the refusal must name the way out: {err}"
+    );
+    assert!(err.contains("1 row(s)"), "{err}");
+    assert_eq!(
+        user_version(&db),
+        before,
+        "the store is untouched: the refusal comes before anything is written"
+    );
+    assert!(
+        !dir.path()
+            .join(format!("library.db.v{before}.bak"))
+            .exists(),
+        "and before the snapshot, so nothing was copied either"
+    );
+}
+
+#[test]
+fn repair_deletes_the_refused_row_and_upgrades() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = store_with_a_refused_row(dir.path());
+    run_migrate(&MigrateArgs {
+        repair: true,
+        ..args(&db)
+    })
+    .unwrap();
+
+    assert_eq!(user_version(&db), LATEST_VERSION);
+    let store = Db::open(&db).unwrap();
+    let tags = store.get_tags(1).unwrap();
+    assert_eq!(tags.len(), 1, "the clean tag survived: {tags:?}");
+    assert_eq!(tags[0].key, "artist");
 }

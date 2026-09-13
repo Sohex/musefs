@@ -14,6 +14,35 @@ see the [Release notes](release-notes.md).
 
 ### Added
 
+- **`musefs migrate --repair`, and the row-rejection pre-flight it exists for.**
+  The 2.0.0 migration tightens constraints an existing store can already
+  violate — an embedded NUL in a tag key or an art mime, a picture dimension
+  past `u32`, a value whose storage class is not what the Rust side reads. Such
+  a row aborts the migration, atomically, which is safe but a poor way to find
+  out: the upgrade can have been copying blobs for a while before it meets one.
+
+  So `migrate` now checks first, before anything is copied or written, and
+  reports what would be refused per table. It does **not** repair on its own —
+  dropping a row an external writer chose is exactly the class of thing that
+  must not happen unasked — so it stops and names `--repair`. With that flag the
+  rows are deleted *after* the snapshot is taken, so they are still in the copy
+  the user can go back to, and the report says plainly that deleting a track
+  takes its tags and art links with it.
+
+  The check does not describe the constraints a second time. It builds the
+  target tables using the migration itself — a scratch store migrated to the
+  target is by definition the shape this one is about to become — attaches them
+  to the store, and offers every row to them with `INSERT OR IGNORE`, which
+  skips exactly what a `CHECK`, `NOT NULL` or `UNIQUE` would refuse. What did
+  not arrive is the answer. A hand-written copy of the rules would have drifted
+  the first time one changed, and there were seven issues' worth of changes to
+  drift from.
+
+  Foreign keys are off for the pass, deliberately: the question is per row and
+  per table, and a tag under a refused track would otherwise be counted for a
+  reason of its own that it does not have. Repair then deletes parent-first and
+  lets the cascade take the children, which is what deleting a track means.
+
 - **`musefs migrate`.** The command the gate above names: an explicit,
   confirmed store upgrade. It refuses a store anything else has open, reports
   the current version, the target version and what each pending step does, and

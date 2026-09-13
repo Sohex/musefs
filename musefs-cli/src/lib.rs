@@ -302,6 +302,10 @@ pub struct MigrateArgs {
     /// with `.v<version>.bak` appended, alongside it.
     #[arg(long, value_name = "PATH", conflicts_with = "no_snapshot")]
     pub snapshot: Option<PathBuf>,
+    /// Delete rows the upgraded schema refuses, instead of stopping to report
+    /// them. Nothing is deleted without this.
+    #[arg(long)]
+    pub repair: bool,
     /// Upgrade without taking a snapshot first. The upgrade is then not
     /// reversible.
     #[arg(long)]
@@ -826,6 +830,33 @@ pub fn run_migrate(args: &MigrateArgs) -> Result<()> {
          than this one will no longer open it."
     );
 
+    // The rows the new shapes refuse, before anything is copied or written.
+    // Ordered here deliberately: a user who is going to be stopped should be
+    // stopped before being asked about disk, snapshots or confirmation.
+    let refused = pending.inspect_rejections()?;
+    if !refused.is_empty() {
+        println!(
+            "{} rows in this store are not valid under the new schema:",
+            refused.total()
+        );
+        for t in refused.tables() {
+            println!("  {}: {} row(s)", t.table, t.rejected);
+        }
+        println!(
+            "They were written before the constraint that now refuses them, or by a \
+             writer with the constraints turned off."
+        );
+        if !args.repair {
+            anyhow::bail!(
+                "refusing to upgrade {}: {} row(s) would be rejected. Pass --repair to \
+                 delete them, or fix them yourself first. The upgrade changes nothing \
+                 until this is resolved",
+                db.display(),
+                refused.total()
+            );
+        }
+    }
+
     let footprint = store_footprint(db);
     let snapshot = if args.no_snapshot {
         None
@@ -904,6 +935,20 @@ pub fn run_migrate(args: &MigrateArgs) -> Result<()> {
             .snapshot_to(dest)
             .with_context(|| format!("writing the snapshot to {}", dest.display()))?;
         println!("snapshot written to {}", dest.display());
+    }
+
+    // After the snapshot, so the deleted rows are in the copy the user can go
+    // back to, and after the confirmation, so --repair alone never deletes.
+    if !refused.is_empty() {
+        let removed = pending.repair()?;
+        println!(
+            "repaired: deleted {} row(s) the new schema refuses",
+            removed.total()
+        );
+        println!(
+            "  deleting a track takes its tags and art links with it, so more rows \
+             than that may have gone."
+        );
     }
 
     let started = Instant::now();
