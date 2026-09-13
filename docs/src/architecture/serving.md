@@ -167,17 +167,33 @@ indefinitely.
 
 So the mount reports the row's `content_version` as the timestamp's
 **nanoseconds** ([#725](https://github.com/Sohex/musefs/issues/725)). That
-counter already increments on every change to the served bytes — it is what
-every internal cache keys on — so the guarantee it buys is:
+counter already increments on every change musefs makes to the served bytes — it
+is what every internal cache keys on — so the guarantee it buys is:
 
-> **The reported mtime changes whenever the synthesized bytes change.**
+> **In synthesis mode, the reported mtime changes whenever a change recorded in
+> the store changes the synthesized bytes.**
 
-Two consequences worth being explicit about. The nanosecond field is a change
-counter, not a duration: it does not measure anything, and two versions exactly
-one billion apart report the same one. And a consumer that truncates to whole
-seconds gets exactly what it got before — including the future-backing-mtime
-masking — because the second is unchanged. The precision exists for tools that
-read a full `timespec`.
+Each qualifier in that sentence is load-bearing.
+
+*In synthesis mode*, because `--mode structure-only` serves the backing file
+verbatim. A tag edit does not change those bytes, so it must not move their
+timestamp either — signalling a change there would send every consumer to
+re-copy a byte-identical file, which is the same failure in the opposite
+direction. Passthrough reports no sub-second part at all.
+
+*A change recorded in the store*, because a backing file rewritten behind
+musefs's back bumps no counter. That case is not handled by the timestamp: the
+freshness stamp catches it and the serve fails closed with `BackingChanged`
+rather than quietly reporting stale attributes. The exception is
+`--trust-backing-mtime`, which opts out of the `getattr` re-stat and so accepts
+exactly that staleness until the next `open`
+([Freshness](tree-scanning.md#freshness-two-version-counters)).
+
+Two further limits. The nanosecond field is a change counter, not a duration: it
+does not measure anything, and two versions exactly one billion apart report the
+same one. And a consumer that truncates to whole seconds gets exactly what it
+got before — including the future-backing-mtime masking — because the second is
+unchanged. The precision exists for tools that read a full `timespec`.
 
 Nothing in the store holds nanoseconds. `updated_at` is still whole seconds, and
 the sub-second part is derived where the timestamp is built, so no column claims

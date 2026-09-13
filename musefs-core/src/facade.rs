@@ -245,7 +245,9 @@ impl std::os::fd::AsFd for PassthroughFd {
 struct SizeEntry {
     content_version: i64,
     total_len: u64,
-    mtime_secs: i64,
+    /// The timestamp the cached attrs report — both halves, so a hit cannot
+    /// rebuild one from a stale copy of the other.
+    mtime: VirtualMtime,
     stamp: BackingStamp,
 }
 
@@ -464,11 +466,11 @@ impl Musefs {
                 },
             }
         };
-        // The version travels with the size and second because the mount reports
-        // it as the timestamp's sub-second part (#725); it is taken from
-        // whichever path produced them, so it always describes the bytes being
-        // described.
-        let (size, mtime_secs, content_version) = self.pool.with(|db| {
+        // The whole timestamp travels with the size, because the mount reports
+        // its sub-second part from the store's change counter (#725) and the two
+        // halves are only meaningful together — `resolve` derives them side by
+        // side, per mount mode.
+        let (size, mtime) = self.pool.with(|db| {
             // Cheap, indexed: the row's identity columns drive lazy invalidation.
             // Only what the validation needs — no full-row materialization.
             let identity = db
@@ -501,7 +503,7 @@ impl Musefs {
                 // opt-out stops here: the miss path below still stats, and so do
                 // `open` and the read paths, so no stale byte is ever served.
                 if self.config.trust_backing_mtime {
-                    return Ok((e.total_len, e.mtime_secs, e.content_version));
+                    return Ok((e.total_len, e.mtime));
                 }
                 // Re-stat the backing file (no synthesis) and compare to the
                 // stamp the cached attrs were built from. An on-disk change
@@ -518,7 +520,7 @@ impl Musefs {
                     self.size_cache.remove(&track_id);
                     return Err(CoreError::BackingChanged(identity.backing_path));
                 }
-                return Ok((e.total_len, e.mtime_secs, e.content_version));
+                return Ok((e.total_len, e.mtime));
             }
             // Miss: full resolve (validates via stat, builds + caches the layout).
             let resolved = self.cache.resolve(db, track_id)?;
@@ -527,24 +529,17 @@ impl Musefs {
                 SizeEntry {
                     content_version: identity.content_version,
                     total_len: resolved.total_len,
-                    mtime_secs: resolved.mtime_secs,
+                    mtime: resolved.mtime,
                     stamp: resolved.stamp,
                 },
             );
-            Ok((
-                resolved.total_len,
-                resolved.mtime_secs,
-                resolved.content_version,
-            ))
+            Ok((resolved.total_len, resolved.mtime))
         })?;
         Ok(Attr {
             inode,
             is_dir: false,
             size,
-            mtime: Some(VirtualMtime {
-                secs: mtime_secs,
-                content_version,
-            }),
+            mtime: Some(mtime),
         })
     }
 

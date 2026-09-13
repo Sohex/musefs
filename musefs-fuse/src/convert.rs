@@ -53,19 +53,21 @@ pub(crate) fn make_attr(
 /// `nanos`, so `-1` with half a billion nanoseconds is half a second *before*
 /// the epoch, not one and a half.
 ///
-/// `checked_*` rather than the operators: a stored second near `i64`'s ends
-/// would otherwise panic in the middle of a `getattr`. Such a row is nonsense
-/// either way, and reporting the fallback beats taking the mount down.
-fn virtual_mtime_to_system_time(m: VirtualMtime, fallback: SystemTime) -> Option<SystemTime> {
+/// `checked_*` rather than the operators, which panic on overflow. `None` is
+/// belt and braces rather than a live path: on the platforms musefs supports a
+/// `SystemTime` is a `timespec` whose `tv_sec` is itself an `i64`, so every
+/// `i64` second is representable and this never returns `None` today. The
+/// operators would still be a mount-killer on a platform where that stopped
+/// being true, and the caller has a fallback to hand either way.
+fn virtual_mtime_to_system_time(m: VirtualMtime) -> Option<SystemTime> {
+    let secs = Duration::from_secs(m.secs.unsigned_abs());
     let nanos = Duration::from_nanos(u64::from(m.nanos()));
-    if m.secs >= 0 {
-        let secs = Duration::from_secs(m.secs.unsigned_abs());
-        SystemTime::UNIX_EPOCH.checked_add(secs)?.checked_add(nanos)
+    let whole = if m.secs >= 0 {
+        SystemTime::UNIX_EPOCH.checked_add(secs)
     } else {
-        let secs = Duration::from_secs(m.secs.unsigned_abs());
-        SystemTime::UNIX_EPOCH.checked_sub(secs)?.checked_add(nanos)
-    }
-    .or(Some(fallback))
+        SystemTime::UNIX_EPOCH.checked_sub(secs)
+    };
+    whole?.checked_add(nanos)
 }
 
 /// Translate a core `Attr` into a `fuser::FileAttr`. Permission bits come from
@@ -86,9 +88,10 @@ pub(crate) fn to_file_attr(
     dir_mode: u16,
     fallback_mtime: SystemTime,
 ) -> FileAttr {
-    let mtime = attr.mtime.map_or(fallback_mtime, |m| {
-        virtual_mtime_to_system_time(m, fallback_mtime).unwrap_or(fallback_mtime)
-    });
+    let mtime = attr
+        .mtime
+        .and_then(virtual_mtime_to_system_time)
+        .unwrap_or(fallback_mtime);
     let node = if attr.is_dir {
         (FileType::Directory, dir_mode, 2)
     } else {

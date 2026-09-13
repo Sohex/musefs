@@ -32,7 +32,10 @@ fn validate_opened_backing_rejects_mismatched_descriptor_metadata() {
         content_version: 1,
         backing_path: expected_path,
         stamp: crate::freshness::BackingStamp::from_metadata(&expected_meta),
-        mtime_secs: crate::freshness::BackingStamp::from_metadata(&expected_meta).display_secs(),
+        mtime: crate::VirtualMtime {
+            secs: crate::freshness::BackingStamp::from_metadata(&expected_meta).display_secs(),
+            content_version: 0,
+        },
         last_page: std::sync::Mutex::new(None),
         cache_bytes: 0,
         streams_db_rowid: false,

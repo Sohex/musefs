@@ -558,9 +558,11 @@ see the [Release notes](release-notes.md).
   was worse: `max` meant it masked *every* metadata edit for as long as the skew
   lasted. musefs itself was never wrong, because its caches key on
   `content_version`; the contract presented outward was. The mount now reports
-  that same counter as the timestamp's nanoseconds, so the mtime changes
-  whenever the synthesized bytes change. Nothing in the store holds nanoseconds
-  — the precision is derived where the timestamp is built.
+  that same counter as the timestamp's nanoseconds, so a store change that
+  changes the synthesized bytes always moves the mtime. Nothing in the store
+  holds nanoseconds — the precision is derived where the timestamp is built, and
+  only in synthesis mode: `--mode structure-only` serves the backing file
+  verbatim, where a tag edit changes nothing and must not claim to.
 
   Separately, `Attr`'s `mtime_secs` was a bare `i64` in which zero meant both
   "synthetic directory" and "the Unix epoch", and the mount substituted the

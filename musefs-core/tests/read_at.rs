@@ -103,7 +103,10 @@ fn read_at_streams_art_image_segments() {
             ctime_ns: 0,
             ino: None,
         },
-        mtime_secs: 0,
+        mtime: musefs_core::VirtualMtime {
+            secs: 0,
+            content_version: 0,
+        },
         last_page: std::sync::Mutex::new(None),
         cache_bytes: 0,
         // Splicing test: bypass the snapshot/version-recheck path (no real track
