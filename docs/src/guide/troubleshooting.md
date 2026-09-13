@@ -72,7 +72,6 @@ it. Raising verbosity during an interactive scan is safe.
   to version 4; this is irreversible …`. Once per store per schema bump — it is
   at `warn` precisely so it lands in your scrollback before you ever try to run
   an older musefs against that store.
-- `scan --revalidate` deprecation.
 - `error` sits above it, reserved for a caught panic in a synthesis or scan
   worker, a scan aborted mid-ingest, and recovered lock poisoning.
 

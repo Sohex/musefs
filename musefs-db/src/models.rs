@@ -11,6 +11,7 @@ use strum::{EnumIter, EnumString, IntoStaticStr};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, IntoStaticStr, EnumIter)]
 #[strum(serialize_all = "lowercase")]
 #[cfg_attr(feature = "mutants", derive(Default))]
+#[non_exhaustive]
 pub enum Format {
     #[cfg_attr(feature = "mutants", default)]
     Flac,

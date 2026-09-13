@@ -84,6 +84,11 @@ pub(crate) fn lacing_values(payload_len: usize) -> Vec<u8> {
 /// Each page carries up to 255 lacing values (≤ 65 025 payload bytes). `bos` sets
 /// the BOS flag on the packet's first page; continuation pages get FLAG_CONTINUED.
 /// All pages use the given `granule`. Returns `(bytes, pages_used)`.
+///
+/// A fixture builder: synthesis patches pages in place and never lays out fresh
+/// ones, so this has no production caller and compiles only with the test
+/// surface.
+#[cfg(any(test, feature = "fuzzing"))]
 pub fn lace_packet(
     serial: u32,
     seq_start: u32,
@@ -136,7 +141,9 @@ pub fn lace_packet(
 
 /// Lace a sequence of header packets onto fresh pages starting at sequence 0, with
 /// BOS on the very first page and granule 0 throughout (header pages carry no
-/// audio). Each packet begins a new page. Returns `(bytes, page_count)`.
+/// audio). Each packet begins a new page. Returns `(bytes, page_count)`. A
+/// fixture builder, like [`lace_packet`].
+#[cfg(any(test, feature = "fuzzing"))]
 pub fn build_header(serial: u32, packets: &[&[u8]]) -> (Vec<u8>, u32) {
     let mut out = Vec::new();
     let mut seq = 0u32;

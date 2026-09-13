@@ -106,18 +106,16 @@ failures, are in
   lower: it is counted in `failed` (under `checksum-failed` in the end-of-scan
   breakdown) and so reaches the exit-`2` partial-failure signal.
 
-Two flags govern how a fingerprint match is confirmed before retargeting a
-moved file:
+`--match` (env `MUSEFS_MATCH`) governs how a fingerprint match is confirmed
+before a moved file is retargeted:
 
-- **`--fast`** (env `MUSEFS_FAST`) — fingerprint match is always sufficient;
-  never reads the full file even when a stored `content_hash` exists.
-- **`--strict`** (env `MUSEFS_STRICT`) — require a full-hash match; if the
-  matched candidate has no stored `content_hash`, refuse the retarget and
-  insert a fresh row instead. The default (neither flag) auto-escalates:
-  full-hash the new file when the candidate already has a `content_hash`,
-  and trust the fingerprint alone when it does not.
-
-`--fast` and `--strict` are mutually exclusive.
+- **`auto`** (default) — escalate when there is something to escalate to:
+  full-hash the new file when the matched candidate already has a
+  `content_hash`, and trust the fingerprint alone when it does not.
+- **`fast`** — a fingerprint match is always sufficient; never reads the full
+  file, even when a stored `content_hash` exists.
+- **`strict`** — require a full-hash match; if the matched candidate has no
+  stored `content_hash`, refuse the retarget and insert a fresh row instead.
 
 **Upgrading from musefs 1.3.0 or earlier.** The schema upgrade clears every
 stored fingerprint, because the value now includes sampled audio and the old
@@ -137,7 +135,7 @@ fingerprint and cannot be retargeted until a later fingerprint-tier pass).
 
 A `content_hash` only ever describes the file a row currently points at. A pass
 that computes no full hash — a `fingerprint`-tier re-scan of a rewritten file,
-or a `--fast` retarget that confirms nothing — clears the column rather than
+or a `--match=fast` retarget that confirms nothing — clears the column rather than
 leaving the previous bytes' hash standing. Re-run with `--checksum=full` to
 restore it. A pass over a file that has not changed keeps the hash it already
 has, so a cheap pass never undoes an expensive one.

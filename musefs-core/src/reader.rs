@@ -339,6 +339,16 @@ impl HeaderCache {
                             &src,
                         )?
                     }
+                    // `Format` is `#[non_exhaustive]` (#708), so the compiler no
+                    // longer flags a format this dispatch forgot. A stored format
+                    // with no arm is a bug here, not in the file;
+                    // `a_new_format_must_be_wired_into_the_dispatch` fails first.
+                    _ => {
+                        return Err(musefs_format::FormatError::ProducerBug(
+                            "stored format has no synthesis arm",
+                        )
+                        .into());
+                    }
                 };
                 let total = layout.total_len();
                 (
@@ -660,6 +670,38 @@ pub fn read_at_with_file<M>(
     let mut out = Vec::new();
     read_at_with_file_into(resolved, Some(db), backing, offset, size, &mut out)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod format_dispatch_tests {
+    use musefs_db::Format;
+    use strum::IntoEnumIterator;
+
+    /// A tripwire standing in for the check the compiler made before `Format`
+    /// became `#[non_exhaustive]` (#708) and `HeaderCache::resolve`'s dispatch
+    /// took a wildcard. It cannot see the dispatch: what it checks is that every
+    /// variant is one this list names, so a new variant fails here — naming the
+    /// dispatch to wire it into — rather than reaching a mount as an unservable
+    /// track. The list is only as honest as whoever extends it.
+    #[test]
+    fn a_new_format_must_be_wired_into_the_dispatch() {
+        for format in Format::iter() {
+            assert!(
+                matches!(
+                    format,
+                    Format::Flac
+                        | Format::Mp3
+                        | Format::M4a
+                        | Format::Wav
+                        | Format::Opus
+                        | Format::Vorbis
+                        | Format::OggFlac
+                ),
+                "{format:?} has no arm in HeaderCache::resolve's synthesis dispatch; \
+                 add one there, then add it here"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

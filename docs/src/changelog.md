@@ -159,6 +159,29 @@ see the [Release notes](release-notes.md).
 
 ### Changed
 
+- **The public enums a downstream crate matches on are `#[non_exhaustive]`**
+  ([#708](https://github.com/Sohex/musefs/issues/708)). Until now adding a
+  variant to any of them was a breaking change, so the next audio format or
+  error case would have cost a 3.0.0. A `match` on one of these outside its
+  crate now needs a wildcard arm:
+  - errors: `DbError`, `CoreError`, `FormatError`, `LayoutError`,
+    `TemplateError`;
+  - `Format`, so a new audio format is a minor release;
+  - scan and mount inputs: `ChecksumTier`, `MatchStrictness`, `Mode`,
+    `NodeKind`, and the `ScanProgress` events;
+  - `musefs-cli`'s `Command`, `CliMode`, `ChecksumMode` and `MatchMode`.
+
+  Deliberately left exhaustive, because a new variant there should fail to
+  compile rather than reach a wildcard: `Segment`, which `read_at` splices audio
+  bytes from; `Extent`, a two-state probe protocol; `ogg::Codec` and
+  `Mp4ScanError`, which the scanner and reader translate variant by variant; and
+  `WarnDecision`, which `serve_warn!` matches inside other crates. Where the
+  workspace itself lost an exhaustive check across a crate boundary, it has a
+  stand-in: a test fails as soon as `Format` gains a variant, naming the
+  synthesis dispatch to add it to, and `musefs-fuse` maps a `CoreError` it has
+  not placed to
+  `EIO`, the collapse it already documents for structural errors.
+
 - **`tracks` is rebuilt by the 2.0.0 store migration.** This is the step that
   makes the upgrade gated: `musefs migrate` runs it, and afterwards the store no
   longer opens with an older musefs. It is one rebuild because SQLite can add
@@ -542,6 +565,44 @@ see the [Release notes](release-notes.md).
   every healthy scan only teaches operators to tune warnings out. The `skipped`
   count itself is unchanged and still printed in the per-target summary.
 
+### Removed
+
+- **`scan --revalidate`**, deprecated since 1.1.0 in favour of the `revalidate`
+  subcommand, and its `MUSEFS_REVALIDATE` variable
+  ([#707](https://github.com/Sohex/musefs/issues/707)). The flag is now a usage
+  error. The variable is refused rather than ignored: clap never reads an
+  environment variable no flag declares, so a unit file still setting it would
+  have gone on running a full scan where it used to revalidate, and said
+  nothing. `scan` stops with a message naming the subcommand instead.
+  `musefs_cli::run_scan` loses its `revalidate` parameter. The `contrib`
+  packages have called the subcommand since their 1.1.0, so only a copy older
+  than that is affected.
+
+- **`scan --fast` and `--strict`, replaced by `--match=auto|fast|strict`**, and
+  `MUSEFS_FAST`/`MUSEFS_STRICT` by `MUSEFS_MATCH`
+  ([#709](https://github.com/Sohex/musefs/issues/709)). Match strictness has
+  three states, and two booleans spent a fourth on a combination the CLI had to
+  detect and reject; one value has no such combination, and takes the same
+  shape as `--checksum` beside it. `auto` is the default and behaves exactly as
+  passing neither flag did. The old flags are usage errors, and the old
+  variables are refused with the `MUSEFS_MATCH` value to use — ignoring
+  `MUSEFS_STRICT=true` would have quietly weakened how a moved file is
+  confirmed. `musefs_cli::run_scan` takes a `MatchMode` in place of the two
+  booleans.
+
+- **Test scaffolding is no longer published API**
+  ([#710](https://github.com/Sohex/musefs/issues/710)).
+  `musefs_core::scan_directory_full_oracle`, the `*_for_test` methods on
+  `Musefs` and `Db`, and `musefs_format::ogg::page_test_support` were `pub` so
+  the crates' own integration tests could reach them — most of them behind
+  `#[doc(hidden)]`, which keeps a symbol out of rustdoc but not out of semver,
+  and `Musefs::refresh_for_test` not even that. They are compiled for tests
+  only now: `musefs-core` and `musefs-db` each gain a `test-support` feature
+  their own test builds switch on, `page_test_support` joins `fuzz_check`
+  behind `musefs-format`'s `fuzzing`, and the five helpers only a crate's own
+  unit tests call are `pub(crate)`. Nothing outside the test suites called any
+  of them.
+
 ### Fixed
 
 - **A synthesized file's mtime now moves whenever its bytes do, and a pre-epoch
@@ -631,7 +692,7 @@ see the [Release notes](release-notes.md).
   every row in an upgraded store starts in — and such a row is compared on the
   other three fields alone. Failing closed on a field the store has nothing to
   say about would take an entire library offline on the first serve after an
-  upgrade. `musefs scan --revalidate` re-probes exactly the rows still holding
+  upgrade. `musefs revalidate` re-probes exactly the rows still holding
   the sentinel and fills it in, which makes it the complete repopulation path
   for an upgraded store alongside the structural-block and checksum backfills it
   already covered.
@@ -736,7 +797,7 @@ see the [Release notes](release-notes.md).
   write now carries an explicit intent — keep, set, or clear — and a pass below
   the `full` tier clears the column whenever it observes that the recorded bytes
   changed, while still keeping a higher tier's value for a file that has not
-  changed. A `--fast` retarget, which confirms nothing by design, likewise no
+  changed. A `--match=fast` retarget, which confirms nothing by design, likewise no
   longer inherits the departed file's hash
   ([#689](https://github.com/Sohex/musefs/issues/689)).
 

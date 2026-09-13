@@ -22,6 +22,7 @@ pub use crate::logging::install_logger;
 
 /// Mount content mode (CLI surface for `musefs_core::Mode`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[non_exhaustive]
 pub enum CliMode {
     /// Synthesize a fresh metadata region in front of the audio (default).
     Synthesis,
@@ -40,6 +41,7 @@ impl From<CliMode> for musefs_core::Mode {
 
 /// CLI surface for `musefs_core::ChecksumTier`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[non_exhaustive]
 pub enum ChecksumMode {
     /// No checksums.
     None,
@@ -55,6 +57,29 @@ impl From<ChecksumMode> for musefs_core::ChecksumTier {
             ChecksumMode::None => musefs_core::ChecksumTier::None,
             ChecksumMode::Fingerprint => musefs_core::ChecksumTier::Fingerprint,
             ChecksumMode::Full => musefs_core::ChecksumTier::Full,
+        }
+    }
+}
+
+/// CLI surface for `musefs_core::MatchStrictness`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[non_exhaustive]
+pub enum MatchMode {
+    /// Confirm with a full hash when the matched row has one; otherwise trust
+    /// the fingerprint (default).
+    Auto,
+    /// Trust a fingerprint match; never read the whole file.
+    Fast,
+    /// Require a full-hash match: a row with no stored hash is not retargeted.
+    Strict,
+}
+
+impl From<MatchMode> for musefs_core::MatchStrictness {
+    fn from(m: MatchMode) -> musefs_core::MatchStrictness {
+        match m {
+            MatchMode::Auto => musefs_core::MatchStrictness::Auto,
+            MatchMode::Fast => musefs_core::MatchStrictness::Fast,
+            MatchMode::Strict => musefs_core::MatchStrictness::Strict,
         }
     }
 }
@@ -201,6 +226,7 @@ pub struct MountArgs {
 }
 
 #[derive(Subcommand, Debug)]
+#[non_exhaustive]
 pub enum Command {
     /// Walk backing files or directories, ingesting supported audio
     /// (FLAC, MP3, M4A/M4B, Ogg, WAV) into the SQLite store.
@@ -211,10 +237,6 @@ pub enum Command {
         /// Path to the SQLite database (created if absent).
         #[arg(long, env = "MUSEFS_DB")]
         db: PathBuf,
-        /// DEPRECATED: use the `revalidate` subcommand. Forwards to it (now
-        /// non-pruning). Removed next release.
-        #[arg(long, env = "MUSEFS_REVALIDATE", value_parser = clap::builder::BoolishValueParser::new())]
-        revalidate: bool,
         /// Re-ingest files already present in the DB, overwriting curated tags
         /// and art with the file's embedded metadata.
         #[arg(long, env = "MUSEFS_FORCE", value_parser = clap::builder::BoolishValueParser::new())]
@@ -233,12 +255,10 @@ pub enum Command {
         /// Which content checksums to compute and store (none|fingerprint|full).
         #[arg(long, value_enum, env = "MUSEFS_CHECKSUM", default_value_t = ChecksumMode::Fingerprint)]
         checksum: ChecksumMode,
-        /// Confirm a move only by fingerprint, never reading the full file.
-        #[arg(long, env = "MUSEFS_FAST", value_parser = clap::builder::BoolishValueParser::new())]
-        fast: bool,
-        /// Require a full-hash match to retarget a moved file.
-        #[arg(long, env = "MUSEFS_STRICT", value_parser = clap::builder::BoolishValueParser::new())]
-        strict: bool,
+        /// How a moved file's fingerprint match is confirmed before its row is
+        /// retargeted (auto|fast|strict).
+        #[arg(long = "match", value_enum, env = "MUSEFS_MATCH", default_value_t = MatchMode::Auto)]
+        match_mode: MatchMode,
     },
     /// Refresh tracks already in the store: re-probe files whose backing bytes
     /// changed while preserving curated tags and art. Files not yet in the
@@ -326,9 +346,8 @@ pub struct MigrateArgs {
 }
 
 /// Open (creating/migrating) the DB at `db_path` once, then scan each target in
-/// `targets` (a file or a directory; directories recurse). With `revalidate`,
-/// run the maintenance pass (skip-unchanged, prune, GC) instead of a full
-/// ingest. With `quiet`, suppress the per-target summary on stdout. Fails fast:
+/// `targets` (a file or a directory; directories recurse). With `quiet`,
+/// suppress the per-target summary on stdout. Fails fast:
 /// the first failing target aborts the batch; targets already scanned stay
 /// committed (ingest is an idempotent upsert).
 ///
@@ -336,45 +355,17 @@ pub struct MigrateArgs {
 /// failures (an unparseable/uningestible entry) do not abort the batch — only a
 /// hard `Err` does — so the caller inspects the returned count to signal partial
 /// or total ingest failure via the process exit code (#554).
-#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+#[allow(clippy::too_many_arguments)]
 pub fn run_scan(
     db_path: &Path,
     targets: &[PathBuf],
-    revalidate: bool,
     force: bool,
     jobs: usize,
     follow_symlinks: bool,
     quiet: bool,
     checksum: ChecksumMode,
-    fast: bool,
-    strict: bool,
+    match_mode: MatchMode,
 ) -> Result<u64> {
-    if revalidate {
-        if force {
-            anyhow::bail!("--force and --revalidate are mutually exclusive");
-        }
-        if fast || strict {
-            anyhow::bail!("--fast/--strict are scan-only and cannot be combined with --revalidate");
-        }
-        log::warn!(
-            "`scan --revalidate` is deprecated; use `revalidate` (now non-pruning — add `--prune` to delete gone tracks). This alias will be removed next release."
-        );
-        return run_revalidate(
-            db_path,
-            targets,
-            false,
-            jobs,
-            follow_symlinks,
-            quiet,
-            checksum,
-        );
-    }
-    let strictness = match (fast, strict) {
-        (true, true) => anyhow::bail!("--fast and --strict are mutually exclusive"),
-        (true, false) => musefs_core::MatchStrictness::Fast,
-        (false, true) => musefs_core::MatchStrictness::Strict,
-        (false, false) => musefs_core::MatchStrictness::Auto,
-    };
     let db =
         Db::open(db_path).with_context(|| format!("opening database at {}", db_path.display()))?;
     let reporter = ScanReporter::new(quiet);
@@ -383,7 +374,7 @@ pub fn run_scan(
         follow_symlinks,
         progress: reporter.sink(),
         checksum: checksum.into(),
-        strictness,
+        strictness: match_mode.into(),
         force,
         ..Default::default()
     };
@@ -459,6 +450,30 @@ pub fn run_revalidate(
     }
     reporter.finish();
     Ok(total_failed)
+}
+
+/// Environment variables for `scan` flags that 2.0.0 removed, each with what to
+/// use instead. clap rejects a removed flag, but it never reads a variable no
+/// flag declares, so without this a unit file still setting one would carry on
+/// doing something different from what it asks for, and say nothing.
+const RETIRED_SCAN_ENV: &[(&str, &str)] = &[
+    (
+        "MUSEFS_REVALIDATE",
+        "run the `revalidate` subcommand instead",
+    ),
+    ("MUSEFS_FAST", "set `MUSEFS_MATCH=fast` instead"),
+    ("MUSEFS_STRICT", "set `MUSEFS_MATCH=strict` instead"),
+];
+
+/// Refuse to run while any of `retired` is set. An empty value counts as unset,
+/// which is how clap treats a declared variable too.
+fn refuse_retired_env(retired: &[(&str, &str)]) -> Result<()> {
+    for (var, instead) in retired {
+        if std::env::var_os(var).is_some_and(|v| !v.is_empty()) {
+            anyhow::bail!("{var} was removed in musefs 2.0.0; {instead}");
+        }
+    }
+    Ok(())
 }
 
 /// Split a `--fallback FIELD=VALUE` argument. The value may contain '=' (only
@@ -1095,26 +1110,23 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         Command::Scan {
             targets,
             db,
-            revalidate,
             force,
             jobs,
             follow_symlinks,
             quiet,
             checksum,
-            fast,
-            strict,
+            match_mode,
         } => {
+            refuse_retired_env(RETIRED_SCAN_ENV)?;
             let failed = run_scan(
                 &db,
                 &targets,
-                revalidate,
                 force,
                 jobs,
                 follow_symlinks,
                 quiet,
                 checksum,
-                fast,
-                strict,
+                match_mode,
             )?;
             // Per-file ingest failures are not a hard error (they don't abort the
             // batch), but a pipeline like `scan && mount` needs a machine-detectable

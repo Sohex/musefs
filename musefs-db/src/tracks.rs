@@ -458,7 +458,7 @@ impl Db<ReadWrite> {
     /// never mutates format without a rescan. As of V5 this also bumps
     /// content_version (the `tracks_geometry_au` format guard); it is no longer a
     /// content_version-neutral edit.
-    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn set_format_for_test(&self, id: i64, fmt: Format) -> Result<()> {
         self.conn.execute(
             "UPDATE tracks SET format = ?1, updated_at = CAST(strftime('%s','now') AS INTEGER) WHERE id = ?2",
@@ -470,7 +470,7 @@ impl Db<ReadWrite> {
     /// Test-only: delete changelog rows up to and including `seq`, simulating the
     /// ring having pruned past a sleeping mount (gap-path coverage). Follows the
     /// `set_format_for_test` precedent.
-    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn delete_changelog_through_for_test(&self, seq: i64) -> Result<()> {
         self.conn
             .execute("DELETE FROM track_changes WHERE seq <= ?1", [seq])?;

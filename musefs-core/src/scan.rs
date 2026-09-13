@@ -93,6 +93,7 @@ fn clear_after_s1_hook() {
 /// negligible next to the existing per-file `to_string_lossy` + DB write, so do
 /// not contort the API to preserve the borrow.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum ScanProgress<'a> {
     /// A supported-audio file was found during the walk; `found` is the running
     /// count of collected files.
@@ -464,6 +465,7 @@ fn is_supported_audio(path: &Path) -> bool {
 
 /// Walk `root` with a throwaway failure tally — the callers that do not
 /// aggregate walk errors (the legacy oracle scan, unit tests).
+#[cfg(any(test, feature = "test-support"))]
 fn collect_audio(
     root: &Path,
     out: &mut Vec<PathBuf>,
@@ -1263,6 +1265,7 @@ fn probe_prefix(
 
 /// How much checksum work a scan does per file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ChecksumTier {
     /// No checksums (legacy behavior).
     None,
@@ -1279,6 +1282,7 @@ pub enum ChecksumTier {
 
 /// How a fingerprint match is confirmed before a retarget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MatchStrictness {
     /// Confirm with the full hash when the candidate has one; else trust the
     /// fingerprint.
@@ -2080,7 +2084,7 @@ fn ingest_unit(
                     // The candidate's stored hash described the file that left
                     // this row, so unless this retarget produced one for the
                     // file arriving, the column has to go — never `Keep`.
-                    // `--fast` confirms nothing by design and so inherits
+                    // `--match=fast` confirms nothing by design and so inherits
                     // nothing either (#689).
                     ChecksumWrite::from_computed(new_hash.as_deref(), false),
                 )?;
@@ -2114,6 +2118,7 @@ fn ingest_unit(
 /// Upsert a track from a probed backing file through a direct `&Db`. Thin
 /// wrapper over [`ingest_into`]; the `oracle`/non-bulk scan path. Computes no
 /// checksums, so both columns are left exactly as they are.
+#[cfg(any(test, feature = "test-support"))]
 fn ingest(db: &Db, abs_path: &Path, meta: &std::fs::Metadata, probed: Probed) -> Result<()> {
     ingest_into(
         db,
@@ -2596,7 +2601,7 @@ fn run_pipeline(
 
 /// Test/oracle only: scan using the legacy whole-file probe (`probe_full`). The
 /// equivalence property compares this against the bounded `scan_directory`.
-#[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn scan_directory_full_oracle(db: &Db, root: &Path) -> Result<ScanStats> {
     let mut files = Vec::new();
     let mut skipped = 0u64;

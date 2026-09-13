@@ -2,6 +2,7 @@ use crate::BlobLen;
 
 /// Validation errors discovered in a layout at synthesis time.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum LayoutError {
     /// A segment reported zero length.
     #[error("a segment reported zero length")]
@@ -23,6 +24,9 @@ pub enum LayoutError {
 
 /// One contiguous run of bytes in a synthesized virtual file.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// Deliberately not `#[non_exhaustive]` (#708): `read_at` matches every segment
+// kind, and a new one must fail to compile there rather than fall into a
+// wildcard on the path that splices audio bytes.
 pub enum Segment {
     /// Generated framing/text bytes, fully materialized.
     Inline(Vec<u8>),

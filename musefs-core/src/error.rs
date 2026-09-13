@@ -1,6 +1,7 @@
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum CoreError {
     #[error(transparent)]
     Db(#[from] musefs_db::DbError),

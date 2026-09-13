@@ -28,12 +28,19 @@ mutants = []
 # can plant hostile rows the validating public API cannot produce. Never enabled
 # in normal builds. Mirrors the `mutants` feature pattern.
 fuzzing = []
+# Test-only: compiles the `Db` `*_for_test` hooks, which integration tests here
+# and in musefs-core call across the crate boundary. Enabled by the
+# self-dev-dependency below and by musefs-core's dev-dependency; never part of
+# the published API.
+test-support = []
 
 [dev-dependencies]
 # Used to plant a future `user_version` on a file-backed store, exercising the
 # "store is newer than this binary" guard the public API cannot otherwise reach.
 rusqlite = { version = "0.40", features = ["bundled"] }
 tempfile = "3"
+# Self-dependency: turns `test-support` on for this crate's own test builds.
+musefs-db = { path = ".", features = ["test-support"] }
 
 [lints]
 workspace = true

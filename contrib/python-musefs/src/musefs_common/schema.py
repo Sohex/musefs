@@ -513,7 +513,7 @@ CREATE TABLE tracks (
     -- and each scan arms the guard for the rows it touches. Linux never hands
     -- out inode 0 for a file, so the sentinel cannot collide with a real value;
     -- the Rust model still says `Option<u64>` rather than making every reader
-    -- remember that. `musefs scan --revalidate` re-probes exactly the rows
+    -- remember that. `musefs revalidate` re-probes exactly the rows
     -- still holding the sentinel, which is what makes it the repopulation path
     -- for an upgraded store.
     --

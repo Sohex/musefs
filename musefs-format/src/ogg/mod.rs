@@ -717,7 +717,10 @@ fn oggflac_packets_with_art(
     Ok(out)
 }
 
-#[doc(hidden)]
+/// Page and comment-body builders for fixtures, used by `fuzz_check` and by
+/// musefs-core's tests. Behind `fuzzing` with the rest of the test surface, so
+/// none of it is published API.
+#[cfg(any(test, feature = "fuzzing"))]
 pub mod page_test_support {
     pub use crate::ogg::page::{build_header as build_header_pub, lace_packet as lace_packet_pub};
 
