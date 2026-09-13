@@ -110,15 +110,13 @@ fn readdirplus_attrs_match_what_lookup_reports() {
     }
 
     let walked_mount = tempfile::tempdir().unwrap();
+    let mut fuse_config = FuseConfig::default();
+    fuse_config.expose_metrics = true;
     let walked = musefs_fuse::spawn_with(
         Musefs::open(musefs_db::Db::open(&db_path).unwrap(), config()).unwrap(),
         walked_mount.path(),
         "musefs-readdirplus-e2e",
-        {
-            let mut fuse_config = FuseConfig::default();
-            fuse_config.expose_metrics = true;
-            fuse_config
-        },
+        fuse_config,
     )
     .unwrap();
 
