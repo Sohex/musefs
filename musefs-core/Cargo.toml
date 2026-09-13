@@ -45,6 +45,9 @@ musefs-format = { path = "../musefs-format", features = ["fuzzing"] }
 musefs-db = { path = "../musefs-db", features = ["test-support"] }
 # Self-dependency: turns `test-support` on for this crate's own test builds.
 musefs-core = { path = ".", features = ["test-support"] }
+# `Format::iter()`, for the test standing in for the exhaustive format match
+# that `#[non_exhaustive]` took away.
+strum = "0.28"
 ogg = "0.9"
 crc = "3"
 base64 = "0.23"

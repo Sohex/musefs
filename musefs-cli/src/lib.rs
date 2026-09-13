@@ -22,6 +22,7 @@ pub use crate::logging::install_logger;
 
 /// Mount content mode (CLI surface for `musefs_core::Mode`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[non_exhaustive]
 pub enum CliMode {
     /// Synthesize a fresh metadata region in front of the audio (default).
     Synthesis,
@@ -40,6 +41,7 @@ impl From<CliMode> for musefs_core::Mode {
 
 /// CLI surface for `musefs_core::ChecksumTier`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[non_exhaustive]
 pub enum ChecksumMode {
     /// No checksums.
     None,
@@ -61,6 +63,7 @@ impl From<ChecksumMode> for musefs_core::ChecksumTier {
 
 /// CLI surface for `musefs_core::MatchStrictness`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[non_exhaustive]
 pub enum MatchMode {
     /// Confirm with a full hash when the matched row has one; otherwise trust
     /// the fingerprint (default).
@@ -223,6 +226,7 @@ pub struct MountArgs {
 }
 
 #[derive(Subcommand, Debug)]
+#[non_exhaustive]
 pub enum Command {
     /// Walk backing files or directories, ingesting supported audio
     /// (FLAC, MP3, M4A/M4B, Ogg, WAV) into the SQLite store.

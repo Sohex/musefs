@@ -159,6 +159,28 @@ see the [Release notes](release-notes.md).
 
 ### Changed
 
+- **The public enums a downstream crate matches on are `#[non_exhaustive]`**
+  ([#708](https://github.com/Sohex/musefs/issues/708)). Until now adding a
+  variant to any of them was a breaking change, so the next audio format or
+  error case would have cost a 3.0.0. A `match` on one of these outside its
+  crate now needs a wildcard arm:
+  - errors: `DbError`, `CoreError`, `FormatError`, `LayoutError`,
+    `TemplateError`;
+  - `Format`, so a new audio format is a minor release;
+  - scan and mount inputs: `ChecksumTier`, `MatchStrictness`, `Mode`,
+    `NodeKind`, and the `ScanProgress` events;
+  - `musefs-cli`'s `Command`, `CliMode`, `ChecksumMode` and `MatchMode`.
+
+  Deliberately left exhaustive, because a new variant there should fail to
+  compile rather than reach a wildcard: `Segment`, which `read_at` splices audio
+  bytes from; `Extent`, a two-state probe protocol; `ogg::Codec` and
+  `Mp4ScanError`, which the scanner and reader translate variant by variant; and
+  `WarnDecision`, which `serve_warn!` matches inside other crates. Where the
+  workspace itself lost an exhaustive check across a crate boundary, it has a
+  stand-in: `every_format_has_a_synthesis_arm` fails when a `Format` has no
+  synthesis arm, and `musefs-fuse` maps a `CoreError` it has not placed to
+  `EIO`, the collapse it already documents for structural errors.
+
 - **`tracks` is rebuilt by the 2.0.0 store migration.** This is the step that
   makes the upgrade gated: `musefs migrate` runs it, and afterwards the store no
   longer opens with an older musefs. It is one rebuild because SQLite can add

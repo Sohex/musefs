@@ -19,6 +19,7 @@ const MAX_SECTION_DEPTH: usize = 64;
 /// [`crate::CoreError::InvalidTemplate`] when `Musefs::open` parses a bad
 /// `--template`.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum TemplateError {
     /// `[...]` sections nested deeper than `limit`.
     #[error("template nesting exceeds the maximum depth of {limit}")]

@@ -1,6 +1,7 @@
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum DbError {
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),

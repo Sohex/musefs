@@ -17,6 +17,7 @@ use crate::tree::{InodeAllocator, NodeKind, VirtualTree};
 
 /// How the mount serves file *contents*. The virtual tree is identical either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Mode {
     /// Splice a freshly synthesized metadata region in front of the backing audio.
     Synthesis,

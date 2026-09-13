@@ -339,6 +339,16 @@ impl HeaderCache {
                             &src,
                         )?
                     }
+                    // `Format` is `#[non_exhaustive]` (#708), so the compiler no
+                    // longer flags a format this dispatch forgot. A stored format
+                    // with no arm is a bug here, not in the file, and
+                    // `every_format_has_a_synthesis_arm` exists to catch it first.
+                    _ => {
+                        return Err(musefs_format::FormatError::ProducerBug(
+                            "stored format has no synthesis arm",
+                        )
+                        .into());
+                    }
                 };
                 let total = layout.total_len();
                 (
@@ -660,6 +670,36 @@ pub fn read_at_with_file<M>(
     let mut out = Vec::new();
     read_at_with_file_into(resolved, Some(db), backing, offset, size, &mut out)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod format_dispatch_tests {
+    use musefs_db::Format;
+    use strum::IntoEnumIterator;
+
+    /// The compiler's check that `HeaderCache::resolve` handles every format,
+    /// restored by hand now that `Format` is `#[non_exhaustive]` (#708) and the
+    /// dispatch needs a wildcard. A new variant fails here, naming the place to
+    /// wire it, instead of reaching a mount as an unservable track.
+    #[test]
+    fn every_format_has_a_synthesis_arm() {
+        for format in Format::iter() {
+            assert!(
+                matches!(
+                    format,
+                    Format::Flac
+                        | Format::Mp3
+                        | Format::M4a
+                        | Format::Wav
+                        | Format::Opus
+                        | Format::Vorbis
+                        | Format::OggFlac
+                ),
+                "{format:?} has no arm in HeaderCache::resolve's synthesis dispatch; \
+                 add one there, then add it here"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

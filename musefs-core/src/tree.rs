@@ -151,6 +151,7 @@ impl InodeAllocator {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NodeKind {
     Dir,
     File { track_id: i64 },

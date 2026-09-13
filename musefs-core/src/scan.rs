@@ -93,6 +93,7 @@ fn clear_after_s1_hook() {
 /// negligible next to the existing per-file `to_string_lossy` + DB write, so do
 /// not contort the API to preserve the borrow.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum ScanProgress<'a> {
     /// A supported-audio file was found during the walk; `found` is the running
     /// count of collected files.
@@ -1264,6 +1265,7 @@ fn probe_prefix(
 
 /// How much checksum work a scan does per file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ChecksumTier {
     /// No checksums (legacy behavior).
     None,
@@ -1280,6 +1282,7 @@ pub enum ChecksumTier {
 
 /// How a fingerprint match is confirmed before a retarget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MatchStrictness {
     /// Confirm with the full hash when the candidate has one; else trust the
     /// fingerprint.

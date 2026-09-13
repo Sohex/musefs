@@ -180,6 +180,12 @@ fn statfs_params() -> (u64, u64, u64, u64, u64, u32, u32, u32) {
 
 /// Map a core error onto a POSIX errno for the FUSE reply. `Io` errors carry the
 /// underlying errno when present; everything structural collapses to `EIO`.
+#[expect(
+    clippy::match_same_arms,
+    reason = "the named EIO arm records which errors are deliberately EIO; the wildcard is \
+              `#[non_exhaustive]`'s fallback for variants not yet placed, and folding the \
+              two would erase the record"
+)]
 pub fn errno(err: &CoreError) -> fuser::Errno {
     match err {
         CoreError::NoEntry(_) | CoreError::TrackNotFound(_) => fuser::Errno::ENOENT,
@@ -206,6 +212,10 @@ pub fn errno(err: &CoreError) -> fuser::Errno {
         | CoreError::TrackMetadataTooLarge { .. }
         | CoreError::Format(_)
         | CoreError::InvalidTemplate(_) => fuser::Errno::EIO,
+        // `CoreError` is `#[non_exhaustive]` (#708). A variant added after this
+        // list collapses to `EIO` with the structural errors above until it is
+        // given a place in it.
+        _ => fuser::Errno::EIO,
     }
 }
 
