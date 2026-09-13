@@ -725,6 +725,20 @@ fn two_paths_differing_only_in_invalid_utf8_stay_two_tracks() {
     let a = dir.path().join(OsStr::from_bytes(b"bad\x80name.flac"));
     let b = dir.path().join(OsStr::from_bytes(b"bad\x81name.flac"));
     assert_ne!(a, b);
+
+    // Not every filesystem will host such a name. APFS and HFS+ enforce valid
+    // UTF-8 and refuse the create with `EILSEQ`, so macOS cannot run this;
+    // Linux and FreeBSD take arbitrary bytes and do. Detected by trying rather
+    // than by an OS allowlist, because it is a property of the filesystem under
+    // the temp directory, not of the platform — the same Linux build hits it on
+    // a FAT32 or a network mount.
+    if let Err(e) = std::fs::write(&a, b"") {
+        eprintln!(
+            "skipping two_paths_differing_only_in_invalid_utf8_stay_two_tracks: \
+             this filesystem will not accept a non-UTF-8 filename ({e})"
+        );
+        return;
+    }
     assert_eq!(
         a.to_string_lossy(),
         b.to_string_lossy(),
