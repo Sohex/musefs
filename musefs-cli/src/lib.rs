@@ -91,6 +91,7 @@ impl From<MatchMode> for musefs_core::MatchStrictness {
     propagate_version = true,
     about = "Read-only re-tagging FUSE view of a music library"
 )]
+#[non_exhaustive]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -104,6 +105,7 @@ pub struct Cli {
 /// instead of ten ordering-fragile positional parameters.
 #[derive(clap::Args, Debug)]
 #[allow(clippy::struct_excessive_bools)] // independent CLI toggles, not a state machine
+#[non_exhaustive]
 pub struct MountArgs {
     /// Empty directory to mount at. Not required with `--dry-run`, which only
     /// previews the template and never touches a target (#555).
@@ -311,6 +313,7 @@ pub enum Command {
 }
 
 #[derive(clap::Args, Debug)]
+#[non_exhaustive]
 pub struct MigrateArgs {
     /// Path to the SQLite database.
     #[arg(long, env = "MUSEFS_DB")]
@@ -369,15 +372,13 @@ pub fn run_scan(
     let db =
         Db::open(db_path).with_context(|| format!("opening database at {}", db_path.display()))?;
     let reporter = ScanReporter::new(quiet);
-    let opts = musefs_core::ScanOptions {
-        jobs,
-        follow_symlinks,
-        progress: reporter.sink(),
-        checksum: checksum.into(),
-        strictness: match_mode.into(),
-        force,
-        ..Default::default()
-    };
+    let mut opts = musefs_core::ScanOptions::default();
+    opts.jobs = jobs;
+    opts.follow_symlinks = follow_symlinks;
+    opts.progress = reporter.sink();
+    opts.checksum = checksum.into();
+    opts.strictness = match_mode.into();
+    opts.force = force;
     let mut total_failed = 0u64;
     for target in targets {
         reporter.start_target();
@@ -419,14 +420,12 @@ pub fn run_revalidate(
     let db =
         Db::open(db_path).with_context(|| format!("opening database at {}", db_path.display()))?;
     let reporter = ScanReporter::new(quiet);
-    let opts = musefs_core::ScanOptions {
-        jobs,
-        follow_symlinks,
-        progress: reporter.sink(),
-        checksum: checksum.into(),
-        prune,
-        ..Default::default()
-    };
+    let mut opts = musefs_core::ScanOptions::default();
+    opts.jobs = jobs;
+    opts.follow_symlinks = follow_symlinks;
+    opts.progress = reporter.sink();
+    opts.checksum = checksum.into();
+    opts.prune = prune;
     let mut total_failed = 0u64;
     for target in targets {
         reporter.start_target();
@@ -541,41 +540,39 @@ fn effective_allow_other(flag: bool, owner: Option<u32>, group: Option<u32>) -> 
 /// Parse mount CLI flags into `MountConfig` and `FuseConfig`. Pure function —
 /// no DB access, no mounting. Exported for unit testing.
 pub fn parse_mount_config(args: &MountArgs) -> (MountConfig, musefs_fuse::FuseConfig) {
-    let config = MountConfig {
-        template: args.template.clone(),
-        // Field names are case-insensitive everywhere else (the template parser
-        // and `tags_to_fields` ASCII-lowercase them), so a fallback keyed under
-        // any uppercase letter would never match at render time (#504). Normalize
-        // the key the same way; later duplicates win, matching `collect`'s prior
-        // last-write semantics.
-        fallbacks: args
-            .fallbacks
-            .iter()
-            .map(|(field, value)| (field.to_ascii_lowercase(), value.clone()))
-            .collect(),
-        default_fallback: args.default_fallback.clone(),
-        mode: args.mode.into(),
-        poll_interval: std::time::Duration::from_millis(args.poll_interval_ms),
-        case_insensitive: args.case_insensitive,
-        read_ahead_budget: u64::from(args.read_ahead_budget_mib).saturating_mul(1024 * 1024),
-        read_ahead_prefetch: args.read_ahead_prefetch,
-        skip_on_missing: args.skip_on_missing,
-        trust_backing_mtime: args.trust_backing_mtime,
-    };
-    let defaults = musefs_fuse::FuseConfig::default();
-    let fuse_config = musefs_fuse::FuseConfig {
-        ttl: std::time::Duration::from_millis(args.attr_ttl_ms),
-        max_readahead: args.max_readahead_kib.saturating_mul(1024),
-        max_background: args.max_background,
-        keep_cache: args.keep_cache,
-        uid: args.owner.unwrap_or(defaults.uid),
-        gid: args.group.unwrap_or(defaults.gid),
-        file_mode: args.file_mode.unwrap_or(defaults.file_mode),
-        dir_mode: args.dir_mode.unwrap_or(defaults.dir_mode),
-        allow_other: effective_allow_other(args.allow_other, args.owner, args.group),
-        expose_metrics: args.expose_metrics,
-        workers: args.workers,
-    };
+    let mut config = MountConfig::default();
+    config.template.clone_from(&args.template);
+    // Field names are case-insensitive everywhere else (the template parser
+    // and `tags_to_fields` ASCII-lowercase them), so a fallback keyed under
+    // any uppercase letter would never match at render time (#504). Normalize
+    // the key the same way; later duplicates win, matching `collect`'s prior
+    // last-write semantics.
+    config.fallbacks = args
+        .fallbacks
+        .iter()
+        .map(|(field, value)| (field.to_ascii_lowercase(), value.clone()))
+        .collect();
+    config.default_fallback.clone_from(&args.default_fallback);
+    config.mode = args.mode.into();
+    config.poll_interval = std::time::Duration::from_millis(args.poll_interval_ms);
+    config.case_insensitive = args.case_insensitive;
+    config.read_ahead_budget = u64::from(args.read_ahead_budget_mib).saturating_mul(1024 * 1024);
+    config.read_ahead_prefetch = args.read_ahead_prefetch;
+    config.skip_on_missing = args.skip_on_missing;
+    config.trust_backing_mtime = args.trust_backing_mtime;
+    // Starts from the defaults, so an unset owner, group or mode keeps its default.
+    let mut fuse_config = musefs_fuse::FuseConfig::default();
+    fuse_config.ttl = std::time::Duration::from_millis(args.attr_ttl_ms);
+    fuse_config.max_readahead = args.max_readahead_kib.saturating_mul(1024);
+    fuse_config.max_background = args.max_background;
+    fuse_config.keep_cache = args.keep_cache;
+    fuse_config.uid = args.owner.unwrap_or(fuse_config.uid);
+    fuse_config.gid = args.group.unwrap_or(fuse_config.gid);
+    fuse_config.file_mode = args.file_mode.unwrap_or(fuse_config.file_mode);
+    fuse_config.dir_mode = args.dir_mode.unwrap_or(fuse_config.dir_mode);
+    fuse_config.allow_other = effective_allow_other(args.allow_other, args.owner, args.group);
+    fuse_config.expose_metrics = args.expose_metrics;
+    fuse_config.workers = args.workers;
     (config, fuse_config)
 }
 

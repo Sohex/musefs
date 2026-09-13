@@ -141,6 +141,7 @@ impl fmt::Debug for ProgressSink {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ScanStats {
     pub scanned: u64,
     pub skipped: u64,
@@ -434,6 +435,7 @@ struct WalkTally<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RevalidateStats {
     pub updated: u64,
     pub unchanged: u64,
@@ -1307,6 +1309,7 @@ enum WritePolicy {
 
 /// Knobs for a scan. `jobs == 0` means "use available parallelism".
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ScanOptions {
     pub jobs: usize,
     /// Initial probe read window in bytes; widened on `NeedMore`.

@@ -34,6 +34,7 @@ pub enum Mode {
 /// Per-mount configuration for rendering the virtual hierarchy.
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)] // independent mount toggles, not a state machine
+#[non_exhaustive]
 pub struct MountConfig {
     pub template: String,
     pub fallbacks: BTreeMap<String, String>,
@@ -71,6 +72,27 @@ pub struct MountConfig {
     /// trades away is the freshness of the size and mtime a `stat` reports
     /// between the change and the next `open`.
     pub trust_backing_mtime: bool,
+}
+
+/// What `musefs mount` does with no flags, so code outside this crate — which
+/// cannot build a `#[non_exhaustive]` struct with a literal — starts from the
+/// CLI's behaviour and assigns only what it changes. `musefs-cli` pins the two
+/// together in a test, so they cannot drift.
+impl Default for MountConfig {
+    fn default() -> Self {
+        Self {
+            template: "$albumartist/$album/$title".to_string(),
+            fallbacks: BTreeMap::new(),
+            default_fallback: "Unknown".to_string(),
+            mode: Mode::Synthesis,
+            poll_interval: std::time::Duration::from_secs(1),
+            case_insensitive: cfg!(target_os = "macos"),
+            read_ahead_budget: 64 * 1024 * 1024,
+            read_ahead_prefetch: false,
+            skip_on_missing: false,
+            trust_backing_mtime: false,
+        }
+    }
 }
 
 /// The modification time of a node that has one, and everything needed to

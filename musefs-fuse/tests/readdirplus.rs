@@ -114,9 +114,10 @@ fn readdirplus_attrs_match_what_lookup_reports() {
         Musefs::open(musefs_db::Db::open(&db_path).unwrap(), config()).unwrap(),
         walked_mount.path(),
         "musefs-readdirplus-e2e",
-        FuseConfig {
-            expose_metrics: true,
-            ..FuseConfig::default()
+        {
+            let mut fuse_config = FuseConfig::default();
+            fuse_config.expose_metrics = true;
+            fuse_config
         },
     )
     .unwrap();

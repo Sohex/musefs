@@ -2,8 +2,7 @@
 
 mod common;
 use common::corpus::{ALL_FORMATS, CorpusParams, Format, format_token, prepare_format};
-use musefs_core::{Mode, MountConfig, Musefs, VirtualTree, metrics, scan_directory};
-use std::collections::BTreeMap;
+use musefs_core::{MountConfig, Musefs, VirtualTree, metrics, scan_directory};
 use std::sync::Mutex;
 
 /// The `metrics` counters are global statics; serialize every measured region.
@@ -15,21 +14,15 @@ const AUDIO_BYTES_USIZE: usize = 4 * 1024 * 1024;
 const CHUNK: u64 = 128 * 1024;
 
 fn config() -> MountConfig {
-    MountConfig {
-        template: "$artist/$album/$title".to_string(),
-        fallbacks: BTreeMap::new(),
-        default_fallback: "Unknown".to_string(),
-        mode: Mode::Synthesis,
-        poll_interval: std::time::Duration::ZERO,
-        case_insensitive: false,
-        // Read-ahead off: these goldens are exact per-format pread counts that
-        // detect synthesis-path regressions; read amplification would collapse
-        // and mask them. Read-ahead's own effects are covered in readahead.rs.
-        read_ahead_budget: 0,
-        read_ahead_prefetch: false,
-        skip_on_missing: false,
-        trust_backing_mtime: false,
-    }
+    let mut config = MountConfig::default();
+    config.template = "$artist/$album/$title".to_string();
+    config.poll_interval = std::time::Duration::ZERO;
+    config.case_insensitive = false;
+    // Read-ahead off: these goldens are exact per-format pread counts that
+    // detect synthesis-path regressions; read amplification would collapse
+    // and mask them. Read-ahead's own effects are covered in readahead.rs.
+    config.read_ahead_budget = 0;
+    config
 }
 
 /// Recursively collect every file inode (non-FLAC corpus tracks render under

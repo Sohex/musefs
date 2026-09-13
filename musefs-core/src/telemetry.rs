@@ -10,6 +10,7 @@ use std::fmt::Write;
 /// virtual-tree footprint, refresh health, and the shared serve-path warn
 /// limiter's suppressed count. Produced by `Musefs::telemetry`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CoreTelemetry {
     pub handles_open: u64,
     pub cache_header_entries: u64,
@@ -77,6 +78,7 @@ pub struct AllocatorStats {
 /// [`AllocatorStats`], which under-reports the process by whatever SQLite
 /// holds (#631).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ProcessStats {
     /// Whole-process resident set size in bytes, from the OS. `None` where no
     /// cheap source exists (`/proc/self/status` is the only one wired up, so

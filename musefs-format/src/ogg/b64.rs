@@ -9,6 +9,7 @@ use base64::Engine;
 
 /// The raw-input read plan for an output base64 window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct B64Window {
     /// First raw input byte to read.
     pub in_start: u64,

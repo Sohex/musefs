@@ -193,6 +193,7 @@ pub(crate) fn retarget_track_in(
 /// ids (ascending) plus the table's retained seq bounds (0/0 when empty). The
 /// caller derives gap detection from `min_seq` (see musefs-core's refresh).
 #[derive(Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChangelogRead {
     pub changed_ids: Vec<i64>,
     pub min_seq: i64,

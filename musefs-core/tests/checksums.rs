@@ -4,11 +4,10 @@ use musefs_core::{ChecksumTier, MatchStrictness, ScanOptions, scan_directory_wit
 use musefs_db::Db;
 
 fn opts(tier: ChecksumTier) -> ScanOptions {
-    ScanOptions {
-        jobs: 1,
-        checksum: tier,
-        ..Default::default()
-    }
+    let mut options = ScanOptions::default();
+    options.jobs = 1;
+    options.checksum = tier;
+    options
 }
 
 #[test]
@@ -47,12 +46,11 @@ fn full_tier_populates_both_columns_fingerprint_tier_only_one_none_neither() {
 }
 
 fn full_opts(strictness: MatchStrictness) -> ScanOptions {
-    ScanOptions {
-        jobs: 1,
-        checksum: ChecksumTier::Full,
-        strictness,
-        ..Default::default()
-    }
+    let mut options = ScanOptions::default();
+    options.jobs = 1;
+    options.checksum = ChecksumTier::Full;
+    options.strictness = strictness;
+    options
 }
 
 fn write_a_flac(dir: &std::path::Path, name: &str, audio: &[u8]) -> std::path::PathBuf {
@@ -110,16 +108,10 @@ fn strict_refuses_when_candidate_has_no_content_hash() {
     let old = write_a_flac(dir.path(), "old.flac", &[0xCD; 64]);
     let db = Db::open_in_memory().unwrap();
     // Seed at fingerprint tier => candidate has fingerprint but no content_hash.
-    scan_directory_with(
-        &db,
-        dir.path(),
-        &ScanOptions {
-            jobs: 1,
-            checksum: ChecksumTier::Fingerprint,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut options = ScanOptions::default();
+    options.jobs = 1;
+    options.checksum = ChecksumTier::Fingerprint;
+    scan_directory_with(&db, dir.path(), &options).unwrap();
     let id = db.list_tracks().unwrap()[0].id;
 
     std::fs::rename(&old, dir.path().join("new.flac")).unwrap();
@@ -196,17 +188,11 @@ fn fast_retarget_without_a_new_hash_clears_the_stale_one() {
 
     std::fs::remove_file(&a).unwrap();
     write_a_flac(dir.path(), "b.flac", &colliding_audio(0xBB));
-    scan_directory_with(
-        &db,
-        dir.path(),
-        &ScanOptions {
-            jobs: 1,
-            checksum: ChecksumTier::Fingerprint,
-            strictness: MatchStrictness::Fast,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut options = ScanOptions::default();
+    options.jobs = 1;
+    options.checksum = ChecksumTier::Fingerprint;
+    options.strictness = MatchStrictness::Fast;
+    scan_directory_with(&db, dir.path(), &options).unwrap();
 
     let tracks = db.list_tracks().unwrap();
     assert_eq!(tracks.len(), 1, "Fast still retargets");
@@ -268,30 +254,18 @@ fn revalidate_backfills_fingerprint_on_unchanged_files() {
     write_a_flac(dir.path(), "a.flac", &[0xAB; 64]);
     let db = Db::open_in_memory().unwrap();
     // Initial scan with no checksums.
-    scan_directory_with(
-        &db,
-        dir.path(),
-        &ScanOptions {
-            jobs: 1,
-            checksum: ChecksumTier::None,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut options = ScanOptions::default();
+    options.jobs = 1;
+    options.checksum = ChecksumTier::None;
+    scan_directory_with(&db, dir.path(), &options).unwrap();
     assert!(db.list_tracks().unwrap()[0].fingerprint.is_none());
 
     // Revalidate at the fingerprint tier: the file is unchanged but missing the
     // fingerprint, so it must be re-processed (backfilled), not skipped.
-    let stats = revalidate_with(
-        &db,
-        dir.path(),
-        &ScanOptions {
-            jobs: 1,
-            checksum: ChecksumTier::Fingerprint,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut options = ScanOptions::default();
+    options.jobs = 1;
+    options.checksum = ChecksumTier::Fingerprint;
+    let stats = revalidate_with(&db, dir.path(), &options).unwrap();
     assert!(
         db.list_tracks().unwrap()[0].fingerprint.is_some(),
         "backfilled"
@@ -305,16 +279,10 @@ fn revalidate_full_backfills_content_hash_on_fingerprint_tier_row() {
     write_a_flac(dir.path(), "a.flac", &[0xAB; 64]);
     let db = Db::open_in_memory().unwrap();
     // Seed at the fingerprint tier: fingerprint set, content_hash NULL.
-    scan_directory_with(
-        &db,
-        dir.path(),
-        &ScanOptions {
-            jobs: 1,
-            checksum: ChecksumTier::Fingerprint,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut options = ScanOptions::default();
+    options.jobs = 1;
+    options.checksum = ChecksumTier::Fingerprint;
+    scan_directory_with(&db, dir.path(), &options).unwrap();
     let seeded = &db.list_tracks().unwrap()[0];
     assert!(seeded.fingerprint.is_some(), "fingerprint seeded");
     assert!(seeded.content_hash.is_none(), "content_hash not yet set");
@@ -323,16 +291,10 @@ fn revalidate_full_backfills_content_hash_on_fingerprint_tier_row() {
     // `!has_fingerprint || !has_content_hash` gate must re-process the row to
     // backfill content_hash (kills the `||`->`&&` and the two `delete !` mutants
     // — any of which would leave the fp-present/ch-absent track skipped).
-    let stats = revalidate_with(
-        &db,
-        dir.path(),
-        &ScanOptions {
-            jobs: 1,
-            checksum: ChecksumTier::Full,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut options = ScanOptions::default();
+    options.jobs = 1;
+    options.checksum = ChecksumTier::Full;
+    let stats = revalidate_with(&db, dir.path(), &options).unwrap();
     assert_eq!(stats.updated, 1, "the fp-only row must be re-processed");
     assert!(
         db.list_tracks().unwrap()[0].content_hash.is_some(),
@@ -348,16 +310,10 @@ fn revalidate_full_reprocesses_row_missing_fingerprint() {
     // Seed with no checksums, then force a row that has a content_hash but NO
     // fingerprint — the case that exercises the Full arm's `!has_fingerprint`
     // half of `!has_fingerprint || !has_content_hash`.
-    scan_directory_with(
-        &db,
-        dir.path(),
-        &ScanOptions {
-            jobs: 1,
-            checksum: ChecksumTier::None,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut options = ScanOptions::default();
+    options.jobs = 1;
+    options.checksum = ChecksumTier::None;
+    scan_directory_with(&db, dir.path(), &options).unwrap();
     let id = db.list_tracks().unwrap()[0].id;
     db.set_track_checksums(
         id,
@@ -372,16 +328,10 @@ fn revalidate_full_reprocesses_row_missing_fingerprint() {
     // Full tier must re-process the row to backfill the missing fingerprint
     // (kills the Full-arm `delete !` on `!has_fingerprint` — dropping it would
     // leave this row skipped because content_hash is already present).
-    let stats = revalidate_with(
-        &db,
-        dir.path(),
-        &ScanOptions {
-            jobs: 1,
-            checksum: ChecksumTier::Full,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut options = ScanOptions::default();
+    options.jobs = 1;
+    options.checksum = ChecksumTier::Full;
+    let stats = revalidate_with(&db, dir.path(), &options).unwrap();
     assert_eq!(
         stats.updated, 1,
         "row missing a fingerprint must be re-processed"
@@ -451,10 +401,8 @@ fn in_place_rewrite_at_fingerprint_tier_clears_the_stale_content_hash() {
         // Rewrite the same path with different bytes, then re-probe it at the
         // default tier, which computes no full hash for it.
         write_a_flac(dir.path(), "a.flac", &[0xBB; 96]);
-        let reprobe = ScanOptions {
-            force: true,
-            ..opts(ChecksumTier::Fingerprint)
-        };
+        let mut reprobe = opts(ChecksumTier::Fingerprint);
+        reprobe.force = true;
         if revalidating {
             musefs_core::revalidate_with(&db, dir.path(), &reprobe).unwrap();
         } else {
@@ -483,15 +431,9 @@ fn a_rewritten_file_can_still_be_move_recovered() {
     let dir = tempfile::tempdir().unwrap();
     let (db, seeded) = seed_at_full(dir.path(), &[0xAA; 64]);
     let path = write_a_flac(dir.path(), "a.flac", &[0xBB; 96]);
-    scan_directory_with(
-        &db,
-        dir.path(),
-        &ScanOptions {
-            force: true,
-            ..opts(ChecksumTier::Fingerprint)
-        },
-    )
-    .unwrap();
+    let mut options = opts(ChecksumTier::Fingerprint);
+    options.force = true;
+    scan_directory_with(&db, dir.path(), &options).unwrap();
 
     std::fs::rename(&path, dir.path().join("moved.flac")).unwrap();
     scan_directory_with(&db, dir.path(), &full_opts(MatchStrictness::Auto)).unwrap();
@@ -510,15 +452,9 @@ fn unchanged_file_at_fingerprint_tier_keeps_its_content_hash() {
     let dir = tempfile::tempdir().unwrap();
     let (db, seeded) = seed_at_full(dir.path(), &[0xAA; 64]);
 
-    scan_directory_with(
-        &db,
-        dir.path(),
-        &ScanOptions {
-            force: true,
-            ..opts(ChecksumTier::Fingerprint)
-        },
-    )
-    .unwrap();
+    let mut options = opts(ChecksumTier::Fingerprint);
+    options.force = true;
+    scan_directory_with(&db, dir.path(), &options).unwrap();
     assert_eq!(
         db.list_tracks().unwrap()[0].content_hash,
         seeded.content_hash,

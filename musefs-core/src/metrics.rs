@@ -53,6 +53,7 @@ macro_rules! decl_snapshot {
         /// backing statics. Present (and `Default`) even without the `metrics`
         /// feature so consumers compile unconditionally.
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+        #[non_exhaustive]
         pub struct Snapshot {
             $(pub $field: u64,)*
         }

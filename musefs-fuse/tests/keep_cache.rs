@@ -22,10 +22,8 @@ fn keep_cache_mount_reflects_retag_after_refresh() {
     let fs = Musefs::open(db, config()).unwrap();
 
     // 2. Mount with keep-cache=true and debounce=ZERO (already set via MountConfig).
-    let cfg = musefs_fuse::FuseConfig {
-        keep_cache: true,
-        ..Default::default()
-    };
+    let mut cfg = musefs_fuse::FuseConfig::default();
+    cfg.keep_cache = true;
     let mountpoint = tempfile::tempdir().unwrap();
     let session = musefs_fuse::spawn_with(fs, mountpoint.path(), "musefs-keepcache", cfg).unwrap();
 

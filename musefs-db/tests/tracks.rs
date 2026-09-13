@@ -51,17 +51,16 @@ fn track_identity_returns_content_version_and_backing_identity() {
         "linking art must bump content_version above the default"
     );
     let track = db.get_track(id).unwrap().expect("track by id");
+    let identity = db.track_identity(id).unwrap().expect("identity by id");
+    assert_eq!(identity.content_version, cv);
     assert_eq!(
-        db.track_identity(id).unwrap(),
-        Some(musefs_db::TrackIdentity {
-            content_version: cv,
-            backing_path: std::path::PathBuf::from("/music/a.flac"),
-            backing_size: track.backing_size,
-            backing_mtime_ns: track.backing_mtime_ns,
-            backing_ctime_ns: track.backing_ctime_ns,
-            backing_ino: track.backing_ino,
-        }),
+        identity.backing_path,
+        std::path::PathBuf::from("/music/a.flac")
     );
+    assert_eq!(identity.backing_size, track.backing_size);
+    assert_eq!(identity.backing_mtime_ns, track.backing_mtime_ns);
+    assert_eq!(identity.backing_ctime_ns, track.backing_ctime_ns);
+    assert_eq!(identity.backing_ino, track.backing_ino);
     assert!(db.track_identity(999_999).unwrap().is_none());
 }
 

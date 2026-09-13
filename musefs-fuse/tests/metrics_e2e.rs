@@ -19,10 +19,9 @@ mod common;
 use common::{config, make_flac};
 
 fn fuse_config() -> FuseConfig {
-    FuseConfig {
-        expose_metrics: true,
-        ..FuseConfig::default()
-    }
+    let mut fuse_config = FuseConfig::default();
+    fuse_config.expose_metrics = true;
+    fuse_config
 }
 
 /// Read entire file by looping in `chunk_size` byte reads until empty (handles

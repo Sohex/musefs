@@ -7,8 +7,7 @@ use common::corpus::{
 };
 use common::report::{RunReport, peak_rss_kib};
 use musefs_core::{
-    Mode, MountConfig, Musefs, ScanOptions, VirtualTree, metrics, revalidate_with,
-    scan_directory_with,
+    MountConfig, Musefs, ScanOptions, VirtualTree, metrics, revalidate_with, scan_directory_with,
 };
 use musefs_db::Db;
 
@@ -25,10 +24,8 @@ fn run_one(target: &Target, tier: &str, format: &str, storage: &str) {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let opts = ScanOptions {
-        jobs,
-        ..Default::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.jobs = jobs;
 
     metrics::reset();
     let t0 = Instant::now();
@@ -133,19 +130,13 @@ fn bench_scan_under_latency() {
     let fsyncs_before_scan = mount.fsyncs();
     metrics::reset();
     let t0 = Instant::now();
-    let stats = scan_directory_with(
-        &db,
-        &mount.path(),
-        &ScanOptions {
-            jobs: std::env::var("MUSEFS_BENCH_JOBS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0),
-            checksum,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut options = ScanOptions::default();
+    options.jobs = std::env::var("MUSEFS_BENCH_JOBS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    options.checksum = checksum;
+    let stats = scan_directory_with(&db, &mount.path(), &options).unwrap();
     let scan_ms = t0.elapsed().as_millis();
     let s = metrics::snapshot();
 
@@ -203,17 +194,14 @@ fn bench_read_under_latency() {
     let ra_prefetch = std::env::var("MUSEFS_READ_AHEAD_PREFETCH")
         .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"));
 
-    let cfg = || MountConfig {
-        template: "$artist/$album/$title".to_string(),
-        fallbacks: std::collections::BTreeMap::new(),
-        default_fallback: "Unknown".to_string(),
-        mode: Mode::Synthesis,
-        poll_interval: std::time::Duration::ZERO,
-        case_insensitive: false,
-        read_ahead_budget: ra_mib.saturating_mul(1024 * 1024),
-        read_ahead_prefetch: ra_prefetch,
-        skip_on_missing: false,
-        trust_backing_mtime: false,
+    let cfg = || {
+        let mut config = MountConfig::default();
+        config.template = "$artist/$album/$title".to_string();
+        config.poll_interval = std::time::Duration::ZERO;
+        config.case_insensitive = false;
+        config.read_ahead_budget = ra_mib.saturating_mul(1024 * 1024);
+        config.read_ahead_prefetch = ra_prefetch;
+        config
     };
     fn first_inode(fs: &Musefs, dir: u64) -> Option<u64> {
         for (_, ino, is_dir) in fs.readdir(dir).unwrap() {

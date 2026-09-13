@@ -7,7 +7,6 @@
 mod common;
 use common::{make_flac, streaminfo_body, vorbis_comment_body};
 use musefs_core::{MountConfig, Musefs, VirtualTree, scan_directory};
-use std::collections::BTreeMap;
 
 /// Encode a 28-bit synchsafe size the way an ID3v2 header does.
 fn syncsafe(n: u32) -> [u8; 4] {
@@ -38,18 +37,11 @@ fn id3_tag(frames: &[(&str, &str)]) -> Vec<u8> {
 }
 
 fn config() -> MountConfig {
-    MountConfig {
-        template: "$artist/$title".to_string(),
-        fallbacks: BTreeMap::new(),
-        default_fallback: "Unknown".to_string(),
-        mode: musefs_core::Mode::Synthesis,
-        poll_interval: std::time::Duration::ZERO,
-        case_insensitive: false,
-        read_ahead_budget: 64 * 1024 * 1024,
-        read_ahead_prefetch: false,
-        skip_on_missing: false,
-        trust_backing_mtime: false,
-    }
+    let mut config = MountConfig::default();
+    config.template = "$artist/$title".to_string();
+    config.poll_interval = std::time::Duration::ZERO;
+    config.case_insensitive = false;
+    config
 }
 
 fn read_whole(fs: &Musefs, inode: u64) -> Vec<u8> {
@@ -216,15 +208,9 @@ fn bounded_widening_matches_the_full_probe_over_a_large_tag() {
     musefs_core::scan_directory_full_oracle(&oracle_db, dir.path()).unwrap();
 
     let bounded_db = musefs_db::Db::open_in_memory().unwrap();
-    musefs_core::scan_directory_with(
-        &bounded_db,
-        dir.path(),
-        &musefs_core::ScanOptions {
-            window: 64,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut options = musefs_core::ScanOptions::default();
+    options.window = 64;
+    musefs_core::scan_directory_with(&bounded_db, dir.path(), &options).unwrap();
 
     let rows = |db: &musefs_db::Db| {
         let t = &db.list_tracks().unwrap()[0];

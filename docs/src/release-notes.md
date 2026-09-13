@@ -56,11 +56,20 @@ directly.
   `musefs_core::scan_directory_full_oracle`, the `*_for_test` methods on `Musefs`
   and `Db`, and `musefs_format::ogg::page_test_support`. No production code
   called any of them.
+- The configuration and result structs follow the enums ([#743]):
+  `ScanOptions`, `MountConfig`, `FuseConfig`, `musefs-cli`'s argument structs and
+  the crates' result types are `#[non_exhaustive]`, so outside their crate they
+  can no longer be built with a struct literal, `..Default::default()` included.
+  Start from `default()` — new for `MountConfig`, matching a bare `musefs mount`
+  — and assign the fields you change. The store-row and synthesis input structs
+  (`NewTrack`, `TrackArt`, `ArtInput` and the like) are unchanged, so a new store
+  column is still a breaking change for code that writes rows.
 
 [#707]: https://github.com/Sohex/musefs/issues/707
 [#708]: https://github.com/Sohex/musefs/issues/708
 [#709]: https://github.com/Sohex/musefs/issues/709
 [#710]: https://github.com/Sohex/musefs/issues/710
+[#743]: https://github.com/Sohex/musefs/issues/743
 
 ## v1.3.0
 

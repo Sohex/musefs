@@ -92,16 +92,11 @@ fn failed_flush_does_not_strand_budget_blocked_workers() {
     let baseline = live_threads();
     // Cap the in-flight budget below two files' cumulative art, so workers pile
     // up in `acquire` behind the batch the failing flush never releases.
-    let err = scan_directory_with(
-        &db,
-        &lib,
-        &ScanOptions {
-            jobs: 4,
-            batch_bytes: 8,
-            ..Default::default()
-        },
-    )
-    .expect_err("a wedged store must fail the batch commit");
+    let mut options = ScanOptions::default();
+    options.jobs = 4;
+    options.batch_bytes = 8;
+    let err = scan_directory_with(&db, &lib, &options)
+        .expect_err("a wedged store must fail the batch commit");
     assert!(
         db.list_tracks().unwrap().is_empty(),
         "nothing may have been persisted through a wedged store"

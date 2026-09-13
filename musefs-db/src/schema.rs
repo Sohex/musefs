@@ -1123,6 +1123,7 @@ const fn is_major_release(version: &str) -> bool {
 
 /// One step a store has yet to receive, as [`pending`] reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PendingStep {
     /// The `user_version` the store carries once this step has been applied.
     pub version: i64,

@@ -129,10 +129,8 @@ fn force_rescan_reseeds_tags_from_file() {
     db.replace_tags(id, &[Tag::new("title", "Curated", 0)])
         .unwrap();
 
-    let opts = ScanOptions {
-        force: true,
-        ..Default::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.force = true;
     scan_directory_with(&db, dir.path(), &opts).unwrap();
 
     let tags = db.get_tags(id).unwrap();
@@ -311,15 +309,9 @@ fn revalidate_skips_unchanged_prunes_missing_and_gcs_art() {
         .unwrap();
     assert!(tags.iter().any(|t| t.key == "title" && t.value == "Edited"));
 
-    let stats = musefs_core::revalidate_with(
-        &db,
-        dir.path(),
-        &ScanOptions {
-            prune: true,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut options = ScanOptions::default();
+    options.prune = true;
+    let stats = musefs_core::revalidate_with(&db, dir.path(), &options).unwrap();
     assert_eq!(stats.pruned, 1); // gone.flac's track is removed
     assert_eq!(db.list_tracks().unwrap().len(), 1);
 }
