@@ -541,9 +541,10 @@ impl PageStart {
     }
 }
 
-/// How many listings stateless enumerations keep pinned (#695). Eviction is not
-/// an error: an enumeration whose listing was evicted continues on the current
-/// generation, which is what every stateless page did before.
+/// How many listings stateless enumerations keep pinned (#695). Eviction alone
+/// costs an enumeration nothing while its generation is still current: the
+/// listing is rebuilt identically. Only a listing evicted *and* replaced by a
+/// refresh leaves the enumeration unresumable — see [`StatelessPage::Stale`].
 const MAX_STATELESS_LISTINGS: usize = 64;
 
 /// Listings pinned for enumerations served without a directory handle (#695).
@@ -600,14 +601,52 @@ impl StatelessListings {
     }
 }
 
-/// Resolve a stateless `readdir`/`readdirplus` page (#695): the listing to page
-/// and where its page starts.
+/// What a stateless `readdir`/`readdirplus` cookie resolves to (#695).
+enum StatelessPage {
+    /// The listing to page, and where the page starts.
+    Page(Arc<DirListing>, PageStart),
+    /// The cookie belongs to an enumeration that can no longer be resumed: its
+    /// listing was evicted, and a refresh has since replaced the generation it
+    /// was paging. Its index points into a listing that no longer exists, and
+    /// applied to the current one it would repeat or skip entries. The reply is
+    /// [`stale_enumeration`]'s errno.
+    Stale,
+}
+
+/// The errno for a [`StatelessPage::Stale`] cookie, logged at the serve-path
+/// warn budget.
 ///
-/// A tagged cookie resumes the listing its tag pinned, whatever has been
-/// published since. An untagged offset — the first page of an enumeration — or a
-/// tag whose listing has been evicted is served from `snapshot`'s generation,
-/// which is tagged and pinned so the rest of the enumeration stays on it.
-/// `build` supplies that listing when it is not pinned already, and runs without
+/// `ESTALE` rather than `EIO`: nothing failed to read. The enumeration's view of
+/// the directory is gone, which is what "stale file handle" means, and `ls`,
+/// `find` and scandir-style walkers report exactly that for the one directory
+/// and carry on. An `EIO` reads as a disk fault. Neither is retried by the
+/// kernel: the Linux VFS retries `ESTALE` only on path lookups, and `getdents`
+/// on an open directory is not one; the macOS and FreeBSD FUSE clients pass a
+/// `readdir` errno straight through. A new enumeration of the directory starts
+/// on the current generation and succeeds.
+fn stale_enumeration(op: &str, ino: u64) -> fuser::Errno {
+    serve_warn!(
+        "{op}({ino}) rejected: ESTALE — the enumeration's listing was evicted and \
+         the tree has changed since, so its cookie cannot be resumed"
+    );
+    fuser::Errno::ESTALE
+}
+
+/// Resolve a stateless `readdir`/`readdirplus` cookie (#695).
+///
+/// - An untagged offset — the first page of an enumeration — is served from
+///   `snapshot`'s generation, which is tagged and pinned so the rest of the
+///   enumeration stays on it.
+/// - A tagged cookie resumes the listing its tag pinned, whatever has been
+///   published since.
+/// - A tagged cookie whose listing was evicted, but whose tag is still the
+///   current generation's, gets that listing rebuilt and re-pinned: it is the
+///   same generation, so the index still means what it meant.
+/// - A tagged cookie whose listing was evicted and whose generation has been
+///   replaced is [`StatelessPage::Stale`]. Paging the new generation at the old
+///   index was exactly the duplicate-or-skip this cache exists to prevent.
+///
+/// `build` supplies a listing when one is not pinned already, and runs without
 /// the cache lock held.
 fn stateless_page<E>(
     listings: &Mutex<StatelessListings>,
@@ -615,7 +654,7 @@ fn stateless_page<E>(
     offset: u64,
     snapshot: &TreeSnapshot,
     build: impl FnOnce() -> Result<Arc<DirListing>, E>,
-) -> Result<(Arc<DirListing>, PageStart), E> {
+) -> Result<StatelessPage, E> {
     let (tag, index) = split_dir_cookie(offset);
     let current = {
         let mut guard = listings
@@ -624,11 +663,14 @@ fn stateless_page<E>(
         if tag != 0
             && let Some(listing) = guard.get(ino, tag)
         {
-            return Ok((listing, PageStart { index, tag }));
+            return Ok(StatelessPage::Page(listing, PageStart { index, tag }));
         }
         let current = guard.tag_for(snapshot);
+        if tag != 0 && tag != current {
+            return Ok(StatelessPage::Stale);
+        }
         if let Some(listing) = guard.get(ino, current) {
-            return Ok((
+            return Ok(StatelessPage::Page(
                 listing,
                 PageStart {
                     index,
@@ -643,7 +685,7 @@ fn stateless_page<E>(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(ino, current, Arc::clone(&listing));
-    Ok((
+    Ok(StatelessPage::Page(
         listing,
         PageStart {
             index,
@@ -1866,7 +1908,10 @@ impl Filesystem for MusefsFs {
                     .map(Arc::new)
                 });
                 match page {
-                    Ok((listing, start)) => reply_dir_entries(reply, &listing, start),
+                    Ok(StatelessPage::Page(listing, start)) => {
+                        reply_dir_entries(reply, &listing, start);
+                    }
+                    Ok(StatelessPage::Stale) => reply.error(stale_enumeration("readdir", ino.0)),
                     Err(e) => reply.error(e),
                 }
             });
@@ -1946,8 +1991,11 @@ impl Filesystem for MusefsFs {
                     .map(Arc::new)
                 });
                 match page {
-                    Ok((listing, start)) => {
+                    Ok(StatelessPage::Page(listing, start)) => {
                         start_plus_fill(&core, &pool, style, expose_metrics, listing, start, reply);
+                    }
+                    Ok(StatelessPage::Stale) => {
+                        reply.error(stale_enumeration("readdirplus", ino.0));
                     }
                     Err(e) => reply.error(e),
                 }
@@ -2523,10 +2571,12 @@ mod tests {
         let listings = Mutex::new(StatelessListings::default());
 
         let first = fs.core.tree_snapshot();
-        let (listing, page) = stateless_page(&listings, artist, 0, &first, || {
-            build_dir_listing(&first, artist, false).map(Arc::new)
-        })
-        .unwrap();
+        let (listing, page) = page_of(
+            stateless_page(&listings, artist, 0, &first, || {
+                build_dir_listing(&first, artist, false).map(Arc::new)
+            })
+            .unwrap(),
+        );
         assert_eq!(page.index, 0);
         let all = names(&listing, 0);
         assert_eq!(all.len(), 4, "{all:?}");
@@ -2538,10 +2588,12 @@ mod tests {
         add("a");
         assert!(fs.core.poll_refresh().unwrap());
         let second = fs.core.tree_snapshot();
-        let (listing, resumed) = stateless_page(&listings, artist, resume, &second, || {
-            build_dir_listing(&second, artist, false).map(Arc::new)
-        })
-        .unwrap();
+        let (listing, resumed) = page_of(
+            stateless_page(&listings, artist, resume, &second, || {
+                build_dir_listing(&second, artist, false).map(Arc::new)
+            })
+            .unwrap(),
+        );
         assert_eq!(
             resumed.tag, page.tag,
             "the enumeration stays on its generation"
@@ -2552,10 +2604,12 @@ mod tests {
             "no b twice, no c skipped"
         );
 
-        let (listing, fresh) = stateless_page(&listings, artist, 0, &second, || {
-            build_dir_listing(&second, artist, false).map(Arc::new)
-        })
-        .unwrap();
+        let (listing, fresh) = page_of(
+            stateless_page(&listings, artist, 0, &second, || {
+                build_dir_listing(&second, artist, false).map(Arc::new)
+            })
+            .unwrap(),
+        );
         assert_ne!(
             fresh.tag, page.tag,
             "a new enumeration takes the new generation"
@@ -2563,6 +2617,141 @@ mod tests {
         let now = names(&listing, 0);
         assert_eq!(now.len(), 5, "{now:?}");
         assert!(now[2].starts_with('a'), "{now:?}");
+    }
+
+    /// The page a [`stateless_page`] resolved to, failing the test on a stale one.
+    fn page_of(page: StatelessPage) -> (Arc<DirListing>, PageStart) {
+        match page {
+            StatelessPage::Page(listing, start) => (listing, start),
+            StatelessPage::Stale => panic!("expected a page, got a stale enumeration"),
+        }
+    }
+
+    /// Pin a cap's worth of other directories under `tag`, evicting every
+    /// listing pinned before them.
+    fn pin_a_cap_of_others(listings: &Mutex<StatelessListings>, tag: u32) {
+        let mut guard = listings.lock().unwrap();
+        for i in 0..u64::try_from(MAX_STATELESS_LISTINGS).unwrap() {
+            guard.insert(u64::MAX / 2 + i, tag, listing(&["other"]));
+        }
+    }
+
+    /// A track under artist "Art" titled `title`, in `dir`'s store.
+    fn add_art_track(dir: &std::path::Path, db: &musefs_db::Db, title: &str) {
+        let id = db
+            .upsert_track(&musefs_db::NewTrack {
+                backing_path: dir.join(format!("{title}.flac")),
+                format: musefs_db::Format::Flac,
+                audio_offset: 0,
+                audio_length: 1,
+                backing_size: 1,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
+                backing_ino: None,
+            })
+            .unwrap();
+        db.replace_tags(
+            id,
+            &[
+                musefs_db::Tag::new("artist", "Art", 0),
+                musefs_db::Tag::new("title", title, 0),
+            ],
+        )
+        .unwrap();
+    }
+
+    /// #695: eviction alone does not cost an enumeration its place. A cookie
+    /// whose listing was evicted, with no refresh since, rebuilds that same
+    /// generation's listing and resumes at its index.
+    #[test]
+    fn an_evicted_listing_resumes_while_its_generation_is_current() {
+        let (dir, fs) = test_fs();
+        let db = musefs_db::Db::open(dir.path().join("m.db")).unwrap();
+        add_art_track(dir.path(), &db, "b");
+        add_art_track(dir.path(), &db, "c");
+        assert!(fs.core.poll_refresh().unwrap());
+        let artist = fs
+            .core
+            .lookup(musefs_core::VirtualTree::ROOT, "Art")
+            .unwrap();
+        let listings = Mutex::new(StatelessListings::default());
+
+        let snapshot = fs.core.tree_snapshot();
+        let (listing, page) = page_of(
+            stateless_page(&listings, artist, 0, &snapshot, || {
+                build_dir_listing(&snapshot, artist, false).map(Arc::new)
+            })
+            .unwrap(),
+        );
+        let resume = dir_cookie(page.tag, 3);
+        pin_a_cap_of_others(&listings, page.tag);
+        assert!(
+            listings.lock().unwrap().get(artist, page.tag).is_none(),
+            "precondition: the enumeration's listing is evicted"
+        );
+
+        let same = fs.core.tree_snapshot();
+        let (rebuilt, resumed) = page_of(
+            stateless_page(&listings, artist, resume, &same, || {
+                build_dir_listing(&same, artist, false).map(Arc::new)
+            })
+            .unwrap(),
+        );
+        assert_eq!((resumed.tag, resumed.index), (page.tag, 3));
+        assert_eq!(*rebuilt, *listing, "the same generation's listing, rebuilt");
+    }
+
+    /// #695: a cookie whose listing was evicted *and* whose generation a refresh
+    /// has since replaced is refused as stale. Resuming the new generation at
+    /// the old index, as eviction used to, returned "b" a second time.
+    #[test]
+    fn an_evicted_listing_from_a_replaced_generation_is_refused_as_stale() {
+        let (dir, fs) = test_fs();
+        let db = musefs_db::Db::open(dir.path().join("m.db")).unwrap();
+        add_art_track(dir.path(), &db, "b");
+        add_art_track(dir.path(), &db, "c");
+        assert!(fs.core.poll_refresh().unwrap());
+        let artist = fs
+            .core
+            .lookup(musefs_core::VirtualTree::ROOT, "Art")
+            .unwrap();
+        let listings = Mutex::new(StatelessListings::default());
+
+        let first = fs.core.tree_snapshot();
+        let (_, page) = page_of(
+            stateless_page(&listings, artist, 0, &first, || {
+                build_dir_listing(&first, artist, false).map(Arc::new)
+            })
+            .unwrap(),
+        );
+        // The kernel took ".", "..", b, and hands back the cookie after b.
+        let resume = dir_cookie(page.tag, 3);
+        pin_a_cap_of_others(&listings, page.tag);
+
+        add_art_track(dir.path(), &db, "a");
+        assert!(fs.core.poll_refresh().unwrap());
+        let second = fs.core.tree_snapshot();
+        let outcome = stateless_page(&listings, artist, resume, &second, || {
+            build_dir_listing(&second, artist, false).map(Arc::new)
+        })
+        .unwrap();
+        assert!(
+            matches!(outcome, StatelessPage::Stale),
+            "an unresumable cookie must not be paged against the new generation"
+        );
+
+        let (_, fresh) = page_of(
+            stateless_page(&listings, artist, 0, &second, || {
+                build_dir_listing(&second, artist, false).map(Arc::new)
+            })
+            .unwrap(),
+        );
+        assert_ne!(fresh.tag, page.tag, "a new enumeration is unaffected");
+    }
+
+    #[test]
+    fn a_stale_enumeration_replies_estale() {
+        assert_eq!(stale_enumeration("readdir", 7), fuser::Errno::ESTALE);
     }
 
     fn empty_dir_handles() -> DirHandles {

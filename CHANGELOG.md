@@ -426,7 +426,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ([#695](https://github.com/Sohex/musefs/issues/695)). Past the 1,024-handle
   cap each page was rebuilt from the current tree and resumed at a plain index;
   the first page of an enumeration now pins its listing and tags its cookies
-  with that generation.
+  with that generation. If that listing is evicted and the tree has changed
+  since, the next page fails with `ESTALE` instead of resuming on another
+  generation; a new enumeration succeeds.
 
 - **A crafted `art` row can no longer hand one image's bytes to a file embedding
   another** ([#724](https://github.com/Sohex/musefs/issues/724)). On a

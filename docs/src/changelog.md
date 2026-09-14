@@ -662,8 +662,11 @@ see the [Release notes](release-notes.md).
   the entries under that index, so one enumeration could return an entry twice
   or miss one. The first page of such an enumeration now pins its listing and
   tags the cookies it returns with that generation, so every later page reads
-  the same listing. Up to 64 listings stay pinned; one evicted before its
-  enumeration finishes falls back to the old behaviour.
+  the same listing. Up to 64 listings stay pinned. One evicted before its
+  enumeration finishes is rebuilt and resumed if the tree has not changed since.
+  If a refresh has replaced its generation, that `readdir` fails with `ESTALE`
+  rather than paging the new listing at the old position, and a new enumeration
+  of the directory succeeds.
 
 - **A crafted `art` row can no longer hand one image's bytes to a file embedding
   another** ([#724](https://github.com/Sohex/musefs/issues/724)). `art` is

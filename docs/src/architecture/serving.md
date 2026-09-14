@@ -121,8 +121,15 @@ every later page resolves its cookie back to the same listing. Paging whatever
 generation was current, as it used to, let a refresh landing between two pages
 shift entries under the cursor, so one enumeration could return an entry twice
 or skip one ([#695](https://github.com/Sohex/musefs/issues/695)). The cache
-holds 64 listings; an enumeration whose listing was evicted continues on the
-current generation, which is where every stateless page used to be. The work
+holds 64 listings. Evicting one costs its enumeration nothing while no refresh
+has landed: the same generation's listing is rebuilt and the enumeration resumes
+where it was. If a refresh *has* landed, the listing the cookie points into no
+longer exists, and paging the new one at the old index would repeat or skip
+entries, so that `readdir` fails with `ESTALE` instead. A client sees "stale file
+handle" for that one directory, and a fresh enumeration of it succeeds. It takes
+more than 64 stateless enumerations in flight at once and a store change
+mid-listing, which is rare even for a large parallel walk; an error it can see
+is the better failure than a listing that is silently wrong. The work
 runs on the worker pool, like every other blocking operation, not on the single
 fuser dispatch thread. `musefs_dir_handle_rejections_total` counts the opens that took the
 fallback; the `musefs_dir_handles` gauge cannot show this, because
