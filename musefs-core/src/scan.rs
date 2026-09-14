@@ -1005,10 +1005,15 @@ fn read_mp3_tail(file: &std::fs::File, file_len: u64) -> std::io::Result<Option<
         crate::metrics::on_scan_read(want);
         match mp3::locate_trailer(&bytes, file_len) {
             Ok(Extent::Complete(trailer)) => return Ok(Some(Mp3Tail { bytes, trailer })),
-            Ok(Extent::NeedMore { up_to }) if up_to <= cap => {
-                want = (up_to + MP3_TAIL_WINDOW).min(cap);
+            Ok(Extent::NeedMore { up_to }) => {
+                let next = (up_to + MP3_TAIL_WINDOW).min(cap);
+                // Short of what was asked for only when the ceiling cut it off.
+                if up_to > next {
+                    return Ok(None);
+                }
+                want = next;
             }
-            Ok(Extent::NeedMore { .. }) | Err(_) => return Ok(None),
+            Err(_) => return Ok(None),
         }
     }
     Ok(None)

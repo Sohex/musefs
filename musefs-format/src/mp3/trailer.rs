@@ -215,6 +215,7 @@ mod tests {
         loop {
             match locate_trailer(from_end(have), len).unwrap() {
                 Extent::NeedMore { up_to } => {
+                    assert!(up_to > have, "asked for {up_to} bytes, holding {have}");
                     asked.push(up_to);
                     have = up_to;
                 }
