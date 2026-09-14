@@ -67,8 +67,9 @@ pub struct MountConfig {
     /// on every traversal after the first (#668).
     ///
     /// Scoped to `getattr` alone: `open` and the read paths validate
-    /// unconditionally, so a changed backing is still caught before any byte is
-    /// served and the `BackingChanged` guarantee is untouched. What the flag
+    /// unconditionally, so a changed backing is still caught before musefs
+    /// serves any byte of it and the `BackingChanged` guarantee is untouched.
+    /// What the flag
     /// trades away is the freshness of the size and mtime a `stat` reports
     /// between the change and the next `open`.
     pub trust_backing_mtime: bool,
@@ -238,6 +239,37 @@ impl Handle {
     /// address can't be reused while still registered).
     fn pool_key(&self) -> usize {
         Arc::as_ptr(&self.readahead) as usize
+    }
+
+    /// Publish a freshly resolved layout for this handle's reads.
+    ///
+    /// The read-ahead windows hold bytes read through `file`, keyed by backing
+    /// offset alone, and a read's post-read check validates the fd only against
+    /// the stamp its layout names. A backing file rewritten in place fails that
+    /// check until the row is restamped (`musefs revalidate`, `scan --force`);
+    /// after that the held fd matches again, so a window cached before the
+    /// rewrite would pass and be served behind the new header. A layout resolved
+    /// against a different stamp therefore drops the windows first.
+    ///
+    /// The stamp alone decides, not the path: the windows came through this
+    /// handle's own fd, which a retarget does not reopen, and the stamp is what
+    /// that fd's bytes are checked against. `!=` rather than `matches_live`,
+    /// since both sides are stored stamps.
+    ///
+    /// The order is load-bearing. The epoch moves first, so a prefetch that read
+    /// the old file and stores after the clear is refused by the epoch check it
+    /// makes under the buffer lock. The clear precedes the store, so no read
+    /// holding the new layout can reach a window cached under the old stamp; a
+    /// window cached after the clear was read after the resolve's stat matched
+    /// the new stamp, and a change since then moves ctime and fails its check.
+    /// The watermark resets because the windows it counts as dispatched are gone.
+    fn publish(&self, fresh: Arc<ResolvedFile>) {
+        if self.resolved.load().stamp != fresh.stamp {
+            self.epoch.fetch_add(1, Ordering::AcqRel);
+            crate::readahead::discard_windows(&self.pool, &self.readahead);
+            self.prefetched_upto.store(0, Ordering::Relaxed);
+        }
+        self.resolved.store(fresh);
     }
 }
 
@@ -549,7 +581,9 @@ impl Musefs {
                 // skips the re-stat below, for backings where that stat is a
                 // network round trip rather than a microsecond (#668). The
                 // opt-out stops here: the miss path below still stats, and so do
-                // `open` and the read paths, so no stale byte is ever served.
+                // `open` and the read paths, so musefs serves no byte of a
+                // changed backing file. Pages the kernel cached under
+                // `--keep-cache` never reach it, and are not its to police.
                 if self.config.trust_backing_mtime {
                     return Ok((e.total_len, e.mtime));
                 }
@@ -770,7 +804,7 @@ impl Musefs {
                         if self.refresh_gen.load(Ordering::Acquire) != cur {
                             continue;
                         }
-                        h.resolved.store(fresh);
+                        h.publish(fresh);
                         h.generation.store(cur, Ordering::Release);
                     }
                     let resolved = h.resolved.load();
@@ -825,8 +859,10 @@ impl Musefs {
                     // change that predated or overlapped the read is caught here;
                     // one that begins after it cannot touch bytes already acquired.
                     // Read-ahead bytes were acquired by an earlier read whose own
-                    // check covered them, and a later change moves ctime for good,
-                    // so every read after it fails too. The drift outranks whatever
+                    // check covered them. A later change moves ctime, so every read
+                    // after it fails too — until the row is restamped to match, and
+                    // `Handle::publish` drops the windows before a layout carrying
+                    // the new stamp is served. The drift outranks whatever
                     // the read reported, since a rewrite can surface as a short read
                     // first, and it is terminal — propagate, don't retry the loop.
                     validate_opened_backing(&h.file, r)?;
@@ -835,7 +871,7 @@ impl Musefs {
                     }
                     // Stale layout: force a re-resolve next iteration against the live version.
                     let fresh = self.pool.with(|db| self.cache.resolve(db, h.track_id))?;
-                    h.resolved.store(fresh);
+                    h.publish(fresh);
                     h.generation
                         .store(self.refresh_gen.load(Ordering::Acquire), Ordering::Release);
                 }

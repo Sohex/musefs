@@ -104,7 +104,7 @@ re-stat, because on NFS, SMB, or a spun-down array that stat is a network round
 trip or a head seek rather than a microsecond — one per track per traversal, on
 every traversal after the first. Resolve, `open`, and the per-handle read path
 keep validating unconditionally, so a silently replaced backing is still caught
-before a single byte is served, and the cold traversal that populates the cache
+before musefs serves a single byte of it, and the cold traversal that populates the cache
 stats regardless. What the flag trades away is the freshness of the one
 metadata surface that can outrun a backing change: between such a change and
 the next `open`, a `stat` reports the pre-change size and mtime. Off by
@@ -134,8 +134,9 @@ The FUSE layer fires `poll_refresh` on metadata ops (`lookup`, `readdir`,
 Polling is debounced (`--poll-interval-ms`) and rebuilds are single-flighted:
 a metadata-op storm costs at most one rebuild per interval. When mounted with
 `--keep-cache`, the changed-inode notifications drive kernel page-cache
-invalidation (`inval_inode`), so a re-tagged file never serves stale cached
-bytes. That covers changes recorded in the store; a backing file rewritten in
+invalidation (`inval_inode`), so a re-tagged file's cached pages are dropped
+at the refresh that picks the re-tag up. That covers changes recorded in the
+store that raise `content_version`; a backing file rewritten in
 place writes nothing to the store and raises no notification (see
 [above](#freshness-two-version-counters)).
 
