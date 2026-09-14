@@ -269,12 +269,15 @@ impl Musefs {
         // Gap iff changes may have been pruned past the watermark: an emptied ring
         // while we held a watermark (external truncation), or a retained window
         // that no longer reaches back to it (min_seq > last_seq + 1; equality is
-        // an adjacent — contiguous — read, not a gap).
-        let gap = if log.max_seq == 0 {
-            last_seq > 0
-        } else {
-            log.min_seq > last_seq + 1
-        };
+        // an adjacent — contiguous — read, not a gap). A row naming no readable
+        // track is one too (#760): whatever it recorded is lost to this read, and
+        // the full rebuild is what recovers it without re-reading the row forever.
+        let gap = log.malformed
+            || if log.max_seq == 0 {
+                last_seq > 0
+            } else {
+                log.min_seq > last_seq + 1
+            };
         if gap {
             return Ok(None);
         }

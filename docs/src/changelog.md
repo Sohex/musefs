@@ -474,6 +474,22 @@ see the [Release notes](release-notes.md).
   once the served mtime derived from `content_version` (#725); V1's text is
   frozen, so the correction lives in V4's comments.
 
+- **The `track_changes` ring is recreated with its storage class pinned**
+  ([#760](https://github.com/Sohex/musefs/issues/760)). It kept V1's
+  `track_id INTEGER NOT NULL` with no `typeof`, the one internal table the
+  storage-class work left out, and the refresh reads the column straight into an
+  `i64`. A text, real or blob row past a mount's watermark was therefore a
+  conversion error, and an error — unlike a gap — advances no watermark: every
+  later poll re-read the same window and failed on the same row, so the mount
+  stopped picking up external edits until 8192 further changes pruned it or the
+  mount restarted. The migration drops and recreates the ring with
+  `CHECK (typeof(track_id) = 'integer')` instead of carrying its contents: it is
+  derived state, the step is gated so no mount holds a watermark into it, and a
+  mount takes its watermark from whatever is there. The reader does not rely on
+  the `CHECK` either. `changelog_since` skips such a row and reports it in
+  `ChangelogRead::malformed`, and the refresh treats that as a gap and falls back
+  to a full rebuild.
+
 - **`art` is rebuilt by the same migration** — the third of the four, and the
   one with an ordering constraint the others did not have. `track_art.art_id`
   references `art(id)` with **no** `ON DELETE CASCADE`, so with foreign keys

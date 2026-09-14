@@ -472,6 +472,55 @@ fn a_rekeyed_track_leaves_no_ghost_in_the_live_tree() {
     );
 }
 
+/// A changelog row whose `track_id` is not an integer (#760), from a store
+/// written with its constraints off. It used to be a conversion error, and an
+/// error moves no watermark, so every later poll re-read the same window and
+/// failed on the same row: the mount stopped picking up external edits. The
+/// refresh cannot tell which track the row named, so it treats it as a gap.
+#[test]
+fn a_malformed_changelog_row_falls_back_instead_of_stalling() {
+    let target = small_corpus(2);
+    let db_path = target.db_path.clone();
+    let corpus = target.corpus_dir.clone();
+    let db = Db::open(&db_path).unwrap();
+    scan_directory(&db, &corpus).unwrap();
+    let fs = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+    let writer = Db::open(&db_path).unwrap();
+    let ids: Vec<i64> = writer.list_tracks().unwrap().iter().map(|t| t.id).collect();
+
+    let raw = rusqlite::Connection::open(&db_path).unwrap();
+    raw.pragma_update(None, "ignore_check_constraints", true)
+        .unwrap();
+    raw.execute(
+        "INSERT INTO track_changes (track_id) VALUES ('not an id')",
+        [],
+    )
+    .unwrap();
+    writer
+        .replace_tags(ids[0], &[Tag::new("TITLE", "past-the-bad-row", 0)])
+        .unwrap();
+
+    assert!(
+        fs.poll_refresh().unwrap(),
+        "the poll must refresh, not fail"
+    );
+    assert_eq!(fs.gap_fallbacks_for_test(), 1, "an unreadable row is a gap");
+
+    // Not stuck: the watermark moved past the bad row, so the next edit is an
+    // ordinary incremental refresh.
+    writer
+        .replace_tags(ids[1], &[Tag::new("TITLE", "after-the-gap", 0)])
+        .unwrap();
+    assert!(fs.poll_refresh().unwrap());
+    assert_eq!(fs.gap_fallbacks_for_test(), 1);
+
+    let reference = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+    assert_eq!(
+        tree_fingerprint(&fs).into_keys().collect::<Vec<_>>(),
+        tree_fingerprint(&reference).into_keys().collect::<Vec<_>>(),
+    );
+}
+
 #[test]
 fn empty_ring_with_zero_watermark_polls_incremental() {
     // A data_version bump with no changelog rows and no watermark (the ring was

@@ -29,7 +29,9 @@ plugins under `contrib/` write tags and art here out-of-band.
   rows. Triggers bump the owning track's `content_version`/`updated_at` on any
   `tags`/`track_art` edit; `CHECK` constraints enforce the contract invariants
   below at commit time. A bounded, self-pruning `track_changes` ring (capacity
-  8192, `CHANGELOG_CAP`) fed by triggers on `tracks` gives O(changed) refresh —
+  8192, `CHANGELOG_CAP`; its `track_id` pinned to an integer from v4, and a row
+  without one read by the refresh as a gap rather than an error) fed by
+  triggers on `tracks` gives O(changed) refresh —
   every metadata edit funnels through an `UPDATE` on the tracks row, relying on
   SQLite's nested trigger activation (on by default). Freshness-superset
   triggers make `content_version` cover every DB-knowable input to synthesized

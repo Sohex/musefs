@@ -774,6 +774,25 @@ DROP TABLE track_art_hold_v4;
 DROP TABLE structural_blocks_hold_v4;
 DROP TABLE art_hold_v4;
 
+-- The changelog ring is the one internal table whose payload never gained a
+-- storage class: V1's `track_id INTEGER NOT NULL` accepts text, a real or a
+-- blob, and the refresh reads the column straight into an i64 (#760). It is
+-- recreated rather than migrated, because nothing in it is worth keeping: it is
+-- derived state, this step is gated so no mount holds a watermark into it, and
+-- a mount takes its watermark from whatever is there when it opens. Here, after
+-- every refill and before the changelog triggers come back, nothing inserts
+-- into it while it is gone. `track_changes_prune` is on the table, so it goes
+-- with it and comes back with it; `seq` restarts at 1, which nothing depends on.
+DROP TABLE track_changes;
+CREATE TABLE track_changes (
+    seq      INTEGER PRIMARY KEY AUTOINCREMENT,
+    track_id INTEGER NOT NULL,
+    CHECK (typeof(track_id) = 'integer')
+);
+CREATE TRIGGER track_changes_prune AFTER INSERT ON track_changes BEGIN
+    DELETE FROM track_changes WHERE seq <= NEW.seq - 8192;
+END;
+
 -- 6. Recreate the indexes and the thirteen triggers the drops took with them,
 -- plus what the new shapes add. Verbatim except where noted: `tracks_geometry_au`
 -- gains `backing_ino`, `tracks_changelog_au` logs the old id too, the two `_au`
@@ -974,7 +993,8 @@ END;
 ";
 
 /// Ring capacity of the `track_changes` changelog. Must match the literal in
-/// MIGRATION_V1 (guarded by `changelog_cap_constant_matches_migration_sql`).
+/// MIGRATION_V4, which recreates the ring (guarded by
+/// `changelog_cap_constant_matches_migration_sql`).
 #[allow(dead_code)]
 pub const CHANGELOG_CAP: i64 = 8192;
 
@@ -3195,10 +3215,11 @@ mod baseline_tests {
         );
     }
 
-    /// The SQL literal and the exported constant must not drift.
+    /// The SQL literal and the exported constant must not drift. V4 recreates
+    /// the ring and its prune trigger (#760), so the live literal is V4's.
     #[test]
     fn changelog_cap_constant_matches_migration_sql() {
-        assert!(super::MIGRATION_V1.contains(&format!("NEW.seq - {}", super::CHANGELOG_CAP)));
+        assert!(super::MIGRATION_V4.contains(&format!("NEW.seq - {}", super::CHANGELOG_CAP)));
     }
 
     /// The caps a later migration has since widened live in V1/V2 as *frozen
@@ -4828,5 +4849,82 @@ mod structural_blocks_immutability_tests {
             (a + 1, b + 1),
             "a reparent bumps both owners"
         );
+    }
+}
+
+/// `track_changes` is recreated by V4 with its storage class pinned (#760).
+#[cfg(test)]
+mod v4_changelog_ring_tests {
+    use rusqlite::Connection;
+
+    /// A V3 store whose ring holds a real change and a row the V1 definition
+    /// accepted but the refresh cannot read.
+    fn migrated_from_a_v3_ring() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        for (target, migration) in (1i64..).zip(super::MIGRATIONS).take(3) {
+            conn.execute_batch(migration.sql).unwrap();
+            conn.pragma_update(None, "user_version", target).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime_ns, backing_ctime_ns, updated_at) \
+             VALUES ('/lib/a.flac', 'flac', 0, 0, 0, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO track_changes (track_id) VALUES ('not an id')",
+            [],
+        )
+        .unwrap();
+        super::migrate_all(&mut conn).unwrap();
+        conn
+    }
+
+    fn ring(conn: &Connection) -> (i64, i64, i64) {
+        conn.query_row(
+            "SELECT COUNT(*), COALESCE(MIN(seq), 0), COALESCE(MAX(seq), 0) FROM track_changes",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    /// Nothing is carried over: the ring is disposable, and the migration is
+    /// gated, so no mount holds a watermark into it.
+    #[test]
+    fn the_ring_starts_empty_and_refuses_a_non_integer_id() {
+        let conn = migrated_from_a_v3_ring();
+        assert_eq!(ring(&conn), (0, 0, 0));
+        // Non-integral on purpose: INTEGER affinity stores an exactly-integral
+        // REAL, or an integer-looking TEXT, as the integer it spells.
+        for bad in ["'not an id'", "1.5", "X'01'"] {
+            assert!(
+                conn.execute(
+                    &format!("INSERT INTO track_changes (track_id) VALUES ({bad})"),
+                    [],
+                )
+                .is_err(),
+                "track_id {bad} must be refused"
+            );
+        }
+    }
+
+    /// The prune trigger goes with the table and has to come back with it.
+    #[test]
+    fn the_recreated_ring_still_logs_and_prunes() {
+        let conn = migrated_from_a_v3_ring();
+        for i in 0..(super::CHANGELOG_CAP + 10) {
+            conn.execute("UPDATE tracks SET backing_mtime_ns = ?1 WHERE id = 1", [i])
+                .unwrap();
+        }
+        let (rows, min_seq, max_seq) = ring(&conn);
+        assert_eq!(
+            rows,
+            super::CHANGELOG_CAP,
+            "ring must hold exactly CAP rows"
+        );
+        assert_eq!(min_seq, max_seq - super::CHANGELOG_CAP + 1, "contiguous");
     }
 }

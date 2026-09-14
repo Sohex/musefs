@@ -213,6 +213,13 @@ pub struct ChangelogRead {
     pub changed_ids: Vec<i64>,
     pub min_seq: i64,
     pub max_seq: i64,
+    /// A row past `last_seq` whose `track_id` is not an integer (#760). V4's
+    /// `CHECK` refuses one, so only a store written with its constraints off
+    /// holds it. It names no track the caller can act on, so it is left out of
+    /// `changed_ids` rather than failing the read, and the caller treats the
+    /// window as a gap: an error would advance no watermark, and every later
+    /// read would meet the same row.
+    pub malformed: bool,
 }
 
 impl<M> Db<M> {
@@ -355,16 +362,24 @@ impl<M> Db<M> {
         )?;
         let changed_ids = {
             let mut stmt = tx.prepare(
-                "SELECT DISTINCT track_id FROM track_changes WHERE seq > ?1 ORDER BY track_id",
+                "SELECT DISTINCT track_id FROM track_changes \
+                 WHERE seq > ?1 AND typeof(track_id) = 'integer' ORDER BY track_id",
             )?;
             stmt.query_map([last_seq], |r| r.get(0))?
                 .collect::<rusqlite::Result<Vec<i64>>>()?
         };
+        let malformed: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM track_changes \
+             WHERE seq > ?1 AND typeof(track_id) <> 'integer')",
+            [last_seq],
+            |r| r.get(0),
+        )?;
         tx.commit()?;
         Ok(ChangelogRead {
             changed_ids,
             min_seq,
             max_seq,
+            malformed,
         })
     }
 

@@ -779,6 +779,25 @@ DROP TABLE track_art_hold_v4;
 DROP TABLE structural_blocks_hold_v4;
 DROP TABLE art_hold_v4;
 
+-- The changelog ring is the one internal table whose payload never gained a
+-- storage class: V1's `track_id INTEGER NOT NULL` accepts text, a real or a
+-- blob, and the refresh reads the column straight into an i64 (#760). It is
+-- recreated rather than migrated, because nothing in it is worth keeping: it is
+-- derived state, this step is gated so no mount holds a watermark into it, and
+-- a mount takes its watermark from whatever is there when it opens. Here, after
+-- every refill and before the changelog triggers come back, nothing inserts
+-- into it while it is gone. `track_changes_prune` is on the table, so it goes
+-- with it and comes back with it; `seq` restarts at 1, which nothing depends on.
+DROP TABLE track_changes;
+CREATE TABLE track_changes (
+    seq      INTEGER PRIMARY KEY AUTOINCREMENT,
+    track_id INTEGER NOT NULL,
+    CHECK (typeof(track_id) = 'integer')
+);
+CREATE TRIGGER track_changes_prune AFTER INSERT ON track_changes BEGIN
+    DELETE FROM track_changes WHERE seq <= NEW.seq - 8192;
+END;
+
 -- 6. Recreate the indexes and the thirteen triggers the drops took with them,
 -- plus what the new shapes add. Verbatim except where noted: `tracks_geometry_au`
 -- gains `backing_ino`, `tracks_changelog_au` logs the old id too, the two `_au`

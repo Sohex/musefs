@@ -218,6 +218,44 @@ fn changelog_since_empty_table_reports_zero_bounds() {
     let log = db.changelog_since(0).unwrap();
     assert!(log.changed_ids.is_empty());
     assert_eq!((log.min_seq, log.max_seq), (0, 0));
+    assert!(!log.malformed);
+}
+
+/// A row whose `track_id` is not an integer, in a store written with its
+/// constraints off (#760). The read must not fail on it: an error advances no
+/// watermark, so the refresh would hit the same row on every poll. It is
+/// skipped and reported instead, and only while it is past the watermark.
+#[test]
+fn changelog_since_skips_a_malformed_row_and_reports_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.db");
+    let db = Db::open(&path).unwrap();
+    let id = db.upsert_track(&new_track("/a.flac")).unwrap();
+
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.pragma_update(None, "ignore_check_constraints", true)
+        .unwrap();
+    for bad in ["'not an id'", "1.5", "X'01'"] {
+        raw.execute(
+            &format!("INSERT INTO track_changes (track_id) VALUES ({bad})"),
+            [],
+        )
+        .unwrap();
+    }
+
+    let log = db.changelog_since(0).unwrap();
+    assert_eq!(
+        log.changed_ids,
+        vec![id],
+        "only the readable id is returned"
+    );
+    assert!(log.malformed, "the unreadable rows are reported");
+
+    let later = db.changelog_since(log.max_seq).unwrap();
+    assert!(
+        !later.malformed,
+        "a malformed row behind the watermark is none of the caller's business"
+    );
 }
 
 #[test]
