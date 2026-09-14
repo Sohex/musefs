@@ -887,7 +887,9 @@ see the [Release notes](release-notes.md).
   ([#678](https://github.com/Sohex/musefs/issues/678)). The sequence is now raised
   to the highest integer id that ring holds, including when every track was
   deleted. The identity check ignores `sqlite_%` tables, so a migrated store
-  still compares equal to a fresh one.
+  still compares equal to a fresh one. A ring row naming id 9223372036854775807,
+  which the old ring accepted, is skipped rather than seeding the sequence at its
+  maximum, where the upgraded store could not have added another track.
 
 - **A rewrite that changes only a file's ctime invalidates its synthesized
   file.** `tracks_geometry_au` bumped `content_version` on a change of format,

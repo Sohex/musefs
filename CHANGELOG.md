@@ -483,7 +483,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the id sequence to the highest id still standing, so a track deleted from the
   top of the range before `musefs migrate` could have its id handed out again,
   while the changelog still named it for the old track
-  ([#678](https://github.com/Sohex/musefs/issues/678)).
+  ([#678](https://github.com/Sohex/musefs/issues/678)). A changelog row naming id
+  9223372036854775807, which the old ring accepted, is skipped rather than
+  seeding the sequence at its maximum, where the upgraded store could not have
+  added another track.
 
 - **A rewrite that changes only a file's ctime invalidates its synthesized
   file**, unless a fingerprint or content hash written with the new stamp proves
