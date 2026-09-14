@@ -248,6 +248,36 @@ pub(crate) fn key_to_mp4(key: &str) -> Option<Mp4Slot> {
     VOCAB.iter().find(|e| e.key == k).map(|e| e.mp4)
 }
 
+/// QuickTime keyed-metadata (`mdta` handler) key names that fold onto a
+/// canonical key when scanned: Apple's well-known `com.apple.quicktime.*` keys
+/// that have a canonical equivalent, and the generic ffmpeg metadata names that
+/// ffmpeg's `-movflags use_metadata_tags` writes verbatim as keys where they
+/// differ from the canonical spelling (an ffmpeg name that already is canonical,
+/// such as `artist`, needs no entry). Scan-only: synthesis never emits keyed
+/// metadata, so there is no reverse lookup.
+const MP4_KEYED: &[(&str, &str)] = &[
+    ("com.apple.quicktime.title", "title"),
+    ("com.apple.quicktime.artist", "artist"),
+    ("com.apple.quicktime.album", "album"),
+    ("com.apple.quicktime.genre", "genre"),
+    ("com.apple.quicktime.comment", "comment"),
+    ("com.apple.quicktime.copyright", "copyright"),
+    ("com.apple.quicktime.year", "date"),
+    ("album_artist", "albumartist"),
+    ("track", "tracknumber"),
+    ("disc", "discnumber"),
+];
+
+/// The keyed-metadata key whose value is cover art (JPEG/PNG), not text.
+pub(crate) const MP4_KEYED_ARTWORK: &str = "com.apple.quicktime.artwork";
+
+/// QuickTime keyed-metadata key name -> canonical key (case-insensitive).
+pub(crate) fn mp4_keyed_to_key(name: &str) -> Option<&'static str> {
+    MP4_KEYED
+        .iter()
+        .find_map(|(n, key)| n.eq_ignore_ascii_case(name).then_some(*key))
+}
+
 /// Vorbis field name -> canonical key (case-insensitive).
 pub(crate) fn vorbis_to_key(field: &str) -> Option<&'static str> {
     VOCAB
@@ -339,6 +369,26 @@ mod tests {
             mp4_freeform_to_key("com.apple.itunes", "MusicBrainz Album Id"),
             Some("musicbrainz_albumid")
         );
+    }
+
+    #[test]
+    fn mp4_keyed_names_fold_onto_vocabulary_keys() {
+        // Every mapping targets a real canonical key, or the folded tag would
+        // be an orphan no format re-emits natively.
+        for (name, key) in MP4_KEYED {
+            assert!(
+                VOCAB.iter().any(|e| e.key == *key),
+                "{name} maps to non-vocabulary key {key}"
+            );
+            assert_eq!(mp4_keyed_to_key(name), Some(*key));
+        }
+        assert_eq!(
+            mp4_keyed_to_key("COM.APPLE.QUICKTIME.Artist"),
+            Some("artist")
+        );
+        assert_eq!(mp4_keyed_to_key("Album_Artist"), Some("albumartist"));
+        assert_eq!(mp4_keyed_to_key("com.apple.quicktime.author"), None);
+        assert_eq!(mp4_keyed_to_key(MP4_KEYED_ARTWORK), None);
     }
 
     #[test]
