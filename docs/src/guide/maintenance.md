@@ -206,17 +206,23 @@ write is exactly the kind of thing that should not happen without being asked.
 
 `--repair` deletes after the snapshot is taken, so the rows are still in the copy
 you can go back to — which is why it refuses to run alongside `--no-snapshot`.
-The count is what will actually go: a child whose parent does not survive is
-reported with it, rather than left to the cascade to take silently.
+The deletes are part of the upgrade itself, in the same transaction: if the
+upgrade then fails, on a full disk for instance, they are undone with it and the
+store is left exactly as it was. The count is what will actually go: a child
+whose parent does not survive is reported with it, rather than left to the
+cascade to take silently.
 
 **Art filed under a digest that is not lowercase hex.** From 2.0.0 an `art` row's
 `sha256` must be 64 lowercase hexadecimal characters
 ([#761](https://github.com/Sohex/musefs/issues/761)). musefs and the `contrib`
 plugins have always written that form, so a row that fails this was written by
-another tool. `--repair` **deletes such a row and every picture link to it**, so
-each track that used it loses that picture; the rows survive only in the
-snapshot. `migrate` does not lowercase the digest for you, because a correctly
-filed row for the same image may already exist, and two rows cannot share one.
+another tool. `--repair` **deletes such a row**. Where a correctly filed row
+already holds the same bytes, each picture link to it moves onto that row, so
+the track keeps the picture; `migrate` reports those links as relinked rather
+than refused. Where none does, the links are deleted with the row and each track
+that used it loses that picture, which then survives only in the snapshot.
+`migrate` does not lowercase the digest for you, because a correctly filed row
+for the same image may already exist, and two rows cannot share one.
 
 Fixing the row by hand first is possible but not a one-statement edit. Art rows
 cannot be changed once written, before 2.0.0 as well, so you insert a correctly
@@ -226,6 +232,17 @@ not hex at all has to be recomputed from the image outside SQLite, which has no
 SHA-256 function. And because the store you are fixing still keeps the MIME type
 and dimensions on the `art` row, a link you move onto an existing row takes that
 row's values; a `revalidate` restores them for pictures the file embeds itself.
+
+**One path stored twice.** Before 2.0.0 a track's path was text, and a tool that
+bound it as bytes could add a second row for a file musefs already had: SQLite
+never compares the two spellings equal, so nothing refused it. 2.0.0 stores
+every path as bytes, which makes the two one path, and only one row can keep it.
+`migrate` reports each such pair with both track ids. `--repair` keeps the row
+that carries tags or picture links and deletes the other; when neither carries
+any, nothing is lost either way, and it keeps the older one. When both do, it
+cannot know which you want, so it refuses and deletes nothing: delete the row
+you do not want yourself (deleting a track takes its tags and links with it),
+then run `migrate` again.
 
 The check also catches a row that is fine in itself but points at a parent that
 is not there — the kind an external tool can leave behind with foreign keys

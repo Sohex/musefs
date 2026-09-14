@@ -74,6 +74,22 @@ pub(crate) fn query_in_chunks<T: rusqlite::ToSql>(
     Ok(())
 }
 
+/// Install [`limits::MAX_ROW_BYTES`] as `conn`'s `SQLITE_LIMIT_LENGTH`, the most
+/// SQLite will build or load as one string, blob or row. A hostile value past it
+/// is refused with `SQLITE_TOOBIG` as its row is stepped, rather than loaded;
+/// the constant says why the reader guards alone cannot bound that.
+///
+/// Every connection that serves reads carries it. The one that does not is a
+/// [`PendingMigration`]'s until the upgrade has run: the pre-V4 schema bounds no
+/// row — `backing_path` has no cap, and its text caps stop counting at a NUL —
+/// so a legacy row can be wider than any conforming one, and the pre-flight has
+/// to report such a row rather than fail on it.
+pub(crate) fn bound_lengths(conn: &Connection) -> Result<()> {
+    let max = i32::try_from(limits::MAX_ROW_BYTES).expect("the row cap fits SQLite's limit");
+    conn.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH, max)?;
+    Ok(())
+}
+
 /// Page-cache cap for [`Db::open_readonly`] connections, in KiB (negative
 /// `PRAGMA cache_size` form). See the comment at the pragma site.
 const READ_CONN_CACHE_KIB: i64 = 512;
@@ -93,6 +109,20 @@ pub fn sqlite_memory_used() -> u64 {
     let used = unsafe { rusqlite::ffi::sqlite3_memory_used() };
     // Never negative in practice; clamp rather than wrap if SQLite misbehaves.
     u64::try_from(used.max(0)).expect("non-negative i64 fits u64")
+}
+
+/// TEST ONLY (`test-support`). The most SQLite has held through its C allocator
+/// at once (`sqlite3_memory_highwater`), after resetting the mark to current
+/// usage when `reset` is set. Process-wide like [`sqlite_memory_used`], so only
+/// a test binary that runs nothing beside it can read it meaningfully.
+#[cfg(any(test, feature = "test-support"))]
+pub fn sqlite_memory_highwater_for_test(reset: bool) -> u64 {
+    #[expect(
+        unsafe_code,
+        reason = "sqlite3_memory_highwater FFI; rusqlite has no safe wrapper"
+    )]
+    let high = unsafe { rusqlite::ffi::sqlite3_memory_highwater(i32::from(reset)) };
+    u64::try_from(high.max(0)).expect("non-negative i64 fits u64")
 }
 
 /// Type-state markers for [`Db`]: the connection's write capability, at the
@@ -150,9 +180,13 @@ impl Db<ReadWrite> {
     /// (e.g. a beets-plugin sync) don't block each other; the busy timeout lets
     /// brief lock contention retry instead of failing immediately with
     /// SQLITE_BUSY. A gated migration is refused rather than applied here; the
-    /// only door that applies one is [`crate::PendingMigration`].
+    /// only door that applies one is [`crate::PendingMigration`]. The length limit
+    /// ([`bound_lengths`]) comes first, so no statement runs without it: the only
+    /// migrations an open applies run on a store being created, or on one
+    /// already past the gate, whose rows V4's constraints bound.
     fn configure(conn: &mut Connection, wal: bool) -> Result<()> {
         conn.busy_timeout(Duration::from_secs(5))?;
+        bound_lengths(conn)?;
         conn.pragma_update(None, "foreign_keys", true)?;
         if wal {
             // journal_mode returns the resulting mode; query_row consumes it
@@ -190,6 +224,7 @@ impl Db<ReadOnly> {
         // No configure()/migrate and no foreign_keys pragma: the schema already
         // exists and no writes are possible on a read-only connection.
         conn.busy_timeout(Duration::from_secs(5))?;
+        bound_lengths(&conn)?;
         // Cap this connection's page cache well below SQLite's ~2 MiB default.
         // The serve path opens one of these per worker thread (up to 2×CPUs),
         // so the default multiplies into hundreds of MB of process RSS on a
@@ -336,6 +371,86 @@ mod tests {
             used > 4096,
             "a live migrated connection must hold more than a page, got {used}"
         );
+    }
+
+    /// Every connection the crate opens carries the length limit, which is what
+    /// bounds what `sqlite3_step` materializes from a hostile row.
+    #[test]
+    fn every_open_carries_the_length_limit() {
+        fn limit<M>(db: &Db<M>) -> i64 {
+            i64::from(
+                db.conn
+                    .limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH)
+                    .unwrap(),
+            )
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("l.db");
+        let want = crate::limits::MAX_ROW_BYTES;
+        assert_eq!(limit(&Db::open(&path).unwrap()), want, "open");
+        assert_eq!(
+            limit(&Db::open_in_memory().unwrap()),
+            want,
+            "open_in_memory"
+        );
+        assert_eq!(
+            limit(&Db::open_readonly(&path).unwrap()),
+            want,
+            "open_readonly"
+        );
+    }
+
+    /// The backstop itself. A value one byte past the limit is refused by SQLite
+    /// as the row is stepped, before any guard of ours runs and before the value
+    /// is loaded; without it the tag reader loaded all of it to find it too big.
+    #[test]
+    fn a_value_past_the_length_limit_is_refused_as_too_big() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.db");
+        let db = Db::open(&path).unwrap();
+        let track = db
+            .upsert_track(&crate::NewTrack {
+                backing_path: std::path::PathBuf::from("/a.flac"),
+                format: crate::Format::Flac,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
+                backing_ino: None,
+            })
+            .unwrap();
+        let over = crate::limits::MAX_ROW_BYTES + 1;
+        {
+            // A connection of its own, which carries no limit and ignores the
+            // constraints: how a hostile writer leaves such a row.
+            let raw = rusqlite::Connection::open(&path).unwrap();
+            raw.pragma_update(None, "ignore_check_constraints", true)
+                .unwrap();
+            raw.execute(
+                "INSERT INTO tags (track_id, key, value, ordinal) \
+                 VALUES (?1, 'k', CAST(zeroblob(?2) AS TEXT), 0)",
+                rusqlite::params![track, over],
+            )
+            .unwrap();
+            raw.execute(
+                "INSERT INTO art (sha256, byte_len, data) VALUES (?1, 1, zeroblob(?2))",
+                rusqlite::params!["d".repeat(64), over],
+            )
+            .unwrap();
+        }
+        let too_big = |what: &str, err: crate::DbError| {
+            assert!(
+                matches!(
+                    &err,
+                    crate::DbError::Sqlite(rusqlite::Error::SqliteFailure(e, _))
+                        if e.code == rusqlite::ErrorCode::TooBig
+                ),
+                "{what}: {err:?}"
+            );
+        };
+        too_big("get_tags", db.get_tags(track).unwrap_err());
+        too_big("get_art", db.get_art(1).unwrap_err());
     }
 
     #[test]

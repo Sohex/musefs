@@ -60,6 +60,25 @@ pub enum DbError {
         /// thing. Mirrors `musefs_core::CoreError::TrackFieldTooLarge`.
         unit: &'static str,
     },
+    /// A value of the wrong storage class, which only a store written with its
+    /// constraints off can hold: V4 pins every column's class with a `CHECK`.
+    /// Refused from `typeof()`, so the value is never loaded to find out.
+    #[error("{table}.{field} is not a {expected} (crafted or corrupt DB)")]
+    WrongStorageClass {
+        table: &'static str,
+        field: &'static str,
+        expected: &'static str,
+    },
+    /// Two `tracks` rows name one backing path, once as text and once as bytes,
+    /// and both carry tags or art links. The 2.0.0 upgrade gives a path one row,
+    /// and keeping either would drop what the other carries, so the repair
+    /// leaves the choice to the user rather than guess.
+    #[error(
+        "tracks {first} and {second} name the same backing path, once as text and once as \
+         bytes, and both carry tags or art links; the repair will not choose between them. \
+         Delete the one you do not want, then migrate again"
+    )]
+    AmbiguousDuplicatePath { first: i64, second: i64 },
     #[error("structural block for track {track_id} is invalid: {detail} (crafted or corrupt DB)")]
     InvalidStructuralBlock { track_id: i64, detail: String },
     /// An `art` row is filed under a `sha256` its own bytes do not hash to, so
