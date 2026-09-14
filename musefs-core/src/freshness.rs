@@ -4,8 +4,8 @@
 //! nanosecond mtime + ctime (#276) so a same-size in-place rewrite — including
 //! an adversarial one that resets mtime — cannot evade the guard, and then with
 //! the inode (#674) for backing filesystems with coarse timestamps, where those
-//! three can agree across a replacement — wherever the filesystem keeps an inode
-//! number to record (#757).
+//! three can agree across a replacement — wherever the filesystem's inode
+//! numbers survive a remount (#757).
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
@@ -25,14 +25,14 @@ const NANOS_PER_SEC: i64 = 1_000_000_000;
 /// tagger writes a temporary file and renames over the original, which is what
 /// almost every tagger does.
 ///
-/// It is recorded only where the filesystem keeps one (#757). FAT and exFAT
-/// store no inode numbers: Linux hands one out each time a file enters the inode
-/// cache, so an untouched file reports a different number after a remount, or
-/// after eviction. Recording it there would fail every serve after a replug, so
-/// `BackingStamp::recordable` drops it, and on those filesystems the stamp is
-/// effectively size plus a coarse mtime — two-second steps on FAT, 10 ms on
-/// exFAT, and both report ctime as mtime. That is why neither is recommended as
-/// backing storage.
+/// It is recorded only where the filesystem's inode numbers are known to survive
+/// a remount (#757; see `keeps_inodes`). FAT and exFAT number a file each time
+/// it enters the inode cache, and SMB, FUSE and overlayfs mounts can renumber on
+/// a remount. Recording such a number would fail every serve of an untouched file
+/// after one, so `BackingStamp::recordable` drops it. There the stamp is size,
+/// mtime and ctime — on FAT and exFAT effectively size plus a coarse mtime,
+/// two-second steps on FAT and 10 ms on exFAT, both reporting ctime as mtime,
+/// which is why neither is recommended as backing storage.
 ///
 /// The device number is absent on purpose (#757). An inode is unique only within
 /// one filesystem, so a different filesystem appearing at the backing path — a
@@ -169,27 +169,65 @@ impl BackingStamp {
     }
 }
 
-/// `f_type` values from `linux/magic.h` for the filesystems that keep no inode
-/// numbers (#757).
+/// `f_type` values of the Linux filesystems whose inode numbers survive a
+/// remount (#757), from `linux/magic.h` unless another source is named.
 #[cfg(target_os = "linux")]
-const MSDOS_SUPER_MAGIC: u64 = 0x4d44;
-#[cfg(target_os = "linux")]
-const EXFAT_SUPER_MAGIC: u64 = 0x2011_BAB0;
+const PERSISTENT_INODE_FILESYSTEMS: [u64; 18] = [
+    0xEF53,      // EXT4_SUPER_MAGIC, which ext2 and ext3 share
+    0x9123_683E, // BTRFS_SUPER_MAGIC
+    0x5846_5342, // XFS_SUPER_MAGIC
+    0x2FC1_2FC1, // ZFS_SUPER_MAGIC (OpenZFS, include/sys/fs/zfs.h)
+    0xF2F5_2010, // F2FS_SUPER_MAGIC
+    0xCA45_1A4E, // BCACHEFS_SUPER_MAGIC
+    0x3153_464A, // JFS_SUPER_MAGIC (fs/jfs/jfs_superblock.h)
+    0x5265_4973, // REISERFS_SUPER_MAGIC
+    0x7366_746E, // ntfs3's s_magic (fs/ntfs3/super.c)
+    0x5346_544E, // NTFS_SB_MAGIC, the older ntfs driver
+    0x482B,      // HFSPLUS_SUPER_MAGIC (fs/hfsplus/hfsplus_raw.h)
+    0x0102_1994, // TMPFS_MAGIC
+    0x7371_7368, // SQUASHFS_MAGIC
+    0xE0F5_E1E2, // EROFS_SUPER_MAGIC_V1
+    0x9660,      // ISOFS_SUPER_MAGIC
+    0x1501_3346, // UDF_SUPER_MAGIC
+    0x6969,      // NFS_SUPER_MAGIC
+    0x00C3_6400, // CEPH_SUPER_MAGIC
+];
 
-/// Whether the filesystem holding `file` keeps inode numbers, and so whether a
-/// stamp recorded for it may carry one (#757).
+/// The type names, as macOS and FreeBSD report them in `f_fstypename`, of the
+/// filesystems whose inode numbers survive a remount (#757): APFS and HFS+
+/// (`hfs`) on macOS; UFS, ext2fs and tmpfs on FreeBSD; ZFS and NFS on either.
+/// Their SMB clients (`smbfs`), FUSE (`macfuse`, `osxfuse`, `fusefs.*`) and FAT
+/// and exFAT drivers (`msdos`, `msdosfs`, `exfat`) are left off for the reasons
+/// [`keeps_inodes`] gives.
+#[cfg(any(test, target_os = "macos", target_os = "freebsd"))]
+const PERSISTENT_INODE_FILESYSTEM_NAMES: [&[u8]; 7] =
+    [b"apfs", b"hfs", b"ufs", b"ext2fs", b"tmpfs", b"zfs", b"nfs"];
+
+/// Whether the filesystem holding `file` keeps its inode numbers across a
+/// remount, and so whether a stamp recorded for it may carry one (#757).
 ///
-/// FAT and exFAT do not. Both Linux drivers assign a number with `iunique()`
-/// each time a file enters the inode cache, so an untouched file reports a
-/// different one after a remount, and within a mount after eviction. Recording
-/// it would fail the stamp of a file that never changed.
+/// An allowlist, because a filesystem that renumbers files is worse than one
+/// with no numbers at all. A recorded number that changes after a remount fails
+/// every serve of an untouched file with `BackingChanged` until a revalidate
+/// rewrites the row — and again after the next remount. FAT and exFAT number a
+/// file with `iunique()` each time it enters the inode cache. libfuse without
+/// `use_ino` (sshfs's default, `exfat-fuse`, many `rclone` and `s3fs` mounts)
+/// reports node ids it hands out again after a remount, and even after the
+/// kernel forgets a node. CIFS mounted `noserverino`, which the kernel also
+/// falls back to on its own, uses `iunique()` numbers, and so does vboxsf;
+/// overlayfs's depend on `xino`. `statfs` cannot see `serverino`, `use_ino` or
+/// `xino`, so SMB, FUSE and overlayfs are left off rather than guessed at.
 ///
-/// A question `fstatfs` cannot answer is answered yes. That records the inode,
-/// as the stamp always did, so a failed query keeps the stronger stamp rather
-/// than quietly weakening it.
+/// An absent inode costs far less: detection of a same-size replacement inside
+/// the timestamp granularity window, the one case the inode exists for. So a
+/// filesystem the list does not name, or one `statfs` cannot answer for,
+/// records none. That is the opposite of the choice made while FAT and exFAT
+/// were the only filesystems known to renumber, which kept the stronger stamp
+/// for an unknown filesystem and so took a remounted FUSE library dark.
 ///
-/// Off Linux nothing is asked and the answer is always yes: `f_type` holds a
-/// Linux magic number only on Linux, so elsewhere no value in it could name FAT.
+/// Off Linux the filesystem's type name decides, against the same kind of list,
+/// on macOS and FreeBSD (`f_fstypename`); anywhere else nothing names the
+/// filesystem, and the answer is no.
 pub(crate) fn keeps_inodes(file: &std::fs::File) -> bool {
     #[cfg(test)]
     if NO_INODES.with(std::cell::Cell::get) {
@@ -199,10 +237,14 @@ pub(crate) fn keeps_inodes(file: &std::fs::File) -> bool {
     {
         f_type_keeps_inodes(fs_type(rustix::fs::fstatfs(file)))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    {
+        fs_name(rustix::fs::fstatfs(file)).is_some_and(|name| fs_name_keeps_inodes(&name))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
     {
         let _ = file;
-        true
+        false
     }
 }
 
@@ -217,10 +259,14 @@ pub(crate) fn keeps_inodes_at(path: &Path) -> bool {
     {
         f_type_keeps_inodes(fs_type(rustix::fs::statfs(path)))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    {
+        fs_name(rustix::fs::statfs(path)).is_some_and(|name| fs_name_keeps_inodes(&name))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
     {
         let _ = path;
-        true
+        false
     }
 }
 
@@ -230,11 +276,131 @@ fn fs_type(stat: rustix::io::Result<rustix::fs::StatFs>) -> Option<u64> {
     stat.ok().and_then(|s| u64::try_from(s.f_type).ok())
 }
 
-/// The decision itself, on a bare `f_type`, so it is testable without a FAT
-/// mount. An unknown type keeps inodes, for the reason [`keeps_inodes`] gives.
+/// The filesystem type name a BSD-family `statfs` reported (`f_fstypename`, up
+/// to its NUL), or `None` when it could not say.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn fs_name(stat: rustix::io::Result<rustix::fs::StatFs>) -> Option<Vec<u8>> {
+    let stat = stat.ok()?;
+    Some(
+        stat.f_fstypename
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c.to_ne_bytes()[0])
+            .collect(),
+    )
+}
+
+/// The off-Linux decision, on a bare filesystem type name, so it is testable on
+/// any platform. A name the list does not hold records no inode.
+#[cfg(any(test, target_os = "macos", target_os = "freebsd"))]
+fn fs_name_keeps_inodes(name: &[u8]) -> bool {
+    PERSISTENT_INODE_FILESYSTEM_NAMES.contains(&name)
+}
+
+/// The decision itself, on a bare `f_type`, so it is testable without mounting
+/// each filesystem. An unrecognised type, or none at all, records no inode, for
+/// the reason [`keeps_inodes`] gives.
 #[cfg(target_os = "linux")]
 fn f_type_keeps_inodes(f_type: Option<u64>) -> bool {
-    !matches!(f_type, Some(MSDOS_SUPER_MAGIC | EXFAT_SUPER_MAGIC))
+    f_type.is_some_and(|t| PERSISTENT_INODE_FILESYSTEMS.contains(&t))
+}
+
+/// One pass's answers to [`keeps_inodes`], one per filesystem.
+///
+/// `statfs` is not cached by an NFS or SMB client, so a query per file was a
+/// network round trip per file on exactly the mounts where a scan is slowest.
+/// A pass holds one of these and asks each filesystem once, keyed by the
+/// `st_dev` of the stat its caller has already taken. A device number stays put
+/// for as long as its filesystem is mounted, which outlasts any pass; a
+/// filesystem remounted mid-pass comes back under a new number and is simply
+/// asked again.
+///
+/// The lock is held across the query, so probe workers that meet a new
+/// filesystem together ask it once between them rather than once each. That
+/// happens once per filesystem per pass, so the lock is never held for long.
+#[derive(Debug, Default)]
+pub(crate) struct InodeKeeping {
+    answers: std::sync::Mutex<std::collections::HashMap<u64, bool>>,
+    #[cfg(test)]
+    queries: std::sync::atomic::AtomicUsize,
+}
+
+impl InodeKeeping {
+    /// [`keeps_inodes`] for `file`, whose metadata `meta` was just read.
+    pub(crate) fn of_file(&self, file: &std::fs::File, meta: &std::fs::Metadata) -> bool {
+        self.answer(meta.dev(), || keeps_inodes(file))
+    }
+
+    /// [`keeps_inodes_at`] for `path`, whose metadata `meta` was just read.
+    pub(crate) fn at_path(&self, path: &Path, meta: &std::fs::Metadata) -> bool {
+        self.answer(meta.dev(), || keeps_inodes_at(path))
+    }
+
+    fn answer(&self, dev: u64, ask: impl FnOnce() -> bool) -> bool {
+        let mut answers = self
+            .answers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(&keeps) = answers.get(&dev) {
+            return keeps;
+        }
+        #[cfg(test)]
+        self.queries
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let keeps = ask();
+        answers.insert(dev, keeps);
+        keeps
+    }
+
+    /// How many filesystem queries this pass has made.
+    #[cfg(test)]
+    pub(crate) fn queries(&self) -> usize {
+        self.queries.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test seam: answer `keeps` for device `dev` without asking. Unlike
+    /// [`pretend_no_inodes`], this reaches every thread holding the pass —
+    /// its probe workers included.
+    #[cfg(test)]
+    pub(crate) fn pretend(&self, dev: u64, keeps: bool) {
+        self.answers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(dev, keeps);
+    }
+}
+
+/// Test support: whether musefs records inode numbers for files under `path`,
+/// decided the way a scan decides it, so a test that depends on the answer can
+/// state what it expects on the filesystem it happens to run on — ext4 on one
+/// machine, overlayfs in a container — rather than assume one.
+///
+/// Panics, naming the path, when the filesystem cannot be asked: a test with no
+/// answer to go on must say so rather than pass on a guess.
+#[cfg(any(test, feature = "test-support"))]
+pub fn filesystem_keeps_inodes_for_test(path: &Path) -> bool {
+    let unanswerable = |e: rustix::io::Errno| -> ! {
+        panic!(
+            "cannot statfs {}, so whether its filesystem keeps inode numbers is unknown \
+             and a test depending on it has nothing to go on: {e}",
+            path.display()
+        )
+    };
+    #[cfg(target_os = "linux")]
+    {
+        let stat = rustix::fs::statfs(path).unwrap_or_else(|e| unanswerable(e));
+        f_type_keeps_inodes(fs_type(Ok(stat)))
+    }
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    {
+        let stat = rustix::fs::statfs(path).unwrap_or_else(|e| unanswerable(e));
+        fs_name(Ok(stat)).is_some_and(|name| fs_name_keeps_inodes(&name))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
+    {
+        let _ = (path, unanswerable);
+        false
+    }
 }
 
 #[cfg(test)]
@@ -242,7 +408,8 @@ thread_local! {
     static NO_INODES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Test seam standing in for a FAT or exFAT mount, which the suite cannot make:
+/// Test seam standing in for a filesystem whose inode numbers are not recorded
+/// (FAT, an SMB share, a FUSE mount), which the suite cannot make:
 /// while the returned guard lives, this thread's [`keeps_inodes`] and
 /// [`keeps_inodes_at`] answer no. Thread-local, so it reaches the calling
 /// thread's checks — a direct probe, revalidate's skip pass — and not a scan's
@@ -458,34 +625,110 @@ mod tests {
         assert_ne!(unrecorded, one);
     }
 
-    /// #757's two filesystems by their `linux/magic.h` values, against a spread
-    /// of ones that do keep inode numbers — local, network and FUSE alike.
+    /// The allowlist by `f_type`: the filesystems whose inode numbers survive a
+    /// remount get one recorded, and every other — FAT and exFAT, which number
+    /// files as they enter the inode cache; SMB, FUSE, 9p, vboxsf and overlayfs,
+    /// whose numbers depend on mount options `statfs` cannot see; and anything
+    /// unrecognised — gets none.
     #[cfg(target_os = "linux")]
     #[test]
-    fn fat_and_exfat_are_the_filesystems_that_keep_no_inodes() {
+    fn only_filesystems_with_persistent_inode_numbers_get_one_recorded() {
         let keeps = |f_type: u64| f_type_keeps_inodes(Some(f_type));
-        assert!(!keeps(0x4d44), "FAT");
-        assert!(!keeps(0x2011_BAB0), "exFAT");
         for (name, magic) in [
-            ("ext4", 0xEF53),
+            ("ext2/3/4", 0xEF53),
             ("btrfs", 0x9123_683E),
             ("xfs", 0x5846_5342),
-            ("tmpfs", 0x0102_1994),
+            ("zfs", 0x2FC1_2FC1),
+            ("f2fs", 0xF2F5_2010),
+            ("bcachefs", 0xCA45_1A4E),
+            ("jfs", 0x3153_464A),
+            ("reiserfs", 0x5265_4973),
             ("nfs", 0x6969),
-            ("smb2", 0xFE53_4D42),
-            ("fuse", 0x6573_5546),
+            ("ntfs3", 0x7366_746E),
+            ("ntfs", 0x5346_544E),
+            ("hfsplus", 0x482B),
+            ("tmpfs", 0x0102_1994),
+            ("squashfs", 0x7371_7368),
+            ("erofs", 0xE0F5_E1E2),
+            ("iso9660", 0x9660),
+            ("udf", 0x1501_3346),
+            ("ceph", 0x00C3_6400),
         ] {
-            assert!(keeps(magic), "{name}");
+            assert!(keeps(magic), "{name} keeps its inode numbers");
+        }
+        for (name, magic) in [
+            ("FAT", 0x4D44),
+            ("exFAT", 0x2011_BAB0),
+            ("SMB", 0x517B),
+            ("CIFS", 0xFF53_4D42),
+            ("SMB2", 0xFE53_4D42),
+            ("FUSE", 0x6573_5546),
+            ("overlayfs", 0x794C_7630),
+            ("9p", 0x0102_1997),
+            ("vboxsf", 0x786F_4256),
+            ("procfs", 0x9FA0),
+            ("unrecognised", 0x1234_5678),
+        ] {
+            assert!(!keeps(magic), "{name} gets no inode recorded");
         }
         assert!(
-            f_type_keeps_inodes(None),
-            "a filesystem that cannot say keeps the stronger stamp"
+            !f_type_keeps_inodes(None),
+            "a filesystem that cannot say gets no inode recorded"
         );
     }
 
-    /// The one assertion that pins `fs_type`'s decoding. Every other test sees
-    /// an ordinary filesystem, where any value but FAT's or exFAT's reads the
-    /// same, so a `fs_type` answering the wrong number would pass them all.
+    /// Off Linux the filesystem's name decides, against the same kind of
+    /// allowlist: macOS's and FreeBSD's own disk filesystems and NFS keep their
+    /// numbers, while their SMB clients, FUSE mounts and FAT/exFAT drivers do not
+    /// promise to.
+    #[test]
+    fn off_linux_the_filesystem_name_decides() {
+        for name in ["apfs", "hfs", "ufs", "zfs", "tmpfs", "nfs", "ext2fs"] {
+            assert!(fs_name_keeps_inodes(name.as_bytes()), "{name}");
+        }
+        for name in [
+            "smbfs",
+            "msdos",
+            "msdosfs",
+            "exfat",
+            "macfuse",
+            "osxfuse",
+            "fusefs.sshfs",
+            "apfsx",
+            "",
+        ] {
+            assert!(!fs_name_keeps_inodes(name.as_bytes()), "{name:?}");
+        }
+    }
+
+    /// A pass asks each filesystem once, however many files it meets there.
+    #[test]
+    fn a_pass_asks_each_device_once() {
+        let pass = InodeKeeping::default();
+        let asked = std::cell::Cell::new(0);
+        let ask = |keeps| {
+            asked.set(asked.get() + 1);
+            keeps
+        };
+        assert!(pass.answer(1, || ask(true)));
+        assert!(pass.answer(1, || ask(false)), "the first answer stands");
+        assert!(!pass.answer(2, || ask(false)));
+        assert!(!pass.answer(2, || ask(true)));
+        assert_eq!(asked.get(), 2, "one query per device");
+        assert_eq!(pass.queries(), 2);
+
+        pass.pretend(3, false);
+        assert!(
+            !pass.answer(3, || ask(true)),
+            "a pretended answer is not asked"
+        );
+        assert_eq!(pass.queries(), 2);
+    }
+
+    /// The one assertion that pins `fs_type`'s decoding. Every other test either
+    /// hands `f_type_keeps_inodes` a value directly or derives its expectation
+    /// through `fs_type` itself, so a `fs_type` answering the wrong number would
+    /// pass them all.
     /// `/proc` is procfs on every Linux system and container, so its magic is
     /// a value known in advance.
     #[cfg(target_os = "linux")]
@@ -496,8 +739,8 @@ mod tests {
         assert_eq!(fs_type(rustix::fs::statfs("/proc")), Some(PROC_SUPER_MAGIC));
     }
 
-    /// Answered yes on every platform for an ordinary filesystem: on Linux by
-    /// asking it, and elsewhere without asking at all.
+    /// The descriptor and the path ask the same question and get the answer the
+    /// allowlist gives for the filesystem this test runs on, whichever that is.
     #[test]
     fn a_real_filesystem_is_asked_by_descriptor_and_by_path() {
         let dir = tempfile::tempdir().unwrap();
@@ -508,11 +751,12 @@ mod tests {
             fs_type(rustix::fs::statfs(dir.path())).is_some(),
             "statfs reports a type"
         );
-        assert!(keeps_inodes(&std::fs::File::open(&p).unwrap()));
-        assert!(keeps_inodes_at(&p));
+        let expected = filesystem_keeps_inodes_for_test(dir.path());
+        assert_eq!(keeps_inodes(&std::fs::File::open(&p).unwrap()), expected);
+        assert_eq!(keeps_inodes_at(&p), expected);
         assert!(
-            keeps_inodes_at(&dir.path().join("missing")),
-            "a query that fails keeps the stronger stamp"
+            !keeps_inodes_at(&dir.path().join("missing")),
+            "a query that fails records no inode"
         );
     }
 
@@ -539,6 +783,18 @@ mod tests {
         };
         assert_eq!(live.recordable(true), live);
         assert_eq!(live.recordable(false), BackingStamp { ino: None, ..live });
+    }
+
+    /// The test-support decision gives a real no as well as a real yes. Every
+    /// test that derives its expectation through it runs on whatever the suite's
+    /// tempdir is — often a filesystem that keeps inode numbers — so a helper
+    /// that always answered yes would pass them all while telling a container's
+    /// overlayfs run the wrong thing. `/proc` is procfs on every Linux system and
+    /// container, and procfs is not on the allowlist.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_test_support_decision_answers_no_for_a_filesystem_off_the_allowlist() {
+        assert!(!filesystem_keeps_inodes_for_test(Path::new("/proc")));
     }
 
     /// The failure #757 fixes. FAT hands an untouched file a new inode after a

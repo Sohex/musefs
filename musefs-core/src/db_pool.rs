@@ -46,6 +46,10 @@ use crate::error::{CoreError, Result};
 /// never contended (only its owning thread locks it) but is load-bearing for
 /// the type system: `Db` is `Send + !Sync`, so the mutex wrapper is what keeps
 /// the map values, and therefore `DbPool`, `Send + Sync`.
+///
+/// `#[non_exhaustive]`: other crates build a pool through [`DbPool::new`] and
+/// read through its methods, so a new pooling strategy reaches none of them.
+#[non_exhaustive]
 pub enum DbPool {
     PerThread {
         path: PathBuf,

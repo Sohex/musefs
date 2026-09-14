@@ -314,6 +314,9 @@ impl VirtualTree {
         (files, dir_nodes.saturating_sub(1))
     }
 
+    /// The track a file inode serves. Test scaffolding, behind `test-support`
+    /// (#710).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn track_id(&self, inode: u64) -> Option<i64> {
         match self.nodes.get(&inode).map(|n| &n.kind) {
             Some(NodeKind::File { track_id }) => Some(*track_id),
@@ -583,6 +586,7 @@ impl VirtualTree {
     }
 
     /// Inodes of `dir`'s direct children whose pre-disambiguation name is `rendered`.
+    #[cfg(test)]
     fn children_by_rendered_with_examined(&self, dir: u64, rendered: &str) -> (Vec<u64>, usize) {
         match self
             .rendered_children
@@ -599,7 +603,8 @@ impl VirtualTree {
     }
 
     /// Inodes of `dir`'s direct children whose pre-disambiguation name is `rendered`.
-    pub fn children_by_rendered(&self, dir: u64, rendered: &str) -> Vec<u64> {
+    #[cfg(test)]
+    pub(crate) fn children_by_rendered(&self, dir: u64, rendered: &str) -> Vec<u64> {
         self.children_by_rendered_with_examined(dir, rendered).0
     }
 
@@ -719,20 +724,7 @@ impl VirtualTree {
         new_paths: &std::collections::HashMap<i64, crate::refresh_diff::TrackRenderState>,
         alloc: &mut InodeAllocator,
     ) -> std::result::Result<(), RebuildError> {
-        let mut ids = Vec::new();
-        let mut stack = vec![dir];
-        while let Some(n) = stack.pop() {
-            match self.nodes.get(&n).map(|x| x.kind.clone()) {
-                Some(NodeKind::File { track_id }) => ids.push(track_id),
-                _ => {
-                    if let Some(kids) = self.children.get(&n) {
-                        for &c in kids.values() {
-                            stack.push(c);
-                        }
-                    }
-                }
-            }
-        }
+        let mut ids = self.subtree_track_ids(dir);
         for id in &ids {
             self.remove_track(*id, alloc);
         }
@@ -745,6 +737,23 @@ impl VirtualTree {
             self.insert_file(id, path, alloc);
         }
         Ok(())
+    }
+
+    /// Every track under `dir`, in no particular order.
+    fn subtree_track_ids(&self, dir: u64) -> Vec<i64> {
+        let mut ids = Vec::new();
+        let mut stack = vec![dir];
+        while let Some(n) = stack.pop() {
+            match self.nodes.get(&n).map(|x| &x.kind) {
+                Some(NodeKind::File { track_id }) => ids.push(*track_id),
+                _ => {
+                    if let Some(kids) = self.children.get(&n) {
+                        stack.extend(kids.values().copied());
+                    }
+                }
+            }
+        }
+        ids
     }
 
     /// Apply an incremental change set in place, producing a tree byte-identical to a
@@ -812,19 +821,26 @@ impl VirtualTree {
     /// track id to its rendered path. Returns `Err(RebuildError)` on any inconsistency
     /// (caller falls back to full build). See SP2 Component 3.
     ///
+    /// `reinserted` receives every track the mutation inserted: the added and moved
+    /// ones, and every track under a subtree it rebuilt. Inodes are keyed by path,
+    /// so only those tracks can now hold an inode that served a different track
+    /// before the mutation, and a refresh checks them, not the whole tree, for
+    /// inodes that changed hands (#778).
+    ///
     /// Cost is O(changed) when no rendered names collide (#69): a parent dir is
     /// dirtied — and its subtree rebuilt — only when `collision_gate` says the
     /// change can actually rename a sibling, and the O(subtree) `introducing_id`
     /// walks run only at gated levels. Returns the number of `rebuild_subtree`
     /// calls performed — the tests' observability for the O(changed) contract
     /// (a needless rebuild produces the same tree, so only the count can pin it).
-    pub(crate) fn apply_changes(
+    pub(crate) fn apply_changes_reinserting(
         &mut self,
         new_paths: &std::collections::HashMap<i64, crate::refresh_diff::TrackRenderState>,
         changed: &[i64],
         added: &[i64],
         removed: &[i64],
         alloc: &mut InodeAllocator,
+        reinserted: &mut Vec<i64>,
     ) -> std::result::Result<usize, RebuildError> {
         use std::collections::HashSet;
         let mut dirty: HashSet<u64> = HashSet::new();
@@ -901,6 +917,7 @@ impl VirtualTree {
         // exactly like a fresh build, not by added-before-moved processing order.
         let mut to_insert: Vec<i64> = added.iter().chain(moved_in.iter()).copied().collect();
         to_insert.sort_unstable();
+        reinserted.extend_from_slice(&to_insert);
         for id in to_insert {
             let rendered = new_paths
                 .get(&id)
@@ -929,10 +946,25 @@ impl VirtualTree {
                 continue;
             }
             self.rebuild_subtree(d, new_paths, alloc)?;
+            reinserted.extend(self.subtree_track_ids(d));
             rebuilds += 1;
             done.insert(d);
         }
         Ok(rebuilds)
+    }
+
+    /// [`VirtualTree::apply_changes_reinserting`] without the report, for the tests
+    /// that pin the mutation itself.
+    #[cfg(test)]
+    pub(crate) fn apply_changes(
+        &mut self,
+        new_paths: &std::collections::HashMap<i64, crate::refresh_diff::TrackRenderState>,
+        changed: &[i64],
+        added: &[i64],
+        removed: &[i64],
+        alloc: &mut InodeAllocator,
+    ) -> std::result::Result<usize, RebuildError> {
+        self.apply_changes_reinserting(new_paths, changed, added, removed, alloc, &mut Vec::new())
     }
 
     /// The deepest directory that exists in the current tree along the RENDERED path

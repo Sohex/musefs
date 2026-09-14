@@ -174,8 +174,15 @@ pub struct ReadPacket {
 /// header run never reads a byte of audio. A caller that asks for more than the
 /// data holds gets `Malformed` from the page parse, which the bounded probe reads
 /// as "widen the window".
+///
+/// `end_closes_run` is for data known to end exactly where a header region does
+/// — the stored `[0, audio_offset)` the serve path re-parses — rather than a
+/// window that may simply be short. There, running out of data between pages,
+/// with the last packet complete, returns the packets read so far instead of an
+/// error.
 pub fn read_packets_while(
     data: &[u8],
+    end_closes_run: bool,
     mut more: impl FnMut(&[ReadPacket]) -> Result<bool>,
 ) -> Result<Vec<ReadPacket>> {
     let mut out: Vec<ReadPacket> = Vec::new();
@@ -183,6 +190,9 @@ pub fn read_packets_while(
     let mut pages = 0u32;
     let mut cur: Vec<u8> = Vec::new();
     loop {
+        if end_closes_run && pos == data.len() && cur.is_empty() {
+            return Ok(out);
+        }
         let h = parse_page(data, pos)?;
         pages += 1;
         let table_start = pos + 27;
@@ -217,13 +227,17 @@ pub fn read_packets(data: &[u8], want: usize) -> Result<Vec<ReadPacket>> {
     if want == 0 {
         return Ok(Vec::new());
     }
-    read_packets_while(data, |out| Ok(out.len() < want))
+    read_packets_while(data, false, |out| Ok(out.len() < want))
 }
 
 /// Given the full bytes of one page, return just its header bytes (length
 /// `header_len`) with the sequence number set to `new_seq` and the CRC recomputed
 /// over the patched page. The payload is read (to recompute the CRC) but not
 /// returned — callers splice it verbatim from the backing file.
+///
+/// The oracle the tests hold [`patch_page_header_algebraic`], which the serve
+/// path uses, to: test scaffolding, behind `fuzzing` (#710).
+#[cfg(any(test, feature = "fuzzing"))]
 pub fn patch_page_header(page: &[u8], new_seq: u32) -> Result<Vec<u8>> {
     let h = parse_page(page, 0)?;
     if page.len() < h.total_len() {

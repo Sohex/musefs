@@ -239,24 +239,34 @@ fn scan_revalidate_flag_is_a_usage_error() {
 #[test]
 fn retired_revalidate_env_is_refused() {
     let (_dir, target, db) = library_with_one_flac();
-    let out = musefs()
-        .arg("scan")
-        .arg(&target)
-        .arg("--db")
-        .arg(&db)
-        .env("MUSEFS_REVALIDATE", "true")
-        .output()
-        .unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success(), "stderr: {stderr}");
-    assert!(
-        stderr.contains("MUSEFS_REVALIDATE") && stderr.contains("`revalidate` subcommand"),
-        "the refusal should name the variable and its replacement, stderr: {stderr}"
-    );
-    assert!(
-        !db.exists(),
-        "a refused scan must not have created the store"
-    );
+    // Any non-empty value, `false` and `0` included: the refusal is about the
+    // variable still being set, not about what it asks for. Reading `false` as
+    // "off" would carry on silently for exactly the unit files that most need
+    // telling that the variable no longer does anything.
+    for value in ["true", "false", "0"] {
+        let out = musefs()
+            .arg("scan")
+            .arg(&target)
+            .arg("--db")
+            .arg(&db)
+            .env("MUSEFS_REVALIDATE", value)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "MUSEFS_REVALIDATE={value}, stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("MUSEFS_REVALIDATE") && stderr.contains("`revalidate` subcommand"),
+            "MUSEFS_REVALIDATE={value}: the refusal should name the variable and its \
+             replacement, stderr: {stderr}"
+        );
+        assert!(
+            !db.exists(),
+            "MUSEFS_REVALIDATE={value}: a refused scan must not have created the store"
+        );
+    }
 
     // Empty is unset, as it is for every variable clap reads.
     let out = musefs()
@@ -272,6 +282,89 @@ fn retired_revalidate_env_is_refused() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// What `mount`, `scan` and `revalidate` print while a track awaits the
+/// revalidate an upgrade left owed.
+const OWED_REVALIDATE: &str = "have not been re-probed since the store was upgraded";
+
+/// Run `musefs` with `args` and hand back its stderr, having checked it
+/// succeeded.
+fn stderr_of_success(args: &[&std::ffi::OsStr]) -> String {
+    let out = musefs().args(args).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "musefs {args:?}, stderr: {stderr}");
+    stderr
+}
+
+/// #705: while any track awaits its re-probe, each of the three commands that
+/// open the store for ordinary work says so on stderr — `migrate`'s one report
+/// scrolls away and the gap does not. Once a revalidate has re-probed the track,
+/// none of them does.
+///
+/// `mount` is reached through `--dry-run`, which opens the store and warns
+/// exactly as a mount does and stops before FUSE, so this needs no `/dev/fuse`.
+/// `scan` and `revalidate` are pointed at an empty directory, so they leave the
+/// owed row as it is.
+#[test]
+fn every_store_command_warns_of_an_owed_revalidate_until_it_has_run() {
+    let (dir, library, db) = library_with_one_flac();
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    // The row an upgrade leaves: neither a fingerprint nor an inode. Canonical,
+    // as a scan stores it, so a revalidate of `library` reaches it.
+    let track = std::fs::canonicalize(library.join("a.flac")).unwrap();
+    musefs_db::Db::open(&db)
+        .unwrap()
+        .upsert_track(&musefs_db::NewTrack {
+            backing_path: track,
+            format: musefs_db::Format::Flac,
+            audio_offset: 0,
+            audio_length: 1,
+            backing_size: 1,
+            backing_mtime_ns: 0,
+            backing_ctime_ns: 0,
+            backing_ino: None,
+        })
+        .unwrap();
+
+    let (db, elsewhere, library) = (db.as_os_str(), elsewhere.as_os_str(), library.as_os_str());
+    let commands: [(&str, Vec<&std::ffi::OsStr>); 3] = [
+        (
+            "mount",
+            vec!["mount".as_ref(), "--db".as_ref(), db, "--dry-run".as_ref()],
+        ),
+        (
+            "scan",
+            vec!["scan".as_ref(), elsewhere, "--db".as_ref(), db],
+        ),
+        (
+            "revalidate",
+            vec!["revalidate".as_ref(), elsewhere, "--db".as_ref(), db],
+        ),
+    ];
+
+    for (name, args) in &commands {
+        let stderr = stderr_of_success(args);
+        assert!(
+            stderr.contains(OWED_REVALIDATE) && stderr.contains("1 track(s)"),
+            "`{name}` must warn while a revalidate is owed, stderr: {stderr}"
+        );
+    }
+
+    // The revalidate that re-probes the track does not warn about it afterwards.
+    let stderr = stderr_of_success(&["revalidate".as_ref(), library, "--db".as_ref(), db]);
+    assert!(
+        !stderr.contains(OWED_REVALIDATE),
+        "the revalidate that re-probed every track must not warn, stderr: {stderr}"
+    );
+    for (name, args) in &commands {
+        let stderr = stderr_of_success(args);
+        assert!(
+            !stderr.contains(OWED_REVALIDATE),
+            "`{name}` must not warn once every track is re-probed, stderr: {stderr}"
+        );
+    }
 }
 
 #[test]
@@ -523,6 +616,219 @@ fn migrate_yes_env_takes_boolish_values() {
     );
 }
 
+/// A store 1.x left behind, at the schema version before the gated upgrade: one
+/// clean track `/lib/a.flac` with a tag, a correctly filed picture and a link to
+/// it. Returned open, for the caller to plant what it needs.
+fn store_before_the_upgrade(dir: &Path) -> (PathBuf, rusqlite::Connection) {
+    let path = dir.join("library.db");
+    musefs_db::seed_store_at_version(&path, musefs_db::LATEST_VERSION - 1).unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(&format!(
+        "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+           backing_size, backing_mtime_ns, backing_ctime_ns, updated_at) \
+         VALUES ('/lib/a.flac', 'flac', 0, 0, 0, 0, 0, 0); \
+         INSERT INTO tags (track_id, key, value, ordinal) VALUES (1, 'artist', 'A', 0); \
+         INSERT INTO art (sha256, mime, width, height, byte_len, data) \
+         VALUES ('{}', 'image/png', 1, 1, 1, X'00'); \
+         INSERT INTO track_art (track_id, art_id, picture_type, description, ordinal) \
+         VALUES (1, 1, 3, 'cover', 0);",
+        "a".repeat(64)
+    ))
+    .unwrap();
+    (path, conn)
+}
+
+fn user_version(path: &Path) -> i64 {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap()
+}
+
+fn count(path: &Path, table: &str) -> i64 {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+        .unwrap()
+}
+
+/// `musefs migrate` over `db` with `extra`, confirmed and declining both offers.
+fn migrate(db: &Path, extra: &[&str]) -> Output {
+    musefs()
+        .args([
+            "migrate",
+            "--yes",
+            "--vacuum=false",
+            "--revalidate=false",
+            "--db",
+        ])
+        .arg(db)
+        .args(extra)
+        .output()
+        .unwrap()
+}
+
+/// The pre-flight names what `--repair` decides rather than deletes: a path
+/// stored twice, with both track ids and the one kept, and the picture links it
+/// moves onto an identical, correctly filed copy. With `--repair`, it says the
+/// rows will be deleted as part of the upgrade, and only once the upgrade has
+/// run does it say they were.
+#[test]
+fn migrate_reports_duplicates_and_relinks_then_what_the_repair_did() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, conn) = store_before_the_upgrade(dir.path());
+    // The same path as bytes: a second track row the old schema never compared.
+    conn.execute_batch(&format!(
+        "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+           backing_size, backing_mtime_ns, backing_ctime_ns, updated_at) \
+         VALUES (CAST('/lib/a.flac' AS BLOB), 'flac', 0, 0, 0, 0, 0, 0); \
+         INSERT INTO art (sha256, mime, width, height, byte_len, data) \
+         VALUES ('{}', 'image/png', 1, 1, 1, X'00'); \
+         INSERT INTO track_art (track_id, art_id, picture_type, description, ordinal) \
+         VALUES (1, 2, 4, 'back', 1);",
+        "A".repeat(64)
+    ))
+    .unwrap();
+    drop(conn);
+
+    let out = migrate(&db, &[]);
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout: {stdout} stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains(
+            "  /lib/a.flac is stored twice, as tracks 1 and 2: --repair keeps track 1 and \
+             deletes track 2"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "  1 picture link(s) point at a refused art row with a correctly filed copy of \
+             the same image"
+        ),
+        "{stdout}"
+    );
+    assert!(stderr.contains("Pass --repair"), "{stderr}");
+
+    let out = migrate(&db, &["--repair"]);
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(out.status.success(), "stdout: {stdout} stderr: {stderr}");
+    let position = |needle: &str| {
+        stdout
+            .find(needle)
+            .unwrap_or_else(|| panic!("no {needle:?} in: {stdout}"))
+    };
+    let planned = position(
+        "--repair: 2 row(s) the new schema refuses will be deleted as part of the upgrade, \
+         and 1 picture link(s) moved onto a correctly filed copy of the same image; if the \
+         upgrade fails, they are kept.",
+    );
+    let migrated = position("migrated ");
+    let done = position(
+        "repaired: deleted 2 row(s) the new schema refused, and 1 picture link(s) moved onto \
+         a correctly filed copy of the same image",
+    );
+    assert!(planned < migrated && migrated < done, "{stdout}");
+    assert_eq!(user_version(&db), musefs_db::LATEST_VERSION);
+    assert_eq!(count(&db, "tracks"), 1, "the duplicate row went");
+    assert_eq!(count(&db, "track_art"), 2, "and both pictures stayed");
+}
+
+/// Both rows of a path stored twice carry curated data, so there is nothing
+/// `--repair` can safely keep. It refuses before the snapshot, naming the path,
+/// both track ids and the decision to make, and changes nothing.
+#[test]
+fn migrate_refuses_to_choose_between_two_curated_rows_for_one_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, conn) = store_before_the_upgrade(dir.path());
+    conn.execute_batch(
+        "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+           backing_size, backing_mtime_ns, backing_ctime_ns, updated_at) \
+         VALUES (CAST('/lib/a.flac' AS BLOB), 'flac', 0, 0, 0, 0, 0, 0); \
+         INSERT INTO tags (track_id, key, value, ordinal) VALUES (2, 'artist', 'B', 0);",
+    )
+    .unwrap();
+    drop(conn);
+    let before = user_version(&db);
+
+    let out = migrate(&db, &["--repair"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains(
+            "/lib/a.flac is stored twice, as tracks 1 and 2, and both carry tags or picture \
+             links, so --repair cannot choose which to keep"
+        ) && stderr.contains("delete the other yourself"),
+        "{stderr}"
+    );
+    assert_eq!(user_version(&db), before, "nothing was upgraded");
+    assert_eq!(count(&db, "tracks"), 2, "nothing was deleted");
+    let names: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert!(
+        !names.iter().any(|n| n.contains(".bak")),
+        "refused before any snapshot was written: {names:?}"
+    );
+}
+
+/// An upgrade that fails after `--repair` rolls the repair back with it, and
+/// the error says so and names the snapshot. The failure is a table of the name
+/// the upgrade builds its first holding table under, which nothing in the
+/// pre-flight looks at.
+#[test]
+fn a_failed_upgrade_after_a_repair_says_it_rolled_back_and_names_the_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, conn) = store_before_the_upgrade(dir.path());
+    conn.pragma_update(None, "ignore_check_constraints", true)
+        .unwrap();
+    conn.execute(
+        "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1, ?1, 'v', 1)",
+        [format!("k{}junk", '\0')],
+    )
+    .unwrap();
+    conn.execute_batch("CREATE TABLE tracks_hold_v4 (x)")
+        .unwrap();
+    drop(conn);
+    let before = user_version(&db);
+    let snapshot = dir.path().join(format!("library.db.v{before}.bak"));
+
+    let out = migrate(&db, &["--repair"]);
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout: {stdout} stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "failed: the upgrade was rolled back, and the store is unchanged at schema \
+             version {before}, the rows --repair was to delete included; the snapshot taken \
+             before it is at {}",
+            snapshot.display()
+        )),
+        "{stderr}"
+    );
+    assert!(!stdout.contains("repaired: deleted"), "{stdout}");
+    assert_eq!(user_version(&db), before);
+    assert_eq!(count(&db, "tags"), 2, "the refused tag is back");
+    assert_eq!(user_version(&snapshot), before, "and the snapshot is there");
+}
+
 #[test]
 fn invalid_boolean_env_is_usage_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -617,51 +923,162 @@ fn boolish_boolean_env_values_are_accepted() {
     }
 }
 
-// #370: a boolish MUSEFS_QUIET (1/0) is honoured — `1` suppresses the summary,
-// `0` keeps it. The bare-`bool` parser would reject `0` outright, so this only
-// passes once BoolishValueParser is attached.
+// #370: a boolish MUSEFS_QUIET is honoured in every spelling — a true one
+// suppresses the summary, a false one keeps it, and the empty value is unset, so
+// the default (the summary) applies. The bare-`bool` parser would reject `0`
+// outright, so this only passes once BoolishValueParser is attached. A value that
+// is not a boolean is still a usage error.
 #[test]
 fn boolish_quiet_env_toggles_the_summary() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("library");
     std::fs::create_dir(&target).unwrap();
     let db = dir.path().join("quiet.db");
+    let scan = |value: &str| {
+        musefs()
+            .arg("scan")
+            .arg(&target)
+            .env("MUSEFS_DB", &db)
+            .env("MUSEFS_QUIET", value)
+            .output()
+            .unwrap()
+    };
 
-    let out = musefs()
-        .arg("scan")
-        .arg(&target)
-        .env("MUSEFS_DB", &db)
-        .env("MUSEFS_QUIET", "1")
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "stderr: {}",
+    for (value, quiet) in [
+        ("1", true),
+        ("true", true),
+        ("yes", true),
+        ("on", true),
+        ("0", false),
+        ("false", false),
+        ("no", false),
+        ("off", false),
+        ("", false),
+    ] {
+        let out = scan(value);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "MUSEFS_QUIET={value:?}, stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            stdout.trim().is_empty(),
+            quiet,
+            "MUSEFS_QUIET={value:?} should {} the summary, stdout: {stdout}",
+            if quiet { "suppress" } else { "keep" }
+        );
+    }
+
+    let out = scan("enabled");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a non-boolean MUSEFS_QUIET is a usage error; stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(
-        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
-        "MUSEFS_QUIET=1 should suppress the summary, stdout: {}",
-        String::from_utf8_lossy(&out.stdout)
+}
+
+/// Every boolean flag's variable, with the subcommand that reads it.
+const BOOLEAN_ENV: &[(&str, &str)] = &[
+    ("mount", "MUSEFS_SKIP_ON_MISSING"),
+    ("mount", "MUSEFS_READ_AHEAD_PREFETCH"),
+    ("mount", "MUSEFS_KEEP_CACHE"),
+    ("mount", "MUSEFS_TRUST_BACKING_MTIME"),
+    ("mount", "MUSEFS_CASE_INSENSITIVE"),
+    ("mount", "MUSEFS_ALLOW_OTHER"),
+    ("mount", "MUSEFS_EXPOSE_METRICS"),
+    ("scan", "MUSEFS_FORCE"),
+    ("scan", "MUSEFS_FOLLOW_SYMLINKS"),
+    ("scan", "MUSEFS_QUIET"),
+    ("revalidate", "MUSEFS_PRUNE"),
+    ("revalidate", "MUSEFS_FOLLOW_SYMLINKS"),
+    ("revalidate", "MUSEFS_QUIET"),
+    ("migrate", "MUSEFS_YES"),
+];
+
+/// A boolean flag's variable set to the empty string — how a systemd unit or an
+/// env file blanks one — is unset: the command runs with the flag's default
+/// instead of stopping on a usage error. Each is checked on the subcommand that
+/// reads it, where the default is observable: the dry-run still lists the track
+/// `--skip-on-missing` would drop, the summaries are still printed, nothing is
+/// pruned, and `migrate` still asks for its confirmation.
+#[test]
+fn an_empty_boolean_variable_leaves_the_flag_at_its_default() {
+    // Every boolean flag with a variable is covered, so a new one cannot be
+    // added without this test naming it.
+    let mut declared: Vec<(String, String)> = Vec::new();
+    let boolean = clap::builder::ValueParser::bool().type_id();
+    for sub in <musefs_cli::Cli as clap::CommandFactory>::command().get_subcommands() {
+        for arg in sub.get_arguments() {
+            if let Some(env) = arg.get_env()
+                && arg.get_value_parser().type_id() == boolean
+            {
+                declared.push((
+                    sub.get_name().to_owned(),
+                    env.to_string_lossy().into_owned(),
+                ));
+            }
+        }
+    }
+    let mut listed: Vec<(String, String)> = BOOLEAN_ENV
+        .iter()
+        .map(|(sub, var)| ((*sub).to_owned(), (*var).to_owned()))
+        .collect();
+    declared.sort();
+    listed.sort();
+    assert_eq!(
+        declared, listed,
+        "BOOLEAN_ENV must list every boolean variable"
     );
 
-    let out = musefs()
+    let (dir, library, db) = library_with_one_flac();
+    let scanned = musefs()
         .arg("scan")
-        .arg(&target)
-        .env("MUSEFS_DB", &db)
-        .env("MUSEFS_QUIET", "0")
+        .arg(&library)
+        .arg("--db")
+        .arg(&db)
         .output()
         .unwrap();
-    assert!(
-        out.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&out.stdout).contains("scanned"),
-        "MUSEFS_QUIET=0 should keep the summary, stdout: {}",
-        String::from_utf8_lossy(&out.stdout)
-    );
+    assert!(scanned.status.success());
+    let gated = dir.path().join("gated.db");
+    musefs_db::seed_store_at_version(&gated, musefs_db::LATEST_VERSION - 1).unwrap();
+
+    for (sub, var) in BOOLEAN_ENV {
+        let mut cmd = musefs();
+        cmd.env(var, "");
+        match *sub {
+            "mount" => cmd.args(["mount", "--dry-run", "--db"]).arg(&db),
+            "scan" | "revalidate" => cmd.arg(sub).arg(&library).arg("--db").arg(&db),
+            "migrate" => cmd.args(["migrate", "--db"]).arg(&gated),
+            other => panic!("no invocation for {other}"),
+        };
+        let out = cmd.output().unwrap();
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        let context = format!("{var}= on {sub}; stdout: {stdout} stderr: {stderr}");
+        assert_ne!(out.status.code(), Some(2), "not a usage error: {context}");
+        match *sub {
+            "mount" => {
+                assert!(out.status.success(), "{context}");
+                assert!(stdout.contains("dry run: 1 files"), "{context}");
+            }
+            "scan" => {
+                assert!(out.status.success(), "{context}");
+                assert!(stdout.contains("scanned"), "{context}");
+            }
+            "revalidate" => {
+                assert!(out.status.success(), "{context}");
+                assert!(stdout.contains(" 0 pruned"), "{context}");
+            }
+            _ => {
+                assert_eq!(out.status.code(), Some(1), "{context}");
+                assert!(stderr.contains("pass --yes"), "{context}");
+            }
+        }
+    }
 }
 
 /// #709: `--match` is the one way to ask, and it reaches the scan.

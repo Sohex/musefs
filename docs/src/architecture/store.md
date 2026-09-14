@@ -110,10 +110,13 @@ bijection, and the column is only ever compared for equality (the invalidation
 trigger, and the Rust freshness stamp), never ordered or summed. Zero is the
 sentinel for "not recorded", which every row in a store upgraded to v4 carries
 until `musefs revalidate` (or a `scan --force` of the file) fills it in; a plain
-`scan` leaves tracked rows alone. On Linux, a row for a file on FAT or exFAT
-carries zero permanently, because those filesystems keep no stable inode
-numbers and none is recorded for them. A reader decoding this column must cast
-the bit pattern back rather than treat a negative value as invalid.
+`scan` leaves tracked rows alone. A row for a file on a filesystem whose inode
+numbers musefs does not record carries zero permanently: FAT and exFAT, SMB and
+CIFS, FUSE mounts, overlayfs, and any filesystem musefs does not recognise as
+keeping its numbers across a remount (see
+[Freshness](tree-scanning.md#freshness-two-version-counters) for the list and
+the trade-off). A reader decoding this column must cast the bit pattern back
+rather than treat a negative value as invalid.
 
 **`backing_path` is bytes, not text.** From schema v4 it is a `BLOB` and the
 Rust model is a `PathBuf`, because a filesystem path is a byte string and the
@@ -156,7 +159,12 @@ hash never leaves a stale one behind: every checksum write carries an explicit
 intent — keep the stored value, set a new one, or clear it — and a pass below
 the `full` tier clears the column whenever it observes that the recorded bytes
 changed. A pass over a file that has not changed keeps what is stored, so a
-cheap pass never undoes an expensive one.
+cheap pass never undoes an expensive one. "Has not changed" is the stamp and the
+parsed geometry agreeing. A stored row with no inode, beside a live file whose
+filesystem records one, does not count as agreeing: that is the row an upgraded
+store holds, and it cannot vouch for a hash an older musefs may have left stale.
+Where the filesystem's inode numbers are not recorded at all, neither side has
+one, and size, mtime, ctime and the geometry decide.
 
 **A changed ctime.** From v4, `tracks_geometry_au` also bumps `content_version`
 when an update changes `backing_ctime_ns` and neither checksum proves the bytes
@@ -277,7 +285,8 @@ so a store that passed `musefs migrate` holds no such row; the readers keep the
 guard for a store written with its constraints turned off.
 
 `get_art` is the one reader that materializes a whole `art` row, image blob
-included, rather than streaming it. It therefore guards both of its unbounded
+included, rather than streaming it. It is test scaffolding, compiled only under
+`test-support`; the serve path streams the blob. It therefore guards both of its unbounded
 columns from lengths first — `sha256` as above, and `length(data)` against the
 `art.byte_len` cap, which a crafted store can have been written without since
 both that cap and `byte_len = length(data)` are `CHECK`s. `art.sha256` is the

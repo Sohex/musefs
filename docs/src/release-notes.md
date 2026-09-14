@@ -55,6 +55,13 @@ store upgrade is one-way without the snapshot `migrate` takes.
   - content-addressed art is verified ([#724]);
   - under `--follow-symlinks`, a link is scanned by its target's format, not
     its own name, whether the walk reaches it or it is the scan root ([#766]);
+  - a FLAC or Ogg file over 64 MiB is no longer stored with its audio cut
+    short, and a row stored that way is corrected by a revalidate;
+  - a refresh that hands a name to another track drops the kernel's cached
+    attributes and pages for it ([#778]);
+  - an inode is recorded only where the filesystem keeps its numbers across a
+    remount, so a library on an SMB share or a FUSE mount does not go dark
+    after one ([#757]);
   - chained Ogg is refused, and an old row for one is removable ([#722],
     [#747]).
 - **Directory handles share one listing** ([#675]). Handles open on the same
@@ -69,6 +76,8 @@ store upgrade is one-way without the snapshot `migrate` takes.
   with version 4.
 - **Big-endian RIFX WAVs** ([#770]) scan and are served as RIFX; a
   `LIST('wavl')` WAV is refused as unsupported rather than unparseable ([#769]).
+- **QuickTime keyed metadata** ([#771]) in M4A files is ingested, and no longer
+  served beside the store's tags.
 
 See the [Changelog](changelog.md#200---2026-09-14) for the full list.
 
@@ -108,17 +117,29 @@ volume. Pin `:1.3.0` (or `:1.3.0-musl`) until you are ready to upgrade.
 the image.
 
 **2. Disk space, and the way back** ([#705]). Before asking anything, `migrate`
-checks for free space next to the store: the store's on-disk size (the database
-with its `-wal` and `-shm`) for the rewrite, and the same again for the
-snapshot when it is written to the same filesystem as the store — beside it by
-default, or at a `--snapshot` path on that filesystem. If that is not there it
-refuses up front, rather than failing part-way.
+checks for free space on each filesystem the upgrade writes to, and refuses up
+front rather than failing part-way. With the store, the snapshot and SQLite's
+temporary directory on one filesystem, it needs three times the store's on-disk
+size (the database with its `-wal` and `-shm`), or four with a vacuum;
+`--no-snapshot` takes one copy away, and declining the vacuum another. SQLite's
+temporary directory is the first of `SQLITE_TMPDIR`, `TMPDIR`, `/var/tmp`,
+`/usr/tmp` and `/tmp` it can write to. Where that is a RAM-backed `/tmp`,
+checking the rows and vacuuming each hold a copy of the store in memory, so
+point `SQLITE_TMPDIR` at a disk with room. The
+[maintenance guide](guide/maintenance.md#disk-space) breaks the peak down by
+phase.
 
 The snapshot is a single compacted copy at `<db>.v<version>.bak`, where the
 version is the one the store is at when `migrate` runs — `library.db.v2.bak` for
 a store 1.3.0 left. `--snapshot PATH` puts it elsewhere; `--no-snapshot` skips
 it, and the upgrade is then one-way. `migrate` refuses to overwrite an existing
-snapshot. There is no restore command: to go back, stop everything, replace the
+snapshot, and moves the copy under the snapshot's name only once it is complete,
+so a run killed while copying leaves nothing there to restore from by mistake.
+On a filesystem without hard links, under FreeBSD, the copy cannot be given its
+name without risking replacing a file, so `migrate` refuses before upgrading:
+put the snapshot on another filesystem with `--snapshot PATH`, or pass
+`--no-snapshot`.
+There is no restore command: to go back, stop everything, replace the
 store with the snapshot, delete any leftover `library.db-wal` and
 `library.db-shm`, and run 1.3.0.
 
@@ -182,8 +203,8 @@ directory below `/`, so `migrate` makes no offer and prints the command instead:
 run `musefs revalidate` over each tree yourself. Until
 every track has been re-probed, `mount`, `scan` and `revalidate` each warn with
 the number still waiting ([#705]). That number counts tracks with neither a
-fingerprint nor an inode, so on Linux a track on FAT or exFAT that was scanned at
-`--checksum=none` stays in it until a default-tier `revalidate` records its
+fingerprint nor an inode, so a track on a filesystem where musefs records no
+inode that was scanned at `--checksum=none` stays in it until a default-tier `revalidate` records its
 fingerprint. What waits for the revalidate:
 
 - **Fingerprints are cleared** ([#691]). Until they are recomputed, a moved file
@@ -198,10 +219,11 @@ fingerprint. What waits for the revalidate:
   refuses to retarget.
 - **Stored inodes start unknown** ([#674]). The check that catches a backing
   file replaced in place cannot use the inode until a revalidate records it.
-  On Linux, none is ever recorded on FAT and exFAT ([#757]): those filesystems
-  renumber files on every mount, so an inode there would fail every file after a
-  replug.
-  The check is weaker on them as a result, and they are
+  One is recorded only on filesystems known to keep their inode numbers across
+  a remount, such as ext4, btrfs, XFS, ZFS, APFS and NFS ([#757]). FAT and
+  exFAT renumber files on every mount, and SMB shares, FUSE mounts and overlayfs
+  can, so an inode recorded there could fail every file after a remount. The
+  check is weaker on them as a result, and FAT and exFAT are
   [not recommended](guide/installation.md) for the backing library.
 - **Picture metadata is copied, not per file** ([#716], [#746]). 1.3.0 kept one
   MIME type and one set of dimensions per image, so the upgrade copies those
@@ -212,7 +234,7 @@ fingerprint. What waits for the revalidate:
 A few files need more than that:
 
 - **Ogg FLAC with a zero header-packet count** ([#723]). The revalidate corrects
-  where their audio starts. Tags and art that 1.3.0 never read from those files
+  where their audio starts; until it does, they serve as 1.3.0 served them. Tags and art that 1.3.0 never read from those files
   arrive only through `musefs scan --force <file>`, which replaces that file's
   curated tags and art with what it embeds.
 - **MP3s with an appended ID3v2 tag** ([#768]). 1.3.0 counted a tag appended
@@ -222,6 +244,16 @@ A few files need more than that:
   `musefs scan --force <file>`, which replaces that file's curated tags and art.
   MP3s 1.3.0 refused because they begin with more than one ID3v2 tag ([#767])
   have no row yet; a plain `musefs scan` adds them.
+- **FLAC and Ogg files over 64 MiB.** 1.3.0 could store one whose metadata
+  needed many reads to walk, several large cover images say, with its audio
+  ending at 64 MiB, and served it truncated. The revalidate re-probes each row
+  whose stored audio stops short of its file, corrects its bounds and keeps your
+  tags.
+- **M4A files with QuickTime keyed metadata** ([#771]). The mount stops serving
+  a file's own keyed metadata beside the store's tags straight away, but 1.3.0
+  never ingested it, and a revalidate never adds tags. Its values reach the
+  store only through `musefs scan --force <file>`, which replaces that file's
+  curated tags and art.
 - **Chained Ogg** stored by 1.3.0 ([#722], [#747]). 2.0.0's scan refuses these,
   so they cannot be refreshed. Each counts as `failed` (reason `unsupported`),
   and `revalidate` exits `2` while any remain. Until they are removed, the mount
@@ -244,11 +276,10 @@ compares size and mtime. 1.3.0 served whole seconds, so on the first mount
 nearly every synthesized file's mtime changes. The first revalidate then moves
 it again. The upgrade cleared every fingerprint, so at the default checksum tier
 that revalidate re-probes every file, and a re-probe moves a file's mtime only
-where it records something the store did not hold ([#757]). Except on FAT and
-exFAT under Linux, that includes the file's inode, recorded for the first time,
-so nearly every file's mtime moves again, seconds included. On Linux, musefs
-records no inode on FAT and exFAT, because they keep no stable inode numbers, so
-there the mtime moves only where the revalidate corrects what
+where it records something the store did not hold ([#757]). Where musefs records
+inodes, that includes the file's inode, recorded for the first time, so nearly every file's mtime moves again, seconds included. On a filesystem where
+musefs records no inode (FAT, exFAT, SMB shares, FUSE mounts and overlayfs),
+the mtime moves only where the revalidate corrects what
 the store holds for the file: its picture metadata, an Ogg FLAC's bounds, or
 FLAC structural data an older scan never recorded. A restored picture or Ogg
 FLAC bound can change the size too. To have rsync without `--checksum`,
@@ -362,8 +393,8 @@ directly.
     `&Path`.
   - `Db::track_version_and_path` is replaced by `Db::track_identity`, which
     returns the new `TrackIdentity`.
-  - `NewArt` is only the bytes, and `Art` and `ArtMeta` lose the MIME type and
-    dimensions.
+  - `NewArt` is only the bytes, and `ArtMeta` loses the MIME type and
+    dimensions. `Art` and `Db::get_art` are no longer public (see below).
   - `TrackArt` gains `mime`, `width`, `height`, `depth` and `colors`, and the
     synthesis inputs `ArtInput` and `EmbeddedPicture` gain `depth` and `colors`.
   - `NewTrack`, `TrackArt`, `ArtInput` and `EmbeddedPicture` stay exhaustive, so
@@ -404,11 +435,26 @@ directly.
   wildcard arm; in exchange, a new audio format or error case is no longer a
   breaking change. The changelog lists which enums, and which were deliberately
   left exhaustive.
-- Test scaffolding is no longer public ([#710]):
-  `musefs_core::scan_directory_full_oracle`, the `*_for_test` methods on `Musefs`
-  and `Db`, `musefs_db::seed_store_at_version` ([#751]), and
-  `musefs_format::ogg::page_test_support`. No production code called any of
-  them.
+- Test scaffolding, and anything else only tests called, is no longer public
+  ([#710], [#751]). It is compiled for tests only:
+  - `musefs-core`: `scan_directory_full_oracle`, the `*_for_test` methods on
+    `Musefs`, `Musefs::read` and `Musefs::parent`, `VirtualTree::track_id`,
+    `metrics::reset`, the `scan_directory` and `revalidate` shims (call
+    `scan_directory_with` and `revalidate_with`), and the backing-read fault
+    seam under `metrics` (`BackingFault`, `BackingFaultGuard`,
+    `set_backing_fault`, `set_fault_pread`);
+  - `musefs-db`: the `*_for_test` methods on `Db`, `seed_store_at_version`,
+    `get_art` and `Art`, `get_art_meta`, `get_track_art`, `tags_grouped`,
+    `read_binary_tag_chunk` and `user_version`;
+  - `musefs-format`: `ogg::page_test_support`, `ogg::patch_page_header` and
+    `mp4::read_binary_tags` (use `read_binary_tags_reporting`);
+  - `musefs-fuse`: `spawn` and `spawn_with`.
+- `DbPool`, `ChecksumWrite` and `TableRejections` are `#[non_exhaustive]`.
+  `Rejections`, `TableRejections` and `DuplicatePath` are re-exported beside
+  `PendingMigration`.
+- `TreeSnapshot::generation` is new, and so is `musefs_cli::parse`, which parses
+  arguments as the binary does, reading an empty boolean environment variable
+  as unset.
 - The configuration and result structs follow the enums ([#743]):
   `ScanOptions`, `MountConfig`, `FuseConfig`, `musefs-cli`'s argument structs and
   the crates' result types are `#[non_exhaustive]`, so outside their crate they
@@ -475,6 +521,8 @@ directly.
 [#768]: https://github.com/Sohex/musefs/issues/768
 [#769]: https://github.com/Sohex/musefs/issues/769
 [#770]: https://github.com/Sohex/musefs/issues/770
+[#771]: https://github.com/Sohex/musefs/issues/771
+[#778]: https://github.com/Sohex/musefs/issues/778
 
 ## v1.3.0
 

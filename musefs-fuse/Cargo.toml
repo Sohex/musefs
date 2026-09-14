@@ -16,6 +16,12 @@ exclude = ["tests/"]
 
 [features]
 metrics = ["musefs-core/metrics"]
+# Test-only: the background-session mount (`spawn`, `spawn_with`) the mount e2e
+# tests drive, and the mount seams this crate's integration tests reach across
+# the crate boundary, such as a forced worker-pool admission cap. Enabled by the
+# self-dev-dependency below, so `cargo test` needs no flag; never part of the
+# published API (#710). Mirrors musefs-core's `test-support`.
+test-support = []
 
 [dependencies]
 # Pure-rust fusermount3 mount path; never enable `libfuse` (static musl can't link it).
@@ -30,6 +36,12 @@ threadpool = "1"
 fuser = { version = "0.18", features = ["macos-no-mount"] }
 
 [dev-dependencies]
+# Self-dependency: turns `test-support` on for this crate's own test builds.
+musefs-fuse = { path = ".", features = ["test-support"] }
+# `musefs-core`'s test scaffolding, compiled for tests only (#710):
+# `CoreError::every_variant_for_test` for the errno mapping's coverage test, and
+# the backing-read fault seam the `metrics`-gated fault-injection e2e sets.
+musefs-core = { path = "../musefs-core", features = ["test-support"] }
 tempfile = "3"
 rustix = { version = "1", features = ["fs"] }
 metaflac = "0.2"

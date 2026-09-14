@@ -225,6 +225,17 @@ saw. A file
 that merely fails to parse or to read keeps its row, since a download still in
 progress looks the same.
 
+A chain whose links all share one serial number — concatenated
+`ffmpeg -fflags +bitexact` output, which RFC 7845 forbids but which exists —
+gets past both scan-time checks, because every page carries the header's serial,
+the final page included. What gives it away is the beginning-of-stream page that
+each later link opens with, which a single logical bitstream carries only on its
+first page. Finding that page at scan time would mean walking the whole audio
+region, so the scanner does not look for it. The serve path refuses any page
+past the header region that carries the flag (`EIO`), rather than renumbering
+the second link by the first link's delta. Reads that stay inside the first link
+still serve.
+
 ## Quirks & invariants
 
 - Page and header sizes are bounded at parse and serve time
@@ -246,10 +257,14 @@ progress looks the same.
   mapping requires a count it gives to be accurate, and reserves zero for the
   unknown case. A row scanned before this fix keeps its wrong `audio_offset`
   until a revalidate re-probes the file, which the first default-tier revalidate
-  after the 2.0.0 upgrade does. A `--checksum=none` revalidate skips an
-  unchanged file on a filesystem whose inode numbers musefs does not record (see
+  after the 2.0.0 upgrade does. Until then it serves exactly as it did under
+  1.3.0: the serve path re-parses only the stored header region, and there a run
+  of unknown length may end where the region does, which for such a row is right
+  after the mapping packet. A `--checksum=none` revalidate skips an unchanged file
+  on a filesystem whose inode numbers musefs does not record (see
   [Freshness](../architecture/tree-scanning.md#freshness-two-version-counters)),
-  so run it at the default tier. Unlike a chained Ogg, the file itself parses, so the
+  so the row keeps serving that way rather than failing with `EIO` as it used to;
+  run a default-tier revalidate to correct its bounds. Unlike a chained Ogg, the file itself parses, so the
   re-probe corrects the row rather than refusing it. The revalidate fixes only
   the bounds: tags and art that 1.3.0 never read from such a file arrive only
   through `musefs scan --force <file>`, which replaces that file's curated

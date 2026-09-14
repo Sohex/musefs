@@ -100,6 +100,10 @@ impl<M> Db<M> {
         Ok(out)
     }
 
+    /// Every text tag, grouped by track. Test scaffolding (#710): the virtual
+    /// tree reads only the keys its template names, through
+    /// `tags_grouped_for_keys`.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn tags_grouped(&self) -> Result<std::collections::HashMap<i64, Vec<Tag>>> {
         let mut stmt = self.conn.prepare(concat!(
             "SELECT ",
@@ -175,8 +179,9 @@ impl<M> Db<M> {
         Ok(())
     }
 
-    /// Allocating convenience form of `read_binary_tag_chunk_into` (non-hot-path
-    /// callers).
+    /// Allocating convenience form of `read_binary_tag_chunk_into`. Test
+    /// scaffolding (#710): the serve path reads into its own buffer.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn read_binary_tag_chunk(
         &self,
         payload_id: i64,

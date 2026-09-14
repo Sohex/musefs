@@ -22,6 +22,7 @@ const OP: &str = "migrating";
 
 /// How many rows of one rebuilt table the migrated schema would refuse.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TableRejections {
     /// The table as the store names it.
     pub table: &'static str,
@@ -35,9 +36,11 @@ pub struct TableRejections {
 /// equal to a BLOB, so a tool binding the path as bytes could add a second row
 /// for a file musefs already had. The upgrade stores every path as bytes, which
 /// makes the two one path, and only one row can keep it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DuplicatePath {
+    /// The path both rows name, as the upgrade stores it.
+    pub path: PathBuf,
     /// The row that keeps the path: the one carrying tags or art links, or the
     /// older one when neither does.
     pub kept: i64,
@@ -214,7 +217,8 @@ impl PendingMigration {
     }
 
     /// The store file this was opened from.
-    pub fn path(&self) -> &Path {
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 
@@ -237,8 +241,95 @@ impl PendingMigration {
     /// This is the remedy that makes the upgrade reversible: one `VACUUM INTO`
     /// against a read transaction, which on a reference-shaped library measures
     /// under two seconds.
+    ///
+    /// The copy is written under a temporary name beside `dest`, synced, and
+    /// only then given `dest`'s name, with the directory synced after it. So
+    /// `dest` only ever names a complete snapshot. A run killed part-way through
+    /// leaves the temporary file instead, which
+    /// [`PendingMigration::clear_partial_snapshots`] recognises and removes,
+    /// rather than a torn file that looks like a snapshot to anyone restoring
+    /// from it and blocks the rerun from writing a real one.
+    ///
+    /// The name is given by an operation that refuses an existing `dest`: a hard
+    /// link, or on a filesystem without hard links, a rename that checks and moves
+    /// in one step (`renameat2` with `RENAME_NOREPLACE` on Linux, `renameatx_np`
+    /// with `RENAME_EXCL` on Apple platforms). Where neither is available the
+    /// snapshot is refused with [`crate::DbError::Snapshot`] carrying an
+    /// [`std::io::ErrorKind::Unsupported`] error, and nothing is left under
+    /// `dest` or beside it.
     pub fn snapshot_to(&self, dest: &Path) -> Result<()> {
-        maintenance::snapshot_into(&self.conn, dest, OP)
+        self.snapshot_via(dest, PUBLISH, |_| Ok(()))
+    }
+
+    /// [`PendingMigration::snapshot_to`], naming the copy with `ops` and running
+    /// `before_publish` in the window between the finished, synced copy and its
+    /// move into place — the window a kill has to land in for the promise above
+    /// to matter.
+    fn snapshot_via(
+        &self,
+        dest: &Path,
+        ops: PublishOps,
+        before_publish: impl FnOnce(&Path) -> std::io::Result<()>,
+    ) -> Result<()> {
+        let refuse = |source| crate::DbError::Snapshot {
+            path: dest.to_path_buf(),
+            source,
+        };
+        // Checked here, against the name the caller gave, rather than left to
+        // the copy: the temporary name is the caller's plus a suffix, so it would
+        // be refused just the same, but the refusal would name a file the caller
+        // never asked for.
+        if dest.to_str().is_none() {
+            return Err(crate::DbError::Sqlite(rusqlite::Error::InvalidPath(
+                dest.to_path_buf(),
+            )));
+        }
+        // Checked before the copy rather than left to the rename, so a
+        // destination that is taken costs nothing to refuse.
+        if std::fs::symlink_metadata(dest).is_ok() {
+            return Err(refuse(snapshot_exists()));
+        }
+        let partial = partial_snapshot_path(dest);
+        let written = maintenance::snapshot_into(&self.conn, &partial, OP)
+            .and_then(|()| publish_snapshot(&partial, dest, ops, before_publish).map_err(refuse));
+        if written.is_err() {
+            // Whatever there is of it can never become a snapshot. Best effort:
+            // a copy this could not remove is cleared by the next run.
+            let _ = std::fs::remove_file(&partial);
+        }
+        written
+    }
+
+    /// Remove every file an interrupted snapshot to `dest` left under its
+    /// temporary name, and return their paths.
+    ///
+    /// Such a file is never a snapshot: a copy only takes `dest`'s name once it
+    /// is complete, so one still under the temporary name was cut off before
+    /// that, or was never synced. Nothing else is touched, including `dest`.
+    pub fn clear_partial_snapshots(dest: &Path) -> std::io::Result<Vec<PathBuf>> {
+        let mut removed = Vec::new();
+        let Some(name) = dest.file_name().and_then(|n| n.to_str()) else {
+            return Ok(removed);
+        };
+        let prefix = format!("{name}{PARTIAL_SNAPSHOT}");
+        let entries = match std::fs::read_dir(parent_dir(dest)) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(removed),
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let is_partial = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.strip_prefix(&prefix))
+                .is_some_and(is_partial_tag);
+            if is_partial {
+                std::fs::remove_file(entry.path())?;
+                removed.push(entry.path());
+            }
+        }
+        Ok(removed)
     }
 
     /// The tables V4 refills, **in the order a repair must delete from them**,
@@ -408,7 +499,8 @@ impl PendingMigration {
                     (EXISTS (SELECT 1 FROM main.tags WHERE track_id = m.id) \
                      OR EXISTS (SELECT 1 FROM main.track_art WHERE track_id = m.id)) \
                     AND (EXISTS (SELECT 1 FROM main.tags WHERE track_id = p.id) \
-                     OR EXISTS (SELECT 1 FROM main.track_art WHERE track_id = p.id)) \
+                     OR EXISTS (SELECT 1 FROM main.track_art WHERE track_id = p.id)), \
+                    p.backing_path \
              FROM main.tracks m \
              JOIN probe.tracks p ON p.backing_path = CAST(m.backing_path AS BLOB) \
              WHERE m.rowid NOT IN (SELECT rowid FROM probe.tracks)",
@@ -416,6 +508,7 @@ impl PendingMigration {
         let found = stmt
             .query_map([], |r| {
                 Ok(DuplicatePath {
+                    path: crate::models::path_from_col(r.get(3)?),
                     kept: r.get(0)?,
                     refused: r.get(1)?,
                     ambiguous: r.get(2)?,
@@ -555,6 +648,7 @@ impl PendingMigration {
         let found = self.probe()?;
         if let Some(both) = found.duplicates.iter().find(|d| d.ambiguous) {
             return Err(crate::DbError::AmbiguousDuplicatePath {
+                path: both.path.clone(),
                 first: both.kept,
                 second: both.refused,
             });
@@ -569,26 +663,203 @@ impl PendingMigration {
     /// supposed to produce. A repair [`PendingMigration::repair`] held runs in
     /// the same transaction, first.
     ///
-    /// This is where the connection stops being a migration handle and becomes
-    /// an ordinary [`Db`], so it picks up what [`Db::open`] sets that the
+    /// The rebuild runs under a rollback journal, not the write-ahead log the
+    /// store otherwise uses, because of what each has to hold until the one
+    /// transaction commits (#705). The upgrade copies every table twice, so the
+    /// log would carry every page written — about twice the store — on top of
+    /// the file growing by a copy of its tables, and a checkpoint then copies it
+    /// all back in. A rollback journal holds only the original content of the
+    /// pages the transaction overwrites, at most the store once. Measured on a
+    /// library-shaped store, the store's own filesystem peaks at three times
+    /// the store instead of four. Both commit atomically: a run killed part-way
+    /// leaves a hot journal, which the next open of the store by any SQLite
+    /// rolls back before reading, leaving the store — the repair included — as
+    /// it was.
+    ///
+    /// This is also where the connection stops being a migration handle and
+    /// becomes an ordinary [`Db`], so it picks up what [`Db::open`] sets that the
     /// pre-flight had no use for. Write-ahead logging, which is what keeps a
-    /// reader and a writer off each other's backs: a musefs store is already in
-    /// WAL — the mode is persistent and every other open sets it — so this is
-    /// belt and braces for a store that arrived some other way. And the length
-    /// limit, which a store past V4's constraints can carry.
+    /// reader and a writer off each other's backs: the mode every musefs store
+    /// is in, restored whether or not the migration succeeded, so a refused
+    /// upgrade leaves the store in the mode it found it in. And the length limit,
+    /// which a store past V4's constraints can carry.
     pub fn apply(mut self) -> Result<Db> {
         let _: String = self
             .conn
-            .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
-        match self.repair.take() {
-            Some(plan) => {
-                schema::migrate_all_after(&mut self.conn, &|tx| carry_out(tx, &plan))?;
-            }
-            None => schema::migrate_all(&mut self.conn)?,
-        }
+            .query_row("PRAGMA journal_mode = DELETE", [], |r| r.get(0))?;
+        let migrated = match self.repair.take() {
+            Some(plan) => schema::migrate_all_after(&mut self.conn, &|tx| carry_out(tx, &plan)),
+            None => schema::migrate_all(&mut self.conn),
+        };
+        let restored = self
+            .conn
+            .query_row("PRAGMA journal_mode = WAL", [], |r| r.get::<_, String>(0));
+        migrated?;
+        restored?;
         schema::validate_identity(&self.conn)?;
         crate::bound_lengths(&self.conn)?;
         Ok(Db::from_migrated(self.conn, self.path))
+    }
+}
+
+/// What a snapshot being written carries after its destination's file name, then
+/// a unique tag, `<pid>-<seq>-<nanos>`. Unique because `VACUUM INTO` refuses a
+/// destination that exists; recognisable so the next run can clear one a kill
+/// left behind.
+const PARTIAL_SNAPSHOT: &str = ".partial-";
+
+/// Whether `tag` is one `partial_snapshot_path` writes: exactly three non-empty
+/// runs of decimal digits joined by `-`, and nothing else.
+fn is_partial_tag(tag: &str) -> bool {
+    let fields: Vec<&str> = tag.split('-').collect();
+    fields.len() == 3
+        && fields
+            .iter()
+            .all(|field| !field.is_empty() && field.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The directory `path` sits in, `.` for a bare file name.
+fn parent_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+/// A name beside `dest` that no other snapshot in progress uses.
+fn partial_snapshot_path(dest: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let mut p = dest.as_os_str().to_os_string();
+    p.push(format!(
+        "{PARTIAL_SNAPSHOT}{}-{}-{nanos}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    PathBuf::from(p)
+}
+
+fn snapshot_exists() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "the snapshot destination already exists",
+    )
+}
+
+/// The operations that give a finished copy its name. A test substitutes them to
+/// fail one, or to act just before one runs.
+#[derive(Clone, Copy)]
+struct PublishOps {
+    link: fn(&Path, &Path) -> std::io::Result<()>,
+    rename: fn(&Path, &Path) -> std::io::Result<()>,
+}
+
+const PUBLISH: PublishOps = PublishOps {
+    link: |from, to| std::fs::hard_link(from, to),
+    rename: rename_no_replace,
+};
+
+/// Move `from` to `to` in one step that fails with `AlreadyExists` if `to`
+/// exists: `renameat2` with `RENAME_NOREPLACE` on Linux, `renameatx_np` with
+/// `RENAME_EXCL` on Apple platforms. `Unsupported` where the kernel or the
+/// filesystem lacks it.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+    use rustix::io::Errno;
+    renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE).map_err(|errno| {
+        // Linux answers EINVAL where the filesystem does not implement the flag
+        // and ENOSYS before 3.15; Apple answers ENOTSUP where the volume lacks it
+        // and ENOSYS before 10.12.
+        if [Errno::INVAL, Errno::NOSYS, Errno::NOTSUP].contains(&errno) {
+            std::io::Error::new(std::io::ErrorKind::Unsupported, errno)
+        } else {
+            errno.into()
+        }
+    })
+}
+
+/// No rename here refuses an existing name in the same step. FreeBSD's
+/// `renameat2` checks `AT_RENAME_NOREPLACE` before a filesystem's own rename,
+/// which may relock and reopen the window, so it is not atomic everywhere.
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn rename_no_replace(_: &Path, _: &Path) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
+/// The snapshot cannot be named without risking a file someone else creates
+/// under its name, since neither operation that refuses one is available.
+fn no_safe_publish(link: &std::io::Error, rename: &std::io::Error) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!(
+            "this filesystem refused a hard link ({link}) and has no rename that refuses \
+             an existing file ({rename}), so the snapshot cannot be given its name without \
+             risking replacing a file created there meanwhile; write it to a filesystem \
+             that supports hard links with `musefs migrate --snapshot PATH`, or skip it \
+             with `--no-snapshot`"
+        ),
+    )
+}
+
+/// Give the finished copy at `partial` the name `dest`, never replacing a file
+/// already there, and make the name durable.
+fn publish_snapshot(
+    partial: &Path,
+    dest: &Path,
+    ops: PublishOps,
+    before_publish: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    // `VACUUM INTO` does not sync what it writes. Without this, a crash after
+    // the rename could leave the name pointing at pages that never reached disk.
+    std::fs::File::open(partial)?.sync_all()?;
+    before_publish(partial)?;
+    // A hard link is the portable rename that refuses to replace: it fails when
+    // `dest` exists, where `rename` would silently overwrite it.
+    match (ops.link)(partial, dest) {
+        Ok(()) => {
+            // The snapshot is in place under both names. A temporary name this
+            // could not remove is only a second link to a complete copy, and the
+            // next run clears it.
+            let _ = std::fs::remove_file(partial);
+        }
+        // Taken: refused there and then, with nothing else tried.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(snapshot_exists()),
+        // A filesystem without hard links (FAT, exFAT, some network shares). The
+        // fallback checks that `dest` is free in the same step that moves the
+        // copy, so a file created there in the meantime is refused, not replaced.
+        // Without such a step the snapshot is not published at all.
+        Err(link) => match (ops.rename)(partial, dest) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(snapshot_exists());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                return Err(no_safe_publish(&link, &e));
+            }
+            Err(e) => return Err(e),
+        },
+    }
+    sync_dir(parent_dir(dest))
+}
+
+/// Make the names in `dir` durable, so a snapshot just given its name keeps it
+/// through a crash.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    match std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+        // Some filesystems cannot sync a directory and say so. The complete copy
+        // is under its name either way; only the name's durability is at stake.
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(())
+        }
+        synced => synced,
     }
 }
 
@@ -602,6 +873,394 @@ impl Db {
             path: Some(path),
             _mode: PhantomData,
         }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use std::path::{Path, PathBuf};
+
+    use super::{PARTIAL_SNAPSHOT, PendingMigration};
+
+    fn store_at_v3(dir: &Path) -> PathBuf {
+        let path = dir.join("s.db");
+        crate::schema::seed_store_at_version(&path, 3).unwrap();
+        path
+    }
+
+    fn user_version(path: &Path) -> i64 {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap()
+    }
+
+    fn partials(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.contains(PARTIAL_SNAPSHOT))
+            .collect()
+    }
+
+    /// A run cut off after the copy is written but before it is named leaves the
+    /// snapshot's name free: nothing under it is ever a partial copy. The copy is
+    /// cleaned up, and the rerun writes a complete snapshot.
+    #[test]
+    fn a_snapshot_interrupted_before_it_is_named_leaves_the_name_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_at_v3(dir.path());
+        let dest = dir.path().join("s.db.v3.bak");
+        let pending = PendingMigration::open(&store).unwrap();
+
+        let err = pending
+            .snapshot_via(&dest, super::PUBLISH, |partial| {
+                assert!(
+                    !dest.exists(),
+                    "the snapshot's name must stay free until the copy is complete"
+                );
+                assert_eq!(user_version(partial), 3, "the copy itself is complete");
+                Err(std::io::Error::other("killed"))
+            })
+            .unwrap_err();
+        assert!(matches!(err, crate::DbError::Snapshot { .. }), "{err:?}");
+        assert!(!dest.exists(), "an interrupted snapshot is never named");
+        assert!(partials(dir.path()).is_empty(), "nor left behind");
+
+        pending.snapshot_to(&dest).unwrap();
+        assert_eq!(user_version(&dest), 3);
+        assert!(partials(dir.path()).is_empty());
+    }
+
+    /// A kill during `VACUUM INTO` itself leaves a torn file under the temporary
+    /// name. The next run recognises it and removes it — and nothing that merely
+    /// shares the snapshot's name — and then completes.
+    #[test]
+    fn a_torn_partial_is_cleared_and_the_rerun_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_at_v3(dir.path());
+        let dest = dir.path().join("s.db.v3.bak");
+        let torn = dir
+            .path()
+            .join(format!("s.db.v3.bak{PARTIAL_SNAPSHOT}4242-0-17"));
+        std::fs::write(&torn, b"half a database").unwrap();
+        let notes = dir.path().join("s.db.v3.bak.partial-notes");
+        std::fs::write(&notes, b"mine").unwrap();
+
+        let removed = PendingMigration::clear_partial_snapshots(&dest).unwrap();
+        assert_eq!(removed, vec![torn.clone()]);
+        assert!(!torn.exists());
+        assert!(notes.exists(), "a file musefs did not name is not touched");
+
+        PendingMigration::open(&store)
+            .unwrap()
+            .snapshot_to(&dest)
+            .unwrap();
+        assert_eq!(user_version(&dest), 3);
+    }
+
+    /// Only a name `partial_snapshot_path` could have made is cleared: the
+    /// destination's name, the marker, then exactly three non-empty decimal
+    /// fields. A file that merely resembles one is someone else's.
+    #[test]
+    fn only_a_name_the_snapshot_itself_makes_is_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("library.db.v2.bak");
+        let generated = super::partial_snapshot_path(&dest);
+        std::fs::write(&generated, b"torn").unwrap();
+        let lookalikes = [
+            "partial-2026",
+            "partial-1-2",
+            "partial-1-2-3-4",
+            "partial--1-2",
+            "partial-1--2",
+            "partial-1-2-",
+            "partial-1-2-x",
+            "partial-+1-2-3",
+        ]
+        .map(|tag| dir.path().join(format!("library.db.v2.bak.{tag}")));
+        for lookalike in &lookalikes {
+            std::fs::write(lookalike, b"not musefs's").unwrap();
+        }
+
+        let removed = PendingMigration::clear_partial_snapshots(&dest).unwrap();
+        assert_eq!(removed, vec![generated.clone()]);
+        assert!(!generated.exists());
+        for lookalike in &lookalikes {
+            assert!(
+                lookalike.exists(),
+                "{} must be left alone",
+                lookalike.display()
+            );
+        }
+    }
+
+    /// The destination is still never replaced, and refusing it leaves no copy.
+    #[test]
+    fn an_existing_snapshot_is_never_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_at_v3(dir.path());
+        let dest = dir.path().join("s.db.v3.bak");
+        std::fs::write(&dest, b"an older snapshot").unwrap();
+
+        let pending = PendingMigration::open(&store).unwrap();
+        pending.snapshot_to(&dest).unwrap_err();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"an older snapshot");
+        // Taken between the check and the rename, it is refused there too.
+        std::fs::remove_file(&dest).unwrap();
+        let err = pending
+            .snapshot_via(&dest, super::PUBLISH, |_| {
+                std::fs::write(&dest, b"a racing writer")
+            })
+            .unwrap_err();
+        assert!(matches!(err, crate::DbError::Snapshot { .. }), "{err:?}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"a racing writer");
+        assert!(partials(dir.path()).is_empty());
+    }
+
+    /// A hard link the filesystem refuses, as FAT does, with `EPERM`.
+    fn no_hard_links(_: &Path, _: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "no hard links here",
+        ))
+    }
+
+    /// Where the hard link is refused, a file another party creates under the
+    /// name in the last moment before the fallback runs is still never replaced:
+    /// the fallback refuses an existing name in the same step that moves the copy.
+    #[test]
+    fn a_name_taken_just_before_the_fallback_is_never_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_at_v3(dir.path());
+        let dest = dir.path().join("s.db.v3.bak");
+        let racing = super::PublishOps {
+            link: no_hard_links,
+            rename: |from, to| {
+                std::fs::write(to, b"a racing writer")?;
+                (super::PUBLISH.rename)(from, to)
+            },
+        };
+
+        let err = PendingMigration::open(&store)
+            .unwrap()
+            .snapshot_via(&dest, racing, |_| Ok(()))
+            .unwrap_err();
+        assert!(matches!(err, crate::DbError::Snapshot { .. }), "{err:?}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"a racing writer");
+        assert!(partials(dir.path()).is_empty());
+    }
+
+    /// A name the hard link finds taken is refused there and then. Nothing else
+    /// is tried, so no fallback can reach the file that took it.
+    #[test]
+    fn a_name_the_hard_link_finds_taken_goes_no_further() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_at_v3(dir.path());
+        let dest = dir.path().join("s.db.v3.bak");
+        let ops = super::PublishOps {
+            link: super::PUBLISH.link,
+            rename: |_, _| panic!("a name the hard link found taken reached the fallback"),
+        };
+
+        let err = PendingMigration::open(&store)
+            .unwrap()
+            .snapshot_via(&dest, ops, |_| std::fs::write(&dest, b"a racing writer"))
+            .unwrap_err();
+        assert!(
+            matches!(&err, crate::DbError::Snapshot { source, .. }
+                if source.kind() == std::io::ErrorKind::AlreadyExists),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"a racing writer");
+        assert!(partials(dir.path()).is_empty());
+    }
+
+    /// Where the hard link is refused and the name is free, the fallback gives the
+    /// copy its name.
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn without_hard_links_the_fallback_names_a_free_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_at_v3(dir.path());
+        let dest = dir.path().join("s.db.v3.bak");
+        let ops = super::PublishOps {
+            link: no_hard_links,
+            rename: super::PUBLISH.rename,
+        };
+
+        PendingMigration::open(&store)
+            .unwrap()
+            .snapshot_via(&dest, ops, |_| Ok(()))
+            .unwrap();
+        assert_eq!(user_version(&dest), 3);
+        assert!(partials(dir.path()).is_empty());
+    }
+
+    /// With neither a hard link nor a rename that refuses an existing name, the
+    /// snapshot is not published: nothing is left under its name or beside it,
+    /// and the error says what to do instead.
+    #[test]
+    fn with_no_safe_way_to_name_it_nothing_is_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_at_v3(dir.path());
+        let dest = dir.path().join("s.db.v3.bak");
+        let ops = super::PublishOps {
+            link: no_hard_links,
+            rename: |_, _| Err(std::io::ErrorKind::Unsupported.into()),
+        };
+
+        let err = PendingMigration::open(&store)
+            .unwrap()
+            .snapshot_via(&dest, ops, |_| Ok(()))
+            .unwrap_err();
+        let crate::DbError::Snapshot { source, .. } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(source.kind(), std::io::ErrorKind::Unsupported);
+        let message = source.to_string();
+        assert!(
+            message.contains("--snapshot PATH") && message.contains("--no-snapshot"),
+            "the refusal must name both ways forward: {message}"
+        );
+        assert!(!dest.exists(), "nothing is published");
+        assert!(partials(dir.path()).is_empty(), "nor left beside it");
+    }
+
+    /// The fallback itself moves a file onto a free name and refuses a taken one,
+    /// leaving both files as they were. Where no such rename exists it reports
+    /// that, and never falls back to one that replaces.
+    #[test]
+    fn the_no_replace_rename_refuses_a_taken_name() {
+        let supported = cfg!(any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple"
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let (from, to) = (dir.path().join("from"), dir.path().join("to"));
+        std::fs::write(&from, b"copy").unwrap();
+        std::fs::write(&to, b"theirs").unwrap();
+
+        let taken = super::rename_no_replace(&from, &to).unwrap_err();
+        let expected = if supported {
+            std::io::ErrorKind::AlreadyExists
+        } else {
+            std::io::ErrorKind::Unsupported
+        };
+        assert_eq!(taken.kind(), expected, "{taken}");
+        assert_eq!(std::fs::read(&from).unwrap(), b"copy");
+        assert_eq!(std::fs::read(&to).unwrap(), b"theirs");
+
+        std::fs::remove_file(&to).unwrap();
+        if supported {
+            super::rename_no_replace(&from, &to).unwrap();
+            assert_eq!(std::fs::read(&to).unwrap(), b"copy");
+            assert!(!from.exists());
+        } else {
+            super::rename_no_replace(&from, &to).unwrap_err();
+            assert!(!to.exists());
+        }
+    }
+
+    /// Beside a directory that is not there, there is nothing to clear. One that
+    /// cannot be listed is an error, not a quiet "nothing found" that would leave
+    /// a torn copy in place.
+    #[test]
+    fn clearing_needs_a_directory_it_can_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent").join("s.db.v3.bak");
+        assert_eq!(
+            PendingMigration::clear_partial_snapshots(&missing).unwrap(),
+            Vec::<PathBuf>::new()
+        );
+        let file = dir.path().join("not-a-directory");
+        std::fs::write(&file, b"").unwrap();
+        PendingMigration::clear_partial_snapshots(&file.join("s.db.v3.bak")).unwrap_err();
+    }
+
+    /// A filesystem that cannot sync a directory at all is tolerated: the copy is
+    /// already complete under its name. Any other failure is not.
+    #[test]
+    fn syncing_the_directory_tolerates_only_a_filesystem_that_cannot() {
+        let dir = tempfile::tempdir().unwrap();
+        super::sync_dir(dir.path()).unwrap();
+        super::sync_dir(&dir.path().join("absent")).unwrap_err();
+        // procfs has no fsync, so syncing a directory there is EINVAL.
+        #[cfg(target_os = "linux")]
+        super::sync_dir(Path::new("/proc")).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod apply_tests {
+    use std::path::Path;
+
+    use super::PendingMigration;
+
+    fn store_at_v3_with_art(path: &Path, bytes: usize) {
+        crate::schema::seed_store_at_version(path, 3).unwrap();
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute(
+                "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
+                 VALUES (?1, 'image/png', 1, 1, ?2, ?3)",
+                rusqlite::params!["b".repeat(64), bytes, vec![7u8; bytes]],
+            )
+            .unwrap();
+    }
+
+    fn journal_mode(path: &Path) -> String {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// The rebuild writes every table twice in one transaction. Logged through
+    /// the WAL, every one of those pages would sit in `-wal` beside the store,
+    /// on top of the file's own growth; journalled, the log stays empty (#705).
+    /// The store is back in write-ahead logging afterwards.
+    #[test]
+    fn the_upgrade_is_journalled_rather_than_logged_through_the_wal() {
+        const ART: usize = 2 * 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.db");
+        store_at_v3_with_art(&path, ART);
+
+        let db = PendingMigration::open(&path).unwrap().apply().unwrap();
+        let mut wal = path.as_os_str().to_os_string();
+        wal.push("-wal");
+        let logged = std::fs::metadata(&wal).map_or(0, |m| m.len());
+        assert!(
+            logged < (ART / 4) as u64,
+            "the upgrade must not stage its rewrite in the WAL: {logged} bytes"
+        );
+        drop(db);
+        assert_eq!(journal_mode(&path), "wal");
+    }
+
+    /// An upgrade that fails part-way goes back to write-ahead logging too, so a
+    /// refused store is left in the mode it was found in.
+    #[test]
+    fn a_failed_upgrade_leaves_the_store_in_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.db");
+        store_at_v3_with_art(&path, 16);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
+        // Filed under a digest that is not lowercase hex, which V4 refuses.
+        conn.execute(
+            "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
+             VALUES (?1, 'image/png', 1, 1, 1, X'00')",
+            [&"B".repeat(64)],
+        )
+        .unwrap();
+        drop(conn);
+
+        PendingMigration::open(&path).unwrap().apply().unwrap_err();
+        assert_eq!(journal_mode(&path), "wal");
     }
 }
 
@@ -1103,6 +1762,7 @@ mod rejection_tests {
             assert_eq!(
                 found.duplicates(),
                 [super::DuplicatePath {
+                    path: std::path::PathBuf::from("/lib/a.flac"),
                     kept,
                     refused,
                     ambiguous: false,
@@ -1132,24 +1792,31 @@ mod rejection_tests {
         assert_eq!(
             found.duplicates(),
             [super::DuplicatePath {
+                path: std::path::PathBuf::from("/lib/a.flac"),
                 kept: 1,
                 refused: 2,
                 ambiguous: true,
             }],
-            "reported, both ids named"
+            "reported, the path and both ids named"
         );
         let err = pending
             .repair()
             .expect_err("two curated rows are not the repair's to choose between");
         assert!(
             matches!(
-                err,
+                &err,
                 crate::DbError::AmbiguousDuplicatePath {
+                    path,
                     first: 1,
                     second: 2
-                }
+                } if path == std::path::Path::new("/lib/a.flac")
             ),
             "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.starts_with("/lib/a.flac is stored twice, as tracks 1 and 2"),
+            "{message}"
         );
         drop(pending);
         let tracks: i64 = Connection::open(&path)

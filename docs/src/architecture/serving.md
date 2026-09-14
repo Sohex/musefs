@@ -164,10 +164,52 @@ size is not visible to the handler: resolving a whole wide directory to fill one
 page would front-load enormous latency onto the first call, and anything
 over-resolved lands in the size cache for the page that does ask for it.
 
-An entry whose attributes cannot be resolved is still listed, with placeholder
-attributes and a zero TTL: the kernel caches neither, so the client's next
-access goes back to `lookup` and gets the real error — the same thing it sees
-today, rather than the file silently vanishing from the listing.
+An entry is never sent with attributes that are not the file's own. A zero TTL
+does not make them harmless: the kernel applies a `readdirplus` entry's
+attributes to the inode it already holds for that name whatever the timeout, so
+the size-0 placeholder musefs used to send truncated the page cache of a file
+another process had open, and a program with the file mapped was killed by
+`SIGBUS`. Instead the reply page ends before the first entry that has no
+attributes, and the kernel asks again from that entry's cookie. A short page is
+just a short page; the two other ways to stop would each lose names. An empty
+reply reads as the end of the directory, and an error fails the whole
+`getdents`.
+
+Every page still makes progress. A page's first entry is resolved even when
+the pool is over its admission cap (below), and an entry whose resolution
+failed partway down a page is tried again as the first entry of the next one,
+which is what a transient failure, a blip on an NFS backing, needs. An entry
+that still cannot be resolved as a page's first is listed with the attributes
+musefs last sent the kernel for that inode, and a zero TTL. The mount keeps
+those attributes for every file inode from each `lookup`, `getattr` and
+`readdirplus` reply, once the kernel has negotiated `readdirplus` at all, and
+drops them when the kernel forgets the inode or a refresh invalidates it. Linux
+sends that `FORGET` when it evicts the inode, and also for an entry it was sent
+but could not link, so every count a reply hands it comes back. The record
+therefore never outgrows the file inodes the kernel caches, at about 150 to 300
+bytes each against the tree's ~1.3 KB per track. A kernel that never negotiates
+`readdirplus`, such as FreeBSD's, never gets a record, which also matters
+because FreeBSD can answer a `lookup` it then fails to link without sending
+`FORGET`. If the kernel holds
+attributes for the inode at all, it holds those, so linking them changes
+nothing, and the zero TTL sends the client's next access back to `getattr` and
+its real error. The file neither vanishes from `ls` nor stalls the listing.
+None of this changes what `getattr` serves or when its size cache lets go of a
+stale entry.
+
+Only an inode with no such record is listed with a size no file can have. The
+kernel emits the name and refuses the entry before it links anything, in
+`fuse_invalid_attr`. That check arrived with "fuse: verify attributes"
+(eb59bd17, Linux 5.5) and was backported to 5.4.3, 4.19.89, 4.14.159, 4.9.207,
+4.4.207 and 3.16.85. musefs documents no minimum kernel. On a kernel without
+the check — 3.10, a series that reached end of life before December 2019, or a
+vendor kernel that did not take the patch — the size would be written into an
+inode the kernel holds as a negative `i_size`, and that inode's page cache
+truncated. That is why the out-of-range size goes only where the kernel holds no
+attributes musefs sent: an inode it has never been told about, or one whose
+attributes it has discarded, such as an inode a refresh handed to another track
+([#778](https://github.com/Sohex/musefs/issues/778)). The over-cap path depends
+on none of this.
 
 ### Admission to the worker pool
 
@@ -180,10 +222,12 @@ of it is refused. A job that finds the gate full runs on the thread that
 submitted it. From the dispatch thread that is the backpressure: fuser reads no
 further request until the job is done, so the backlog waits in the kernel
 rather than in musefs' memory. The one exception is a `readdirplus` entry's
-attributes, which are left unresolved over the cap instead, with the zero-TTL
-placeholder above — running them in place would let a wide directory chain
-round after round on one thread. `musefs_pool_over_cap_total` counts the jobs
-that met the cap; on a healthy mount it stays at zero.
+attributes, other than the first of a reply page: over the cap those are not
+run at all, and the page ends before them, as above. The kernel asks again for
+the rest, and the next page's first entry runs in place. Running every entry in
+place would let a wide directory chain round after round on one thread.
+`musefs_pool_over_cap_total` counts the jobs that met the cap; on a healthy
+mount it stays at zero.
 
 Store refreshes run on a lane of their own, a single thread, so a metadata
 backlog never delays freshness and a refresh never runs in place on the

@@ -54,6 +54,57 @@ fn reading_whole_file_matches_total_len_and_splices_audio() {
     );
 }
 
+/// Scan an M4A carrying QuickTime keyed metadata, edit `artist` in the store, and
+/// read the whole served file (#771). It carries only the store's metadata: the
+/// keyed artist the store replaced is gone from its bytes, as is the keyed title
+/// the iTunes `©nam` outranked at scan time, and the audio is the original's,
+/// byte for byte.
+#[test]
+fn served_m4a_carries_only_the_stores_metadata_after_scanning_keyed_metadata() {
+    use musefs_format::fuzz_check::fixtures;
+    let dir = tempfile::tempdir().unwrap();
+    let audio: Vec<u8> = (0..128u8).collect();
+    std::fs::write(dir.path().join("keyed.m4a"), fixtures::m4a_keyed(&audio)).unwrap();
+    let db = Db::open_in_memory().unwrap();
+    musefs_core::scan_directory(&db, dir.path()).unwrap();
+    let track = db.list_tracks().unwrap().remove(0);
+
+    let mut tags = db.get_tags(track.id).unwrap();
+    assert!(
+        tags.iter()
+            .any(|t| t.key == "artist" && t.value == "Keyed Artist"),
+        "the scan ingested the keyed artist: {tags:?}"
+    );
+    tags.retain(|t| t.key != "artist");
+    tags.push(Tag::new("artist", "New Artist", 0));
+    db.replace_tags(track.id, &tags).unwrap();
+
+    let resolved = HeaderCache::new(Mode::Synthesis)
+        .resolve(&db, track.id)
+        .unwrap();
+    let served = read_at(&resolved, &db, 0, resolved.total_len).unwrap();
+    for old in [&b"Keyed Artist"[..], b"Keyed Title"] {
+        assert!(
+            !served.windows(old.len()).any(|w| w == old),
+            "{} survived synthesis",
+            String::from_utf8_lossy(old)
+        );
+    }
+    let artists: Vec<(String, String)> = musefs_format::mp4::read_tags(&served)
+        .into_iter()
+        .filter(|(k, _)| k == "artist")
+        .collect();
+    assert_eq!(
+        artists,
+        vec![("artist".to_string(), "New Artist".to_string())]
+    );
+    let scan = musefs_format::mp4::read_structure(&served).unwrap();
+    assert_eq!(
+        &served[usize::try_from(scan.mdat_payload_offset).unwrap()..],
+        &audio[..]
+    );
+}
+
 #[test]
 fn reading_past_eof_returns_empty() {
     let (_dir, db, id) = setup();

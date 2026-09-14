@@ -136,7 +136,8 @@ impl RegionLayout {
     }
 
     /// True if any segment streams an opaque binary tag payload from the DB.
-    pub fn has_binary_tag(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn has_binary_tag(&self) -> bool {
         self.segments
             .iter()
             .any(|s| matches!(s, Segment::BinaryTag { .. }))

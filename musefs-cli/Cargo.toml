@@ -28,6 +28,9 @@ uzers = "0.12"
 indicatif = { version = "0.18", default-features = false }
 dialoguer = { version = "0.12", default-features = false }
 fs4 = { version = "1", default-features = false }
+# `access(2)`, to find the directory SQLite puts its temporary files in the way
+# SQLite itself does, so `migrate`'s free-space pre-flight counts them there.
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 # Used to rewind a store's user_version, so the migrate command can be exercised

@@ -118,7 +118,14 @@ fn scan_refuses_a_wavl_waveform_by_name() {
     std::fs::write(&path, &bytes).unwrap();
 
     assert!(probe_full(&path, &bytes).is_none());
-    match probe_file(&path, WINDOW, ChecksumTier::Fingerprint).unwrap() {
+    match probe_file(
+        &path,
+        WINDOW,
+        ChecksumTier::Fingerprint,
+        &crate::freshness::InodeKeeping::default(),
+    )
+    .unwrap()
+    {
         ProbeOutcome::Failed(f) => {
             assert_eq!(f.reason, SkipReason::Unsupported);
             assert!(f.message.contains("LIST('wavl')"), "{}", f.message);
@@ -150,7 +157,14 @@ fn an_oversize_wavl_waveform_is_refused_by_name_too() {
         .unwrap();
     drop(f);
 
-    match probe_file(&path, WINDOW, ChecksumTier::Fingerprint).unwrap() {
+    match probe_file(
+        &path,
+        WINDOW,
+        ChecksumTier::Fingerprint,
+        &crate::freshness::InodeKeeping::default(),
+    )
+    .unwrap()
+    {
         ProbeOutcome::Failed(f) => {
             assert_eq!(f.reason, SkipReason::Unsupported);
             assert!(f.message.contains("LIST('wavl')"), "{}", f.message);
@@ -189,6 +203,7 @@ fn an_oversize_non_wav_holding_riff_bytes_is_not_taken_for_a_wav() {
         &dir.path().join("long-riff.ogg"),
         WINDOW,
         ChecksumTier::None,
+        &crate::freshness::InodeKeeping::default(),
     )
     .unwrap()
     {
@@ -200,6 +215,7 @@ fn an_oversize_non_wav_holding_riff_bytes_is_not_taken_for_a_wav() {
         &dir.path().join("long-riff.wav"),
         WINDOW,
         ChecksumTier::None,
+        &crate::freshness::InodeKeeping::default(),
     )
     .unwrap()
     {
