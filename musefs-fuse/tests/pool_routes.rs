@@ -11,6 +11,13 @@
 //! - store refreshes never reach the pool, and `statfs`, `release` and
 //!   `releasedir` are answered without touching it.
 //!
+//! The listing's own route depends on the kernel. Linux negotiates
+//! `readdirplus`, so the listing is `readdirplus` and its entries'
+//! `readdirplus_attr` jobs. FreeBSD's fusefs does not implement the op
+//! (`fuse_internal_send_init` lists `FUSE_DO_READDIRPLUS` as not yet
+//! implemented), so it lists with plain `readdir`, which a held handle answers
+//! from its listing without the pool. macOS never runs this tier.
+//!
 //! Run with:
 //!   cargo test -p musefs-fuse --test pool_routes -- --ignored --nocapture
 
@@ -79,7 +86,8 @@ fn mount(
 /// revalidating one does not), and it lands between the first reply page and
 /// the second. Over the cap that first page ends before its first file entry,
 /// so the second page begins at one — the one case where a page's first entry
-/// needs the pool, and the route pinned over the cap.
+/// needs the pool, and the route pinned over the cap. A kernel without
+/// `readdirplus` lists with `readdir`, and the extra stat is one more `lookup`.
 fn drive(root: &Path) {
     let dir = root.join("Art");
     let song = dir.join("Song0.flac");
@@ -118,12 +126,27 @@ fn every_op_takes_its_route_through_the_worker_pool() {
         let (root, session, trace) = mount(backing.path(), "musefs-routes-queued", None, None);
         drive(root.path());
         let seen = routes(&trace);
-        for op in ["lookup", "getattr", "open", "opendir", "readdirplus_attr"] {
+        for op in ["lookup", "getattr", "open", "opendir"] {
             assert_eq!(
                 seen.get(op),
                 Some(&BTreeSet::from([PoolRoute::Queued])),
                 "{op} must queue on the pool under the cap: {seen:?}"
             );
+        }
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                seen.get("readdirplus_attr"),
+                Some(&BTreeSet::from([PoolRoute::Queued])),
+                "readdirplus_attr must queue on the pool under the cap: {seen:?}"
+            );
+        } else {
+            for op in ["readdirplus", "readdirplus_attr", "readdir"] {
+                assert!(
+                    !seen.contains_key(op),
+                    "without readdirplus, a held handle's readdir needs no pool job, \
+                     so {op} must not appear: {seen:?}"
+                );
+            }
         }
         assert_eq!(
             seen.get("read"),
@@ -162,19 +185,33 @@ fn every_op_takes_its_route_through_the_worker_pool() {
             mount(backing.path(), "musefs-routes-over-cap", Some(0), Some(0));
         drive(root.path());
         let seen = routes(&trace);
-        for op in ["lookup", "getattr", "open", "opendir", "readdirplus"] {
+        let listing = if cfg!(target_os = "linux") {
+            "readdirplus"
+        } else {
+            "readdir"
+        };
+        for op in ["lookup", "getattr", "open", "opendir", listing] {
             assert_eq!(
                 seen.get(op),
                 Some(&BTreeSet::from([PoolRoute::InPlace])),
                 "over the cap {op} must run on the submitting thread, not be refused: {seen:?}"
             );
         }
-        assert_eq!(
-            seen.get("readdirplus_attr"),
-            Some(&BTreeSet::from([PoolRoute::InPlace, PoolRoute::Dropped])),
-            "over the cap a readdirplus page's first entry runs in place and the \
-             rest are dropped unrun: {seen:?}"
-        );
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                seen.get("readdirplus_attr"),
+                Some(&BTreeSet::from([PoolRoute::InPlace, PoolRoute::Dropped])),
+                "over the cap a readdirplus page's first entry runs in place and the \
+                 rest are dropped unrun: {seen:?}"
+            );
+        } else {
+            for op in ["readdirplus", "readdirplus_attr"] {
+                assert!(
+                    !seen.contains_key(op),
+                    "a kernel without readdirplus never sends {op}: {seen:?}"
+                );
+            }
+        }
         assert_eq!(
             seen.get("read"),
             Some(&BTreeSet::from([PoolRoute::ReadLane])),
