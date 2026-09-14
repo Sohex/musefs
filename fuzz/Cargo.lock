@@ -438,6 +438,7 @@ dependencies = [
  "base16ct",
  "log",
  "rusqlite",
+ "rustix",
  "sha2",
  "strum",
  "thiserror",
