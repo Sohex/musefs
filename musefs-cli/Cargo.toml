@@ -6,8 +6,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../README.md"
 keywords = ["fuse", "music", "metadata", "filesystem", "audio"]
 categories = ["filesystem", "multimedia::audio", "command-line-utilities"]
+# Integration tests stay in the repository: `tests/migrate.rs` needs
+# `musefs-db`'s `test-support` feature, which only a path dev-dependency turns
+# on, and cargo strips path dev-dependencies at publish.
+exclude = ["tests/"]
 
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }

@@ -1,3 +1,8 @@
+//! Audio metadata synthesis for musefs (FLAC, MP3, MP4, Ogg, WAV): probe where a
+//! file's audio sits, then describe the file musefs serves as a [`RegionLayout`]
+//! — freshly generated metadata segments followed by the untouched audio bytes,
+//! which are referenced by position and never copied.
+
 mod bytes;
 mod convert;
 mod error;

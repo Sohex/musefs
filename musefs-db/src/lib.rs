@@ -1,3 +1,9 @@
+//! The SQLite store behind musefs: the schema and its migrations, and checked
+//! reads and writes of tracks, tags, content-addressed art and structural blocks.
+//!
+//! The store is the source of truth for a mount's tags and art, and the contract
+//! external tools write to: <https://sohex.github.io/musefs/architecture/store.html>.
+
 mod art;
 mod bulk;
 pub mod convert;

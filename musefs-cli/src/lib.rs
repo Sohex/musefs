@@ -1,5 +1,7 @@
 //! The `musefs` command-line interface: `scan` (ingest a backing directory into a
-//! SQLite store) and `mount` (serve a read-only FUSE view of that store).
+//! SQLite store), `revalidate` (re-check stored tracks against their backing
+//! files), `mount` (serve a read-only FUSE view of that store), and the store
+//! maintenance commands `vacuum` and `migrate`.
 
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
