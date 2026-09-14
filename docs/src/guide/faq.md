@@ -30,5 +30,6 @@ via FUSE passthrough (needs `CAP_SYS_ADMIN`).
 
 **A file in the mount won't open / reads error — why?**
 The most common cause is a backing file that changed since its last scan
-(musefs refuses to serve a file whose size, mtime, or ctime drifted, rather
-than splice at stale offsets). Run `musefs revalidate` to re-probe it.
+(musefs refuses to serve a file whose size, mtime, ctime or inode no longer
+match what the store recorded, rather than splice at stale offsets). Run
+`musefs revalidate` to re-probe it.

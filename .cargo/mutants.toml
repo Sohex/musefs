@@ -222,7 +222,7 @@ exclude_re = [
     # guard: op="+=" fn="revalidate_with" rows=2
 'musefs-core/src/scan\.rs:2878:33:',
     # guard: op="+" fn="revalidate_with" rows=1
-'musefs-core/src/scan\.rs:2991:29: replace \+ with -',
+'musefs-core/src/scan\.rs:2993:29: replace \+ with -',
     # Phase 2 ID3 binary tags: classify_binary_frame's POPM counter fold
     # `(a << 8) | b` -> `(a << 8) ^ b`. The accumulator is left-shifted by 8 before
     # each combine, so its low byte is always zero where `b` lands; `|` and `^` are

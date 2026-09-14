@@ -49,8 +49,8 @@ user. This surprises root-run tooling (Ansible, boot scripts):
 
 ## Configuring with environment variables
 
-Every scalar `mount` and `scan` flag can also be set with a `MUSEFS_*`
-environment variable — uppercase the long flag and turn dashes into
+Most scalar flags of `mount`, `scan`, `revalidate`, `vacuum` and `migrate` can
+also be set with a `MUSEFS_*` environment variable — uppercase the long flag and turn dashes into
 underscores (e.g. `--poll-interval-ms` → `MUSEFS_POLL_INTERVAL_MS`, the
 `mount` mountpoint → `MUSEFS_MOUNTPOINT`). An explicit flag always overrides
 its env var, which overrides the default. Boolean flags (e.g.
@@ -58,10 +58,19 @@ its env var, which overrides the default. Boolean flags (e.g.
 `MUSEFS_QUIET`, `MUSEFS_ALLOW_OTHER`, `MUSEFS_CASE_INSENSITIVE`,
 `MUSEFS_EXPOSE_METRICS`) accept a
 case-insensitive boolish value — `true`/`false`, `yes`/`no`, `on`/`off`,
-`1`/`0` — and reject anything else. The repeatable `--fallback` and the
-`scan` targets are command-line only. See
+`1`/`0` — and reject anything else. The repeatable `--fallback`,
+`mount --dry-run`, the `scan` and `revalidate` targets, and `migrate`'s
+`--snapshot`, `--no-snapshot`, `--repair`, `--vacuum` and `--revalidate` are
+command-line only. See
 [`contrib/systemd/musefs.conf.example`](../../../contrib/systemd/musefs.conf.example)
 for a commented example covering the common settings.
+
+**Retired in 2.0.0.** `MUSEFS_REVALIDATE`, `MUSEFS_FAST` and `MUSEFS_STRICT` no
+longer have a flag to read them, so `scan` refuses to start (exit `1`) while
+any of them is set to a non-empty value, `false` included. Delete the line: use
+the `revalidate` subcommand in place of the first, and `MUSEFS_MATCH=fast` or
+`MUSEFS_MATCH=strict` in place of the others (see the
+[release notes](../release-notes.md#upgrading-from-v130)).
 
 These variables are read the same way no matter how musefs is launched:
 exported into the shell before running the binary directly
@@ -74,10 +83,17 @@ just show the per-deployment wiring.
 
 To run musefs on the host at login, drop-in units live in
 [`contrib/systemd/`](../integrations/systemd.md): a `musefs.service` mount daemon, an
-optional `musefs-scan.timer` for periodic re-scans, and a commented
+optional `musefs-scan.timer` that periodically runs `musefs revalidate --prune`
+(refreshing changed files and removing tracks whose files are gone; it adds no
+new files), and a commented
 `musefs.conf.example` holding every `MUSEFS_*` setting. Copy the units to
 `~/.config/systemd/user/`, copy the config to `~/.config/musefs/musefs.conf`,
 edit `MUSEFS_MOUNTPOINT` and `MUSEFS_DB`, then
 `systemctl --user enable --now musefs.service`. See
 [the systemd integration guide](../integrations/systemd.md) for the full
 walkthrough and the `PATH` / linger gotchas.
+
+**Upgrading to 2.0.0.** Stop `musefs.service` and the timer, delete any
+`MUSEFS_REVALIDATE`, `MUSEFS_FAST` or `MUSEFS_STRICT` line from `musefs.conf`,
+and run `musefs migrate` before starting them again. A 2.0.0 `mount` refuses a
+1.x store, so the service fails at every start until the store is upgraded.

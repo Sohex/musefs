@@ -26,7 +26,8 @@ and these packages adhere to [Semantic Versioning](https://semver.org/spec/v2.0.
   written.
 
 - **`musefs_common.path_param` / `musefs_common.path_value`** — the
-  `backing_path` boundary encode and decode. See the change above.
+  `backing_path` boundary encode and decode. See the `backing_path` change
+  below.
 - **`musefs_common.ScanResult`** — what a completed `run_scan` did. Carries
   `binary`, `target`, `verb`, `returncode`, `partial` and `stderr`, and renders
   the shared non-fatal message via `.warning()` (`None` for a clean run). See
@@ -53,6 +54,8 @@ and these packages adhere to [Semantic Versioning](https://semver.org/spec/v2.0.
   so a link stored without one produces art whose declared type is the empty
   string. `sync_files` passes each `ArtImage`'s own mime, so callers using it are
   unaffected; a caller driving `replace_track_art` directly must add the field.
+  A row of any other length, including the 1.x three-field form, raises
+  `ValueError` naming the accepted shapes.
 
 - **A text-tag sync can no longer collide with a scanner-written binary tag.**
   Schema v4 replaces `tags`' primary key with a unique index that folds the
@@ -70,6 +73,15 @@ and these packages adhere to [Semantic Versioning](https://semver.org/spec/v2.0.
   this — both replace by delete-then-insert — so nothing here changes; it is
   noted because a third-party writer doing it will now get an abort rather than
   silently leaving the old track serving stale bytes.
+
+- **Three more store rules a direct writer must follow** (musefs #758, #761,
+  #762). None changes what these helpers do, since they already comply, but a
+  third-party writer that breaks one now gets an abort:
+  - `tracks.backing_path` is at most 64 KiB, as bytes.
+  - A digest is 64 lowercase hex characters. That covers `art.sha256`, which
+    `upsert_art` already writes in that form, and the scanner-owned
+    `fingerprint` and `content_hash`.
+  - A track's `id` cannot be updated once assigned.
 
 - **`backing_path` is bytes.** Schema v4 changes the column from `TEXT` to
   `BLOB`, because a filesystem path is a byte string. SQLite never compares a
@@ -117,10 +129,9 @@ and these packages adhere to [Semantic Versioning](https://semver.org/spec/v2.0.
   — the insert is `ON CONFLICT(sha256) DO NOTHING`, so the stored row won — and
   from schema v4 there is no column on `art` for it to write.
   `replace_track_art` is where the mime goes now — see its entry under
-  *Changed*, which is the release that put it there. `sync_files` callers are
-  unaffected; a caller driving `upsert_art` directly must drop the argument, and
-  a caller that was relying on it to record the mime must pass one to
-  `replace_track_art`.
+  *Changed*. `sync_files` callers are unaffected; a caller driving `upsert_art`
+  directly must drop the argument, and a caller that was relying on it to
+  record the mime must pass one to `replace_track_art`.
 
 ### Fixed
 

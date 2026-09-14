@@ -1,7 +1,7 @@
 # musefs-picard
 
 A [MusicBrainz Picard](https://picard.musicbrainz.org/) plugin that syncs your
-Picard metadata (tags + front cover) into a [musefs](../introduction.md) SQLite
+Picard metadata (tags + cover art) into a [musefs](../introduction.md) SQLite
 store, so a live musefs mount shows a re-tagged view of your library **without
 rewriting any audio**.
 
@@ -13,7 +13,7 @@ selection → **"Sync to musefs"** *instead of* pressing Save. The plugin:
 
 1. runs `musefs scan` on each selected file to create/refresh its track row and
    structural columns (the offsets only musefs can compute), then
-2. writes Picard's tags and front cover into the store, keyed by the file's
+2. writes Picard's tags and cover art into the store, keyed by the file's
    canonical real path.
 
 musefs's auto-refresh surfaces the change at the mount with no remount. The
@@ -62,9 +62,12 @@ settings (handy for testing).
 
 ## Notes
 
-- **Front cover only:** the first front-cover image Picard holds is synced.
-  Picard art wins when present; otherwise any art `musefs scan` ingested from
-  the file's embedded picture is preserved. Re-syncing a file with no Picard
+- **Cover art:** every image Picard holds that can be saved to tags is synced,
+  in Picard's order, with its picture type (front, back, booklet or medium,
+  otherwise Other) and its comment as the description. Images over the store's
+  art size cap are skipped. Picard art wins when present; otherwise any art
+  `musefs scan` ingested from the file's embedded picture is preserved.
+  Re-syncing a file with no Picard
   art lets the embedded picture re-seed when autoscan is on (musefs scan
   re-reads the file); with autoscan off, existing art is left untouched.
 - **Tags are fully replaced** with Picard's view on every sync.

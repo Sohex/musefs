@@ -16,6 +16,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **An owed revalidate is reported until it runs.** `migrate` reports how many
+  tracks the upgrade left needing a revalidate, but only once, and that line
+  scrolls away. Now `mount`, `scan` and `revalidate` each print a warning with
+  the number of tracks that have neither a fingerprint nor a recorded inode, for
+  as long as any remain ([#705](https://github.com/Sohex/musefs/issues/705)).
+
 - **`musefs migrate --repair`.** Before copying or writing anything, `migrate`
   now checks that every row in the store survives the schema it is about to
   become, reports what would be refused per table, and stops. A row gets there
@@ -144,10 +150,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     ([#674](https://github.com/Sohex/musefs/issues/674)), for backing
     filesystems that store no sub-second timestamps and where a same-size
     replacement could otherwise pass the freshness guard. Zero means *not yet
-    known*, so an upgraded store is not taken dark; each scan arms the guard for
-    the rows it touches. FAT and exFAT get no inode, since they renumber files
-    on every mount ([#757](https://github.com/Sohex/musefs/issues/757)), and are
-    not recommended as backing storage.
+    known*, so an upgraded store is not taken dark; the guard arms as
+    `musefs revalidate` re-probes each row, and for every row a scan newly
+    ingests. On Linux, FAT and exFAT get no inode, since they renumber files on
+    every mount ([#757](https://github.com/Sohex/musefs/issues/757)), and they
+    are not recommended as backing storage.
   - A backing file dated before 1970 is no longer refused
     ([#696](https://github.com/Sohex/musefs/issues/696)). The lower bounds on
     `backing_mtime_ns` and `backing_ctime_ns` are gone, so an archival rip
@@ -164,7 +171,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   keys on, so a bump would invalidate every layout in the store for a migration
   that changed no audio. Fingerprints are retired in the same pass
   ([#691](https://github.com/Sohex/musefs/issues/691)), which `musefs migrate`
-  already reports and offers a `revalidate` for.
+  already reports and offers a `revalidate` for. Every `content_hash` is cleared
+  with them, since a pre-2.0.0 rescan could leave one describing bytes its file
+  no longer holds; `musefs revalidate --checksum=full` recomputes them
+  ([#689](https://github.com/Sohex/musefs/issues/689)).
 
 - **`tags` and `track_art` are rebuilt by the same migration.**
 
@@ -248,6 +258,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and assign the fields you change. The store's write inputs and the synthesis
   inputs stay exhaustive, so a new store column is still a breaking change for
   Rust code that writes rows.
+
+- **Rust crate API.** Beyond the `#[non_exhaustive]` marking, the crates'
+  public API follows the store: paths are `PathBuf`, picture metadata moves from
+  `Art`/`NewArt` to `TrackArt` (and `ArtInput`/`EmbeddedPicture` gain `depth`
+  and `colors`), `BackingStamp` gains an inode compared through `matches_live`,
+  and `Attr`/`ResolvedFile` report a `VirtualMtime`. Checksum writes take a
+  `ChecksumWrite`; `Db::open` refuses a gated store with `StoreNeedsMigration`,
+  and `PendingMigration` drives `musefs migrate`; `StoreInUse` names its
+  operation, and `ArtDigestMismatch`, `DerivedStateStale`, `TrackIdentity`,
+  `refresh_embedded_art`/`EmbeddedArt` and `count_tracks_awaiting_revalidate`
+  are new. `Segment::OggAudio`, `FuseTelemetry`, `render_prometheus`, the
+  virtual tree's name types and `DbError::FieldTooLarge` change shape too. The
+  [release notes](https://sohex.github.io/musefs/release-notes.html#upgrading-from-v130)
+  list every break.
 
 - The serve path no longer zero-fills buffers a read is about to overwrite
   ([#670](https://github.com/Sohex/musefs/issues/670)). Backing-audio segments,
@@ -484,7 +508,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   external edits stopped appearing until the row aged out or the mount
   restarted. The migration recreates the ring with the column's type enforced,
   and a row like that from a store written with constraints off now forces a
-  full rebuild instead.
+  full rebuild instead: `changelog_since` skips it and reports it in the new
+  `ChangelogRead::malformed`.
 
 - **A backing file rewritten mid-read fails that read, not the next one**
   ([#682](https://github.com/Sohex/musefs/issues/682)). The stamp check now runs
@@ -593,8 +618,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is compared on the other three fields alone rather than failing closed on a
   field the store has nothing to say about, so an upgrade does not take a
   library dark. `musefs revalidate` re-probes exactly those rows and fills the
-  inode in, except on FAT and exFAT, which keep no inode numbers to record
-  ([#757](https://github.com/Sohex/musefs/issues/757)).
+  inode in, except on FAT and exFAT under Linux, which keep no stable inode
+  numbers to record ([#757](https://github.com/Sohex/musefs/issues/757)).
 
 - Two files holding byte-identical cover art no longer serve each other's
   picture metadata ([#716](https://github.com/Sohex/musefs/issues/716)). `art`
@@ -754,8 +779,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   no rows behind rather than a track missing its tags.
 - A scan no longer aborts on a file that carries one tag key as both text and a
   binary payload ([#659](https://github.com/Sohex/musefs/issues/659)). The
-  `tags` primary key is `(track_id, key, ordinal)` and does not discriminate on
-  `value_blob`, but the two row classes were numbered from 0 independently, so
+  `tags` primary key was `(track_id, key, ordinal)` and did not discriminate on
+  `value_blob` (the 2.0.0 migration replaces it with a per-class unique index,
+  [#663](https://github.com/Sohex/musefs/issues/663)), but the two row classes
+  were numbered from 0 independently, so
   such a file wrote two rows at the same key and ordinal and failed its ingest
   transaction with `UNIQUE constraint failed: tags.track_id, tags.key,
   tags.ordinal` — fatal to the whole scan, hours in. Text and binary rows now
@@ -791,8 +818,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   neither the offending file nor what the number meant. Every cap the scanner
   can trip is now checked in one place before anything is written, and a
   violation fails only that file, with a message naming it. The same applies to
-  the `tags.key`, `art.mime` and `track_art.description` caps, which had the
-  identical unattributed-abort failure mode. Should a store write still fail
+  the `tags.key`, `track_art.mime` and `track_art.description` caps, which had
+  the identical unattributed-abort failure mode. Should a store write still fail
   fatally, the error now names the file it died on.
 - A FLAC whose tags outgrow what a `VORBIS_COMMENT` block can hold is rejected
   at scan time rather than stored and then served `EIO` on every read. This is
@@ -831,9 +858,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A hostile store row can no longer smuggle an unbounded payload past a
   character cap by hiding it behind an embedded NUL
   ([#693](https://github.com/Sohex/musefs/issues/693)). SQLite permits U+0000 in
-  a TEXT value and stops counting characters at it, so `tags.key`, `art.mime`
-  and `track_art.description` — all capped in characters — measured 1 for a
-  value of `"X\0"` followed by a hundred megabytes, and the reader guard that
+  a TEXT value and stops counting characters at it, so `tags.key`, the picture
+  MIME type and `track_art.description` — all capped in characters — measured 1
+  for a value of `"X\0"` followed by a hundred megabytes, and the reader guard that
   exists to reject an over-cap field *before* it is materialized measured 1 too.
   Every reader of those fields now also bounds the value's byte length against
   the ceiling its character cap implies, so a row already in the store is
@@ -842,7 +869,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is narrowed. Forbidding NUL outright in the constraints themselves is a schema
   change and rides the 2.0.0 store migration. `get_art`, the one reader that
   materializes a whole `art` row rather than streaming its blob, gained the same
-  treatment for `mime`, for `sha256` — whose `length(sha256) = 64` constraint a
+  treatment for `sha256` — whose `length(sha256) = 64` constraint a
   NUL likewise satisfies, so it never guaranteed a 64-character stored identity
   — and for the image blob itself.
 

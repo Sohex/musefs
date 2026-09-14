@@ -145,7 +145,9 @@ A few plugins ignore that gate or are redundant in this mode:
   separators) to mirror your beets layout, including layouts musefs's own template
   engine can't express. Set `write_path: no` in the `musefs:` config to skip it.
   Do not add an extension in a template that consumes `beets_path`. See the
-  computed-tag workflow in [the architecture overview](../architecture/overview.md).
+  path layout offload in
+  [the external-writer contract](../architecture/store.md#the-external-writer-contract)
+  and [path templates](../guide/mounting.md#path-templates).
 - **Pruning is a deliberate act.** The plugin never prunes on its own. Pruning
   track rows whose backing file is gone from disk (renames/moves/deletes) is owned
   entirely by `musefs revalidate --prune`, reachable from beets as `beet musefs

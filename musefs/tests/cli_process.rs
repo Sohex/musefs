@@ -211,7 +211,7 @@ fn scan_with_checksum_full_exits_zero() {
     );
 }
 
-/// #707: the alias deprecated in 1.1.0 is gone, and asking for it is a usage
+/// #707: the alias deprecated in 1.2.0 is gone, and asking for it is a usage
 /// error like any other unknown flag — not a scan that quietly ran instead.
 #[test]
 fn scan_revalidate_flag_is_a_usage_error() {

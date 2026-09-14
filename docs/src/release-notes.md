@@ -84,8 +84,9 @@ the full walkthrough and flag table.
 **2. Disk space, and the way back** ([#705]). Before asking anything, `migrate`
 checks for free space next to the store: the store's on-disk size (the database
 with its `-wal` and `-shm`) for the rewrite, and the same again for the
-snapshot when it goes beside the store. If that is not there it refuses up
-front, rather than failing part-way.
+snapshot when it is written to the same filesystem as the store — beside it by
+default, or at a `--snapshot` path on that filesystem. If that is not there it
+refuses up front, rather than failing part-way.
 
 The snapshot is a single compacted copy at `<db>.v<version>.bak`, where the
 version is the one the store is at when `migrate` runs — `library.db.v2.bak` for
@@ -98,7 +99,7 @@ store with the snapshot, delete any leftover `library.db-wal` and
 The upgraded store is larger than the old one. `migrate` says by how much and
 offers a `vacuum`.
 
-**3. Rows the new schema refuses** ([#731]). This release tightens what a store
+**3. Rows the new schema refuses** ([#705]). This release tightens what a store
 row may hold ([#693], [#716], [#718]). Before anything is copied or written,
 `migrate` offers every row to the new tables. If any are refused, it reports how
 many per table and stops, with nothing changed. The refused shapes are ones a
@@ -133,7 +134,19 @@ through the catches.
 **4. Revalidate afterwards.** Accept `migrate`'s offer to revalidate your
 library, or run `musefs revalidate /path/to/music --db library.db` yourself. The
 upgrade leaves several things only a revalidate puts right, and it is the
-**first** revalidate that does it:
+**first** revalidate that does it.
+
+The offer revalidates the deepest directory every stored track shares. Stored
+paths are already resolved, symlinks included, so that walk reaches every track
+without following symlinks. If your tracks resolve into unrelated trees — a
+library of symlinks pointing into two different disks, say — they share no
+directory below `/`, so `migrate` makes no offer and prints the command instead:
+run `musefs revalidate` over each tree yourself. Until
+every track has been re-probed, `mount`, `scan` and `revalidate` each warn with
+the number still waiting ([#705]). That number counts tracks with neither a
+fingerprint nor an inode, so on Linux a track on FAT or exFAT that was scanned at
+`--checksum=none` stays in it until a default-tier `revalidate` records its
+fingerprint. What waits for the revalidate:
 
 - **Fingerprints are cleared** ([#691]). Until they are recomputed, a moved file
   is not recognised: `scan` ingests it as a new track and leaves its curated
@@ -147,8 +160,9 @@ upgrade leaves several things only a revalidate puts right, and it is the
   refuses to retarget.
 - **Stored inodes start unknown** ([#674]). The check that catches a backing
   file replaced in place cannot use the inode until a revalidate records it.
-  On FAT and exFAT none is ever recorded ([#757]): those filesystems renumber
-  files on every mount, so an inode there would fail every file after a replug.
+  On Linux, none is ever recorded on FAT and exFAT ([#757]): those filesystems
+  renumber files on every mount, so an inode there would fail every file after a
+  replug.
   The check is weaker on them as a result, and they are
   [not recommended](guide/installation.md) for the backing library.
 - **Picture metadata is copied, not per file** ([#716], [#746]). 1.3.0 kept one
@@ -184,10 +198,11 @@ compares size and mtime. 1.3.0 served whole seconds, so on the first mount
 nearly every synthesized file's mtime changes. The first revalidate then moves
 it again. The upgrade cleared every fingerprint, so at the default checksum tier
 that revalidate re-probes every file, and a re-probe moves a file's mtime only
-where it records something the store did not hold ([#757]). Everywhere except
-FAT and exFAT that includes the file's inode, recorded for the first time, so
-nearly every file's mtime moves again, seconds included. FAT and exFAT keep no
-inode numbers, so there the mtime moves only where the revalidate corrects what
+where it records something the store did not hold ([#757]). Except on FAT and
+exFAT under Linux, that includes the file's inode, recorded for the first time,
+so nearly every file's mtime moves again, seconds included. On Linux, musefs
+records no inode on FAT and exFAT, because they keep no stable inode numbers, so
+there the mtime moves only where the revalidate corrects what
 the store holds for the file: its picture metadata, an Ogg FLAC's bounds, or
 FLAC structural data an older scan never recorded. A restored picture or Ogg
 FLAC bound can change the size too. To have rsync without `--checksum`,
@@ -200,6 +215,20 @@ violation on one file used to stop the scan with exit `1`. Now that file fails,
 everything else is stored, and the scan exits `2` with the file counted under
 `rejected` in the `failed N: …` summary. A script that treated exit `1` as "the
 store refused something" should check for `2` and read the summary.
+
+**Other `scan` output a script may read:**
+
+- A file whose metadata exceeds a store limit — an oversize tag, picture or
+  binary tag — now fails, counted under `oversize` ([#644], [#651]). 1.3.0
+  stored such a file without the oversize picture or binary tag, and stopped
+  the whole scan on an oversize tag.
+- A `--checksum=full` scan that cannot hash a file now fails it, counted under
+  `checksum-failed`, instead of storing it with no full-file hash ([#690]).
+- Piped progress lines read `processed N/M (P%)`, not `ingested N/M (P%)`, and
+  now reach `100%` when files fail ([#655]).
+- The per-extension breakdown of `skipped` is logged at `info`, not `warn`, so it
+  needs `-v` or `RUST_LOG=info`. The `skipped N` count still prints at any level
+  ([#651]).
 
 **Scan flags removed.** Both changes fail loudly rather than quietly doing
 something different, so a script or unit that needs updating will tell you:
@@ -245,8 +274,16 @@ what changed underneath:
 - A picture's MIME type and dimensions describe one file's embedding, so they
   moved from `art` to `track_art`, which also gains `depth` and `colors`
   ([#716]). `upsert_art` takes only the bytes, and `replace_track_art` takes
-  `(art_id, picture_type, description, mime)`. A link written without a MIME type
-  is served with an empty one.
+  `(art_id, picture_type, description, mime)` or
+  `(art_id, picture_type, description, mime, width, height)` rows; any other
+  length, the 1.x three-field form included, raises `ValueError`. A link written
+  without a MIME type is served with an empty one. `image_dimensions` reads the
+  width and height from a PNG or JPEG header, which is how `sync_files` now fills
+  them ([#737]).
+- `tags` has no primary key any more. A unique index on
+  `(track_id, key, ordinal, (value_blob IS NULL))` takes its place, so text and
+  binary tags number their ordinals independently, and an upsert naming
+  `ON CONFLICT(track_id, key, ordinal)` no longer matches a constraint ([#663]).
 - `art` rows cannot be changed once written, and a row filed under a digest must
   hold the bytes that digest names. `upsert_art` raises `ArtDigestMismatch` when
   it does not ([#724]).
@@ -257,6 +294,14 @@ what changed underneath:
   `track_id`; delete it and insert it under the new one ([#717]).
 - A track's `id` cannot be changed once assigned. It is the identity the mount's
   refresh keys on, so the store refuses the update ([#762]).
+- A `structural_blocks` row cannot be updated in place ([#759]). The table is
+  scanner-owned and outside this contract, and the scanner replaces a track's
+  blocks by delete-then-insert; the store now refuses the `UPDATE` a writer
+  ignoring the contract could make.
+- In the helpers, `run_scan` returns a `ScanResult` for a partial scan (exit
+  `2`) instead of raising ([#647]), so a caller that relied on the exception
+  needs updating. `MAX_TAG_VALUE_LEN` exports the store's byte cap on
+  `tags.value`.
 
 The scan-flag changes above need no plugin update: the packages have called the
 `revalidate` subcommand since their 1.2.0 and pass neither `--fast` nor
@@ -266,14 +311,21 @@ The scan-flag changes above need no plugin update: the packages have called the
 directly.
 
 - The store model follows the schema ([#674], [#680], [#716]).
-  - `Track`, `TrackIdentity` and `NewTrack` carry `backing_path` as a `PathBuf`,
-    and `Track` and `NewTrack` gain `backing_ino`.
+  - `Track` and `NewTrack` carry `backing_path` as a `PathBuf` and gain
+    `backing_ino`. `Db::get_track_by_path` and `Db::retarget_track` take a
+    `&Path`.
+  - `Db::track_version_and_path` is replaced by `Db::track_identity`, which
+    returns the new `TrackIdentity`.
   - `NewArt` is only the bytes, and `Art` and `ArtMeta` lose the MIME type and
     dimensions.
-  - `TrackArt` gains `mime`, `width`, `height`, `depth` and `colors`.
-  - `NewTrack` and `TrackArt` are write inputs and stay exhaustive, so code that
-    builds them must fill the new fields.
-  - `Db::refresh_embedded_art` and its `EmbeddedArt` input are new ([#746]).
+  - `TrackArt` gains `mime`, `width`, `height`, `depth` and `colors`, and the
+    synthesis inputs `ArtInput` and `EmbeddedPicture` gain `depth` and `colors`.
+  - `NewTrack`, `TrackArt`, `ArtInput` and `EmbeddedPicture` stay exhaustive, so
+    code that builds them must fill the new fields.
+  - `Db::refresh_embedded_art` and its `EmbeddedArt` input are new ([#746]), as
+    is `Db::count_tracks_awaiting_revalidate` ([#705]).
+  - `DbError::FieldTooLarge` gains `unit`, saying whether it measured bytes or
+    characters ([#693]).
 - `Db::set_track_checksums` and the retarget writer take a `ChecksumWrite`
   instead of an `Option<&str>` ([#689]).
 - `Db::open` refuses a store that needs a gated step, with
@@ -283,9 +335,21 @@ directly.
 - `CoreError::BackingChanged` carries the path as a `PathBuf`. The messages it
   used to carry in its place are now `CoreError::DerivedStateStale` ([#680]).
 - `Attr::mtime_secs` is replaced by `mtime: Option<VirtualMtime>`, which is
-  `None` only for a virtual directory ([#696], [#725]).
+  `None` only for a virtual directory, and `ResolvedFile::mtime_secs` by
+  `mtime: VirtualMtime` ([#696], [#725]).
 - `BackingStamp` gains `ino`. Compare a stored stamp with a live one through
   `matches_live`, not `==` ([#674]).
+- `Segment::OggAudio` gains `serial: u32`, the stream's serial, which the serve
+  path checks every page against. `Segment` stays exhaustive ([#722]).
+- `VirtualTree::build`, `build_with` and `build_with_ci` take rendered paths as
+  `Arc<str>`, and `Node`'s names and `remove_track`'s result are `Arc<str>`
+  ([#617], [#629]).
+- `render_prometheus` takes a `&ProcessStats` ([#631]), and `FuseTelemetry`,
+  which the caller fills in and which stays exhaustive, gains `dir_listings`,
+  `dir_handle_rejections`, `readdirplus_calls` and `pool_over_cap`.
+- `ChangelogRead` gains `malformed`, set when `changelog_since` skipped a
+  changelog row whose track id was not an integer. The refresh treats that
+  window as a gap and rebuilds ([#760]).
 - `musefs_cli::run_scan` no longer takes `revalidate`, and takes a
   `musefs_cli::MatchMode` in place of `fast`/`strict`.
 - The public enums a caller matches on — the error types, `Format`, the scan and
@@ -305,10 +369,19 @@ directly.
   can no longer be built with a struct literal, `..Default::default()` included.
   Start from `default()` — new for `MountConfig`, matching a bare `musefs mount`
   — and assign the fields you change. The store-row and synthesis input structs
-  (`NewTrack`, `TrackArt`, `ArtInput` and the like) are unchanged, so a new store
-  column is still a breaking change for code that writes rows.
+  (`NewTrack`, `TrackArt`, `ArtInput` and the like) are not marked, so a new
+  store column is still a breaking change for code that writes rows, as the new
+  fields above are.
 
+[#617]: https://github.com/Sohex/musefs/issues/617
+[#629]: https://github.com/Sohex/musefs/issues/629
+[#631]: https://github.com/Sohex/musefs/issues/631
+[#644]: https://github.com/Sohex/musefs/issues/644
+[#647]: https://github.com/Sohex/musefs/issues/647
+[#651]: https://github.com/Sohex/musefs/issues/651
+[#655]: https://github.com/Sohex/musefs/issues/655
 [#662]: https://github.com/Sohex/musefs/issues/662
+[#663]: https://github.com/Sohex/musefs/issues/663
 [#667]: https://github.com/Sohex/musefs/issues/667
 [#668]: https://github.com/Sohex/musefs/issues/668
 [#672]: https://github.com/Sohex/musefs/issues/672
@@ -317,6 +390,7 @@ directly.
 [#680]: https://github.com/Sohex/musefs/issues/680
 [#682]: https://github.com/Sohex/musefs/issues/682
 [#689]: https://github.com/Sohex/musefs/issues/689
+[#690]: https://github.com/Sohex/musefs/issues/690
 [#691]: https://github.com/Sohex/musefs/issues/691
 [#693]: https://github.com/Sohex/musefs/issues/693
 [#694]: https://github.com/Sohex/musefs/issues/694
@@ -336,7 +410,7 @@ directly.
 [#723]: https://github.com/Sohex/musefs/issues/723
 [#724]: https://github.com/Sohex/musefs/issues/724
 [#725]: https://github.com/Sohex/musefs/issues/725
-[#731]: https://github.com/Sohex/musefs/issues/731
+[#737]: https://github.com/Sohex/musefs/issues/737
 [#743]: https://github.com/Sohex/musefs/issues/743
 [#746]: https://github.com/Sohex/musefs/issues/746
 [#747]: https://github.com/Sohex/musefs/issues/747
@@ -345,6 +419,8 @@ directly.
 [#750]: https://github.com/Sohex/musefs/issues/750
 [#751]: https://github.com/Sohex/musefs/issues/751
 [#758]: https://github.com/Sohex/musefs/issues/758
+[#759]: https://github.com/Sohex/musefs/issues/759
+[#760]: https://github.com/Sohex/musefs/issues/760
 [#761]: https://github.com/Sohex/musefs/issues/761
 [#762]: https://github.com/Sohex/musefs/issues/762
 

@@ -292,6 +292,23 @@ impl<M> Db<M> {
         )?)
     }
 
+    /// How many tracks no probe has visited since the store was upgraded: no
+    /// `fingerprint` and no recorded inode. That is every row the 2.0.0
+    /// migration leaves, and none a default-tier scan or revalidate writes.
+    ///
+    /// The lasting half of the count `musefs migrate` reports once: `mount`,
+    /// `scan` and `revalidate` warn while it is non-zero (#705). A
+    /// `--checksum none` scan on FAT or exFAT under Linux, which records
+    /// neither, lands a row here too, and a default-tier `revalidate` clears it
+    /// the same way.
+    pub fn count_tracks_awaiting_revalidate(&self) -> Result<u64> {
+        Ok(self.conn.query_row(
+            "SELECT count(*) FROM tracks WHERE fingerprint IS NULL AND backing_ino = 0",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
     pub fn track_content_version(&self, id: i64) -> Result<i64> {
         Ok(self.conn.query_row(
             "SELECT content_version FROM tracks WHERE id = ?1",
@@ -669,6 +686,28 @@ mod render_key_tests {
         db.set_track_checksums(a, ChecksumWrite::Clear, ChecksumWrite::Keep)
             .unwrap();
         assert_eq!(db.count_tracks_without_fingerprint().unwrap(), 2);
+    }
+
+    /// A row is owed a revalidate only while it lacks both values a probe
+    /// writes. Either one is proof a 2.0.0 probe has visited it.
+    #[test]
+    fn count_tracks_awaiting_revalidate_needs_both_values_missing() {
+        use crate::models::ChecksumWrite;
+        let db = open_mem();
+        let a = db
+            .upsert_track(&new_track("/a.flac", Format::Flac))
+            .unwrap();
+        db.upsert_track(&new_track("/b.mp3", Format::Mp3)).unwrap();
+        assert_eq!(db.count_tracks_awaiting_revalidate().unwrap(), 2);
+
+        db.set_track_checksums(a, ChecksumWrite::Set(&"a".repeat(64)), ChecksumWrite::Keep)
+            .unwrap();
+        assert_eq!(db.count_tracks_awaiting_revalidate().unwrap(), 1);
+
+        let mut b = new_track("/b.mp3", Format::Mp3);
+        b.backing_ino = Some(7);
+        db.upsert_track(&b).unwrap();
+        assert_eq!(db.count_tracks_awaiting_revalidate().unwrap(), 0);
     }
 
     #[test]

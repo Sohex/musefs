@@ -57,6 +57,14 @@ file, so the mount never shows a track quietly missing its tags. These are worth
 reporting: unlike `oversize`, which names a documented limit, a `rejected` file
 is a shape musefs did not anticipate.
 
+Two more buckets are new in 2.0.0. `unsupported` counts files that parsed but
+hold a shape musefs refuses to serve: a chained Ogg, several streams
+concatenated end to end ([Ogg](../formats/ogg.md#one-bitstream-per-file)). A row
+1.3.0 stored for one is removed by `musefs revalidate --prune`.
+`checksum-failed` counts files whose checksum, at the tier `--checksum` asks
+for, could not be computed; such a file is failed rather than stored one tier
+lower.
+
 Per-file skip messages are capped at ten per reason per scan; the rest drop to
 `debug` (`-vv` / `RUST_LOG=debug`) so an unreadable subtree or a share that
 vanished mid-scan cannot emit one line per file. The end-of-scan breakdowns
@@ -117,12 +125,16 @@ before a moved file is retargeted:
 - **`strict`** — require a full-hash match; if the matched candidate has no
   stored `content_hash`, refuse the retarget and insert a fresh row instead.
 
-**Upgrading from musefs 1.3.0 or earlier.** The schema upgrade clears every
-stored fingerprint, because the value now includes sampled audio and the old
-ones were computed without it. The next `revalidate` recomputes them with no
-flag needed, since it re-probes a row missing the checksum its tier asks for; a
-plain `scan` does not, because it leaves already-tracked rows alone. Until then those rows cannot be move-recovered, exactly as
-an unfingerprinted row never could, so run one pass before moving files around.
+**Upgrading from musefs 1.3.0 or earlier.** Every command refuses a 1.3.0
+store until `musefs migrate --db library.db` upgrades it (see
+[Maintenance](maintenance.md#upgrading-the-store-musefs-migrate)). That upgrade
+clears every stored fingerprint, because the value now includes sampled audio
+and the old ones were computed without it. The next `revalidate` recomputes
+them with no flag needed, since it re-probes a row missing the checksum its tier
+asks for; a plain `scan` does not, because it leaves already-tracked rows alone.
+Until then those rows cannot be move-recovered, exactly as an unfingerprinted
+row never could, so run one pass before moving files around, and `mount`,
+`scan` and `revalidate` each print a warning with the number still waiting.
 The upgrade clears every stored `content_hash` too. Before #689 was fixed, a
 fingerprint-tier rescan of a rewritten file could keep the old bytes' hash, so
 none is carried across. Run `musefs revalidate --checksum=full` to recompute

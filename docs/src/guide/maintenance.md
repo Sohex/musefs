@@ -3,12 +3,16 @@
 ## Refreshing the store (`musefs revalidate`)
 
 `musefs revalidate` is the maintenance pass over a library you have already
-scanned. It re-probes only the tracks whose backing file changed on disk (by
-size / mtime / ctime) and refreshes their structural serving data — audio byte
-range, content checksums, and FLAC structural blocks — while **preserving the
-curated tags, art, and binary tags in the store**. Unchanged files are skipped,
-and files not yet in the store are ignored (ingesting new files is `scan`'s
-job — see [Scanning](scanning.md)).
+scanned. It re-probes the tracks whose backing file changed on disk (by
+size / mtime / ctime / recorded inode) and refreshes their structural serving
+data — audio byte range, content checksums, and FLAC structural blocks — while
+**preserving the curated tags, art, and binary tags in the store**. It also
+re-probes an unchanged file whose row lacks something a probe records: the
+checksum the `--checksum` tier asks for, a FLAC file's structural blocks, or an
+inode on a filesystem that keeps inode numbers — which, after
+[`musefs migrate`](#upgrading-the-store-musefs-migrate), is every row. Other
+unchanged files are skipped, and files not yet in the store are ignored
+(ingesting new files is `scan`'s job — see [Scanning](scanning.md)).
 
 The one thing about art it does refresh is what a file declares about its own
 pictures. A link to an image the file embeds, under the same picture type and
@@ -34,10 +38,18 @@ a file that fails to parse, or cannot be read, keeps its row. Without
 a track's curated metadata along with its row, so a transient mount blip or an
 unplugged drive can't silently drop your edits.
 
+The scope is the track's stored path, which is always fully resolved. With
+`--follow-symlinks`, a track reached through a symlink is stored under the path
+it resolves to, so `revalidate --prune /music --follow-symlinks` never prunes a
+track whose file resolved to `/nas/...`, even once that file is gone. Prune such
+tracks by running `revalidate --prune` over the directory their files resolve
+into.
+
 It shares `scan`'s probe flags — `--jobs N`, `--follow-symlinks`, `--quiet` /
-`-q`, and `--checksum` (which also backfills missing checksums on a changed
-row) — and shows the same live progress indicator. The per-target summary reads
-`revalidated N: U updated, C unchanged, P pruned, F failed`.
+`-q`, and `--checksum` (a row missing a checksum that tier computes is
+re-probed to fill it, whether or not its file changed) — and shows the same
+live progress indicator. The per-target summary reads
+`revalidated <target>: U updated, C unchanged, P pruned, F failed in <duration>`.
 
 ### When to run it
 
@@ -56,8 +68,8 @@ library onto new storage gives every file a new change time, so every file reads
 as changed: opens fail until a revalidate re-probes them. A file that agrees on
 all four fields cannot be told apart and is served as the original. On
 filesystems with real timestamps that takes a coincidence nothing ordinary
-produces, but on FAT and exFAT, where only the size and a coarse modification
-time are compared, a copy that preserved its timestamps can agree — one more
+produces, but on FAT and exFAT under Linux, where only the size and a coarse
+modification time are compared, a copy that preserved its timestamps can agree — one more
 reason [they are not recommended](installation.md) for the backing library.
 
 ## Compacting the store (`musefs vacuum`)
@@ -89,7 +101,7 @@ else with the store open — a mount, including one sitting idle between reads, 
 a scan — makes it refuse before anything is rewritten:
 
 ```text
-error: the store is in use — unmount the filesystem or stop any scan before vacuuming
+musefs: the store is in use — unmount the filesystem or stop any scan before vacuuming: <SQLite error>
 ```
 
 Once it has the store, nothing else can attach until it finishes. One case it
@@ -123,8 +135,10 @@ expect. Those are **gated**, and a major release is the only place they appear.
 Every command that opens a store for ordinary work refuses one that needs it:
 
 ```text
-error: store schema version 2 needs an explicit upgrade to version 4 before this
-musefs build can open it; run `musefs migrate --db <store>`.
+musefs: opening database at library.db: store schema version 2 needs an explicit
+upgrade to version 4 before this musefs build can open it; run `musefs migrate
+--db <store>`. The upgrade rewrites the store in place and older musefs builds
+will no longer open it, which is why it is not applied automatically
 ```
 
 A command that refuses leaves the store exactly as it found it. While a gated
@@ -158,7 +172,7 @@ The upgrade takes the store for itself and refuses to start if anything else
 has it open — a mount, a running scan, another `musefs migrate`:
 
 ```text
-error: the store is in use — unmount the filesystem or stop any scan before migrating
+musefs: the store is in use — unmount the filesystem or stop any scan before migrating: <SQLite error>
 ```
 
 ### Rows the new schema refuses
@@ -175,7 +189,7 @@ If any are found, the command reports them per table and stops:
   tags: 1 row(s)
   art: 1 row(s)
 They were written before the constraint that now refuses them, or by a writer with the constraints turned off.
-error: refusing to upgrade library.db: 2 row(s) would be rejected. Pass --repair to delete them, or fix them yourself first. The upgrade changes nothing until this is resolved
+musefs: refusing to upgrade library.db: 2 row(s) would be rejected. Pass --repair to delete them, or fix them yourself first. The upgrade changes nothing until this is resolved
 ```
 
 Nothing has happened at this point — no snapshot, no rewrite. Either fix the
@@ -243,12 +257,32 @@ fingerprint; the revalidate does. Until it runs, those tracks cannot be
 re-identified after a move.
 
 The 2.0.0 upgrade leaves more than fingerprints for that revalidate: it records
-each file's inode, and restores each file's own picture metadata. The offer
+each file's inode, except on FAT and exFAT under Linux, which keep none, and
+restores each file's own picture metadata. The offer
 never prunes. If the revalidate counts any file as failed, `migrate` exits `2`
 once it is done, as `revalidate` itself would, even though the store is
 upgraded ([#750](https://github.com/Sohex/musefs/issues/750)). The
 [release notes](../release-notes.md#upgrading-from-v130) list what else the
 first revalidate changes, including every synthesized file's modification time.
+
+The offer covers the deepest directory every stored track shares. Stored paths
+are already resolved, symlinks included, so walking that directory reaches every
+track without following any symlink. The one library it cannot cover is one
+whose tracks resolve into unrelated trees, such as symlinks into two separate
+disks: they share no directory below `/`, so `migrate` prints the command
+instead of offering it, and you run `musefs revalidate` over each tree.
+
+The report is printed once, but the gap it describes lasts. So until every
+track has been re-probed, `mount`, `scan` and `revalidate` each print a warning
+with the number still waiting
+([#705](https://github.com/Sohex/musefs/issues/705)). A track counts while it
+has neither a fingerprint nor a recorded inode, which is how the upgrade leaves
+every row. A `--checksum none` scan on FAT or exFAT under Linux records
+neither, so its
+tracks count too until a revalidate at the default `--checksum` tier
+fingerprints them. A file the revalidate cannot re-probe, such as a chained Ogg
+([#747](https://github.com/Sohex/musefs/issues/747)), stays counted until
+`revalidate --prune` removes it.
 
 ### Flags, for scripts
 
@@ -265,6 +299,12 @@ The two offers decline themselves unless you ask for them:
 | `--vacuum` / `--vacuum=false` | Compact afterwards, or do not. Omit to be asked. |
 | `--revalidate` / `--revalidate=false` | Revalidate afterwards, or do not. Omit to be asked. A revalidate that counts failures makes `migrate` exit `2`; one that cannot run at all, because the tracks share no directory below `/`, fails the command once the store is upgraded. |
 | `--jobs N` | Probe worker threads for that revalidate. |
+
+`--db`, `--yes` and `--jobs` also read `MUSEFS_DB`, `MUSEFS_YES` and
+`MUSEFS_JOBS`, so a `MUSEFS_YES` set in an environment file, such as a systemd
+`EnvironmentFile`, confirms the upgrade without asking. `--snapshot`,
+`--repair`, `--no-snapshot`, `--vacuum` and `--revalidate` have no environment
+form.
 
 Running it against a store that is already current reports so and changes
 nothing, so it is safe to put in a provisioning script ahead of `mount` — and

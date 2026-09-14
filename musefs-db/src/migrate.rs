@@ -749,6 +749,55 @@ mod rejection_tests {
         assert_eq!(links[0].description, "cover");
     }
 
+    /// A `backing_path` past the 64 KiB ceiling (#758). 1.3.0 set none, so a
+    /// store can hold one, and the pre-flight sees it only because its reference
+    /// tables come from the migration itself. One exactly at the ceiling is not
+    /// refused.
+    #[test]
+    fn a_backing_path_over_the_ceiling_is_reported_and_one_at_it_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.db");
+        let conn = store_at_v3(&path);
+        let cap = usize::try_from(crate::limits::MAX_BACKING_PATH_BYTES).unwrap();
+        for (dir_name, len) in [("at", cap), ("over", cap + 1)] {
+            let stored = format!("/{dir_name}/{}", "a".repeat(len - dir_name.len() - 2));
+            assert_eq!(stored.len(), len);
+            plant_hostile(
+                &conn,
+                "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+                 backing_size, backing_mtime_ns, backing_ctime_ns, updated_at) \
+                 VALUES (?1, 'flac', 0, 0, 0, 0, 0, 0)",
+                &[&stored],
+            );
+        }
+        drop(conn);
+
+        let pending = PendingMigration::open(&path).unwrap();
+        let found = pending.inspect_rejections().unwrap();
+        let named: Vec<(&str, u64)> = found
+            .tables()
+            .iter()
+            .map(|t| (t.table, t.rejected))
+            .collect();
+        assert_eq!(named, vec![("tracks", 1)], "only the one over: {found:?}");
+
+        let removed = pending.repair().unwrap();
+        assert_eq!(removed.total(), 1);
+        let db = pending.apply().unwrap();
+        let mut lens: Vec<usize> = db
+            .list_backing_paths()
+            .unwrap()
+            .iter()
+            .map(|p| p.as_os_str().len())
+            .collect();
+        lens.sort_unstable();
+        assert_eq!(
+            lens,
+            vec!["/lib/a.flac".len(), cap],
+            "the clean row and the one at the cap"
+        );
+    }
+
     /// A V1 store has no checksum columns at all, so the probe's `tracks`
     /// projection cannot name them. Upgrading from the oldest released shape is
     /// the arm that catches a projection written against the newest one.

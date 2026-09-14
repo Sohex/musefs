@@ -2950,6 +2950,8 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
         // Only that refusal counts, never a file that failed to parse or could
         // not be read, and only while the file still carries the stamp the
         // refusing probe saw: one rewritten since deserves the next pass.
+        #[cfg(test)]
+        fire_hook(&BEFORE_PRUNE_REFUSED_HOOK);
         for (path, stamp) in refused {
             // The probe recorded `stamp`, so compare the way it records (#757).
             let as_refused = std::fs::metadata(&path).is_ok_and(|meta| {
@@ -3127,6 +3129,8 @@ pub(crate) fn full_file_hash(file: &std::fs::File) -> std::io::Result<String> {
             .checked_add(n as u64)
             .expect("a file offset reached by reading fits u64");
         crate::metrics::on_scan_read(n as u64);
+        #[cfg(test)]
+        fire_hook(&DURING_FULL_HASH_HOOK);
     }
     Ok(format!("{:x}", base16ct::HexDisplay(&h.finalize())))
 }
@@ -3155,6 +3159,35 @@ fn hash_confirm(path: &Path, expect: BackingStamp) -> std::io::Result<Option<Str
         return Ok(None);
     }
     Ok(Some(hash))
+}
+
+/// Test-only hooks for two windows the barrier tests reach into: a full-file
+/// hash already under way (#690), and a revalidate's refused files between the
+/// probe that refused them and the prune that acts on it (#747). Thread-local
+/// like `AFTER_S1_HOOK`, since both fire on the thread that called in.
+#[cfg(test)]
+type TestHook = std::cell::RefCell<Option<Box<dyn FnMut()>>>;
+#[cfg(test)]
+thread_local! {
+    static DURING_FULL_HASH_HOOK: TestHook = const { std::cell::RefCell::new(None) };
+    static BEFORE_PRUNE_REFUSED_HOOK: TestHook = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+fn fire_hook(hook: &'static std::thread::LocalKey<TestHook>) {
+    // Taken, not borrowed: each hook fires once, so one that rewrites the file
+    // it watches cannot fire again on the next loop iteration.
+    let armed = hook.with(|h| h.borrow_mut().take());
+    if let Some(mut f) = armed {
+        f();
+    }
+}
+#[cfg(test)]
+fn set_hook(hook: &'static std::thread::LocalKey<TestHook>, f: impl FnMut() + 'static) {
+    hook.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+}
+#[cfg(test)]
+fn clear_hook(hook: &'static std::thread::LocalKey<TestHook>) {
+    hook.with(|h| *h.borrow_mut() = None);
 }
 
 #[cfg(test)]

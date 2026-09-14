@@ -606,6 +606,86 @@ fn scan_fails_only_the_file_with_oversized_art() {
     assert_eq!(db.get_art_meta(ta[0].art_id).unwrap().unwrap().byte_len, 50);
 }
 
+/// A crafted `art` row filed under one image's digest but holding other bytes
+/// (#724). Linking it would serve the wrong picture, so the store refuses the
+/// link with `ArtDigestMismatch`. The scanner has to treat that the way it treats
+/// a constraint violation: fail the one file that would have linked the row, and
+/// keep going. Classified any other way, the error aborts the whole scan.
+#[test]
+fn a_digest_mismatch_fails_only_the_file_that_would_link_it() {
+    use sha2::{Digest, Sha256};
+
+    let image = [0x5Cu8; 48];
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path().join("library");
+    std::fs::create_dir(&library).unwrap();
+
+    // a.flac embeds `image`; b.flac embeds no picture at all.
+    let mut picture = Vec::new();
+    picture.extend_from_slice(&3u32.to_be_bytes()); // front cover
+    let mime = b"image/png";
+    picture.extend_from_slice(&u32::try_from(mime.len()).unwrap().to_be_bytes());
+    picture.extend_from_slice(mime);
+    picture.extend_from_slice(&0u32.to_be_bytes()); // empty description
+    for field in [1u32, 1, 24, 0] {
+        // width, height, depth, colours
+        picture.extend_from_slice(&field.to_be_bytes());
+    }
+    picture.extend_from_slice(&u32::try_from(image.len()).unwrap().to_be_bytes());
+    picture.extend_from_slice(&image);
+    let a = make_flac(
+        &[
+            (0, streaminfo_body()),
+            (4, vorbis_comment_body("v", &["TITLE=A"])),
+            (6, picture),
+        ],
+        &[0xAA; 30],
+    );
+    std::fs::write(library.join("a.flac"), a).unwrap();
+    let b = make_flac(
+        &[
+            (0, streaminfo_body()),
+            (4, vorbis_comment_body("v", &["TITLE=B"])),
+        ],
+        &[0xBB; 30],
+    );
+    std::fs::write(library.join("b.flac"), b).unwrap();
+
+    // No musefs writer can file bytes under another image's digest, so the row
+    // goes in through a second connection.
+    let db_path = dir.path().join("store.db");
+    let db = Db::open(&db_path).unwrap();
+    let digest = Sha256::digest(image)
+        .iter()
+        .fold(String::new(), |mut hex, byte| {
+            use std::fmt::Write as _;
+            write!(hex, "{byte:02x}").unwrap();
+            hex
+        });
+    let other = [0x00u8; 16];
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "INSERT INTO art (sha256, byte_len, data) VALUES (?1, ?2, ?3)",
+            rusqlite::params![digest, i64::try_from(other.len()).unwrap(), &other[..]],
+        )
+        .unwrap();
+
+    let stats = scan_directory(&db, &library).expect("a mismatch fails the file, not the scan");
+    assert_eq!(
+        (stats.scanned, stats.failed),
+        (1, 1),
+        "the clean file is stored and the one that would link the row fails"
+    );
+    let tracks = db.list_tracks().unwrap();
+    assert_eq!(tracks.len(), 1);
+    assert!(
+        tracks[0].backing_path.ends_with("b.flac"),
+        "only the clean file is stored, got {}",
+        tracks[0].backing_path.display()
+    );
+}
+
 /// Two files holding byte-identical art that describe it differently.
 ///
 /// This is #716's reproduction. `art` is deduplicated on `sha256(data)`, and it

@@ -192,3 +192,97 @@ fn a_tag_edit_does_not_move_the_passthrough_mtime() {
     assert_eq!(synth.content_version, bumped);
     assert_ne!(synth.nanos(), after.nanos());
 }
+
+/// Rebuild `id`'s row as the scanner would write it, with `backing_ino` and the
+/// backing timestamps replaced. Every other column is carried over unchanged.
+fn restamp(db: &Db, id: i64, backing_ino: Option<u64>, mtime_ns: i64, ctime_ns: i64) {
+    let track = db.get_track(id).unwrap().unwrap();
+    db.upsert_track(&NewTrack {
+        backing_path: track.backing_path,
+        format: track.format,
+        audio_offset: track.bounds.audio_offset(),
+        audio_length: track.bounds.audio_length(),
+        backing_size: track.backing_size,
+        backing_mtime_ns: mtime_ns,
+        backing_ctime_ns: ctime_ns,
+        backing_ino,
+    })
+    .unwrap();
+}
+
+/// #725's promise is wider than tag edits: any store change to what synthesis
+/// serves bumps `content_version`, and the reported timestamp has to move with
+/// it. Here nothing but the geometry trigger fires, recording the file's inode
+/// for the first time. That is what the first revalidate after the V4 upgrade
+/// does to every row, with no tag, art or structural block touched.
+#[test]
+fn a_version_bump_with_no_tag_edit_moves_the_synthesis_mtime() {
+    use std::os::unix::fs::MetadataExt;
+
+    let (dir, db, id) = setup();
+    let flac = dir.path().join("song.flac");
+    let cache = HeaderCache::new(Mode::Synthesis);
+    let before = cache.resolve(&db, id).unwrap().mtime;
+    let tags = db.get_tags(id).unwrap();
+
+    let track = db.get_track(id).unwrap().unwrap();
+    let ino = std::fs::metadata(&flac).unwrap().ino();
+    restamp(
+        &db,
+        id,
+        Some(ino),
+        track.backing_mtime_ns,
+        track.backing_ctime_ns,
+    );
+
+    let after = cache.resolve(&db, id).unwrap().mtime;
+    assert_eq!(db.get_tags(id).unwrap(), tags, "no tag was touched");
+    assert!(
+        after.content_version > before.content_version,
+        "recording the inode bumps content_version"
+    );
+    assert_ne!(
+        after.nanos(),
+        before.nanos(),
+        "and the reported timestamp moves with it"
+    );
+}
+
+/// The limit #725 documents rather than fixes. The reported second is the later
+/// of the backing file's mtime and the row's `updated_at`, so a backing file
+/// dated in the future holds that second still across a tag edit, and only the
+/// nanoseconds move. A consumer comparing whole seconds misses the edit; one
+/// comparing the full timestamp sees it. Pinned so the serving guide's
+/// description of the limit stays true, and any change to it is deliberate.
+#[test]
+fn a_future_backing_mtime_holds_the_second_and_only_the_nanoseconds_move() {
+    let (dir, db, id) = setup();
+    let flac = dir.path().join("song.flac");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // Ten years ahead: later than any `updated_at` this run can stamp.
+    let future = i64::try_from(now).unwrap() + 10 * 365 * 86_400;
+    common::set_mtime(&flac, future, 0);
+    restamp(
+        &db,
+        id,
+        None,
+        common::real_mtime_ns(&flac),
+        common::real_ctime_ns(&flac),
+    );
+
+    let cache = HeaderCache::new(Mode::Synthesis);
+    let before = cache.resolve(&db, id).unwrap().mtime;
+    assert_eq!(before.secs, future, "the backing file's future second wins");
+
+    db.replace_tags(id, &[Tag::new("title", "Edited", 0)])
+        .unwrap();
+    let after = cache.resolve(&db, id).unwrap().mtime;
+    assert_eq!(
+        after.secs, before.secs,
+        "a whole-second comparison cannot see the edit"
+    );
+    assert_ne!(after.nanos(), before.nanos(), "the full timestamp can");
+}

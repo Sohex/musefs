@@ -405,7 +405,34 @@ pub fn run_scan(
         }
     }
     reporter.finish();
+    warn_if_revalidate_owed(&db, db_path)?;
     Ok(total_failed)
+}
+
+/// The warning `mount`, `scan` and `revalidate` print while tracks still await
+/// the revalidate an upgrade leaves owed, or `None` when none do (#705).
+/// `migrate` reports the number once, but that line scrolls away and the gap
+/// does not: until a row is re-probed, a moved file is not recognised and a
+/// file replaced in place is caught on fewer fields.
+fn revalidate_owed_warning(db: &Db, db_path: &Path) -> Result<Option<String>> {
+    let owed = db.count_tracks_awaiting_revalidate()?;
+    Ok((owed > 0).then(|| {
+        format!(
+            "{owed} track(s) have not been re-probed since the store was upgraded, so a moved \
+             file is not recognised and a file replaced in place is caught on fewer fields; run \
+             `musefs revalidate <library> --db {}` (with --follow-symlinks if the library is \
+             reached through symlinks). A file it cannot re-probe stays counted until \
+             `revalidate --prune` removes it",
+            db_path.display()
+        )
+    }))
+}
+
+fn warn_if_revalidate_owed(db: &Db, db_path: &Path) -> Result<()> {
+    if let Some(w) = revalidate_owed_warning(db, db_path)? {
+        eprintln!("warning: {w}");
+    }
+    Ok(())
 }
 
 /// Open the DB once and revalidate each target, preserving curated metadata.
@@ -450,6 +477,7 @@ pub fn run_revalidate(
         }
     }
     reporter.finish();
+    warn_if_revalidate_owed(&db, db_path)?;
     Ok(total_failed)
 }
 
@@ -635,6 +663,7 @@ pub fn run_mount(args: &MountArgs) -> Result<()> {
     }
     let db =
         Db::open(&args.db).with_context(|| format!("opening database at {}", args.db.display()))?;
+    warn_if_revalidate_owed(&db, &args.db)?;
     let (config, fuse_config) = parse_mount_config(args);
     let template = config.template.clone();
     for (flag, mode) in [("file-mode", args.file_mode), ("dir-mode", args.dir_mode)] {
@@ -1234,6 +1263,39 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #705: the warning names the count and the command while any track lacks
+    /// both values a probe writes, and says nothing once none does.
+    #[test]
+    fn the_owed_revalidate_warning_lasts_until_every_track_is_reprobed() {
+        let db = Db::open_in_memory().unwrap();
+        let store = Path::new("/srv/library.db");
+        assert_eq!(revalidate_owed_warning(&db, store).unwrap(), None);
+
+        let mut track = musefs_db::NewTrack {
+            backing_path: PathBuf::from("/lib/a.flac"),
+            format: musefs_db::Format::Flac,
+            audio_offset: 0,
+            audio_length: 1,
+            backing_size: 1,
+            backing_mtime_ns: 0,
+            backing_ctime_ns: 0,
+            backing_ino: None,
+        };
+        db.upsert_track(&track).unwrap();
+        let warning = revalidate_owed_warning(&db, store)
+            .unwrap()
+            .expect("an upgraded row is owed a revalidate");
+        assert!(warning.starts_with("1 track(s) "), "{warning}");
+        assert!(
+            warning.contains("`musefs revalidate <library> --db /srv/library.db`"),
+            "{warning}"
+        );
+
+        track.backing_ino = Some(7);
+        db.upsert_track(&track).unwrap();
+        assert_eq!(revalidate_owed_warning(&db, store).unwrap(), None);
+    }
 
     #[test]
     fn space_needed_scales_with_the_copies_and_saturates() {

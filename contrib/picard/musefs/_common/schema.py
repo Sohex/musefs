@@ -615,9 +615,10 @@ INSERT INTO tracks (id, backing_path, format, audio_offset, audio_length,
 -- the source. `tags` and `track_art` change shape; `structural_blocks` keeps
 -- its columns and gains only the storage classes every other table now pins.
 
--- `tags` loses its primary key in favour of two partial unique indexes split on
--- `value_blob IS NULL` (#663). The PK numbered a track's text rows and its
--- binary rows in one ordinal space per key, and an external writer that
+-- `tags` loses its primary key in favour of one unique index that folds the row
+-- class, `value_blob IS NULL`, in as a fourth column (#663). The PK numbered a
+-- track's text rows and its binary rows in one ordinal space per key, and an
+-- external writer that
 -- rewrites text rows alone -- which both `contrib` helpers do, scoping their
 -- DELETE to `value_blob IS NULL` so scanner-written binary payloads survive --
 -- could write a text row onto an ordinal a binary row already held. The two
@@ -657,9 +658,10 @@ CREATE TABLE tags (
 -- FLAC's parser already reads and throws away.
 --
 -- The backfill can only copy the shared values to every link -- the true
--- per-embedding ones were destroyed at ingest and come back on a rescan, which
--- is what `musefs migrate`'s rescan offer is for. `depth` and `colors` have no
--- shared value to copy and start at 0, which is what both the format and
+-- per-embedding ones were destroyed at ingest and come back on a revalidate,
+-- which is what `musefs migrate`'s revalidate offer is for (#746). `depth` and
+-- `colors` have no shared value to copy and start at 0, which is what both the
+-- format and
 -- synthesis already take to mean unknown.
 DROP TABLE track_art;
 CREATE TABLE track_art (
