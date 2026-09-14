@@ -1607,6 +1607,38 @@ mod tests {
     }
 
     #[test]
+    fn oggflac_nonzero_count_wins_over_a_disagreeing_last_block_flag() {
+        // #723 settled that a nonzero count is taken at its word: only zero is the
+        // mapping's "unknown". Every fixture above has the count and the flags
+        // agree, so a count that deferred to the flags would pass them all.
+        let seektable = {
+            let mut b = Vec::new();
+            crate::flac::push_block_header(&mut b, 3, 18, false).unwrap();
+            b.extend(std::iter::repeat_n(0xEEu8, 18));
+            b
+        };
+        let blocks = vec![seektable, vorbis_comment_block(true, "RealTitle")];
+
+        // More declared than STREAMINFO's last-block flag allows: the count reads
+        // on past it.
+        let (long, header_len) = oggflac_file(2, true, &blocks);
+        let h = read_header(&long).unwrap();
+        assert_eq!(h.packets.len(), 3, "mapping + both declared blocks");
+        assert_eq!(h.audio_offset, header_len as u64);
+        assert_eq!(
+            read_tags(&long).unwrap(),
+            vec![("title".to_string(), "RealTitle".to_string())]
+        );
+
+        // Fewer declared than the flags describe: the run ends at the count, so the
+        // VORBIS_COMMENT that sets the flag is not part of the header.
+        let (short, _) = oggflac_file(1, false, &blocks);
+        let h = read_header(&short).unwrap();
+        assert_eq!(h.packets.len(), 2, "mapping + SEEKTABLE, as declared");
+        assert_eq!(read_tags(&short).unwrap(), Vec::new());
+    }
+
+    #[test]
     fn oggflac_run_that_never_flags_its_last_block_is_malformed() {
         // No last-block flag anywhere: the walk reaches the audio packet, which is
         // not a metadata block, and there is nothing left to guess from.

@@ -225,7 +225,11 @@ fn revalidate_prunes_a_stored_chained_ogg_only_when_asked() {
         ..ScanOptions::default()
     };
     let stats = crate::revalidate_with(&db, dir.path(), &opts).unwrap();
-    assert_eq!(stats.pruned, 1, "the chained row, and only it");
+    assert_eq!(
+        (stats.failed, stats.pruned),
+        (2, 1),
+        "both still fail on the pass that prunes, and only the chained row goes"
+    );
     let left = db.list_tracks().unwrap();
     assert_eq!(left.len(), 1);
     assert!(
@@ -236,6 +240,57 @@ fn revalidate_prunes_a_stored_chained_ogg_only_when_asked() {
 
     let stats = crate::revalidate(&db, dir.path()).unwrap();
     assert_eq!(stats.failed, 1, "the failure count comes back down");
+}
+
+/// #747's other condition: `--prune` deletes a refused file only while it still
+/// carries the stamp the refusing probe saw. One rewritten in between keeps its
+/// row for the next pass to judge, which here refuses it again and prunes it.
+#[test]
+fn revalidate_prune_spares_a_refused_file_rewritten_since_the_refusal() {
+    let dir = tempfile::tempdir().unwrap();
+    let chained = dir.path().join("rewritten-chained.opus");
+    std::fs::write(&chained, chained_opus_bytes()).unwrap();
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    plant_stored_row(&db, &chained);
+
+    struct HookGuard;
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            clear_hook(&BEFORE_PRUNE_REFUSED_HOOK);
+        }
+    }
+    let pc = chained.clone();
+    // An explicit mtime rather than a second write: a rewrite this soon after
+    // the probe can land in the same coarse timestamp tick and move nothing.
+    set_hook(&BEFORE_PRUNE_REFUSED_HOOK, move || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&pc)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10))
+            .unwrap();
+    });
+    let _guard = HookGuard;
+
+    let opts = ScanOptions {
+        prune: true,
+        ..ScanOptions::default()
+    };
+    let stats = crate::revalidate_with(&db, dir.path(), &opts).unwrap();
+    assert_eq!(
+        (stats.failed, stats.pruned),
+        (1, 0),
+        "refused, but rewritten before the prune"
+    );
+    assert_eq!(db.list_tracks().unwrap().len(), 1);
+
+    let stats = crate::revalidate_with(&db, dir.path(), &opts).unwrap();
+    assert_eq!(
+        (stats.failed, stats.pruned),
+        (1, 1),
+        "unchanged since this pass refused it"
+    );
+    assert!(db.list_tracks().unwrap().is_empty());
 }
 
 #[test]

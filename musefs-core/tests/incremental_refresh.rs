@@ -415,6 +415,65 @@ fn pruned_ring_prefix_is_a_gap_and_full_rebuild_recovers_lost_change() {
     );
 }
 
+/// Track-id reuse (#678). Without `AUTOINCREMENT`, SQLite hands out
+/// `max(rowid) + 1`, so deleting the highest-numbered track and ingesting another
+/// file gave the newcomer the freed id, and the incremental refresh, already
+/// holding that id, could keep serving the old file under it. The DB layer pins
+/// that no id is reused. This pins the substitution where it bit, with the
+/// delete and the ingest both landing between two polls.
+#[test]
+fn a_freed_id_is_not_handed_to_the_next_track_between_polls() {
+    let target = small_corpus(2);
+    let db_path = target.db_path.clone();
+    let corpus = target.corpus_dir.clone();
+    let db = Db::open(&db_path).unwrap();
+    scan_directory(&db, &corpus).unwrap();
+    let fs = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+
+    let tracks = db.list_tracks().unwrap();
+    let freed = tracks.iter().map(|t| t.id).max().unwrap();
+    let old_path = tracks
+        .iter()
+        .find(|t| t.id == freed)
+        .unwrap()
+        .backing_path
+        .clone();
+
+    // The substitute is the same bytes under a new name, so only the id and the
+    // path tell the two rows apart: exactly what a reused id hid.
+    db.delete_track(freed).unwrap();
+    let new_path = old_path.with_file_name("substitute.flac");
+    std::fs::rename(&old_path, &new_path).unwrap();
+    scan_directory(&db, &corpus).unwrap();
+    let newcomer = db
+        .list_tracks()
+        .unwrap()
+        .into_iter()
+        .find(|t| t.backing_path.ends_with("substitute.flac"))
+        .expect("the substitute was ingested");
+    assert!(
+        newcomer.id > freed,
+        "id {} reused the freed {freed}",
+        newcomer.id
+    );
+
+    assert!(fs.poll_refresh().unwrap());
+    let reference = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+    let live = tree_fingerprint(&fs);
+    assert_eq!(
+        live.keys().collect::<Vec<_>>(),
+        tree_fingerprint(&reference).keys().collect::<Vec<_>>(),
+        "the substitution must reach the live tree"
+    );
+    // Every file the live tree lists must serve: an entry still resolving to the
+    // renamed-away path fails its read.
+    for &ino in live.values() {
+        let size = fs.getattr(ino).unwrap().size;
+        let served = fs.read(ino, None, 0, size).unwrap();
+        assert_eq!(served.len() as u64, size);
+    }
+}
+
 /// A track id rewritten in place must leave the live tree the way a fresh open
 /// would see it (#762). The schema refuses the rekey, so this drops the refusal
 /// for the one statement — the shape a `writable_schema` writer produces — and
