@@ -441,6 +441,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`--follow-symlinks` judges a link by the file it points at**
+  ([#766](https://github.com/Sohex/musefs/issues/766)). The walk checked the
+  extension of the link's own name but probed its target, so a recursive scan
+  skipped `track -> song.flac` and `notes.txt -> song.flac` (though the same
+  link passed as the scan root was ingested), and accepted `song.flac -> notes`
+  only to fail it at probe. The walk now resolves each link it follows once and
+  uses that path throughout: the target decides eligibility and the skip bucket,
+  and the resolved path is what dedup, the already-present check, `revalidate`
+  and the probe use, and what is stored. A link that cannot be resolved counts
+  as a `symlink` walk error.
+
 - **Re-probing an unchanged file no longer moves its served mtime**
   ([#757](https://github.com/Sohex/musefs/issues/757)). Every re-probe stamped
   the row's `updated_at`, which a synthesized file's whole second follows, and

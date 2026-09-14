@@ -51,6 +51,8 @@ store upgrade is one-way without the snapshot `migrate` takes.
   - an over-cap directory listing stays stable across a refresh ([#695]);
   - metadata work on the worker pool is admission-controlled ([#694]);
   - content-addressed art is verified ([#724]);
+  - under `--follow-symlinks`, a link is scanned by its target's format, not
+    its own name, whether the walk reaches it or it is the scan root ([#766]);
   - chained Ogg is refused, and an old row for one is removable ([#722],
     [#747]).
 - **Directory handles share one listing** ([#675]). Handles open on the same
@@ -449,6 +451,7 @@ directly.
 [#760]: https://github.com/Sohex/musefs/issues/760
 [#761]: https://github.com/Sohex/musefs/issues/761
 [#762]: https://github.com/Sohex/musefs/issues/762
+[#766]: https://github.com/Sohex/musefs/issues/766
 
 ## v1.3.0
 

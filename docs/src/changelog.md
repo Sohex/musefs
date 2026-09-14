@@ -818,6 +818,22 @@ see the [Release notes](release-notes.md).
 
 ### Fixed
 
+- **`--follow-symlinks` judges a link by the file it points at**
+  ([#766](https://github.com/Sohex/musefs/issues/766)). The walk checked the
+  extension of the link's own name, but the worker canonicalized the path and
+  the probe dispatched on the target's: two namespaces for one decision. A
+  recursive scan therefore skipped `track -> song.flac` and
+  `notes.txt -> song.flac`, while the same link passed as the scan root was
+  ingested because the root is canonicalized before its extension is checked;
+  `song.flac -> notes` passed discovery only to fail at probe. The walk now
+  resolves each link it follows once, to its canonical path, and carries that
+  path onward: the target decides eligibility and the skip bucket, a followed
+  directory is descended by its resolved path, and dedup, the already-present
+  check, `revalidate` and the probe all use the resolved path, which is what is
+  stored. Nothing downstream resolves it again, so #684's single resolution
+  still holds. A link that cannot be resolved (dangling, looping, or retargeted
+  away mid-walk) counts as a `symlink` walk error.
+
 - **Re-probing an unchanged file no longer moves its served mtime**
   ([#757](https://github.com/Sohex/musefs/issues/757)). A synthesized file's
   modification time follows two values a re-probe wrote whether or not anything
