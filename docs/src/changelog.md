@@ -16,6 +16,21 @@ see the [Release notes](release-notes.md).
 
 ### Added
 
+- **An owed revalidate is reported until it runs**
+  ([#705](https://github.com/Sohex/musefs/issues/705)). `migrate` counts the
+  tracks the upgrade left needing a revalidate, but it prints that count once,
+  and the line scrolls away while the gap stays. Until those rows are re-probed,
+  a moved file is not recognised and a file replaced in place is caught on fewer
+  fields.
+  - `mount`, `scan` and `revalidate` now each print a warning while any track
+    has neither a `fingerprint` nor a recorded inode. The count comes from the
+    new `Db::count_tracks_awaiting_revalidate`.
+  - A default-tier probe writes at least one of the two, so the count reaches
+    zero as a revalidate re-probes each row. That holds on FAT and exFAT too,
+    where no inode is ever recorded.
+  - A file the revalidate cannot re-probe, such as a chained Ogg, stays counted
+    until `revalidate --prune` removes it, which the warning says.
+
 - **`musefs migrate --repair`, and the row-rejection pre-flight it exists for.**
   The 2.0.0 migration tightens constraints an existing store can already
   violate — an embedded NUL in a tag key or an art mime, a picture dimension

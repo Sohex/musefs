@@ -254,6 +254,15 @@ The offer walks the library without following symlinks. If yours reaches its
 files through symlinks, decline it and run `musefs revalidate --follow-symlinks`
 over the library yourself.
 
+The report is printed once, but the gap it describes lasts. So until every
+track has been re-probed, `mount`, `scan` and `revalidate` each print a warning
+with the number still waiting
+([#705](https://github.com/Sohex/musefs/issues/705)). A track counts while it
+has neither a fingerprint nor a recorded inode, which is how the upgrade leaves
+every row. A file the revalidate cannot re-probe, such as a chained Ogg
+([#747](https://github.com/Sohex/musefs/issues/747)), stays counted until
+`revalidate --prune` removes it.
+
 ### Flags, for scripts
 
 There is no terminal in a pipeline, so `migrate` never blocks waiting on one.

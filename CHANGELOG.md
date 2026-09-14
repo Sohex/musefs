@@ -16,6 +16,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **An owed revalidate is reported until it runs.** `migrate` reports how many
+  tracks the upgrade left needing a revalidate, but only once, and that line
+  scrolls away. Now `mount`, `scan` and `revalidate` each print a warning with
+  the number of tracks that have neither a fingerprint nor a recorded inode, for
+  as long as any remain ([#705](https://github.com/Sohex/musefs/issues/705)).
+
 - **`musefs migrate --repair`.** Before copying or writing anything, `migrate`
   now checks that every row in the store survives the schema it is about to
   become, reports what would be refused per table, and stops. A row gets there

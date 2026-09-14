@@ -139,7 +139,9 @@ upgrade leaves several things only a revalidate puts right, and it is the
 The offer walks your library without following symlinks, like `revalidate`
 without `--follow-symlinks`. If your library reaches its files through symlinks,
 decline it and run `musefs revalidate --follow-symlinks /path/to/music --db
-library.db` yourself, or those files keep everything below until you do:
+library.db` yourself, or those files keep everything below until you do. Until
+every track has been re-probed, `mount`, `scan` and `revalidate` each warn with
+the number still waiting ([#705]):
 
 - **Fingerprints are cleared** ([#691]). Until they are recomputed, a moved file
   is not recognised: `scan` ingests it as a new track and leaves its curated
