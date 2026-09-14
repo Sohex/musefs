@@ -625,14 +625,22 @@ INSERT INTO tracks (id, backing_path, format, audio_offset, audio_length,
 -- row cannot name a higher one: one whose track is gone fails the refill below,
 -- or `migrate --repair` has removed it. A ring row whose track_id is not an
 -- integer names no track.
+--
+-- Nor does one at 9223372036854775807. The old ring put no bound on track_id,
+-- and a sequence seeded at the largest integer leaves no id to allocate: the
+-- next insert into `tracks` would fail with SQLITE_FULL. A ring row names a
+-- track already deleted, so skipping it costs only the retirement of that one
+-- id, which is best effort anyway.
 UPDATE sqlite_sequence
-   SET seq = (SELECT max(track_id) FROM track_changes WHERE typeof(track_id) = 'integer')
+   SET seq = (SELECT max(track_id) FROM track_changes
+              WHERE typeof(track_id) = 'integer' AND track_id < 9223372036854775807)
  WHERE name = 'tracks'
-   AND seq < (SELECT max(track_id) FROM track_changes WHERE typeof(track_id) = 'integer');
+   AND seq < (SELECT max(track_id) FROM track_changes
+              WHERE typeof(track_id) = 'integer' AND track_id < 9223372036854775807);
 INSERT INTO sqlite_sequence (name, seq)
     SELECT 'tracks', ring.top
     FROM (SELECT max(track_id) AS top FROM track_changes
-          WHERE typeof(track_id) = 'integer') AS ring
+          WHERE typeof(track_id) = 'integer' AND track_id < 9223372036854775807) AS ring
     WHERE ring.top > 0
       AND NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'tracks');
 
