@@ -162,8 +162,10 @@ A few plugins ignore that gate or are redundant in this mode:
   leaves a servable row in place even then — musefs can still serve those bytes.
 - **Orphaned art:** replacing art can orphan old blobs; `musefs revalidate --prune`
   garbage-collects them.
-- **Schema version:** the plugin refuses to run if the DB's `user_version` differs
-  from the version it targets — rebuild after upgrading musefs.
+- **Schema version:** the plugin refuses to run if the DB's `user_version`
+  differs from the version it targets. The message says which side is behind:
+  upgrade the plugin for a store newer than it, or run `musefs migrate` for an
+  older one.
 
 ## Tests
 

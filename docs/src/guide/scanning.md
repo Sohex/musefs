@@ -119,9 +119,9 @@ before a moved file is retargeted:
 
 **Upgrading from musefs 1.3.0 or earlier.** The schema upgrade clears every
 stored fingerprint, because the value now includes sampled audio and the old
-ones were computed without it. The next `scan` or `revalidate` recomputes them
-with no flag needed — `revalidate` already re-probes a row missing the checksum
-its tier asks for. Until then those rows cannot be move-recovered, exactly as
+ones were computed without it. The next `revalidate` recomputes them with no
+flag needed, since it re-probes a row missing the checksum its tier asks for; a
+plain `scan` does not, because it leaves already-tracked rows alone. Until then those rows cannot be move-recovered, exactly as
 an unfingerprinted row never could, so run one pass before moving files around.
 `content_hash` is untouched by the upgrade.
 
@@ -131,13 +131,13 @@ already in the store, the scanner looks up rows whose fingerprint matches and
 whose old path is gone, and retargets the unique match in place — its `id`,
 tags, and art are preserved. Move recovery only applies to rows that were
 fingerprinted before the move (rows scanned under `--checksum=none` have no
-fingerprint and cannot be retargeted until a later fingerprint-tier pass).
+fingerprint and cannot be retargeted until a later fingerprint-tier `revalidate`).
 
 A `content_hash` only ever describes the file a row currently points at. A pass
-that computes no full hash — a `fingerprint`-tier re-scan of a rewritten file,
+that computes no full hash — a `fingerprint`-tier revalidate of a rewritten file,
 or a `--match=fast` retarget that confirms nothing — clears the column rather than
-leaving the previous bytes' hash standing. Re-run with `--checksum=full` to
-restore it. A pass over a file that has not changed keeps the hash it already
+leaving the previous bytes' hash standing. A `revalidate --checksum=full`
+restores it. A pass over a file that has not changed keeps the hash it already
 has, so a cheap pass never undoes an expensive one.
 Run `scan` after a move and ideally **before** any `revalidate` — `revalidate`
 only refreshes already tracked rows, so a moved file must be re-seeded before

@@ -76,7 +76,9 @@ settings (handy for testing).
 - **Orphaned art:** replacing art can orphan old blobs; `musefs revalidate --prune`
   garbage-collects them.
 - **Schema version:** the plugin refuses to run if the DB's `user_version`
-  differs from the version it targets — rebuild the store after upgrading musefs.
+  differs from the version it targets. The message says which side is behind:
+  upgrade the plugin for a store newer than it, or run `musefs migrate` for an
+  older one.
 
 ## Tests
 

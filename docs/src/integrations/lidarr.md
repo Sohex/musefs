@@ -196,8 +196,9 @@ binary are importable/on `PATH`.
   cover, replacing the track's art rows on every sync (an over-cap or
   unreachable cover is skipped, leaving any scanner-ingested art in place).
 - **Schema version:** the sync refuses to run if the DB's `user_version`
-  differs from the version it targets — rebuild the store after upgrading
-  musefs.
+  differs from the version it targets. The message says which side is behind:
+  upgrade the plugin for a store newer than it, or run `musefs migrate` for an
+  older one.
 - **Deletions prune by MusicBrainz id, scoped to rows this plugin owns.** On an
   Album/Artist delete, the sync removes the matching store rows
   (`musicbrainz_albumid` / `musicbrainz_artistid`) so the mount stops presenting
