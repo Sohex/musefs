@@ -356,7 +356,9 @@ aborts any `UPDATE` that changes it
 stop a rekey: a childless track has nothing referencing its old id. The
 changelog trigger records the old id as well as a changed new one regardless,
 so a writer that drops the refusal still leaves the mount's refresh able to see
-the old id go.
+the old id go. The upgrade to v4 starts the id sequence past the highest id the
+old changelog ring still names, so a track deleted from the top of the range
+before the upgrade does not have its id handed out after it.
 
 **And a structural block is replaced, never updated.** `structural_blocks` is
 scanner-owned, so no external writer should touch it at all, but SQL permits an

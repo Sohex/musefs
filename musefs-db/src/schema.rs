@@ -615,6 +615,25 @@ INSERT INTO tracks (id, backing_path, format, audio_offset, audio_length,
            0
     FROM tracks_hold_v4;
 
+-- The refill leaves `sqlite_sequence` at the highest id still standing. The old
+-- table allocated max(id) + 1, so a track deleted from the top of the range
+-- left its id for the next insert to take (#678), and the changelog ring may
+-- still name that id -- the ring goes below -- as may state an external tool
+-- kept. So the sequence starts past the highest id the ring holds too. A child
+-- row cannot name a higher one: one whose track is gone fails the refill below,
+-- or `migrate --repair` has removed it. A ring row whose track_id is not an
+-- integer names no track.
+UPDATE sqlite_sequence
+   SET seq = (SELECT max(track_id) FROM track_changes WHERE typeof(track_id) = 'integer')
+ WHERE name = 'tracks'
+   AND seq < (SELECT max(track_id) FROM track_changes WHERE typeof(track_id) = 'integer');
+INSERT INTO sqlite_sequence (name, seq)
+    SELECT 'tracks', ring.top
+    FROM (SELECT max(track_id) AS top FROM track_changes
+          WHERE typeof(track_id) = 'integer') AS ring
+    WHERE ring.top > 0
+      AND NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'tracks');
+
 -- 5. Rebuild the three child tables. All are empty right now -- the cascade
 -- above took them -- so each is a drop and a create, with the holding tables as
 -- the source. `tags` and `track_art` change shape; `structural_blocks` keeps
@@ -2289,6 +2308,37 @@ mod v4_tracks_rebuild_tests {
         )
         .unwrap();
         assert_eq!(conn.last_insert_rowid(), 3, "id 2 is retired, not recycled");
+    }
+
+    /// #678 across the upgrade itself. The pre-V4 table reused the highest id
+    /// once its track was deleted, so the rebuild's own refill would set the
+    /// sequence to the highest id still standing and hand a deleted one out
+    /// again. The changelog ring still names it, which is what an incremental
+    /// refresh, or a plugin holding ids, has to be able to trust. A ring row
+    /// whose `track_id` is not an integer, which V3 accepted, counts for nothing.
+    #[test]
+    fn an_id_deleted_before_the_upgrade_is_not_handed_out_after_it() {
+        for (what, deleted) in [
+            ("nothing deleted", &[][..]),
+            ("the highest id deleted", &[2][..]),
+            ("every id deleted", &[1, 2][..]),
+        ] {
+            let mut conn = populated_store_at(3);
+            for id in deleted {
+                conn.execute("DELETE FROM tracks WHERE id = ?1", [id])
+                    .unwrap();
+            }
+            conn.execute("INSERT INTO track_changes (track_id) VALUES ('zzz')", [])
+                .unwrap();
+            super::migrate_all(&mut conn).unwrap();
+            conn.execute(
+                "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+                 backing_size, backing_mtime_ns, updated_at) VALUES (?1,'flac',0,1,1,0,0)",
+                [&b"/lib/c.flac"[..]],
+            )
+            .unwrap();
+            assert_eq!(conn.last_insert_rowid(), 3, "{what}");
+        }
     }
 
     /// #674: the column arrives as the `not yet known` sentinel on every

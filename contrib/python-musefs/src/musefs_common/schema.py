@@ -617,6 +617,25 @@ INSERT INTO tracks (id, backing_path, format, audio_offset, audio_length,
            0
     FROM tracks_hold_v4;
 
+-- The refill leaves `sqlite_sequence` at the highest id still standing. The old
+-- table allocated max(id) + 1, so a track deleted from the top of the range
+-- left its id for the next insert to take (#678), and the changelog ring may
+-- still name that id -- the ring goes below -- as may state an external tool
+-- kept. So the sequence starts past the highest id the ring holds too. A child
+-- row cannot name a higher one: one whose track is gone fails the refill below,
+-- or `migrate --repair` has removed it. A ring row whose track_id is not an
+-- integer names no track.
+UPDATE sqlite_sequence
+   SET seq = (SELECT max(track_id) FROM track_changes WHERE typeof(track_id) = 'integer')
+ WHERE name = 'tracks'
+   AND seq < (SELECT max(track_id) FROM track_changes WHERE typeof(track_id) = 'integer');
+INSERT INTO sqlite_sequence (name, seq)
+    SELECT 'tracks', ring.top
+    FROM (SELECT max(track_id) AS top FROM track_changes
+          WHERE typeof(track_id) = 'integer') AS ring
+    WHERE ring.top > 0
+      AND NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'tracks');
+
 -- 5. Rebuild the three child tables. All are empty right now -- the cascade
 -- above took them -- so each is a drop and a create, with the holding tables as
 -- the source. `tags` and `track_art` change shape; `structural_blocks` keeps
