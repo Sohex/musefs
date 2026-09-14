@@ -30,7 +30,7 @@ const NANOS_PER_SEC: i64 = 1_000_000_000;
 /// cache, so an untouched file reports a different number after a remount, or
 /// after eviction. Recording it there would fail every serve after a replug, so
 /// `BackingStamp::recordable` drops it, and on those filesystems the stamp is
-/// effectively size plus a coarse mtime — two-second steps on FAT32, 10 ms on
+/// effectively size plus a coarse mtime — two-second steps on FAT, 10 ms on
 /// exFAT, and both report ctime as mtime. That is why neither is recommended as
 /// backing storage.
 ///
@@ -187,12 +187,23 @@ const EXFAT_SUPER_MAGIC: u64 = 0x2011_BAB0;
 /// A question `fstatfs` cannot answer is answered yes. That records the inode,
 /// as the stamp always did, so a failed query keeps the stronger stamp rather
 /// than quietly weakening it.
+///
+/// Off Linux nothing is asked and the answer is always yes: `f_type` holds a
+/// Linux magic number only on Linux, so elsewhere no value in it could name FAT.
 pub(crate) fn keeps_inodes(file: &std::fs::File) -> bool {
     #[cfg(test)]
     if NO_INODES.with(std::cell::Cell::get) {
         return false;
     }
-    f_type_keeps_inodes(fs_type(rustix::fs::fstatfs(file)))
+    #[cfg(target_os = "linux")]
+    {
+        f_type_keeps_inodes(fs_type(rustix::fs::fstatfs(file)))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = file;
+        true
+    }
 }
 
 /// [`keeps_inodes`] for a pathname, at the call sites that stat a path rather
@@ -202,10 +213,19 @@ pub(crate) fn keeps_inodes_at(path: &Path) -> bool {
     if NO_INODES.with(std::cell::Cell::get) {
         return false;
     }
-    f_type_keeps_inodes(fs_type(rustix::fs::statfs(path)))
+    #[cfg(target_os = "linux")]
+    {
+        f_type_keeps_inodes(fs_type(rustix::fs::statfs(path)))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        true
+    }
 }
 
 /// The filesystem type a `statfs` reported, or `None` when it could not say.
+#[cfg(target_os = "linux")]
 fn fs_type(stat: rustix::io::Result<rustix::fs::StatFs>) -> Option<u64> {
     stat.ok().and_then(|s| u64::try_from(s.f_type).ok())
 }
@@ -215,13 +235,6 @@ fn fs_type(stat: rustix::io::Result<rustix::fs::StatFs>) -> Option<u64> {
 #[cfg(target_os = "linux")]
 fn f_type_keeps_inodes(f_type: Option<u64>) -> bool {
     !matches!(f_type, Some(MSDOS_SUPER_MAGIC | EXFAT_SUPER_MAGIC))
-}
-
-/// `f_type` holds a Linux magic number only on Linux, so elsewhere no value in
-/// it can name FAT and the inode is always kept.
-#[cfg(not(target_os = "linux"))]
-fn f_type_keeps_inodes(_: Option<u64>) -> bool {
-    true
 }
 
 #[cfg(test)]
@@ -445,15 +458,12 @@ mod tests {
         assert_ne!(unrecorded, one);
     }
 
-    fn keeps(f_type: u64) -> bool {
-        f_type_keeps_inodes(Some(f_type))
-    }
-
     /// #757's two filesystems by their `linux/magic.h` values, against a spread
     /// of ones that do keep inode numbers — local, network and FUSE alike.
     #[cfg(target_os = "linux")]
     #[test]
     fn fat_and_exfat_are_the_filesystems_that_keep_no_inodes() {
+        let keeps = |f_type: u64| f_type_keeps_inodes(Some(f_type));
         assert!(!keeps(0x4d44), "FAT");
         assert!(!keeps(0x2011_BAB0), "exFAT");
         for (name, magic) in [
@@ -473,11 +483,14 @@ mod tests {
         );
     }
 
+    /// Answered yes on every platform for an ordinary filesystem: on Linux by
+    /// asking it, and elsewhere without asking at all.
     #[test]
     fn a_real_filesystem_is_asked_by_descriptor_and_by_path() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("f");
         std::fs::write(&p, b"x").unwrap();
+        #[cfg(target_os = "linux")]
         assert!(
             fs_type(rustix::fs::statfs(dir.path())).is_some(),
             "statfs reports a type"
