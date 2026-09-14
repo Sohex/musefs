@@ -61,8 +61,17 @@ human side.
 3. `CARGO_REGISTRY_TOKEN` is present in repo secrets.
 4. Smoke-build every cross target so `jemalloc-sys` is known to compile under
    zig before tagging (the release matrix builds with the `jemalloc` feature on).
-   These are the six `build` targets in `release.yml`; `rustup target add` each
-   triple first:
+   These are the six `build` targets in `release.yml`. Add the Rust triples
+   first; `rustup` takes them without a glibc suffix:
+
+   ```bash
+   rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+     x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
+     riscv64gc-unknown-linux-gnu riscv64gc-unknown-linux-musl
+   ```
+
+   Then build each one. `cargo zigbuild --target` takes the suffixed form, which
+   pins the glibc floor (2.17, or 2.27 for riscv64):
 
    ```bash
    for t in x86_64-unknown-linux-gnu.2.17 aarch64-unknown-linux-gnu.2.17 \
@@ -114,7 +123,8 @@ human side.
    version (e.g. `musefs-db = { version = "X.Y.Z", path = "..." }`) — a stale
    internal floor fails the publish.
 4. Refresh the lockfiles. `cargo update --workspace` moves the workspace
-   crates' versions in `Cargo.lock` without touching any other dependency; the
+   crates' versions in `Cargo.lock` and leaves every existing non-workspace
+   entry locked (Cargo still adds an entry a new dependency needs); the
    dry run below and every `release.yml` publish use `--locked`, so a stale
    lockfile fails them. `fuzz/` is outside the workspace and keeps its own
    `fuzz/Cargo.lock`, which still pins the old musefs versions until
@@ -223,10 +233,11 @@ workspace and the `contrib/` packages cuts both tags, `vX.Y.Z` and
 
 ### Before you push
 
-The pre-commit hook already gates fmt, clippy, the workspace tests, and the
-Python/shell/YAML lints on every commit, plus the mutant-anchor drift guard
-when the mutants config, its check script, or a `musefs-core`/`musefs-format`
-source file is staged. What it does **not** run — check the ones your change
+The pre-commit hook already gates every commit on `ruff`, and on fmt, clippy
+and the workspace tests unless every staged path is a doc. `shellcheck` and
+`yamllint` run when a shell or YAML file is staged, and the mutant-anchor drift
+guard when the mutants config, its check script, or a
+`musefs-core`/`musefs-format` source file is staged. What it does **not** run — check the ones your change
 triggers:
 
 - **Logic changes** → the [in-diff mutation gate](testing.md#mutation-testing). It is CI
