@@ -68,11 +68,6 @@ ignore = [
     # (Not present in fuzz/Cargo.lock, which this config is also run against —
     # cargo-deny warns advisory-not-detected there, which is not an error.)
     "RUSTSEC-2024-0436",
-    # bitmaps is archived/unmaintained, reached only as
-    # imbl -> imbl-sized-chunks -> bitmaps (the persistent collections behind the
-    # virtual tree). The maintained imbl fork still depends on it, so there is no
-    # upgrade path; the suggested replacements are not drop-in for SparseChunk.
-    "RUSTSEC-2026-0247",
 ]
 
 [sources]

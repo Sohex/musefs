@@ -526,10 +526,77 @@ fn scan_still_reads_id3v1_tail_for_mp3() {
     scan_directory_with(&db, &target.corpus_dir, &no_checksum_opts()).unwrap();
     let s = metrics::snapshot();
     // Corpus tracks are far below the default 64 KiB scan window (this test must
-    // keep the default ScanOptions::window): one prefix read + the tail. read_tail_128
-    // always reads 128 bytes when file_len >= 128, trailer present or not, so
-    // the +128 assertion is robust. `--checksum=none` keeps the fingerprint
-    // tier's audio sampling out of the count.
-    assert_eq!(s.scan_preads, 2, "mp3: prefix read + ID3v1 tail read");
-    assert_eq!(s.scan_bytes_read, len + 128, "mp3 keeps the 128-byte tail");
+    // keep the default ScanOptions::window): one prefix read + the tail. The MP3
+    // tail read is 138 bytes, an ID3v1 trailer and the ID3v2.4 footer in front of
+    // it, whether or not either is there; it widens only when a footer declares
+    // an appended tag, which no corpus file carries (#768). `--checksum=none`
+    // keeps the fingerprint tier's audio sampling out of the count.
+    assert!(
+        len >= 138,
+        "the corpus mp3 is at least one tail window long"
+    );
+    assert_eq!(s.scan_preads, 2, "mp3: prefix read + trailer tail read");
+    assert_eq!(s.scan_bytes_read, len + 138, "mp3 reads a 138-byte tail");
+}
+
+/// An appended ID3v2.4 tag `len` bytes long in all: header with the footer flag,
+/// zeroed (padding) body, and the matching `3DI` footer.
+fn appended_id3v24_tag(len: usize) -> Vec<u8> {
+    let body = u32::try_from(len - 20).unwrap();
+    let size = [body >> 21, body >> 14, body >> 7, body].map(|b| u8::try_from(b & 0x7F).unwrap());
+    let mut tag = vec![b'I', b'D', b'3', 4, 0, 0x10];
+    tag.extend_from_slice(&size);
+    tag.resize(len - 10, 0);
+    tag.extend_from_slice(&[b'3', b'D', b'I', 4, 0, 0x10]);
+    tag.extend_from_slice(&size);
+    tag
+}
+
+/// #768: an MP3 whose appended tags take several widenings of the tail read.
+/// Each pass reads only the bytes in front of what the last one already holds,
+/// so the tail costs its final window in bytes rather than the sum of every
+/// window it passed through.
+#[test]
+fn mp3_tail_widening_reads_each_byte_once() {
+    let _guard = METRICS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("appended.mp3");
+    let mut audio = vec![0xFF, 0xFB];
+    audio.resize(4096, 0);
+    common::write_mp3(&path, &audio);
+    let tags = [500, 700, 900];
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    for len in tags {
+        std::io::Write::write_all(&mut file, &appended_id3v24_tag(len)).unwrap();
+    }
+    drop(file);
+    let len = std::fs::metadata(&path).unwrap().len();
+
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    metrics::reset();
+    let stats = scan_directory_with(&db, tmp.path(), &no_checksum_opts()).unwrap();
+    let s = metrics::snapshot();
+    assert_eq!((stats.scanned, stats.failed), (1, 0), "the file probes");
+    // One window, then one widening per appended tag, newest first: each footer
+    // points one tag further back, plus a window for what may sit in front.
+    let final_window = 500 + 700 + 900 + 138;
+    assert!(
+        len > final_window,
+        "the tail window never reaches the ceiling"
+    );
+    assert_eq!(
+        s.scan_preads,
+        1 + 1 + tags.len() as u64,
+        "prefix + 4 tail reads"
+    );
+    assert_eq!(
+        s.scan_bytes_read,
+        len + final_window,
+        "the prefix, and the tail's final window once"
+    );
 }

@@ -305,7 +305,7 @@ pub(crate) fn refresh_embedded_art_in(
 impl Db<ReadWrite> {
     /// Insert `a`, deduplicated by content, and return its `art` id. A row filed
     /// under the same digest is verified to hold these bytes before it is
-    /// returned (#724); see [`upsert_art_in`]. Each call verifies afresh — a
+    /// returned (#724); see `upsert_art_in`. Each call verifies afresh — a
     /// bulk scan remembers what it verified through [`crate::BulkWriter`].
     pub fn upsert_art(&self, a: &NewArt) -> Result<i64> {
         upsert_art_in(&self.conn, a, &mut std::collections::HashSet::new())
@@ -723,6 +723,32 @@ mod guard_tests {
                         table: "track_art",
                         field: "mime",
                         unit: "bytes",
+                        ..
+                    }
+                ),
+                "{err:?}"
+            );
+        }
+    }
+
+    /// The character arm, on both readers: a mime one character over the cap,
+    /// with no NUL for the byte ceiling to catch.
+    #[test]
+    fn both_track_art_readers_reject_an_oversize_mime() {
+        let (db, track, art) = db_track_art();
+        let over = usize::try_from(MAX_ART_MIME_LEN).unwrap() + 1;
+        link_with_mime(&db, track, art, &"m".repeat(over));
+        for err in [
+            db.get_track_art(track).unwrap_err(),
+            db.get_track_art_with_meta(track).unwrap_err(),
+        ] {
+            assert!(
+                matches!(
+                    err,
+                    DbError::FieldTooLarge {
+                        table: "track_art",
+                        field: "mime",
+                        unit: "characters",
                         ..
                     }
                 ),

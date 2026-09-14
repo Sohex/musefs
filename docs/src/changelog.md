@@ -16,6 +16,20 @@ see the [Release notes](release-notes.md).
 
 ### Added
 
+- **Big-endian RIFX WAV files scan and serve**
+  ([#770](https://github.com/Sohex/musefs/issues/770)). `riff_wave_start` required
+  the literal `RIFF` and every size was decoded little-endian, so a `RIFX` file,
+  the big-endian WAVE variant, was refused as not a WAV. A `wav::ByteOrder` is now
+  read from the magic, and the chunk walk, the INFO subchunk reader and the
+  structural read decode sizes with it. Synthesis writes `RIFX` with every size
+  big-endian: the form, `fmt `/`fact`, the INFO subchunks, `id3 ` and `data`, as
+  libsndfile writes it; the `fmt `/`fact` payloads are carried untouched. Nothing
+  new is stored, because the serve path already re-reads `[0, audio_offset)` and
+  the magic is its first four bytes. libsndfile and sox read the served file
+  back correctly; FFmpeg decodes RIFX PCM byte-swapped and skips a big-endian
+  INFO list, a bug it shows equally on the untouched source file, and still reads
+  every tag from the `id3 ` chunk.
+
 - **An owed revalidate is reported until it runs**
   ([#705](https://github.com/Sohex/musefs/issues/705)). `migrate` counts the
   tracks the upgrade left needing a revalidate, but it prints that count once,
@@ -196,6 +210,15 @@ see the [Release notes](release-notes.md).
 
 ### Changed
 
+- **The published crates no longer ship tests that cannot build outside the
+  repository.** Cargo strips path-only dev-dependencies at publish, so the
+  integration tests of `musefs-db`, `musefs-core`, `musefs-fuse` and
+  `musefs-cli`, and `musefs-core`'s benches, which reach sibling crates or a
+  `test-support` feature that way, failed to compile from the published
+  tarball, and `musefs-format`'s `fuzzing`-gated property tests compiled to
+  nothing. Those crates now exclude `tests/` (and `musefs-core` its `benches/`),
+  with the reason in each manifest; `musefs` keeps its tests, which build.
+
 - **The serve path no longer zero-fills buffers a read is about to overwrite**
   ([#670](https://github.com/Sohex/musefs/issues/670)). Each backing-audio
   segment and Ogg audio page a read touched was zero-filled and then overwritten
@@ -271,7 +294,13 @@ see the [Release notes](release-notes.md).
   `musefs migrate`; `StoreInUse` names its operation; `ArtDigestMismatch`,
   `DerivedStateStale`, `TrackIdentity` (replacing
   `Db::track_version_and_path`), `refresh_embedded_art`/`EmbeddedArt` and
-  `count_tracks_awaiting_revalidate` are new. `Segment::OggAudio`,
+  `count_tracks_awaiting_revalidate` are new, as are
+  `Db::upsert_track_with_checksums` and `BulkWriter::upsert_track_with_checksums`,
+  `DbError::WrongStorageClass`, `DbError::AmbiguousDuplicatePath`,
+  `limits::MAX_ROW_BYTES`, `DuplicatePath` with `Rejections::duplicates` and
+  `Rejections::relinked`, and for MP3 `mp3::read_metadata`/`Mp3Metadata` (every
+  ID3v2 tag at either end, merged), `mp3::locate_trailer`/`Mp3Trailer` and
+  `Mp3Bounds::id3v2_tags`. `Segment::OggAudio`,
   `FuseTelemetry`, `render_prometheus`, the virtual tree's name types and
   `DbError::FieldTooLarge` change shape too. The
   [release notes](release-notes.md#upgrading-from-v130) list every break.
@@ -817,6 +846,152 @@ see the [Release notes](release-notes.md).
   `test-support` ([#751](https://github.com/Sohex/musefs/issues/751)).
 
 ### Fixed
+
+- **A WAV whose waveform is a `LIST('wavl')` is refused by name**
+  ([#769](https://github.com/Sohex/musefs/issues/769)). RIFF also lets a WAVE
+  store its waveform as a `LIST('wavl')` of `data` and `slnt` chunks instead of
+  one top-level `data`, and the scan skipped such a file as unparseable. No
+  mainstream decoder plays that layout (FFmpeg, libsndfile, GStreamer and sox all
+  fail on it for want of a top-level `data` chunk), so serving it is not
+  worthwhile: it is now counted as `unsupported`, with the reason "WAVE waveform
+  stored as LIST('wavl')", on both the bounded and the over-ceiling probe paths,
+  and a stored row for a WAV later rewritten that way is removable by
+  `revalidate --prune`, like a chained Ogg. The WAV format page now states the
+  supported surface: RIFF and RIFX, `wavl` refused, RF64/BW64 out of scope.
+
+- **Upgrading a 1.0.0 store no longer drops long tags.** The schema step that
+  made `tags.value`'s cap count bytes (version 2, shipped in 1.1.0) rebuilt the
+  table at 256 KiB and filtered its refill to match, deleting every tag past it.
+  1.0.0's character-counted cap had admitted such a tag, and its read guard
+  counted characters too, so it was stored and served: a multibyte lyrics tag of
+  a few hundred kilobytes, for one. `musefs migrate` applies versions 2 to 4
+  together and its pre-flight checks rows only against version 4, which would
+  have kept the row, so the loss went unreported and survived only in the
+  snapshot. Since no step applies while a gated one is pending
+  ([#749](https://github.com/Sohex/musefs/issues/749)), version 2 now only ever
+  runs inside `migrate` beside version 3's widening, so it rebuilds at that
+  widened 16 MiB − 1 cap and a store still at version 1 keeps every tag. Stores
+  already past version 2 are unaffected.
+
+- **`musefs vacuum` no longer holds the store after being refused.** Claiming the
+  store sets exclusive locking mode before it tries the lock; when another
+  connection had the store open the claim failed, `vacuum` returned early, and
+  the connection stayed exclusive, so its next statement locked everything else
+  out ([#721](https://github.com/Sohex/musefs/issues/721)). The previous mode is
+  restored on the refused path too.
+
+- **A track deleted before the upgrade keeps its id retired.** The version 4
+  rebuild left `sqlite_sequence` at the highest id still standing, so a track
+  deleted from the top of the range before `musefs migrate` could have its id
+  handed out again while the old `track_changes` ring still named it
+  ([#678](https://github.com/Sohex/musefs/issues/678)). The sequence is now raised
+  to the highest integer id that ring holds, including when every track was
+  deleted. The identity check ignores `sqlite_%` tables, so a migrated store
+  still compares equal to a fresh one. A ring row naming id 9223372036854775807,
+  which the old ring accepted, is skipped rather than seeding the sequence at its
+  maximum, where the upgraded store could not have added another track.
+
+- **A rewrite that changes only a file's ctime invalidates its synthesized
+  file.** `tracks_geometry_au` bumped `content_version` on a change of format,
+  bounds, size, mtime or inode, but not ctime, so a same-size rewrite that put the
+  old mtime back left the served mtime unmoved, and under `--keep-cache` the
+  kernel kept serving pages from before it. A ctime change now bumps too, unless
+  a fingerprint or content hash that was already stored is written again
+  unchanged in the same statement: that proves the bytes, so a chmod or a link
+  change does not bring back the churn #757 removed. A first fingerprint proves
+  nothing and does not stop the bump. `Db::upsert_track_with_checksums` writes the
+  stamp and both checksums in one statement so the trigger can see both.
+
+- **Reading a hostile store row is bounded where the value is loaded**
+  ([#693](https://github.com/Sohex/musefs/issues/693),
+  [#758](https://github.com/Sohex/musefs/issues/758)). The reader guards decided
+  from projected lengths, but `sqlite3_step` materializes every selected column
+  before any guard sees the row, so a crafted 200 MB value was loaded in full
+  (and a TEXT path with an early NUL passed `length()` while being loaded). Every
+  `Db` connection now sets `SQLITE_LIMIT_LENGTH` to `limits::MAX_ROW_BYTES`
+  (16 MiB + 1117 bytes, the widest record a schema-valid row makes), so SQLite
+  refuses a value past it with `SQLITE_TOOBIG` as the row is stepped. A store
+  still behind a gated upgrade gets no limit until `apply` has run, so the
+  pre-flight can report an oversized legacy row. The `backing_path` projections
+  check `typeof` before `length()`, so a path over its cap or not stored as a
+  BLOB is refused (`DbError::WrongStorageClass`) without being loaded; measured,
+  a path read now stays under 3 MiB of SQLite memory against a 12 MiB hostile
+  path.
+
+- **`musefs migrate --repair` is less destructive and all-or-nothing**
+  ([#705](https://github.com/Sohex/musefs/issues/705),
+  [#761](https://github.com/Sohex/musefs/issues/761)). A picture link to an art row
+  with a non-canonical digest now moves onto a correctly filed row holding
+  byte-identical data (`Rejections::relinked`) instead of being deleted with it.
+  The same path stored as both TEXT and BLOB, which the rebuild's cast makes
+  collide, is reported as a duplicate with both ids (`Rejections::duplicates`);
+  `--repair` keeps the row carrying tags or picture links (the older one when
+  neither does) and refuses with `DbError::AmbiguousDuplicatePath` when both do,
+  where it used to keep whichever the probe inserted first. And `repair` now only
+  plans: `apply` carries the deletes out inside the migration's own transaction,
+  so an upgrade that fails, on a full disk say, rolls them back too.
+
+- **An MP3 that begins with more than one ID3v2 tag scans**
+  ([#767](https://github.com/Sohex/musefs/issues/767)). `mp3::locate_audio` and
+  its bounded twin called `id3v2::total_len` once, so `[ID3][ID3][MPEG…]` stepped
+  over the first tag and demanded a frame sync at the start of the second,
+  refusing the file as `NotMp3`, although `id3v2::leading_tags_len` already walked
+  such a run for FLAC. Both locators now step over the whole leading run; the
+  bounded one waits for the bytes that show the run has ended, so a window cut
+  inside a second tag's `ID3` widens instead of refusing.
+
+- **An appended ID3v2 tag is no longer served as audio, and is ingested**
+  ([#768](https://github.com/Sohex/musefs/issues/768)). ID3v2.4 lets a tag follow
+  the audio, requires it to carry a `3DI` footer, and lets a file carry tags at
+  both ends. musefs stepped over only a leading tag and a trailing ID3v1, so an
+  appended tag was stored as audio and served as audio, and its metadata never
+  reached the store; a file tagged at both ends served fresh metadata at the
+  front and the stale original at the end, where a v2.4 reader is told to look.
+  `mp3::locate_trailer` now walks back from the end of the file: a tag counts only
+  when its footer validates (`3DI`, version 4, the footer flag, a synchsafe size)
+  and matches the header its size points back to, up to 64 appended tags, with
+  one ID3v1 trailer allowed on either side of them and only tags after the frame
+  sync counted. The scan reads exactly the declared extents from the tail, within
+  the 64 MiB probe ceiling, and never the MPEG payload. Every tag at either end is
+  parsed within its own extent and merged in file order as ID3v2.4 §5 and §3.2
+  specify: a later tag replaces what came before unless its extended header sets
+  the update flag, in which case only the frames the ID3v2.4 frames document
+  calls unique override (text, `TXXX`, `COMM` and `USLT` by store key; `POPM` by
+  rating and play count together; `APIC` by description; binary frames by their
+  own rules). A tag the allocation guard will not parse contributes nothing and
+  discards nothing.
+  ID3v2.3 has no update flag, but its §4.19 makes every later tag an update of
+  the one before, so a later v2.2 or v2.3 tag now overrides only the frames it
+  carries and keeps everything else, where the scan used to read only the first
+  tag. `SEEK` frames are not
+  followed, and APEv2 tags remain out of scope.
+
+- **The published crates carry their license.** None of the six `.crate` files
+  included the MIT `LICENSE`, whose notice has to travel with the code; each
+  crate now ships it, through a `LICENSE` symlink to the workspace root's, which
+  cargo packages as the file's contents. `musefs-db`, `musefs-format`,
+  `musefs-core`, `musefs-fuse` and `musefs-cli` gained a `readme`, the four
+  library crates keywords and categories, and `musefs-db`, `musefs-format` and
+  `musefs-core` crate-level docs, so their crates.io and docs.rs pages are no
+  longer blank.
+
+- **A release can pass its gate after a re-run.** The release workflow's gate
+  discards check-runs that started before the release run did, so a green run
+  from the earlier push to `main` cannot stand in for the tag's own legs. It
+  took that cutoff from the run's `run_started_at`, which GitHub documents as
+  resetting on every re-run attempt: re-running CI's failed jobs and then the
+  release moved the cutoff past the check-runs that re-run had just produced,
+  and the gate timed out after 45 minutes. It now uses the run's `created_at`,
+  which stays at the tag push; the retry procedure in
+  [Releasing](contributing/releasing.md) says to re-run CI first.
+
+- **The `bitmaps` advisories are cleared.** `imbl` 7.0.2 depends on
+  `imbl-sized-chunks` 0.2.0, which no longer uses `bitmaps`, so
+  RUSTSEC-2026-0247 (unmaintained) and RUSTSEC-2025-0167 (unsound, and
+  unreachable from musefs) no longer apply; their ignores are removed from
+  `deny.toml` and `.cargo/audit.toml`, where a leftover would have failed
+  `cargo deny`'s `advisory-not-detected` check. Both lockfiles changed only
+  those three crates.
 
 - **An open file no longer serves read-ahead cached before a backing rewrite**
   once the row is restamped. A handle's read-ahead windows are keyed by backing
@@ -1481,6 +1656,17 @@ see the [Release notes](release-notes.md).
 
 ### Internal
 
+- CI gained three checks it never ran. The `check` job builds the docs with
+  rustdoc warnings denied, after 21 broken or private intra-doc links, an
+  unescaped `Option<Instant>` and a bare URL had accumulated unseen. A new
+  `msrv` job, required by `ci-ok`, runs `cargo check --workspace --all-targets`
+  on exactly the `rust-version` `Cargo.toml` declares; the comment there now
+  states the real floors (let-chains need 1.88 in the libraries, the tests 1.91)
+  instead of blaming a dependency that no longer forces it. And the `e2e` job
+  runs the kernel passthrough read test as root, with `MUSEFS_REQUIRE_PASSTHROUGH`
+  turning its skips into failures, so `structure_only_reads_are_kernel_passthrough`
+  is no longer a test that only ever skipped. No job installs `libfuse3-dev` or
+  `pkg-config` any more: fuser mounts in pure Rust and SQLite is bundled.
 - The `ogg_page` fuzz target round-trips the page machinery the serve path
   actually depends on — `verify_page_crc` and `patch_page_header_algebraic` —
   instead of only decoding a header ([#625](https://github.com/Sohex/musefs/issues/625)). Coverage against the

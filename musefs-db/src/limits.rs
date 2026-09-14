@@ -1,8 +1,8 @@
 //! Size and identity caps enforced at the DB boundary (#267/#269/#278).
 //!
-//! The `CHECK` constraints in [`crate::schema`] (`MIGRATION_V1`) enforce these
-//! at write time for honest writers; the reader guards in [`crate::tags`],
-//! [`crate::art`] and [`crate::structural`] re-enforce them at read time,
+//! The `CHECK` constraints in `crate::schema` (`MIGRATION_V1`) enforce these
+//! at write time for honest writers; the reader guards in `crate::tags`,
+//! `crate::art` and `crate::structural` re-enforce them at read time,
 //! because a crafted DB can carry the canonical schema yet smuggle a
 //! CHECK-violating row (`PRAGMA ignore_check_constraints`). Values are public so
 //! cross-layer drift tests can assert they match the format ceiling and the
@@ -12,7 +12,7 @@
 pub const MAX_TAG_KEY_LEN: i64 = 256;
 /// Max `tags.value` length in bytes — 16 MiB − 1. Both the schema `CHECK`
 /// (`length(CAST(value AS BLOB)) <= 16777215`) and the read-time guard in
-/// [`crate::tags`] count bytes, not UTF-8 characters, so the
+/// `crate::tags` count bytes, not UTF-8 characters, so the
 /// materialized-memory bound is exact rather than ~4x looser for multibyte
 /// text (#505).
 ///
@@ -36,7 +36,7 @@ pub const MAX_TAG_VALUE_LEN: i64 = 0x00FF_FFFF;
 /// (#716).
 pub const MAX_ART_MIME_LEN: i64 = 255;
 /// Max `tracks.backing_path` length in bytes — 64 KiB (#758). The column is a
-/// BLOB, so the schema `CHECK` and the reader guard in [`crate::tracks`] both
+/// BLOB, so the schema `CHECK` and the reader guard in `crate::tracks` both
 /// count bytes.
 ///
 /// A generous portable ceiling rather than `PATH_MAX`, which is 4096 on Linux and
@@ -47,7 +47,7 @@ pub const MAX_ART_MIME_LEN: i64 = 255;
 /// store could make that allocation as large as SQLite allows a value.
 pub const MAX_BACKING_PATH_BYTES: i64 = 64 * 1024;
 /// Exact `art.sha256` length: a hex-encoded SHA-256 digest. The schema `CHECK`
-/// pins it to equality; the reader guard in [`crate::art`] bounds only the
+/// pins it to equality; the reader guard in `crate::art` bounds only the
 /// upper side, since a short digest is a correctness problem for the caller
 /// rather than an allocation one.
 pub const ART_SHA256_LEN: i64 = 64;
@@ -90,6 +90,34 @@ pub const MAX_BINARY_TAG_BYTES: i64 = 16_711_680;
 /// `byte_len = length(data)` `CHECK` (#693).
 pub const MAX_ART_BYTES: i64 = 16_711_680;
 
+/// The most a SQLite record spends beyond its text and blob payloads: a
+/// header-size varint, then per column a serial-type varint and an integer
+/// body, at most 9 and 8 bytes each. Counted over the five columns of `tags`,
+/// the table whose payloads [`MAX_ROW_BYTES`] adds up.
+const RECORD_OVERHEAD_BYTES: i64 = 9 + 5 * (9 + 8);
+
+/// The widest record a row valid under the schema can be: a `tags` value at
+/// [`MAX_TAG_VALUE_LEN`] beside a key at its byte ceiling, which outweighs a
+/// structural block or an art row at their caps. Every [`crate::Db`]
+/// connection installs it as `SQLITE_LIMIT_LENGTH`.
+///
+/// That limit is what bounds a read against a hostile row. The reader guards
+/// decide from projected lengths, but `sqlite3_step` materializes every column
+/// a statement selects before any guard sees the row, so a guard bounds what
+/// Rust allocates and nothing about what SQLite already did. With the limit,
+/// SQLite refuses a string or blob past it with `SQLITE_TOOBIG` instead of
+/// loading it. It has to admit the whole record rather than the widest value
+/// alone, because SQLite applies it to a record built for a write and to one
+/// a `VACUUM` copies.
+pub const MAX_ROW_BYTES: i64 =
+    MAX_TAG_VALUE_LEN + crate::error::max_utf8_bytes(MAX_TAG_KEY_LEN) + RECORD_OVERHEAD_BYTES;
+// The widest row is the tag row: a structural block or an art row at its cap is
+// narrower, so neither needs a term of its own.
+const _: () = assert!(
+    MAX_STRUCTURAL_BODY_LEN + MAX_STRUCTURAL_KIND_LEN < MAX_ROW_BYTES - RECORD_OVERHEAD_BYTES
+);
+const _: () = assert!(MAX_ART_BYTES + ART_SHA256_LEN < MAX_ROW_BYTES - RECORD_OVERHEAD_BYTES);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,5 +144,7 @@ mod tests {
         assert_eq!(MAX_ART_ROWS_PER_TRACK, 4096);
         assert_eq!(ART_SHA256_LEN, 64);
         assert_eq!(MAX_BACKING_PATH_BYTES, 65_536);
+        assert_eq!(RECORD_OVERHEAD_BYTES, 94);
+        assert_eq!(MAX_ROW_BYTES, 16 * 1024 * 1024 - 1 + 4 * 256 + 94);
     }
 }

@@ -6,6 +6,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../README.md"
+keywords = ["fuse", "music", "metadata", "filesystem", "audio"]
+categories = ["filesystem", "multimedia::audio"]
+# Integration tests and benches stay in the repository: they need
+# `musefs-latencyfs` (unpublished) and the `test-support`/`fuzzing` features
+# that only path dev-dependencies turn on, and cargo strips path
+# dev-dependencies at publish, so they could not build from the published crate.
+exclude = ["tests/", "benches/"]
 
 [features]
 metrics = []

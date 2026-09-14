@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use crate::convert::usize_from;
 use crate::error::{FormatError, Result};
 use crate::id3v2;
@@ -8,15 +10,24 @@ use crate::layout::{RegionLayout, Segment};
 use crate::probe::Extent;
 use crate::size;
 
-/// Where the MP3 audio frames begin and end (excluding any ID3v2 prefix and
-/// ID3v1 trailer). Unlike FLAC there is no preserved structural metadata: the
-/// ID3v2 tag is regenerated from the DB, and the Xing/LAME info frame lives
-/// inside the first audio frame, carried by the backing-audio segment.
+mod merge;
+mod trailer;
+
+pub use merge::{Mp3Metadata, read_metadata};
+pub use trailer::{Mp3Trailer, locate_trailer};
+
+/// Where an MP3's audio frames begin and end, and where its ID3v2 tags are.
+/// Unlike FLAC there is no preserved structural metadata: every ID3v2 tag is
+/// regenerated from the DB as one prepended tag, and the Xing/LAME info frame
+/// lives inside the first audio frame, carried by the backing-audio segment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Mp3Bounds {
     pub audio_offset: u64,
     pub audio_length: u64,
+    /// The extent of every ID3v2 tag in the file, prepended and appended, in
+    /// file order: what [`read_metadata`] merges.
+    pub id3v2_tags: Vec<Range<u64>>,
 }
 
 /// Decode an ID3v2 frame's 4-byte size field. ID3v2.4 sizes are syncsafe (a 28-bit
@@ -33,95 +44,99 @@ fn decode_frame_size(major_version: u8, raw: &[u8]) -> u32 {
     }
 }
 
-/// Locate the audio region: skip a leading ID3v2 tag (if present) and a trailing
-/// 128-byte ID3v1 tag (if present), then require an MPEG frame sync at the audio
-/// offset. The synthesized file re-prepends a fresh ID3v2 tag, so the original
-/// one is intentionally *not* preserved.
+/// Locate the audio region of a whole file in memory: [`locate_trailer`] and
+/// [`locate_audio_bounded`] over the entire buffer, so the windowed probe and
+/// this one cannot disagree about any file both can see.
 pub fn locate_audio(data: &[u8]) -> Result<Mp3Bounds> {
-    let len = data.len();
-
-    let mut audio_offset = 0usize;
-    if let Some(tag_len) = id3v2::total_len(data)? {
-        if tag_len > len {
-            return Err(FormatError::Malformed);
-        }
-        audio_offset = tag_len;
+    let len = data.len() as u64;
+    // Over the whole file, neither step can run short of bytes.
+    let Extent::Complete(trailer) = locate_trailer(data, len)? else {
+        return Err(FormatError::Malformed);
+    };
+    match locate_audio_bounded(data, len, &trailer)? {
+        Extent::Complete(bounds) => Ok(bounds),
+        Extent::NeedMore { .. } => Err(FormatError::Malformed),
     }
-
-    let mut audio_end = len;
-    if audio_end >= audio_offset + 128 && &data[audio_end - 128..audio_end - 125] == b"TAG" {
-        audio_end -= 128; // strip ID3v1 trailer
-    }
-
-    // Require an MPEG audio frame sync (11 set bits) at the audio offset.
-    if audio_offset + 1 >= len
-        || data[audio_offset] != 0xFF
-        || (data[audio_offset + 1] & 0xE0) != 0xE0
-    {
-        return Err(FormatError::NotMp3);
-    }
-
-    Ok(Mp3Bounds {
-        audio_offset: audio_offset as u64,
-        audio_length: (audio_end - audio_offset) as u64,
-    })
 }
 
-/// Bounded twin of [`locate_audio`]. `prefix` is a front window; `file_len` is the
-/// true size; `tail` is the file's last 128 bytes (or `None` if the file is
-/// shorter than 128 bytes). The audio start is the end of any leading ID3v2 tag
-/// (declared in its 10-byte header); if that end is past the prefix, returns
-/// `NeedMore`. The audio end is `file_len` minus a 128-byte ID3v1 trailer when the
-/// `tail` begins with `TAG`.
+/// Locate the audio region from `prefix`, a window on the front of a file
+/// `file_len` long, and the tags [`locate_trailer`] found at its end.
+///
+/// The audio starts after the whole run of prepended ID3v2 tags (#767), and
+/// must open with an MPEG frame sync; the synthesized file prepends one fresh
+/// tag in their place. It ends where the trailing tags begin (#768), counting
+/// only tags that start after that frame sync: a footer whose tag would begin
+/// inside the prepended run, or on the sync, is describing bytes that do not
+/// follow the audio.
+///
+/// `Malformed` when a prepended tag declares more than the file holds, `NotMp3`
+/// when no frame sync follows the run, and `NeedMore` when the run, the three
+/// bytes that show it has ended, or the sync lie past `prefix`.
 pub fn locate_audio_bounded(
     prefix: &[u8],
     file_len: u64,
-    tail: Option<&[u8; 128]>,
+    trailer: &Mp3Trailer,
 ) -> Result<Extent<Mp3Bounds>> {
-    let mut audio_offset = 0usize;
-    if prefix.len() < 10 && file_len >= 10 {
-        // Not enough bytes even to read the ID3v2 header.
-        return Ok(Extent::NeedMore { up_to: 10 });
+    let audio_offset = match id3v2::leading_tags_len(prefix)? {
+        Extent::Complete(run_len) => run_len as u64,
+        Extent::NeedMore { up_to } if up_to > file_len => return Err(FormatError::Malformed),
+        Extent::NeedMore { up_to } => return Ok(Extent::NeedMore { up_to }),
+    };
+    // The frame sync, two bytes, must fit in the file. Without this a tag that
+    // ends at EOF would ask for bytes past it on every retry, instead of failing.
+    if audio_offset + 2 > file_len {
+        return Err(FormatError::NotMp3);
     }
-    if let Some(tag_len) = id3v2::total_len(prefix)? {
-        if tag_len as u64 > file_len {
-            return Err(FormatError::Malformed);
-        }
-        audio_offset = tag_len;
+    // The run ends at the first three bytes that are not `ID3`. A window that
+    // stops short of them has not seen the run end, however unlike a tag the
+    // bytes it does hold look.
+    let run_decided = (audio_offset + 3).min(file_len);
+    if (prefix.len() as u64) < run_decided {
+        return Ok(Extent::NeedMore { up_to: run_decided });
     }
-
-    // The audio start (plus its 2-byte frame sync) must fit in the file. Mirrors
-    // the unbounded `locate_audio`'s `audio_offset + 1 >= len` reject: without
-    // this, a tag that claims audio begins at/after EOF would return `NeedMore`
-    // with `up_to > file_len`, and the caller would widen to the full file and
-    // get the same answer every retry instead of failing fast.
-    if audio_offset as u64 + 2 > file_len {
+    let sync = usize_from(audio_offset);
+    if prefix[sync] != 0xFF || (prefix[sync + 1] & 0xE0) != 0xE0 {
         return Err(FormatError::NotMp3);
     }
 
-    // Need the frame-sync pair at the audio offset to be inside the prefix.
-    if audio_offset + 2 > prefix.len() {
-        return Ok(Extent::NeedMore {
-            up_to: (audio_offset + 2) as u64,
-        });
-    }
-
-    if prefix[audio_offset] != 0xFF || (prefix[audio_offset + 1] & 0xE0) != 0xE0 {
-        return Err(FormatError::NotMp3);
-    }
-
+    let mut id3v2_tags = prepended_extents(&prefix[..sync]);
+    let prepended = id3v2_tags.len();
     let mut audio_end = file_len;
-    if let Some(tail) = tail
-        && file_len >= audio_offset as u64 + 128
-        && &tail[0..3] == b"TAG"
+    for tag in trailer
+        .tags
+        .iter()
+        .take_while(|t| t.start >= audio_offset + 2)
     {
-        audio_end -= 128;
+        audio_end = tag.start;
+        if tag.id3v2 {
+            id3v2_tags.push(tag.start..tag.end);
+        }
     }
+    // The trailer lists its tags nearest the end first.
+    id3v2_tags[prepended..].reverse();
 
     Ok(Extent::Complete(Mp3Bounds {
-        audio_offset: audio_offset as u64,
-        audio_length: audio_end - audio_offset as u64,
+        audio_offset,
+        audio_length: audio_end - audio_offset,
+        id3v2_tags,
     }))
+}
+
+/// The extent of each tag in `run`, a run of prepended tags that
+/// [`id3v2::leading_tags_len`] has already walked end to end.
+fn prepended_extents(run: &[u8]) -> Vec<Range<u64>> {
+    let mut extents = Vec::new();
+    let mut rest = run;
+    let mut start = 0u64;
+    while let Ok(Some(len)) = id3v2::total_len(rest) {
+        let Some(next) = rest.get(len..) else {
+            break;
+        };
+        extents.push(start..start + len as u64);
+        start += len as u64;
+        rest = next;
+    }
+    extents
 }
 
 const ENC_UTF8: u8 = 0x03;
@@ -494,11 +509,11 @@ pub fn synthesize_layout(
 /// could drive an unbounded allocation in the `id3` crate (which eagerly
 /// `with_capacity`s a frame's declared size — and ID3v2.3 frame sizes are plain
 /// 32-bit, up to 4 GiB). When false, callers skip ID3 parsing (yielding no tags
-/// for that file) rather than risk an OOM. Conservative: tags using an extended
-/// header or unsynchronisation, a malformed synchsafe body/frame-size field
-/// (any byte with high bit set), or an unrecognised major version are skipped
+/// for that file) rather than risk an OOM. Conservative: tags using
+/// unsynchronisation, an extended header other than a well-formed ID3v2.4 one
+/// (see [`frames_start`]), a malformed synchsafe body/frame-size field (any
+/// byte with high bit set), or an unrecognised major version are skipped
 /// (those files lose scan-time tag extraction, but cannot OOM the scanner).
-/// Files without an ID3v2 tag return true (the id3 crate handles them cheaply).
 fn id3v2_alloc_safe(data: &[u8]) -> bool {
     // id3::Tag::read_from2 scans forward to locate a tag, so handing it any
     // buffer that is not a validated ID3v2 tag at offset 0 risks the unbounded
@@ -518,15 +533,17 @@ fn id3v2_alloc_safe(data: &[u8]) -> bool {
     if !id3v2::frames_are_parseable(data) {
         return false;
     }
-    let flags = data[5];
-    // Extended header (0x40) and unsynchronisation (0x80) complicate frame
-    // bounds; skip rather than risk mis-validating.
-    if flags & 0xC0 != 0 {
+    // Unsynchronisation (0x80) rewrites the bytes the frame bounds below are read
+    // from; skip rather than risk mis-validating.
+    if data[5] & 0x80 != 0 {
         return false;
     }
     if tag_end > data.len() {
         return false;
     }
+    let Some(frames_start) = frames_start(data, tag_end) else {
+        return false;
+    };
     let major = data[3];
     let header_len = if major == 2 { 6 } else { 10 };
     // Walk frames over the entire remaining buffer (not just [10, tag_end)):
@@ -535,7 +552,7 @@ fn id3v2_alloc_safe(data: &[u8]) -> bool {
     // header visible in data (i.e. pos + header_len <= data.len()) is also
     // validated.  We still reject if a frame's declared size exceeds tag_end.
     let scan_end = data.len();
-    let mut pos = 10usize;
+    let mut pos = frames_start;
     while pos + header_len <= scan_end {
         // A zero first id byte marks the start of the padding region.
         if data[pos] == 0 {
@@ -590,6 +607,18 @@ fn id3v2_alloc_safe(data: &[u8]) -> bool {
         }
     }
     true
+}
+
+/// Where a tag's frames begin: straight after its 10-byte header, or past the
+/// extended header its flags declare (0x40). Only a well-formed ID3v2.4 extended
+/// header is stepped over. v2.3 lays its own out differently, with a size that
+/// leaves itself out, and the `id3` crate reads every version's as if it were
+/// v2.4's, so any other is `None`.
+fn frames_start(data: &[u8], tag_end: usize) -> Option<usize> {
+    if data[5] & 0x40 == 0 {
+        return Some(id3v2::HEADER_LEN);
+    }
+    id3v2::extended_header_len(data, tag_end).map(|len| id3v2::HEADER_LEN + len)
 }
 
 /// Extract all APIC pictures from an MP3's ID3v2 tag as embedded pictures, for
@@ -676,7 +705,8 @@ pub(crate) const MUSICBRAINZ_UFID_OWNER: &str = "http://musicbrainz.org";
 ///
 /// Text (`T***`), `COMM`, `USLT`, `APIC` are handled by `read_tags`/`read_pictures`
 /// and skipped. Gated by `id3v2_alloc_safe`, so the tag is well-formed, has no
-/// unsynchronisation/extended header/frame flags, and bodies are sliced verbatim.
+/// unsynchronisation or frame flags and at most a well-formed v2.4 extended
+/// header, and bodies are sliced verbatim.
 /// v2.2 (3-char ids) is not processed (rare; text/art still parse via the crate).
 pub fn read_binary_tags(data: &[u8]) -> (Vec<EmbeddedBinaryTag>, Vec<(String, String)>) {
     let mut opaque = Vec::new();
@@ -685,7 +715,9 @@ pub fn read_binary_tags(data: &[u8]) -> (Vec<EmbeddedBinaryTag>, Vec<(String, St
         return (opaque, promoted);
     }
     let tag_end = 10 + id3v2::synchsafe_decode(&data[6..10]) as usize;
-    let mut pos = 10usize;
+    let Some(mut pos) = frames_start(data, tag_end) else {
+        return (opaque, promoted);
+    };
     while pos + 10 <= tag_end {
         if data[pos] == 0 {
             break;
@@ -1593,12 +1625,26 @@ mod tests {
         (v, audio_offset)
     }
 
+    /// A trailer with no tags in it, for a file that ends in audio.
+    fn no_trailer() -> Mp3Trailer {
+        Mp3Trailer { tags: Vec::new() }
+    }
+
+    /// The tags trailing a whole file.
+    fn trailer_of(file: &[u8]) -> Mp3Trailer {
+        match locate_trailer(file, file.len() as u64).unwrap() {
+            Extent::Complete(t) => t,
+            Extent::NeedMore { up_to } => panic!("a whole file asked for {up_to} bytes"),
+        }
+    }
+
     #[test]
     fn locate_audio_bounded_complete_with_no_id3v1() {
         let (full, audio_offset) = mp3_with_id3v2(8, b"frames");
-        let prefix = &full[..usize_from(audio_offset) + 2]; // covers tag + sync
+        // The tag, the sync, and the third byte that shows no tag follows.
+        let prefix = &full[..usize_from(audio_offset) + 3];
         let file_len = full.len() as u64;
-        match locate_audio_bounded(prefix, file_len, None).unwrap() {
+        match locate_audio_bounded(prefix, file_len, &no_trailer()).unwrap() {
             Extent::Complete(b) => {
                 assert_eq!(b.audio_offset, audio_offset);
                 assert_eq!(b.audio_length, file_len - audio_offset);
@@ -1612,8 +1658,8 @@ mod tests {
         let (full, _audio_offset) = mp3_with_id3v2(4096, b"frames");
         let prefix = &full[..32]; // only the 10-byte header is present
         let file_len = full.len() as u64;
-        match locate_audio_bounded(prefix, file_len, None).unwrap() {
-            Extent::NeedMore { up_to } => assert_eq!(up_to, 10 + 4096 + 2),
+        match locate_audio_bounded(prefix, file_len, &no_trailer()).unwrap() {
+            Extent::NeedMore { up_to } => assert_eq!(up_to, 10 + 4096),
             other @ Extent::Complete(_) => panic!("expected NeedMore, got {other:?}"),
         }
     }
@@ -1625,9 +1671,8 @@ mod tests {
         full.extend_from_slice(b"TAG"); // ID3v1 marker
         full.extend(std::iter::repeat_n(0u8, 125)); // 128-byte tag total
         let file_len = full.len() as u64;
-        let tail: [u8; 128] = full[full.len() - 128..].try_into().unwrap();
-        let prefix = &full[..usize_from(audio_offset) + 2];
-        match locate_audio_bounded(prefix, file_len, Some(&tail)).unwrap() {
+        let prefix = &full[..usize_from(audio_offset) + 3];
+        match locate_audio_bounded(prefix, file_len, &trailer_of(&full)).unwrap() {
             Extent::Complete(b) => {
                 assert_eq!(b.audio_offset, audio_offset);
                 assert_eq!(b.audio_length, body_end as u64 - audio_offset);
@@ -1645,7 +1690,7 @@ mod tests {
         full.extend_from_slice(&syncsafe(8));
         full.extend(std::iter::repeat_n(0u8, 8)); // tag body; file ends here
         let file_len = full.len() as u64; // == tag end == audio_offset
-        match locate_audio_bounded(&full, file_len, None) {
+        match locate_audio_bounded(&full, file_len, &no_trailer()) {
             Err(FormatError::NotMp3) => {}
             other => panic!("expected Err(NotMp3), got {other:?}"),
         }
@@ -1662,7 +1707,7 @@ mod tests {
         // 0xFF 0xFB frame sync at offset 0, then payload. len 12 (>= 10).
         let data = [0xFF, 0xFB, 0x90, 0x00, 1, 2, 3, 4, 5, 6, 7, 8];
         let file_len = data.len() as u64;
-        match locate_audio_bounded(&data, file_len, None).unwrap() {
+        match locate_audio_bounded(&data, file_len, &no_trailer()).unwrap() {
             Extent::Complete(b) => {
                 assert_eq!(b.audio_offset, 0);
                 assert_eq!(b.audio_length, file_len);
@@ -1686,7 +1731,7 @@ mod tests {
         // 0xFF 0xFB sync at offset 0; file_len 5 (< 10).
         let data = [0xFF, 0xFB, 0x90, 0x00, 0x00];
         let file_len = data.len() as u64; // 5
-        match locate_audio_bounded(&data, file_len, None).unwrap() {
+        match locate_audio_bounded(&data, file_len, &no_trailer()).unwrap() {
             Extent::Complete(b) => {
                 assert_eq!(b.audio_offset, 0);
                 assert_eq!(b.audio_length, 5);
@@ -1712,7 +1757,7 @@ mod tests {
         full.extend_from_slice(&[0xFF, 0xFB]); // frame sync at offset 26
         full.extend_from_slice(b"audio");
         let file_len = full.len() as u64;
-        match locate_audio_bounded(&full, file_len, None).unwrap() {
+        match locate_audio_bounded(&full, file_len, &no_trailer()).unwrap() {
             Extent::Complete(b) => {
                 assert_eq!(b.audio_offset, 26);
                 assert_eq!(b.audio_offset, expected_offset);
@@ -1737,7 +1782,7 @@ mod tests {
         full.extend_from_slice(&syncsafe(u32::try_from(body).unwrap()));
         full.extend(std::iter::repeat_n(0u8, body)); // file ends exactly at tag end
         let file_len = full.len() as u64; // == tag_len == audio_offset (18)
-        match locate_audio_bounded(&full, file_len, None) {
+        match locate_audio_bounded(&full, file_len, &no_trailer()) {
             Err(FormatError::NotMp3) => {}
             other => panic!("expected Err(NotMp3) for tag_len==file_len, got {other:?}"),
         }
@@ -1754,23 +1799,42 @@ mod tests {
         full.extend_from_slice(&syncsafe(100));
         full.extend_from_slice(&[0xFF, 0xFB]); // some bytes, but file is short
         let file_len = full.len() as u64; // 12, << 110
-        match locate_audio_bounded(&full, file_len, None) {
+        match locate_audio_bounded(&full, file_len, &no_trailer()) {
             Err(FormatError::Malformed) => {}
             other => panic!("expected Err(Malformed), got {other:?}"),
         }
     }
 
-    // kills mp3 L86 (`prefix.len() < 10 && file_len >= 10`: the NeedMore{up_to:10}
-    // else-if). Short non-ID3 prefix (len 5) with file_len >= 10. Correct: `5 < 10
-    // && 10 >= 10` = true -> NeedMore{up_to:10} (we cannot even read the ID3 header).
-    // `&&`->`||` keeps it true here; the distinguishing variants are below.
+    /// A window that stops inside the three bytes after a tag cannot tell whether
+    /// the run of prepended tags ends there: `ID` may be the start of `ID3`. It
+    /// asks for the third byte, and for a second tag's whole header once it can
+    /// see one begin. A file too short to hold three more bytes decides on the
+    /// bytes it has (#767).
     #[test]
-    fn locate_audio_bounded_short_prefix_large_file_needs_header() {
-        let prefix = [0x00, 0x00, 0x00, 0x00, 0x00]; // 5 bytes, not "ID3"
-        let file_len = 64u64; // >= 10
-        match locate_audio_bounded(&prefix, file_len, None).unwrap() {
-            Extent::NeedMore { up_to } => assert_eq!(up_to, 10),
-            other @ Extent::Complete(_) => panic!("expected NeedMore{{up_to:10}}, got {other:?}"),
+    fn locate_audio_bounded_needs_three_bytes_to_see_the_run_end() {
+        let (full, audio_offset) = mp3_with_id3v2(8, b"frames");
+        let tag = &full[..usize_from(audio_offset)];
+        let file_len = 64u64;
+        for cut in 0..3 {
+            let mut prefix = tag.to_vec();
+            prefix.extend_from_slice(&b"ID3"[..cut]);
+            match locate_audio_bounded(&prefix, file_len, &no_trailer()).unwrap() {
+                Extent::NeedMore { up_to } => assert_eq!(up_to, audio_offset + 3, "cut {cut}"),
+                other @ Extent::Complete(_) => {
+                    panic!("cut {cut}: expected NeedMore, got {other:?}")
+                }
+            }
+        }
+        let mut prefix = tag.to_vec();
+        prefix.extend_from_slice(b"ID3\x04");
+        match locate_audio_bounded(&prefix, file_len, &no_trailer()).unwrap() {
+            Extent::NeedMore { up_to } => assert_eq!(up_to, audio_offset + 10),
+            other @ Extent::Complete(_) => panic!("expected NeedMore, got {other:?}"),
+        }
+        let sync_only = &full[..usize_from(audio_offset) + 2];
+        match locate_audio_bounded(sync_only, audio_offset + 2, &no_trailer()).unwrap() {
+            Extent::Complete(b) => assert_eq!((b.audio_offset, b.audio_length), (audio_offset, 2)),
+            other @ Extent::NeedMore { .. } => panic!("expected Complete, got {other:?}"),
         }
     }
 
@@ -1785,7 +1849,7 @@ mod tests {
         // 10 bytes, not "ID3", frame sync at offset 0.
         let prefix = [0xFF, 0xFB, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         let file_len = 64u64; // >= 10, audio extends to file_len
-        match locate_audio_bounded(&prefix, file_len, None).unwrap() {
+        match locate_audio_bounded(&prefix, file_len, &no_trailer()).unwrap() {
             Extent::Complete(b) => {
                 assert_eq!(b.audio_offset, 0);
                 assert_eq!(b.audio_length, file_len);
@@ -1809,7 +1873,7 @@ mod tests {
         // Make file_len 8 with the same 5-byte prefix window; the sync pair (2 bytes)
         // is inside the prefix, so it resolves without needing more.
         let file_len = 8u64;
-        match locate_audio_bounded(&data, file_len, None).unwrap() {
+        match locate_audio_bounded(&data, file_len, &no_trailer()).unwrap() {
             Extent::Complete(b) => {
                 assert_eq!(b.audio_offset, 0);
                 assert_eq!(b.audio_length, 8);
@@ -1836,7 +1900,7 @@ mod tests {
         full.push(0xFF); // a single sync byte present (so prefix has audio_offset+1)
         // file_len = audio_offset + 1, so audio_offset + 2 == file_len + 1 (just past).
         let file_len = audio_offset + 1; // 15
-        match locate_audio_bounded(&full, file_len, None) {
+        match locate_audio_bounded(&full, file_len, &no_trailer()) {
             Err(FormatError::NotMp3) => {}
             other => panic!("expected Err(NotMp3) (sync past EOF), got {other:?}"),
         }
@@ -1849,7 +1913,7 @@ mod tests {
     fn locate_audio_bounded_sync_fits_in_file_proceeds() {
         let (full, audio_offset) = mp3_with_id3v2(4, b"frames");
         let file_len = full.len() as u64; // audio_offset + 2 + 6
-        match locate_audio_bounded(&full, file_len, None).unwrap() {
+        match locate_audio_bounded(&full, file_len, &no_trailer()).unwrap() {
             Extent::Complete(b) => assert_eq!(b.audio_offset, audio_offset),
             other @ Extent::NeedMore { .. } => panic!("expected Complete, got {other:?}"),
         }
@@ -1870,7 +1934,7 @@ mod tests {
         full.push(0xFB);
         let file_len = full.len() as u64; // 16 == audio_offset + 2
         // kills mp3 L96 `>`->`>=`: equal-fit audio must be accepted, not rejected.
-        match locate_audio_bounded(&full, file_len, None).unwrap() {
+        match locate_audio_bounded(&full, file_len, &no_trailer()).unwrap() {
             Extent::Complete(b) => {
                 assert_eq!(b.audio_offset, audio_offset);
                 assert_eq!(b.audio_length, 2);
@@ -1897,7 +1961,7 @@ mod tests {
             0xFF, 0x00, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
         let file_len = data.len() as u64;
-        match locate_audio_bounded(&data, file_len, None) {
+        match locate_audio_bounded(&data, file_len, &no_trailer()) {
             Err(FormatError::NotMp3) => {}
             other => panic!("expected Err(NotMp3) (bad sync byte 1), got {other:?}"),
         }
@@ -1918,7 +1982,7 @@ mod tests {
         full.extend_from_slice(&[0xFF, 0x00]); // byte14=0xFF good, byte15=0x00 bad
         full.extend_from_slice(b"tail");
         let file_len = full.len() as u64;
-        match locate_audio_bounded(&full, file_len, None) {
+        match locate_audio_bounded(&full, file_len, &no_trailer()) {
             Err(FormatError::NotMp3) => {}
             other => panic!("expected Err(NotMp3) (bad sync at 15), got {other:?}"),
         }
@@ -1940,9 +2004,10 @@ mod tests {
         full.extend_from_slice(b"more audio bytes here");
         let file_len = full.len() as u64; // plenty of room
         let prefix = &full[..15]; // 14-byte tag + only 1 of the 2 sync bytes
-        match locate_audio_bounded(prefix, file_len, None).unwrap() {
-            Extent::NeedMore { up_to } => assert_eq!(up_to, 16), // audio_offset(14) + 2
-            other @ Extent::Complete(_) => panic!("expected NeedMore{{up_to:16}}, got {other:?}"),
+        match locate_audio_bounded(prefix, file_len, &no_trailer()).unwrap() {
+            // audio_offset(14) + 3: the sync, and the byte that shows no tag follows.
+            Extent::NeedMore { up_to } => assert_eq!(up_to, 17),
+            other @ Extent::Complete(_) => panic!("expected NeedMore{{up_to:17}}, got {other:?}"),
         }
     }
 
@@ -1959,9 +2024,8 @@ mod tests {
         full.extend(std::iter::repeat_n(0u8, 125)); // 128-byte ID3v1 trailer
         let file_len = full.len() as u64;
         assert!(file_len >= audio_offset + 128); // both conditions true
-        let tail: [u8; 128] = full[full.len() - 128..].try_into().unwrap();
-        let prefix = &full[..usize_from(audio_offset) + 2];
-        match locate_audio_bounded(prefix, file_len, Some(&tail)).unwrap() {
+        let prefix = &full[..usize_from(audio_offset) + 3];
+        match locate_audio_bounded(prefix, file_len, &trailer_of(&full)).unwrap() {
             Extent::Complete(b) => {
                 assert_eq!(b.audio_offset, audio_offset);
                 // kills mp3 L113: trimmed length excludes the 128-byte ID3v1 tail.
@@ -1986,8 +2050,8 @@ mod tests {
         assert!(file_len >= audio_offset + 128); // first operand TRUE
         let tail: [u8; 128] = full[full.len() - 128..].try_into().unwrap();
         assert_ne!(&tail[0..3], b"TAG"); // second operand FALSE
-        let prefix = &full[..usize_from(audio_offset) + 2];
-        match locate_audio_bounded(prefix, file_len, Some(&tail)).unwrap() {
+        let prefix = &full[..usize_from(audio_offset) + 3];
+        match locate_audio_bounded(prefix, file_len, &trailer_of(&full)).unwrap() {
             Extent::Complete(b) => {
                 assert_eq!(b.audio_offset, audio_offset);
                 // No trim: full audio length from offset to EOF.
@@ -2009,12 +2073,8 @@ mod tests {
         full.extend_from_slice(b"TAGxx"); // tail-ish marker, but file stays short
         let file_len = full.len() as u64;
         assert!(file_len < audio_offset + 128); // first operand FALSE
-        // Build a 128-byte tail buffer that starts with "TAG" (the function only
-        // looks at tail[0..3]); file_len is the real gate here.
-        let mut tail = [0u8; 128];
-        tail[0..3].copy_from_slice(b"TAG");
-        let prefix = &full[..usize_from(audio_offset) + 2];
-        match locate_audio_bounded(prefix, file_len, Some(&tail)).unwrap() {
+        let prefix = &full[..usize_from(audio_offset) + 3];
+        match locate_audio_bounded(prefix, file_len, &trailer_of(&full)).unwrap() {
             Extent::Complete(b) => {
                 assert_eq!(b.audio_offset, audio_offset);
                 assert_eq!(b.audio_length, file_len - audio_offset); // no trim
@@ -2401,22 +2461,122 @@ mod tests {
         hay.windows(needle.len()).any(|w| w == needle)
     }
 
-    /// On a whole buffer with the production tail (`Some(last 128 bytes)` when
-    /// the file is at least 128 bytes), `locate_audio_bounded` must agree with
-    /// `locate_audio`: same accept/reject, same `Mp3Bounds`. This pins the
+    /// `locate_audio` over a whole buffer, and the probe the scan runs through
+    /// windows (a one-byte tail and a one-byte prefix, each widened on
+    /// `NeedMore`), must agree: same accept/reject, same `Mp3Bounds`. Every
+    /// `NeedMore` must also make progress without leaving the file. This pins the
     /// equivalence the #212 fuzz oracle relies on.
     fn assert_mp3_bounded_matches_full(data: &[u8]) {
         let len = data.len() as u64;
-        let tail: Option<&[u8; 128]> = if data.len() >= 128 {
-            data[data.len() - 128..].try_into().ok()
-        } else {
-            None
+        let windowed = || -> Result<Mp3Bounds> {
+            let mut tail_len = data.len().min(1);
+            let trailer = loop {
+                match locate_trailer(&data[data.len() - tail_len..], len)? {
+                    Extent::Complete(t) => break t,
+                    Extent::NeedMore { up_to } => {
+                        assert!(up_to > tail_len as u64 && up_to <= len, "tail {up_to}");
+                        tail_len = usize_from(up_to);
+                    }
+                }
+            };
+            let mut want = data.len().min(1);
+            loop {
+                match locate_audio_bounded(&data[..want], len, &trailer)? {
+                    Extent::Complete(b) => return Ok(b),
+                    Extent::NeedMore { up_to } => {
+                        assert!(up_to > want as u64 && up_to <= len, "prefix {up_to}");
+                        want = usize_from(up_to);
+                    }
+                }
+            }
         };
-        match (locate_audio(data), locate_audio_bounded(data, len, tail)) {
-            (Ok(full), Ok(Extent::Complete(bounded))) => assert_eq!(full, bounded),
+        match (locate_audio(data), windowed()) {
+            (Ok(full), Ok(bounded)) => assert_eq!(full, bounded),
             (Err(_), Err(_)) => {}
             (full, bounded) => {
                 panic!("mp3 bounded/full divergence: full={full:?} bounded={bounded:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn mp3_bounded_matches_full_across_multi_tag_layouts() {
+        use crate::fuzz_check::fixtures::{
+            MP3_FIXTURE_AUDIO, id3v1_trailer, id3v24_text_tag, mp3_with_front_and_back_tags,
+            mp3_with_leading_tag_run, with_id3v24_footer,
+        };
+        assert_mp3_bounded_matches_full(&mp3_with_leading_tag_run());
+        assert_mp3_bounded_matches_full(&mp3_with_front_and_back_tags());
+        let mut id3v1_first = MP3_FIXTURE_AUDIO.to_vec();
+        id3v1_first.extend(id3v1_trailer());
+        id3v1_first.extend(with_id3v24_footer(&id3v24_text_tag(&[("title", "x")])));
+        assert_mp3_bounded_matches_full(&id3v1_first);
+        let mut lying = id3v24_text_tag(&[("title", "x")]);
+        lying[9] = 0x7F; // declares more than the file holds
+        lying.extend_from_slice(MP3_FIXTURE_AUDIO);
+        assert_mp3_bounded_matches_full(&lying);
+    }
+
+    /// `id3v2_tags` lists every ID3v2 tag's extent in file order: the prepended
+    /// run, then the appended tags, with an ID3v1 trailer in their midst left out.
+    #[test]
+    fn bounds_list_every_id3v2_tag_in_file_order() {
+        use crate::fuzz_check::fixtures::{
+            MP3_FIXTURE_AUDIO, id3v1_trailer, id3v24_text_tag, with_id3v24_footer,
+        };
+        let front = id3v24_text_tag(&[("title", "a")]);
+        let second = with_id3v24_footer(&id3v24_text_tag(&[("title", "bb")]));
+        let back = with_id3v24_footer(&id3v24_text_tag(&[("title", "ccc")]));
+        let last = with_id3v24_footer(&id3v24_text_tag(&[("title", "dddd")]));
+        let mut file = front.clone();
+        file.extend(&second);
+        file.extend_from_slice(MP3_FIXTURE_AUDIO);
+        file.extend(&back);
+        file.extend(id3v1_trailer());
+        file.extend(&last);
+
+        let b = locate_audio(&file).unwrap();
+        let span = |start: usize, len: usize| start as u64..(start + len) as u64;
+        let audio_start = front.len() + second.len();
+        let back_start = audio_start + MP3_FIXTURE_AUDIO.len();
+        let last_start = back_start + back.len() + 128;
+        assert_eq!(
+            b.id3v2_tags,
+            vec![
+                span(0, front.len()),
+                span(front.len(), second.len()),
+                span(back_start, back.len()),
+                span(last_start, last.len()),
+            ]
+        );
+        assert_eq!(
+            (b.audio_offset, b.audio_length),
+            (audio_start as u64, MP3_FIXTURE_AUDIO.len() as u64)
+        );
+    }
+
+    /// A prepended tag that declares more than the file holds is `Malformed`,
+    /// wherever in the run it sits. A window that merely stops short of its
+    /// declared end, in a file long enough to hold it, widens instead.
+    #[test]
+    fn a_prepended_tag_past_the_end_of_the_file_is_malformed() {
+        use crate::fuzz_check::fixtures::{MP3_FIXTURE_AUDIO, id3v24_text_tag};
+        let mut file = id3v24_text_tag(&[("title", "a")]);
+        let first = file.len();
+        file.extend_from_slice(b"ID3\x04\x00\x00\x00\x00\x01\x00"); // a 128-byte body
+        file.extend_from_slice(MP3_FIXTURE_AUDIO);
+        assert_eq!(locate_audio(&file), Err(FormatError::Malformed));
+
+        let window = &file[..first + 10];
+        let declared_end = (first + 10 + 128) as u64;
+        assert_eq!(
+            locate_audio_bounded(window, declared_end - 1, &no_trailer()),
+            Err(FormatError::Malformed)
+        );
+        for file_len in [declared_end, declared_end + 1000] {
+            match locate_audio_bounded(window, file_len, &no_trailer()).unwrap() {
+                Extent::NeedMore { up_to } => assert_eq!(up_to, declared_end),
+                other @ Extent::Complete(_) => panic!("expected NeedMore, got {other:?}"),
             }
         }
     }
@@ -2470,7 +2630,7 @@ mod tests {
         data.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
         let file_len = data.len() as u64;
         assert_eq!(
-            locate_audio_bounded(&data, file_len, None),
+            locate_audio_bounded(&data, file_len, &no_trailer()),
             Err(FormatError::Malformed)
         );
     }

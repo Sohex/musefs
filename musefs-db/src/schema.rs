@@ -217,13 +217,24 @@ ALTER TABLE tracks ADD COLUMN content_hash TEXT
 CREATE INDEX tracks_fingerprint_idx ON tracks(fingerprint);
 
 -- Rebuild `tags` with a byte-accurate value cap (#505). SQLite's length() on
--- TEXT counts characters, so the V1 `CHECK (length(value) <= 262144)` was up to
--- ~4x looser than the documented 256 KiB byte bound; length(CAST(value AS BLOB))
--- counts bytes. SQLite cannot alter a CHECK in place, so recreate the table
--- (V2 is unreleased — this is folded in rather than added as a new migration).
--- Pre-existing over-cap rows (only reachable on an upgraded store) are dropped:
--- the read-time guard already counts bytes, so they were unreadable anyway, and
--- carrying them would abort the rebuild on the new CHECK.
+-- TEXT counts characters, so the V1 `CHECK (length(value) <= 262144)` bounded a
+-- value's bytes only to about four times that; length(CAST(value AS BLOB))
+-- counts bytes. SQLite cannot alter a CHECK in place, so recreate the table.
+--
+-- The cap is 16 MiB - 1, FLAC's metadata-block ceiling and where V3 puts it
+-- too (#644), and the refill keeps every row. This step first shipped at 256
+-- KiB and dropped each row past it: a multibyte lyrics tag V1's character cap
+-- admitted, which 1.0.0 served and V3 and V4 would have kept, went without a
+-- word, and the 2.0.0 upgrade's pre-flight, which checks rows against V4, never
+-- saw it go. V1's character cap bounds a value to about 1 MiB in bytes, so no
+-- row V1 holds fails this CHECK.
+--
+-- A released step's text is safe to change here, and only because of where the
+-- step now runs. A store already past V1 ran the old text, and V3 and V4 both
+-- rebuild `tags` after it, so nothing of that text survives in any schema. A
+-- store still at V1 reaches this step only through `musefs migrate`, which runs
+-- V3 and V4 with it (#749). V3's note about V2's narrowing describes the text
+-- this replaced.
 CREATE TABLE tags_new (
     track_id   INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
     key        TEXT NOT NULL,
@@ -236,12 +247,11 @@ CREATE TABLE tags_new (
     CHECK (length(key) <= 256),
     CHECK (length(key) >= 1
            AND key NOT GLOB '*[' || char(1) || '-' || char(31) || ']*'),
-    CHECK (length(CAST(value AS BLOB)) <= 262144),
+    CHECK (length(CAST(value AS BLOB)) <= 16777215),
     CHECK (value_blob IS NULL OR length(value_blob) <= 16711680)
 );
 INSERT INTO tags_new (track_id, key, value, ordinal, value_blob)
-    SELECT track_id, key, value, ordinal, value_blob FROM tags
-    WHERE length(CAST(value AS BLOB)) <= 262144;
+    SELECT track_id, key, value, ordinal, value_blob FROM tags;
 DROP TABLE tags;
 ALTER TABLE tags_new RENAME TO tags;
 
@@ -605,6 +615,33 @@ INSERT INTO tracks (id, backing_path, format, audio_offset, audio_length,
            0
     FROM tracks_hold_v4;
 
+-- The refill leaves `sqlite_sequence` at the highest id still standing. The old
+-- table allocated max(id) + 1, so a track deleted from the top of the range
+-- left its id for the next insert to take (#678), and the changelog ring may
+-- still name that id -- the ring goes below -- as may state an external tool
+-- kept. So the sequence starts past the highest id the ring holds too. A child
+-- row cannot name a higher one: one whose track is gone fails the refill below,
+-- or `migrate --repair` has removed it. A ring row whose track_id is not an
+-- integer names no track.
+--
+-- Nor does one at 9223372036854775807. The old ring put no bound on track_id,
+-- and a sequence seeded at the largest integer leaves no id to allocate: the
+-- next insert into `tracks` would fail with SQLITE_FULL. A ring row names a
+-- track already deleted, so skipping it costs only the retirement of that one
+-- id, which is best effort anyway.
+UPDATE sqlite_sequence
+   SET seq = (SELECT max(track_id) FROM track_changes
+              WHERE typeof(track_id) = 'integer' AND track_id < 9223372036854775807)
+ WHERE name = 'tracks'
+   AND seq < (SELECT max(track_id) FROM track_changes
+              WHERE typeof(track_id) = 'integer' AND track_id < 9223372036854775807);
+INSERT INTO sqlite_sequence (name, seq)
+    SELECT 'tracks', ring.top
+    FROM (SELECT max(track_id) AS top FROM track_changes
+          WHERE typeof(track_id) = 'integer' AND track_id < 9223372036854775807) AS ring
+    WHERE ring.top > 0
+      AND NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'tracks');
+
 -- 5. Rebuild the three child tables. All are empty right now -- the cascade
 -- above took them -- so each is a drop and a create, with the holding tables as
 -- the source. `tags` and `track_art` change shape; `structural_blocks` keeps
@@ -817,7 +854,8 @@ END;
 
 -- 6. Recreate the indexes and the thirteen triggers the drops took with them,
 -- plus what the new shapes add. Verbatim except where noted: `tracks_geometry_au`
--- gains `backing_ino`, `tracks_changelog_au` logs the old id too, the two `_au`
+-- gains `backing_ino` and a guarded ctime clause, `tracks_changelog_au` logs the
+-- old id too, the two `_au`
 -- bumps widen to both owners, and two reparent-refusal triggers and a rekey
 -- refusal are new.
 CREATE INDEX tracks_fingerprint_idx ON tracks(fingerprint);
@@ -866,6 +904,19 @@ END;
 -- sentinel-to-real transition a revalidate performs on a migrated row: nothing
 -- about the served bytes changed, but the row's identity now covers a field it
 -- did not, so invalidating once is the conservative call.
+--
+-- A changed `backing_ctime_ns` bumps too, unless a checksum proves the bytes
+-- unchanged: a fingerprint or content hash that was stored before and is stored
+-- again unchanged by the same statement. A same-size rewrite that puts its old
+-- mtime back (`touch -r`) changes ctime and nothing else a stamp records, and
+-- without the bump it kept serving its old `content_version`, so the served
+-- mtime held still and a kernel page cache kept what it had. ctime alone cannot
+-- decide it, because a chmod moves ctime as well, and bumping for every such
+-- re-probe is the served-mtime churn #757 removed. A first fingerprint proves
+-- nothing about the bytes before it. A statement that leaves both checksums
+-- alone is taken at its word that they still hold, which is what
+-- `ChecksumWrite::Keep` means, and why the scanner writes a stamp and its
+-- checksums in one statement: a trigger sees only the statement that fired it.
 CREATE TRIGGER tracks_geometry_au
 AFTER UPDATE ON tracks
 WHEN NEW.format        <> OLD.format
@@ -874,6 +925,9 @@ WHEN NEW.format        <> OLD.format
   OR NEW.backing_size  <> OLD.backing_size
   OR NEW.backing_mtime_ns <> OLD.backing_mtime_ns
   OR NEW.backing_ino   <> OLD.backing_ino
+  OR (NEW.backing_ctime_ns <> OLD.backing_ctime_ns
+      AND NOT (OLD.fingerprint IS NOT NULL AND NEW.fingerprint IS OLD.fingerprint)
+      AND NOT (OLD.content_hash IS NOT NULL AND NEW.content_hash IS OLD.content_hash))
 BEGIN
     UPDATE tracks SET content_version = content_version + 1 WHERE id = NEW.id;
 END;
@@ -1209,7 +1263,7 @@ const fn is_major_release(version: &str) -> bool {
     i == b.len() || b[i] == b'-' || b[i] == b'+'
 }
 
-/// One step a store has yet to receive, as [`pending`] reports it.
+/// One step a store has yet to receive, as [`crate::PendingMigration::pending`] reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PendingStep {
@@ -1327,7 +1381,7 @@ fn gated(found: i64) -> crate::error::DbError {
 /// Bring the store up to the latest version it may transparently reach, and
 /// refuse if a gated step stands between that and [`LATEST_VERSION`].
 pub fn migrate(conn: &mut Connection) -> Result<()> {
-    run(conn, GatePolicy::Enforce)
+    run(conn, GatePolicy::Enforce, None)
 }
 
 /// Bring the store all the way to [`LATEST_VERSION`], gated steps included.
@@ -1336,10 +1390,22 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
 /// gated because it does something the user has to be told about first, and
 /// this function is the point at which they already have been.
 pub fn migrate_all(conn: &mut Connection) -> Result<()> {
-    run(conn, GatePolicy::Bypass)
+    run(conn, GatePolicy::Bypass, None)
 }
 
-fn run(conn: &mut Connection, policy: GatePolicy) -> Result<()> {
+/// [`migrate_all`], running `first` inside the migration's own transaction
+/// before any step, so that an upgrade failing anywhere rolls `first` back with
+/// it. It runs on a store already at [`LATEST_VERSION`] too, where there is no
+/// step for it to precede. `musefs migrate --repair`'s deletes are what this is
+/// for.
+pub(crate) fn migrate_all_after(conn: &mut Connection, first: Prelude<'_>) -> Result<()> {
+    run(conn, GatePolicy::Bypass, Some(first))
+}
+
+/// Work a run does inside its transaction before the first step.
+pub(crate) type Prelude<'a> = &'a dyn Fn(&Connection) -> Result<()>;
+
+fn run(conn: &mut Connection, policy: GatePolicy, first: Option<Prelude<'_>>) -> Result<()> {
     let latest = LATEST_VERSION;
     let current = conn.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))?;
     // A store at a user_version past anything this binary knows about was written
@@ -1355,8 +1421,9 @@ fn run(conn: &mut Connection, policy: GatePolicy) -> Result<()> {
             supported: latest,
         });
     }
-    // Fast path: already at the latest version, no transaction needed.
-    if current >= latest {
+    // Fast path: already at the latest version with nothing to run first, so no
+    // transaction is needed.
+    if current >= latest && first.is_none() {
         return Ok(());
     }
     // Test seam: the window between the read above and the write lock below is
@@ -1415,6 +1482,9 @@ fn run(conn: &mut Connection, policy: GatePolicy) -> Result<()> {
             );
         }
         work = Some((at, std::time::Instant::now()));
+    }
+    if let Some(first) = first {
+        first(&tx)?;
     }
     for (target, migration) in (1i64..).zip(MIGRATIONS) {
         if current < target && target <= stop {
@@ -2281,6 +2351,69 @@ mod v4_tracks_rebuild_tests {
         assert_eq!(conn.last_insert_rowid(), 3, "id 2 is retired, not recycled");
     }
 
+    /// #678 across the upgrade itself. The pre-V4 table reused the highest id
+    /// once its track was deleted, so the rebuild's own refill would set the
+    /// sequence to the highest id still standing and hand a deleted one out
+    /// again. The changelog ring still names it, which is what an incremental
+    /// refresh, or a plugin holding ids, has to be able to trust. A ring row
+    /// whose `track_id` is not an integer, which V3 accepted, counts for nothing.
+    #[test]
+    fn an_id_deleted_before_the_upgrade_is_not_handed_out_after_it() {
+        for (what, deleted) in [
+            ("nothing deleted", &[][..]),
+            ("the highest id deleted", &[2][..]),
+            ("every id deleted", &[1, 2][..]),
+        ] {
+            let mut conn = populated_store_at(3);
+            for id in deleted {
+                conn.execute("DELETE FROM tracks WHERE id = ?1", [id])
+                    .unwrap();
+            }
+            conn.execute("INSERT INTO track_changes (track_id) VALUES ('zzz')", [])
+                .unwrap();
+            super::migrate_all(&mut conn).unwrap();
+            conn.execute(
+                "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+                 backing_size, backing_mtime_ns, updated_at) VALUES (?1,'flac',0,1,1,0,0)",
+                [&b"/lib/c.flac"[..]],
+            )
+            .unwrap();
+            assert_eq!(conn.last_insert_rowid(), 3, "{what}");
+        }
+    }
+
+    /// The V1–V3 ring put no bound on `track_id`, so it can hold `i64::MAX`.
+    /// Seeding the sequence there would leave the upgraded store unable to
+    /// insert a single track (`SQLITE_FULL`), so that row counts for nothing,
+    /// while the highest id the ring can still retire is retired as before.
+    #[test]
+    fn a_ring_id_at_i64_max_does_not_exhaust_the_sequence() {
+        for (what, deleted) in [
+            ("nothing deleted", &[][..]),
+            ("every id deleted", &[1, 2][..]),
+        ] {
+            for (ring, next) in [(&[i64::MAX][..], 3), (&[i64::MAX, 7][..], 8)] {
+                let mut conn = populated_store_at(3);
+                for id in deleted {
+                    conn.execute("DELETE FROM tracks WHERE id = ?1", [id])
+                        .unwrap();
+                }
+                for id in ring {
+                    conn.execute("INSERT INTO track_changes (track_id) VALUES (?1)", [id])
+                        .unwrap();
+                }
+                super::migrate_all(&mut conn).unwrap();
+                conn.execute(
+                    "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+                     backing_size, backing_mtime_ns, updated_at) VALUES (?1,'flac',0,1,1,0,0)",
+                    [&b"/lib/c.flac"[..]],
+                )
+                .unwrap_or_else(|e| panic!("{what}, ring {ring:?}: {e}"));
+                assert_eq!(conn.last_insert_rowid(), next, "{what}, ring {ring:?}");
+            }
+        }
+    }
+
     /// #674: the column arrives as the `not yet known` sentinel on every
     /// upgraded row, and joins the geometry bump so that arming it later counts
     /// as a content change.
@@ -2641,26 +2774,43 @@ mod v4_tags_and_track_art_rebuild_tests {
     /// the refusal is how that writer is simulated.
     #[test]
     fn the_bump_names_both_owners_when_the_refusal_is_gone() {
-        let conn = migrated();
-        conn.execute_batch("DROP TRIGGER tags_reject_reparent")
-            .unwrap();
-        let cv = |id: i64| -> i64 {
-            conn.query_row(
-                "SELECT content_version FROM tracks WHERE id = ?1",
-                [id],
-                |r| r.get(0),
-            )
-            .unwrap()
-        };
-        let (before_1, before_2) = (cv(1), cv(2));
-        conn.execute("UPDATE tags SET track_id = 2 WHERE track_id = 1", [])
-            .unwrap();
-        assert_eq!(cv(1), before_1 + 1, "the track that LOST the row must bump");
-        assert_eq!(
-            cv(2),
-            before_2 + 1,
-            "the track that gained it must bump too"
-        );
+        // Both tables, since each has its own `_au` trigger to get wrong. The
+        // link moves to a free ordinal: track 2 already holds ordinal 0, and the
+        // primary key would refuse the move before any trigger ran.
+        for (refusal, reparent) in [
+            (
+                "tags_reject_reparent",
+                "UPDATE tags SET track_id = 2 WHERE track_id = 1",
+            ),
+            (
+                "track_art_reject_reparent",
+                "UPDATE track_art SET track_id = 2, ordinal = 1 WHERE track_id = 1",
+            ),
+        ] {
+            let conn = migrated();
+            conn.execute_batch(&format!("DROP TRIGGER {refusal}"))
+                .unwrap();
+            let cv = |id: i64| -> i64 {
+                conn.query_row(
+                    "SELECT content_version FROM tracks WHERE id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            };
+            let (before_1, before_2) = (cv(1), cv(2));
+            conn.execute(reparent, []).unwrap();
+            assert_eq!(
+                cv(1),
+                before_1 + 1,
+                "{reparent}: the track that LOST the row must bump"
+            );
+            assert_eq!(
+                cv(2),
+                before_2 + 1,
+                "{reparent}: the track that gained it must bump too"
+            );
+        }
     }
 
     /// #716's adding half: the per-embedding columns exist on the link and are
@@ -3255,9 +3405,13 @@ mod baseline_tests {
     fn superseded_migration_literals_are_frozen() {
         assert!(super::MIGRATION_V1.contains("length(value) <= 262144"));
         assert!(super::MIGRATION_V1.contains("length(description) <= 1024"));
+        // V2's own cap is the one exception, and still a literal rather than the
+        // constant: its 256 KiB narrowing silently dropped tags V1 accepted, so
+        // the step now rebuilds at the widened cap V3 also uses. That is safe only
+        // because a store at V1 runs V2 inside `musefs migrate`, with V3 and V4.
         assert!(
-            super::MIGRATION_V2.contains("length(CAST(value AS BLOB)) <= 262144"),
-            "V2's byte-accurate rebuild (#505) shipped at the 256 KiB cap"
+            super::MIGRATION_V2.contains("length(CAST(value AS BLOB)) <= 16777215"),
+            "V2's byte-accurate rebuild (#505) keeps every row V1 accepted"
         );
     }
 
@@ -3278,6 +3432,10 @@ mod baseline_tests {
     ///
     /// A digest mismatch here means an edit reached a frozen migration. The fix
     /// is to move the change to the newest migration, not to update the digest.
+    ///
+    /// V2's digest has been updated once, deliberately: its rebuild dropped tags
+    /// V1 had accepted, and no later step could bring them back. Its own comment
+    /// says why that edit was safe and what makes it the only one.
     #[test]
     fn superseded_migrations_are_byte_for_byte_frozen() {
         use sha2::{Digest, Sha256};
@@ -3290,7 +3448,7 @@ mod baseline_tests {
             (
                 "MIGRATION_V2",
                 super::MIGRATION_V2,
-                "79d14a1ee3b04f4fa8a5d04196637fe2382d23cee102c9ece9e67c08ae10a128",
+                "7cf2ffd6fdac6ca3e1bcb017d90dc7dc57afcd2ffb9aae936e4aa3c6e63546c1",
             ),
             (
                 "MIGRATION_V3",
@@ -3604,10 +3762,11 @@ mod schema_py_tests {
     }
 
     #[test]
-    fn v2_rebuild_enforces_byte_cap_and_drops_oversize_rows() {
+    fn v2_rebuild_enforces_a_byte_cap_and_keeps_every_v1_row() {
         // #505: V2 rebuilds `tags` with a byte-accurate value cap. Simulate a v1
-        // store, plant an over-cap multibyte value (legal under V1's char-counting
-        // CHECK: 150_000 chars / 300_000 bytes) plus a normal one, then upgrade.
+        // store, plant a multibyte value past 256 KiB in bytes (legal under V1's
+        // char-counting CHECK: 150_000 chars / 300_000 bytes) plus a normal one,
+        // then upgrade.
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(MIGRATIONS[0].sql).unwrap(); // V1 only
         conn.pragma_update(None, "user_version", 1i64).unwrap();
@@ -3630,25 +3789,30 @@ mod schema_py_tests {
         )
         .unwrap();
 
-        // V2 only, applied directly. `migrate()` would run on through V3, whose
-        // widened cap (#644) accepts this value — that is the later step's
-        // business, asserted separately below. This test is about what V2 did.
+        // V2 only, applied directly: this test is about what V2 does.
         conn.execute_batch(MIGRATIONS[1].sql).unwrap();
         conn.pragma_update(None, "user_version", 2i64).unwrap();
 
-        // The over-cap row is dropped; the valid row survives.
+        // Both rows survive: no row V1 accepted is over the widened cap.
         let keys: Vec<String> = {
             let mut stmt = conn.prepare("SELECT key FROM tags ORDER BY key").unwrap();
             let rows = stmt.query_map([], |r| r.get(0)).unwrap();
             rows.collect::<rusqlite::Result<_>>().unwrap()
         };
-        assert_eq!(keys, vec!["ok".to_string()]);
+        assert_eq!(keys, vec!["big".to_string(), "ok".to_string()]);
 
-        // The rebuilt CHECK rejects an over-cap multibyte value at write.
+        // The rebuilt CHECK counts bytes: a value of two-byte characters one byte
+        // over the cap is refused, where a character count would take it at half
+        // that.
+        let over = "é".repeat(8_388_608);
+        assert!(
+            over.len() == 16_777_216 && over.chars().count() < 16_777_215,
+            "over the cap in bytes, not in characters"
+        );
         assert!(
             conn.execute(
                 "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1,'big2',?1,0)",
-                rusqlite::params![big],
+                rusqlite::params![over],
             )
             .is_err(),
             "byte-accurate CHECK must reject the write"
@@ -3671,6 +3835,42 @@ mod schema_py_tests {
             cv(&conn) > before,
             "tags_ai trigger must survive the rebuild"
         );
+    }
+
+    /// The upgrade a V1 store takes, end to end: a tag valid under V1's
+    /// character cap and over 256 KiB in bytes reaches V4 intact. V2 used to
+    /// drop it on the way, with V3 and V4 both happy to have kept it, and the
+    /// pre-flight — which asks V4's tables — never saw it go.
+    #[test]
+    fn a_v1_tag_over_256_kib_in_bytes_survives_the_upgrade() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MIGRATIONS[0].sql).unwrap();
+        conn.pragma_update(None, "user_version", 1i64).unwrap();
+        conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime_ns, updated_at) \
+             VALUES ('/a.flac','flac',0,0,0,0,0)",
+            [],
+        )
+        .unwrap();
+        let lyrics = "é".repeat(150_000);
+        assert!(lyrics.len() > 256 * 1024 && lyrics.chars().count() <= 262_144);
+        conn.execute(
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1, 'LYRICS', ?1, 0)",
+            [&lyrics],
+        )
+        .expect("V1's character cap admits it");
+
+        super::migrate_all(&mut conn).unwrap();
+
+        let stored: Vec<u8> = conn
+            .query_row(
+                "SELECT CAST(value AS BLOB) FROM tags WHERE track_id = 1 AND key = 'LYRICS'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("the tag must still be there");
+        assert!(stored == lyrics.as_bytes(), "and byte for byte");
     }
 
     /// #644: V3 widens `tags.value` to FLAC's block ceiling and
@@ -3728,14 +3928,16 @@ mod schema_py_tests {
             .unwrap();
         assert_eq!(desc, "cover");
 
-        // A value the V2 cap rejected now writes cleanly — the point of #644.
-        let over_v2 = "é".repeat(150_000);
+        // A value the 256 KiB caps rejected, V1's in characters and V2's as it
+        // first shipped in bytes, now writes cleanly — the point of #644.
+        let over_v1 = "é".repeat(262_145);
         assert!(
-            over_v2.len() > 262_144 && i64::try_from(over_v2.len()).unwrap() < MAX_TAG_VALUE_LEN
+            over_v1.chars().count() > 262_144
+                && i64::try_from(over_v1.len()).unwrap() < MAX_TAG_VALUE_LEN
         );
         conn.execute(
             "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1,'lyrics',?1,0)",
-            rusqlite::params![over_v2],
+            rusqlite::params![over_v1],
         )
         .expect("V3 accepts a value the 256 KiB cap rejected");
         conn.execute(
@@ -3900,15 +4102,30 @@ mod constraint_tests {
         );
     }
 
+    /// Refused, and by the `CHECK` whose text contains `check`. SQLite names the
+    /// first constraint a row fails, so this is what tells a test apart from one
+    /// that passes because some earlier constraint happened to refuse its row.
+    fn rejected_by(conn: &Connection, sql: &str, check: &str) {
+        let err = conn
+            .execute(sql, [])
+            .expect_err(&format!("expected rejection for: {sql}"))
+            .to_string();
+        assert!(
+            err.contains(check),
+            "{sql} was refused by {err}, not {check}"
+        );
+    }
+
     #[test]
     fn v4_tracks_rejects_unknown_format() {
         let mut conn = Connection::open_in_memory().unwrap();
         fresh(&mut conn);
-        rejected(
+        rejected_by(
             &conn,
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
              backing_size, backing_mtime_ns, updated_at) \
-             VALUES ('/x','aiff',0,0,0,0,0)",
+             VALUES (CAST('/x' AS BLOB),'aiff',0,0,0,0,0)",
+            "format IN (",
         );
     }
 
@@ -3991,47 +4208,46 @@ mod constraint_tests {
     fn v4_tracks_rejects_negative_audio_length() {
         let mut conn = Connection::open_in_memory().unwrap();
         fresh(&mut conn);
-        rejected(
+        rejected_by(
             &conn,
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
              backing_size, backing_mtime_ns, updated_at) \
-             VALUES ('/x','flac',0,-1,0,0,0)",
+             VALUES (CAST('/x' AS BLOB),'flac',0,-1,0,0,0)",
+            "audio_length >= 0",
         );
     }
 
+    /// No row can reach this constraint alone: with the offset and length both
+    /// non-negative, a negative size also fails `audio_offset + audio_length <=
+    /// backing_size`. That one is declared later, so naming the constraint is
+    /// what tells the two apart.
     #[test]
     fn v4_tracks_rejects_negative_backing_size() {
         let mut conn = Connection::open_in_memory().unwrap();
         fresh(&mut conn);
-        rejected(
+        rejected_by(
             &conn,
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
              backing_size, backing_mtime_ns, updated_at) \
-             VALUES ('/x','flac',0,0,-1,0,0)",
+             VALUES (CAST('/x' AS BLOB),'flac',0,0,-1,0,0)",
+            "backing_size >= 0",
         );
     }
 
-    #[test]
-    fn v4_tracks_rejects_negative_backing_mtime_ns() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        fresh(&mut conn);
-        rejected(
-            &conn,
-            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
-             backing_size, backing_mtime_ns, updated_at) \
-             VALUES ('/x','flac',0,0,0,-1,0)",
-        );
-    }
+    // A negative `backing_mtime_ns` is accepted since #696, which
+    // `v4_tracks_rebuild_tests::a_pre_epoch_stamp_is_accepted` pins for both
+    // stamps.
 
     #[test]
     fn v4_tracks_rejects_negative_content_version() {
         let mut conn = Connection::open_in_memory().unwrap();
         fresh(&mut conn);
-        rejected(
+        rejected_by(
             &conn,
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
              backing_size, backing_mtime_ns, content_version, updated_at) \
-             VALUES ('/x','flac',0,0,0,0,-1,0)",
+             VALUES (CAST('/x' AS BLOB),'flac',0,0,0,0,-1,0)",
+            "content_version >= 0",
         );
     }
 
@@ -4039,12 +4255,213 @@ mod constraint_tests {
     fn v4_tracks_rejects_negative_updated_at() {
         let mut conn = Connection::open_in_memory().unwrap();
         fresh(&mut conn);
-        rejected(
+        rejected_by(
             &conn,
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
              backing_size, backing_mtime_ns, updated_at) \
-             VALUES ('/x','flac',0,0,0,0,-1)",
+             VALUES (CAST('/x' AS BLOB),'flac',0,0,0,0,-1)",
+            "updated_at >= 0",
         );
+    }
+
+    /// #718: every integer column of `tracks` pins its storage class. Each
+    /// value is a non-integral real, which INTEGER affinity cannot convert and
+    /// which satisfies every range the column also carries, so the `typeof`
+    /// clause is the only thing that can refuse it.
+    #[test]
+    fn v4_tracks_integer_columns_pin_their_storage_class() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        let insert = |path: &str, column: &str, value: &str| {
+            let mut values = [
+                ("audio_offset", "0"),
+                ("audio_length", "0"),
+                ("backing_size", "2"),
+                ("backing_mtime_ns", "0"),
+                ("backing_ctime_ns", "0"),
+                ("backing_ino", "0"),
+                ("content_version", "0"),
+                ("updated_at", "0"),
+            ];
+            for slot in &mut values {
+                if slot.0 == column {
+                    slot.1 = value;
+                }
+            }
+            let (names, vals): (Vec<&str>, Vec<&str>) = values.into_iter().unzip();
+            format!(
+                "INSERT INTO tracks (backing_path, format, {}) \
+                 VALUES (CAST('{path}' AS BLOB), 'flac', {})",
+                names.join(", "),
+                vals.join(", ")
+            )
+        };
+        conn.execute(&insert("/control", "", ""), [])
+            .expect("the baseline row is valid");
+        for (i, column) in [
+            "audio_offset",
+            "audio_length",
+            "backing_size",
+            "backing_mtime_ns",
+            "backing_ctime_ns",
+            "backing_ino",
+            "content_version",
+            "updated_at",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            rejected_by(
+                &conn,
+                &insert(&format!("/t{i}"), column, "0.5"),
+                &format!("typeof({column})"),
+            );
+        }
+    }
+
+    /// #718 for `tags`: a blob where text belongs, text where a blob belongs, and
+    /// a non-integral real where an integer belongs. Foreign keys are off so the
+    /// `track_id` case cannot be refused by its missing parent instead.
+    #[test]
+    fn v4_tags_columns_pin_their_storage_class() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        insert_track(&conn, "/a.flac");
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn.execute(
+            "INSERT INTO tags (track_id, key, value, ordinal, value_blob) \
+             VALUES (1, 'k', '', 0, X'00')",
+            [],
+        )
+        .expect("the baseline row is valid");
+        for (column, sql) in [
+            (
+                "track_id",
+                "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1.5, 'k', 'v', 1)",
+            ),
+            (
+                "key",
+                "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1, X'6b', 'v', 2)",
+            ),
+            (
+                "value",
+                "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1, 'k', X'76', 3)",
+            ),
+            (
+                "ordinal",
+                "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1, 'k', 'v', 0.5)",
+            ),
+            (
+                "value_blob",
+                "INSERT INTO tags (track_id, key, value, ordinal, value_blob) \
+                 VALUES (1, 'k', '', 4, 'not a blob')",
+            ),
+        ] {
+            rejected_by(&conn, sql, &format!("typeof({column})"));
+        }
+    }
+
+    /// #718 for `track_art`, on the same terms as `tags` above.
+    #[test]
+    fn v4_track_art_columns_pin_their_storage_class() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        seed_track_and_art(&conn);
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        let insert = |column: &str, value: &str| {
+            let mut values = [
+                ("track_id", "1"),
+                ("art_id", "1"),
+                ("picture_type", "3"),
+                ("description", "''"),
+                ("mime", "''"),
+                ("width", "1"),
+                ("height", "1"),
+                ("depth", "0"),
+                ("colors", "0"),
+                ("ordinal", "0"),
+            ];
+            for slot in &mut values {
+                if slot.0 == column {
+                    slot.1 = value;
+                }
+            }
+            let (names, vals): (Vec<&str>, Vec<&str>) = values.into_iter().unzip();
+            format!(
+                "INSERT INTO track_art ({}) VALUES ({})",
+                names.join(", "),
+                vals.join(", ")
+            )
+        };
+        conn.execute(&insert("", ""), [])
+            .expect("the baseline row is valid");
+        conn.execute("DELETE FROM track_art", []).unwrap();
+        for (column, value) in [
+            ("track_id", "1.5"),
+            ("art_id", "1.5"),
+            ("picture_type", "3.5"),
+            ("description", "X'64'"),
+            ("mime", "X'6d'"),
+            ("width", "0.5"),
+            ("height", "0.5"),
+            ("depth", "0.5"),
+            ("colors", "0.5"),
+            ("ordinal", "0.5"),
+        ] {
+            rejected_by(&conn, &insert(column, value), &format!("typeof({column})"));
+        }
+    }
+
+    /// #732: `structural_blocks.track_id`, the one storage class that table's
+    /// own rebuild tests leave out.
+    #[test]
+    fn v4_structural_blocks_track_id_pins_its_storage_class() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        insert_track(&conn, "/a.flac");
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn.execute(
+            "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
+             VALUES (1, 'STREAMINFO', 0, X'00')",
+            [],
+        )
+        .expect("the baseline row is valid");
+        rejected_by(
+            &conn,
+            "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
+             VALUES (1.5, 'STREAMINFO', 0, X'00')",
+            "typeof(track_id)",
+        );
+    }
+
+    /// #693: the NUL bans on `track_art.mime` and `art.sha256`. For the digest
+    /// the ban is the only clause that refuses this value at all: `length()`
+    /// and `GLOB` both stop at the NUL, so they see 64 lowercase hex characters.
+    #[test]
+    fn v4_a_nul_bearing_mime_or_digest_is_refused() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        seed_track_and_art(&conn);
+        let mime = format!("image/png{}junk", '\0');
+        let err = conn
+            .execute(
+                "INSERT INTO track_art (track_id, art_id, picture_type, mime, ordinal) \
+                 VALUES (1, 1, 3, ?1, 0)",
+                [&mime],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("instr(mime, char(0))"), "{err}");
+
+        let sha = format!("{}{}junk", "a".repeat(64), '\0');
+        let err = conn
+            .execute(
+                "INSERT INTO art (sha256, byte_len, data) VALUES (?1, 1, X'01')",
+                [&sha],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("instr(sha256, char(0))"), "{err}");
     }
 
     #[test]

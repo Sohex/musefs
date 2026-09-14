@@ -460,6 +460,27 @@ mod tags_for_tracks_tests {
         assert_eq!(db.get_tags(a).unwrap()[0].value.len(), cap());
     }
 
+    /// The length limit leaves room for the widest row the schema admits: a
+    /// value at the cap beside a key at its byte ceiling and the widest ordinal,
+    /// written, read back, and carried through a vacuum. SQLite applies the limit
+    /// to the whole record a write builds and a vacuum copies, so this row, not
+    /// the value alone, is what the limit has to fit.
+    #[test]
+    fn the_widest_legitimate_tag_row_fits_the_length_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("w.db")).unwrap();
+        let a = db.upsert_track(&new_track("/a.flac")).unwrap();
+        let key = "\u{1D11E}".repeat(usize::try_from(MAX_TAG_KEY_LEN).unwrap());
+        let ordinal = u64::try_from(i64::MAX).unwrap();
+        db.replace_tags(a, &[Tag::new(&key, &at_cap_value(), ordinal)])
+            .unwrap();
+        db.vacuum().unwrap();
+        let got = db.get_tags(a).unwrap();
+        assert_eq!(got[0].key, key);
+        assert_eq!(got[0].value.len(), cap());
+        assert_eq!(got[0].ordinal, ordinal);
+    }
+
     #[test]
     fn multibyte_value_over_byte_cap_is_rejected_at_write_and_read() {
         // Regression for #505: the cap counts bytes, not characters. Half the

@@ -67,6 +67,8 @@ store upgrade is one-way without the snapshot `migrate` takes.
   characters (was 1,024). This is schema version 3, which only widens
   constraints and carries every row across; `musefs migrate` applies it together
   with version 4.
+- **Big-endian RIFX WAVs** ([#770]) scan and are served as RIFX; a
+  `LIST('wavl')` WAV is refused as unsupported rather than unparseable ([#769]).
 
 See the [Changelog](changelog.md#200---2026-09-14) for the full list.
 
@@ -138,18 +140,26 @@ constraints off:
   ([#758]);
 - an art row whose digest is not 64 lowercase hex characters ([#761]);
 - a tag, picture link or structural block whose track is gone, or a link whose
-  image is.
+  image is;
+- the same `backing_path` stored twice, once as text and once as bytes: before
+  2.0.0 nothing compared the two spellings, and the upgrade stores both as bytes.
 
 Fix the rows with whatever wrote them, or pass `--repair` to have `migrate`
 delete them. It does so after the confirmation and the snapshot, so the rows are
-still in the copy — which is why `--repair` refuses `--no-snapshot`. Deleting a
-track takes its tags and picture links with it, and the report counts those too.
+still in the copy — which is why `--repair` refuses `--no-snapshot` — and as part
+of the upgrade's own transaction, so if the upgrade then fails nothing has been
+deleted. Deleting a track takes its tags and picture links with it, and the
+report counts those too. For a path stored twice, `--repair` keeps the row
+carrying tags or picture links (the older one when neither does); when both
+carry some, it refuses and names both track ids, and you delete the one you do
+not want first.
 
 An art row with a non-canonical digest can only have come from a tool other than
 musefs or its plugins, which have always written lowercase. `--repair` deletes
-that row **and every picture link to it**, so each track using it loses that
-picture. It is not lowercased for you, because a correctly filed row for the
-same image may already exist. Fixing it by hand first means inserting a
+that row. Where a correctly filed row for the same image already exists, each
+picture link moves onto it and the track keeps the picture; otherwise the links
+are deleted with the row and **each track using it loses that picture**. The row
+is not lowercased for you, because a correctly filed twin may already exist. Fixing it by hand first means inserting a
 correctly filed row, relinking each `track_art` row to it and deleting the old
 one — art rows cannot be updated — and the
 [maintenance guide](guide/maintenance.md#rows-the-new-schema-refuses) walks
@@ -205,6 +215,13 @@ A few files need more than that:
   where their audio starts. Tags and art that 1.3.0 never read from those files
   arrive only through `musefs scan --force <file>`, which replaces that file's
   curated tags and art with what it embeds.
+- **MP3s with an appended ID3v2 tag** ([#768]). 1.3.0 counted a tag appended
+  after the audio as part of it, so the served file carried the backing file's
+  own tag at its end. The revalidate re-probes every MP3 and corrects where its
+  audio ends, keeping your tags. That tag's contents reach the store only through
+  `musefs scan --force <file>`, which replaces that file's curated tags and art.
+  MP3s 1.3.0 refused because they begin with more than one ID3v2 tag ([#767])
+  have no row yet; a plain `musefs scan` adds them.
 - **Chained Ogg** stored by 1.3.0 ([#722], [#747]). 2.0.0's scan refuses these,
   so they cannot be refreshed. Each counts as `failed` (reason `unsupported`),
   and `revalidate` exits `2` while any remain. Until they are removed, the mount
@@ -454,6 +471,10 @@ directly.
 [#761]: https://github.com/Sohex/musefs/issues/761
 [#762]: https://github.com/Sohex/musefs/issues/762
 [#766]: https://github.com/Sohex/musefs/issues/766
+[#767]: https://github.com/Sohex/musefs/issues/767
+[#768]: https://github.com/Sohex/musefs/issues/768
+[#769]: https://github.com/Sohex/musefs/issues/769
+[#770]: https://github.com/Sohex/musefs/issues/770
 
 ## v1.3.0
 

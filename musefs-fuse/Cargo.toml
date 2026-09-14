@@ -6,6 +6,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../README.md"
+keywords = ["fuse", "filesystem", "music", "metadata", "audio"]
+categories = ["filesystem", "multimedia::audio"]
+# Integration tests stay in the repository: every one uses `musefs-db` or
+# `musefs-format`'s `fuzzing` fixtures through path dev-dependencies, which
+# cargo strips at publish, so they could not build from the published crate.
+exclude = ["tests/"]
 
 [features]
 metrics = ["musefs-core/metrics"]

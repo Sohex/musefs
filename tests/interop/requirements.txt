@@ -1,1 +1,2 @@
 mutagen==1.48.1
+soundfile==0.14.0

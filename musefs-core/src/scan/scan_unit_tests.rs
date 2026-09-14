@@ -55,6 +55,100 @@ fn read_tail_128_short_file_is_none() {
     assert_eq!(read_tail_128(&file, 127).unwrap(), None);
 }
 
+// --- read_mp3_tail() (#768) ---
+
+fn syncsafe(n: u64) -> [u8; 4] {
+    let n = u32::try_from(n).unwrap();
+    [
+        ((n >> 21) & 0x7F) as u8,
+        ((n >> 14) & 0x7F) as u8,
+        ((n >> 7) & 0x7F) as u8,
+        (n & 0x7F) as u8,
+    ]
+}
+
+/// An appended ID3v2.4 tag's 10-byte header and matching `3DI` footer, for a
+/// tag `tag_len` bytes long in all.
+fn header_and_footer(tag_len: u64) -> (Vec<u8>, Vec<u8>) {
+    let mut header = vec![b'I', b'D', b'3', 4, 0, 0x10];
+    header.extend_from_slice(&syncsafe(tag_len - 20));
+    let mut footer = b"3DI".to_vec();
+    footer.extend_from_slice(&header[3..]);
+    (header, footer)
+}
+
+#[test]
+fn read_mp3_tail_reads_one_window_when_no_footer_asks_for_more() {
+    let mut bytes = vec![0xFF, 0xFB];
+    bytes.resize(4096, 0);
+    let (_dir, file) = write_temp("plain.mp3", &bytes);
+    let tail = read_mp3_tail(&file, 4096).unwrap().expect("a tail");
+    assert_eq!(
+        tail.bytes,
+        bytes[4096 - 138..],
+        "an ID3v1 trailer and a footer"
+    );
+
+    let (_dir, file) = write_temp("tiny.mp3", &bytes[..50]);
+    let tail = read_mp3_tail(&file, 50).unwrap().expect("a tail");
+    assert_eq!(
+        tail.bytes,
+        bytes[..50],
+        "a file shorter than one window, whole"
+    );
+}
+
+#[test]
+fn read_mp3_tail_widens_to_the_declared_tag_and_one_window_more() {
+    let (header, footer) = header_and_footer(2020);
+    let mut bytes = vec![0xFF, 0xFB];
+    bytes.resize(8192, 0);
+    bytes.extend_from_slice(&header);
+    bytes.resize(bytes.len() + 2000, 0);
+    bytes.extend_from_slice(&footer);
+    let len = bytes.len() as u64;
+    let (_dir, file) = write_temp("appended.mp3", &bytes);
+
+    let tail = read_mp3_tail(&file, len).unwrap().expect("a tail");
+    assert_eq!(
+        tail.bytes,
+        bytes[bytes.len() - 2020 - 138..],
+        "the tag, and room for a footer or an ID3v1 trailer in front of it"
+    );
+    let bounds = match mp3::locate_audio_bounded(&bytes, len, &tail.trailer).unwrap() {
+        Extent::Complete(b) => b,
+        Extent::NeedMore { up_to } => panic!("a whole prefix asked for {up_to}"),
+    };
+    assert_eq!((bounds.audio_offset, bounds.audio_length), (0, 8192));
+}
+
+/// The tail read is held to the probe ceiling: a tag reaching exactly
+/// `MAX_PROBE_BYTES` back from the end is read whole, one byte further is not
+/// read at all. Sparse files, so neither costs the disk its size.
+#[test]
+fn read_mp3_tail_stops_at_the_probe_ceiling() {
+    use std::os::unix::fs::FileExt;
+    for (tag_len, fits) in [(MAX_PROBE_BYTES, true), (MAX_PROBE_BYTES + 1, false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.mp3");
+        // Four bytes of audio, so no footer or ID3v1 trailer can sit in front.
+        let len = 4 + tag_len;
+        let (header, footer) = header_and_footer(tag_len);
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(len).unwrap();
+        f.write_all_at(&[0xFF, 0xFB], 0).unwrap();
+        f.write_all_at(&header, 4).unwrap();
+        f.write_all_at(&footer, len - 10).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+
+        let tail = read_mp3_tail(&file, len).unwrap();
+        assert_eq!(tail.is_some(), fits, "a {tag_len}-byte appended tag");
+        if let Some(tail) = tail {
+            assert_eq!(tail.bytes.len() as u64, MAX_PROBE_BYTES);
+        }
+    }
+}
+
 // --- effective_jobs() (lines 313-318) ---
 
 // kills scan L314 effective_jobs body→1 (assuming parallelism > 1)

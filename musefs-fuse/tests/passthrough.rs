@@ -66,15 +66,29 @@ fn have_cap_sys_admin() -> bool {
         .is_some_and(|mask| mask & (1 << 21) != 0)
 }
 
+/// Report why the passthrough test cannot run, and skip it — unless
+/// `MUSEFS_REQUIRE_PASSTHROUGH` is set, which turns the skip into a failure.
+/// CI's `e2e` job sets it when it runs this test as root: there the whole point
+/// is to reach kernel passthrough, and a skip would pass without testing it.
+fn skip_unless_required(reason: &str) {
+    assert!(
+        std::env::var_os("MUSEFS_REQUIRE_PASSTHROUGH").is_none(),
+        "MUSEFS_REQUIRE_PASSTHROUGH is set, but {reason}"
+    );
+    eprintln!("{reason}; skipping");
+}
+
 #[test]
 #[ignore = "real mount; needs /dev/fuse + kernel >= 6.9 + CAP_SYS_ADMIN — build as user, run test binary via sudo"]
 fn structure_only_reads_are_kernel_passthrough() {
     if !kernel_supports_passthrough() {
-        eprintln!("kernel < 6.9: no FUSE passthrough; skipping");
+        skip_unless_required("kernel < 6.9: no FUSE passthrough");
         return;
     }
     if !have_cap_sys_admin() {
-        eprintln!("no CAP_SYS_ADMIN: backing-open ioctl would EPERM; skipping (run via sudo)");
+        skip_unless_required(
+            "no CAP_SYS_ADMIN: backing-open ioctl would EPERM (run the test binary via sudo)",
+        );
         return;
     }
     let (backing_bytes, virt, session, _backing, _mnt) = mount_one_track(Mode::StructureOnly);

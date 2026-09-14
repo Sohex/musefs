@@ -86,7 +86,7 @@ exclude_re = [
     # header. The `size + (size & 1)` operator at :35 and the `& 1` at :43 cannot
     # zero the advance (min 8) and stay IN scope (caught by that same test).
     # guard: op="+" fn="walk_chunks" rows=2
-    'musefs-format/src/wav\.rs:58:28:',
+    'musefs-format/src/wav\.rs:106:28:',
     # dirty_min_flip_ancestors (add-side walk) `id < introducing_id(child)`: the
     # `<`->`<=` boundary is unreachable-different. Equality needs the walked id to
     # BE the subtree's introducing id, which only a moved-in id can satisfy (pure
@@ -122,21 +122,21 @@ exclude_re = [
     # block end past the prefix), so `up_to.min(probe_cap)` always wins the max and
     # the `want + 1` term is never selected. `+`->`-`/`*` are equivalent.
     # guard: op="+" fn="probe_body" rows=2
-'musefs-core/src/scan\.rs:1192:31:',
+'musefs-core/src/scan\.rs:1265:31:',
     # probe_body post-loop fallback guard `(prefix.len() as u64) < probe_cap`: when
     # it differs, the only effect is a redundant re-read up to the probe cap that
     # feeds the same `probe_full` result. The >8-retry path that could diverge is
     # unreachable given the probers' exact (FLAC/MP3/WAV) / geometric (Ogg) NeedMore.
     # guard: op="<" fn="probe_body" rows=3
-'musefs-core/src/scan\.rs:1199:30:',
+'musefs-core/src/scan\.rs:1272:30:',
     # probe_body WAV ceiling-fallback guard `file_len > MAX_PROBE_BYTES` (`>` at
-    # :21): differs from `>=` only at file_len == MAX_PROBE_BYTES exactly, where the
+    # :41): differs from `>=` only at file_len == MAX_PROBE_BYTES exactly, where the
     # whole file already fits within probe_cap — so `probe_full` parses it (valid)
     # or `locate_audio_at_ceiling` rejects it on the same off+len>file_len bound
     # (corrupt), giving the identical skip either way. The ceiling branch is never
     # the deciding path at the boundary, so the mutant is equivalent.
     # guard: op=">" fn="probe_body" rows=3
-'musefs-core/src/scan\.rs:1210:21:',
+'musefs-core/src/scan\.rs:1284:41:',
     # `unparseable`'s diagnostic `file_len > MAX_PROBE_BYTES`: picks which of two
     # wordings the skip message carries (naming the probe ceiling, or not). It has
     # no effect on the returned verdict, its reason bucket, or any persisted state,
@@ -144,24 +144,23 @@ exclude_re = [
     # shim, like the metrics counters above. (Was in `probe_body` before #651 moved
     # the message out of the log call and into this helper.)
     # guard: op=">" fn="unparseable" rows=3
-'musefs-core/src/scan\.rs:1221:31:',
+'musefs-core/src/scan\.rs:1307:31:',
     # run_pipeline sync_channel capacity `jobs * 2`: pure throughput/blocking knob;
     # the persisted track set is identical for any positive capacity.
     # guard: op="*" fn="run_pipeline" rows=2
-'musefs-core/src/scan\.rs:2433:46:',
-    # probe_body's tail-read predicate
-    # `has_ext(mp3) || (has_ext(flac) && has_leading_id3(prefix))`, the inner `&&`
-    # (col 66) -> `||`: widening it makes every .flac pay the 128-byte tail read,
-    # not just the rare one with a leading ID3v2 tag (#602). No parsed result
-    # moves — flac::audio_end trims a trailer only when that same leading tag is
-    # present, so a stock FLAC's bounds, tags, and art are byte-identical either
-    # way. The only observable is extra I/O (`scan_bytes_read`), which lives
-    # behind the `metrics` feature the in-diff gate does not build — the same
-    # class as the batching-cadence entries below. The `||` at col 40 IS
-    # behavioral (it decides whether an .mp3 gets its ID3v1 trailer trimmed) and
-    # stays in scope, killed by scan.rs's mp3_id3v1_trailer_is_not_served_as_audio.
+'musefs-core/src/scan\.rs:2514:46:',
+    # probe_body's FLAC tail-read predicate
+    # `has_ext(flac) && has_leading_id3(prefix)`, `&&` -> `||`: widening it makes
+    # every .flac, and every other file that opens with an ID3v2 tag, pay the
+    # 128-byte tail read, not just the rare FLAC with a leading ID3v2 tag (#602).
+    # No parsed result moves — flac::audio_end trims a trailer only when that
+    # same leading tag is present, so a stock FLAC's bounds, tags, and art are
+    # byte-identical either way, and no other arm reads this tail (an MP3 reads
+    # its own, `read_mp3_tail`, #768). The only observable is extra I/O
+    # (`scan_bytes_read`), which lives behind the `metrics` feature the in-diff
+    # gate does not build — the same class as the batching-cadence entries below.
     # guard: op="&&" fn="probe_body" rows=1
-'musefs-core/src/scan\.rs:1156:66:',
+'musefs-core/src/scan\.rs:1217:41:',
     # run_pipeline flush cadence (batch_bytes accounting + the
     # `len >= BATCH_FILES || batch_bytes >= cap` flush triggers, both the try_recv
     # and the recv branch): the mid-loop threshold flush is belt-and-suspenders on
@@ -174,30 +173,30 @@ exclude_re = [
     # safely description-anchored. Re-verify these coordinates (via
     # `cargo mutants --list`) after any change that reformats scan.rs.
     # guard: op="+=" fn="run_pipeline" rows=2
-'musefs-core/src/scan\.rs:2562:22:',
+'musefs-core/src/scan\.rs:2643:22:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2656:33:',
+'musefs-core/src/scan\.rs:2737:33:',
     # guard: op="||" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2656:48:',
+'musefs-core/src/scan\.rs:2737:48:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2656:63:',
+'musefs-core/src/scan\.rs:2737:63:',
     # guard: op="+=" fn="run_pipeline" rows=2
-'musefs-core/src/scan\.rs:2670:37:',
+'musefs-core/src/scan\.rs:2751:37:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2672:41:',
+'musefs-core/src/scan\.rs:2753:41:',
     # guard: op="||" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2672:56:',
+'musefs-core/src/scan\.rs:2753:56:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2672:71:',
+'musefs-core/src/scan\.rs:2753:71:',
     # Same cadence class, one level up: each threshold flush is a let-chain
     # (`(len >= BATCH_FILES || batch_bytes >= cap) && let Err(e) = flush(..)`), so
     # `&&`->`||` short-circuits past the mid-loop flush exactly when the threshold
     # IS met — deferring the commit to the flush-on-empty / final flush, which
     # persist the identical track set and still surface a flush error (#618).
     # guard: op="&&" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2657:21:',
+'musefs-core/src/scan\.rs:2738:21:',
     # guard: op="&&" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2673:29:',
+'musefs-core/src/scan\.rs:2754:29:',
     # `ByteBudget::acquire`'s wait guard (`!st.closed && in_flight != 0 && ...`),
     # the FIRST `&&`->`||`. `&&` binds tighter than `||`, so the guard becomes
     # `!closed || (in_flight != 0 && over_cap)` and every reservation against an
@@ -219,9 +218,9 @@ exclude_re = [
     # the `failed = scan.failed + skip_failed` sum is also insensitive to `+`->`-`
     # (the `+`->`*` variant IS caught, so only `-` is excluded here).
     # guard: op="+=" fn="revalidate_with" rows=2
-'musefs-core/src/scan\.rs:2855:29:',
+'musefs-core/src/scan\.rs:2936:29:',
     # guard: op="+" fn="revalidate_with" rows=1
-'musefs-core/src/scan\.rs:2969:29: replace \+ with -',
+'musefs-core/src/scan\.rs:3050:29: replace \+ with -',
     # Phase 2 ID3 binary tags: classify_binary_frame's POPM counter fold
     # `(a << 8) | b` -> `(a << 8) ^ b`. The accumulator is left-shifted by 8 before
     # each combine, so its low byte is always zero where `b` lands; `|` and `^` are

@@ -1,3 +1,4 @@
+import io
 import json
 import os
 
@@ -5,6 +6,7 @@ import mutagen
 import mutagen.flac
 import mutagen.id3
 import mutagen.mp4
+import soundfile
 
 # Mirrored byte-for-byte from musefs-core/tests/interop_emit.rs (COVR_JPEG/COVR_PNG).
 COVR_JPEG = b"\xff\xd8\xff\xe0interop-jpeg-cover"
@@ -18,11 +20,63 @@ PICTURES = [
 ]
 
 # Every fixture emit_interop_fixtures writes a manifest row for.
-MANIFEST_FILES = {"out.flac", "out.mp3", "out.m4a", "out.ogg", "out.wav"}
+MANIFEST_FILES = {
+    "out.flac",
+    "out.mp3",
+    "out_multi.mp3",
+    "out.m4a",
+    "out.ogg",
+    "out.wav",
+    "out_rifx.wav",
+}
+
+# The samples interop_emit.rs's RIFX fixture holds, big-endian on disk.
+RIFX_SAMPLES = [0x0102, -2, 300, -32768, 32767, 5, 6, 7]
+
+
+def _is_rifx(path):
+    """Whether the file at `path` is RIFX (big-endian WAVE) by its magic."""
+    with open(path, "rb") as fh:
+        return fh.read(4) == b"RIFX"
+
+
+def _synchsafe(b):
+    """Decode the 28-bit synchsafe integer in the four bytes `b` (ID3v2.4 §6.2)."""
+    return (b[0] << 21) | (b[1] << 14) | (b[2] << 7) | b[3]
+
+
+def _appended_id3v2_tags(data):
+    """Every appended ID3v2 tag in `data`, as (start, end) offsets, found the
+    way the ID3v2.4 structure document tells a reader to look (sections 3.4
+    and 5): a `3DI` footer at the end of the file, or just before a 128-byte
+    ID3v1 trailer, whose header copy sits where its size says. Written apart
+    from musefs's own walker so the two cannot share a mistake."""
+    found = []
+    end = len(data)
+    id3v1_seen = False
+    while True:
+        footer = data[end - 10 : end] if end >= 10 else b""
+        if footer[:3] == b"3DI":
+            start = end - 20 - _synchsafe(footer[6:10])
+            if start >= 0 and data[start : start + 10] == b"ID3" + footer[3:10]:
+                found.append((start, end))
+                end = start
+                continue
+        if not id3v1_seen and end >= 128 and data[end - 128 : end - 125] == b"TAG":
+            id3v1_seen = True
+            end -= 128
+            continue
+        return found
 
 
 def _read_tag(path, key):
     """Read a single tag value from an audio file using mutagen."""
+    # RIFX (big-endian WAVE): mutagen's RIFF reader refuses it outright, so read
+    # the LIST/INFO chunk through libsndfile, which reads RIFX natively.
+    if _is_rifx(path):
+        with soundfile.SoundFile(path) as f:
+            return getattr(f, key) or None
+
     # M4A: read via real mutagen.mp4.MP4 (the interop fixture includes mdhd +
     # stsd so mutagen's stream-info parser can open the file).
     if path.endswith(".m4a"):
@@ -119,6 +173,50 @@ def test_synthesized_preserves_source_audio_payload():
             f.seek(row["source_audio_offset"])
             src_payload = f.read(row["source_audio_length"])
         assert synth_payload == src_payload, f"{row['file']}: synthesized audio differs from source"
+
+
+def test_mp3_backing_tags_at_either_end_are_not_served():
+    """A backing MP3 with a prepended tag, an appended ID3v2.4 tag and an ID3v1
+    trailer is served as the synthesized front tag and the audio, nothing else."""
+    base = os.environ["MUSEFS_INTEROP_DIR"]
+    with open(os.path.join(base, "src_multi.mp3"), "rb") as fh:
+        src = fh.read()
+    with open(os.path.join(base, "out_multi.mp3"), "rb") as fh:
+        out = fh.read()
+
+    # The fixture is what it claims: mutagen reads a real tag at each end.
+    assert str(mutagen.id3.ID3(io.BytesIO(src))["TIT2"]) == "Front Title"
+    appended = _appended_id3v2_tags(src)
+    assert len(appended) == 1, f"source appended tags: {appended}"
+    start, end = appended[0]
+    assert str(mutagen.id3.ID3(io.BytesIO(src[start:end]))["TIT2"]) == "Back Title"
+    assert src.endswith(b"TAG" + bytes(125)), "source ID3v1 trailer"
+
+    served = mutagen.id3.ID3(io.BytesIO(out))
+    assert str(served["TIT2"]) == "Interop Title"
+    assert _appended_id3v2_tags(out) == [], "an appended tag survived"
+    # mutagen's size is the whole front tag: what follows it is the audio, to EOF.
+    with open(os.path.join(base, "manifest.json")) as fh:
+        row = next(r for r in json.load(fh) if r["file"] == "out_multi.mp3")
+    audio_start = row["source_audio_offset"]
+    audio = src[audio_start : audio_start + row["source_audio_length"]]
+    assert out[served.size :] == audio
+    for stale in (b"Front Title", b"Back Title", b"3DI"):
+        assert stale not in out, f"{stale!r} survived into the served file"
+
+
+def test_rifx_is_served_as_rifx_and_decodes_like_its_source():
+    """A big-endian RIFX source is served as RIFX (#770), and libsndfile decodes
+    the served file to exactly the source's samples. Decoding them as the
+    fixture's values also proves the preserved `fmt ` is read big-endian."""
+    base = os.environ["MUSEFS_INTEROP_DIR"]
+    src = os.path.join(base, "src_rifx.wav")
+    out = os.path.join(base, "out_rifx.wav")
+    assert _is_rifx(src) and _is_rifx(out)
+    src_samples, src_rate = soundfile.read(src, dtype="int16")
+    out_samples, out_rate = soundfile.read(out, dtype="int16")
+    assert src_samples.tolist() == RIFX_SAMPLES
+    assert (out_samples.tolist(), out_rate) == (RIFX_SAMPLES, src_rate)
 
 
 def test_binary_frames_survive():

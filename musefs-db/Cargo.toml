@@ -6,6 +6,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../README.md"
+keywords = ["music", "metadata", "sqlite", "tags", "fuse"]
+categories = ["database", "multimedia::audio"]
+# Integration tests stay in the repository: they need this crate's
+# `test-support` feature, which only a path dev-dependency turns on, and cargo
+# strips path dev-dependencies at publish, so they could not build from the
+# published crate.
+exclude = ["tests/"]
 
 [dependencies]
 # HexDisplay is the RustCrypto-recommended way to hex-format a digest since
@@ -14,7 +22,9 @@ base16ct = "1.0"
 # fallible_uint enables the checked FromSql/ToSql impls for u64/usize, which
 # validate non-negative row columns at the boundary (the cast-convention spec).
 log = "0.4"
-rusqlite = { version = "0.40", features = ["bundled", "blob", "fallible_uint"] }
+# limits: `Connection::set_limit`, which bounds every value a connection loads
+# (`limits::MAX_ROW_BYTES`).
+rusqlite = { version = "0.40", features = ["bundled", "blob", "fallible_uint", "limits"] }
 sha2 = "0.11"
 strum = { version = "0.28", features = ["derive"] }
 thiserror = "2"

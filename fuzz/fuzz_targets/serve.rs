@@ -152,7 +152,13 @@ fuzz_target!(|data: &[u8]| {
             (b, Format::Flac, s.audio_offset, s.audio_length)
         }
         1 => {
-            let b = musefs_format::fuzz_check::fixtures::wav(&[0i16, 1, -1, 100]);
+            // Either byte order: a RIFX source serves through the same arm (#770).
+            let order = if u.arbitrary::<bool>().unwrap_or(false) {
+                musefs_format::wav::ByteOrder::Big
+            } else {
+                musefs_format::wav::ByteOrder::Little
+            };
+            let b = musefs_format::fuzz_check::fixtures::wav_in(&[0i16, 1, -1, 100], order);
             let s = match musefs_format::wav::locate_audio(&b) {
                 Ok(s) => s,
                 Err(_) => return,

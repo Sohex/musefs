@@ -69,7 +69,8 @@ def main(argv=None, stdin_text=None):
         "--since",
         default=None,
         help="ISO-8601 cutoff; ignore check-runs that started before it (stale "
-        "pre-tag runs). Pass the release run's run_started_at.",
+        "pre-tag runs). Pass the release run's created_at, which a re-run "
+        "keeps (run_started_at resets on every re-run attempt).",
     )
     args = parser.parse_args(argv)
 

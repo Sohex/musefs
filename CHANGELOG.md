@@ -16,6 +16,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Big-endian RIFX WAV files scan and serve**
+  ([#770](https://github.com/Sohex/musefs/issues/770)). A `RIFX` file was refused
+  as not a WAV. It is now read with big-endian sizes and served as RIFX, with
+  every chunk musefs writes (`LIST`/`INFO`, `id3 `, `data`) sized big-endian, as
+  libsndfile writes it. Nothing new is stored: the byte order is read from the
+  backing file's own header at serve time.
+
 - **An owed revalidate is reported until it runs.** `migrate` reports how many
   tracks the upgrade left needing a revalidate, but only once, and that line
   scrolls away. Now `mount`, `scan` and `revalidate` each print a warning with
@@ -119,6 +126,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   much memory is this using" honestly.
 
 ### Changed
+
+- The published crates no longer include integration tests and benches that
+  cannot build outside the repository: they reach sibling crates or a
+  `test-support` feature through path-only dev-dependencies, which cargo strips
+  at publish. `musefs` keeps its tests, which build.
 
 - **The store's `tracks` table is rebuilt** by the 2.0.0 migration, which is
   what makes the upgrade gated: `musefs migrate` runs it, and the store then no
@@ -271,7 +283,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and `PendingMigration` drives `musefs migrate`; `StoreInUse` names its
   operation, and `ArtDigestMismatch`, `DerivedStateStale`, `TrackIdentity`,
   `refresh_embedded_art`/`EmbeddedArt` and `count_tracks_awaiting_revalidate`
-  are new. `Segment::OggAudio`, `FuseTelemetry`, `render_prometheus`, the
+  are new, as are `Db::upsert_track_with_checksums` (and its `BulkWriter` twin),
+  `DbError::WrongStorageClass`, `DbError::AmbiguousDuplicatePath`,
+  `limits::MAX_ROW_BYTES`, `DuplicatePath` with `Rejections::{duplicates,
+  relinked}`, and for MP3 `mp3::read_metadata`/`Mp3Metadata`,
+  `mp3::locate_trailer`/`Mp3Trailer` and `Mp3Bounds::id3v2_tags`.
+  `Segment::OggAudio`, `FuseTelemetry`, `render_prometheus`, the
   virtual tree's name types and `DbError::FieldTooLarge` change shape too. The
   [release notes](https://sohex.github.io/musefs/release-notes.html#upgrading-from-v130)
   list every break.
@@ -441,6 +458,90 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   outside the test suites called them.
 
 ### Fixed
+
+- **A WAV whose waveform is a `LIST('wavl')` is refused by name**
+  ([#769](https://github.com/Sohex/musefs/issues/769)). It was skipped as
+  unparseable. No mainstream decoder plays that layout, so it is now counted as
+  `unsupported` with the reason "WAVE waveform stored as LIST('wavl')", and a
+  stored row for a WAV later rewritten that way is removable by
+  `revalidate --prune`. The WAV format page now states the supported surface:
+  RIFF and RIFX, `wavl` refused, RF64/BW64 out of scope.
+
+- **Upgrading a 1.0.0 store no longer drops long tags.** The 1.1.0 step that made
+  `tags.value`'s cap count bytes rebuilt the table at 256 KiB and deleted every
+  tag past it, which 1.0.0's character-counted cap had admitted and served (a
+  multibyte lyrics tag, for one). `musefs migrate` reported nothing, since the
+  step after it would have kept the row. That step now rebuilds at the widened
+  16 MiB − 1 cap, so a store still at schema version 1 keeps every tag.
+
+- **`musefs vacuum` no longer holds the store after being refused.** When another
+  connection had the store open, the refused claim left the vacuuming connection
+  in exclusive locking mode, so its next statement locked everything else out
+  ([#721](https://github.com/Sohex/musefs/issues/721)).
+
+- **A track deleted before the upgrade keeps its id retired.** The rebuild set
+  the id sequence to the highest id still standing, so a track deleted from the
+  top of the range before `musefs migrate` could have its id handed out again,
+  while the changelog still named it for the old track
+  ([#678](https://github.com/Sohex/musefs/issues/678)). A changelog row naming id
+  9223372036854775807, which the old ring accepted, is skipped rather than
+  seeding the sequence at its maximum, where the upgraded store could not have
+  added another track.
+
+- **A rewrite that changes only a file's ctime invalidates its synthesized
+  file**, unless a fingerprint or content hash written with the new stamp proves
+  the bytes unchanged. A same-size rewrite that restored its mtime left
+  `content_version` and the served mtime untouched, so a kernel page cache kept
+  serving the old bytes; a chmod still does not bump.
+
+- **Reading a hostile store row is bounded where the value is loaded.** Every
+  connection limits a string, blob or row to the widest the schema admits
+  (16 MiB + 1117 bytes), so SQLite refuses anything larger instead of loading it
+  before musefs's own length guards run; and the `backing_path` readers refuse a
+  path over its cap, or not stored as bytes, without loading it
+  ([#693](https://github.com/Sohex/musefs/issues/693),
+  [#758](https://github.com/Sohex/musefs/issues/758)).
+
+- **`musefs migrate --repair` is less destructive and all-or-nothing**
+  ([#705](https://github.com/Sohex/musefs/issues/705),
+  [#761](https://github.com/Sohex/musefs/issues/761)). A picture link to an art row
+  with a non-canonical digest moves onto a correctly filed row holding the same
+  bytes instead of being deleted; a path stored twice (as text and as bytes)
+  keeps the row carrying tags or picture links, and is refused for you to
+  resolve when both do; and the deletes run inside the upgrade's transaction, so
+  an upgrade that fails leaves the store unchanged.
+
+- **An MP3 that begins with more than one ID3v2 tag scans**
+  ([#767](https://github.com/Sohex/musefs/issues/767)). Both audio locators
+  stepped over only the first tag and refused the file as not MP3. They now step
+  over the whole run, and the tags' contents are merged as below.
+
+- **An appended ID3v2 tag is no longer served as audio, and is ingested**
+  ([#768](https://github.com/Sohex/musefs/issues/768)). A tag after the audio,
+  found by its `3DI` footer at the end of the file or beside an ID3v1 trailer,
+  stayed inside the audio region: its metadata never reached the store, and a
+  file tagged at both ends served fresh metadata at the front and the stale tag
+  at the end. Every ID3v2 tag at either end is now excluded from the audio, and
+  their contents are merged in file order as ID3v2.4 §5 specifies: a later tag
+  replaces the earlier one unless it sets the update flag, in which case only its
+  unique frames override. The scan reads each appended tag's declared extent from
+  the end of the file, within the probe ceiling, never the audio.
+
+- **The published crates carry their license.** None of the six `.crate` files
+  included the MIT `LICENSE`, which has to travel with the code; each crate now
+  ships it, and the crates that lacked them gained a README, keywords,
+  categories and crate-level documentation for crates.io and docs.rs.
+
+- **A release can pass its gate after a re-run.** The release workflow ignored
+  check-runs that started before its own `run_started_at`, which GitHub resets
+  on every re-run attempt, so re-running CI's failed jobs and then the release
+  timed out waiting for runs that had already happened. It now uses the run's
+  `created_at`, which stays at the tag push.
+
+- **The `bitmaps` advisories are cleared.** `imbl` 7.0.2 no longer depends on
+  `bitmaps`, which removes RUSTSEC-2026-0247 (unmaintained) and
+  RUSTSEC-2025-0167 (unsound, and unreachable from musefs); their audit and
+  deny ignores are gone with it.
 
 - **An open file no longer serves read-ahead cached before a backing rewrite**
   once the row is restamped. A handle's read-ahead windows are keyed by backing
