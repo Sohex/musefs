@@ -42,7 +42,8 @@ described here is shared with WAV's embedded `id3 ` chunk — see
 ## Where the tags are
 
 ID3v2.4 lets a tag be prepended to the audio, appended after it, or both
-([ID3v2.4.0 structure §5](https://id3.org/id3v2.4.0-structure)). musefs finds
+([ID3v2.4.0 structure §5](https://mutagen-specs.readthedocs.io/en/latest/id3/id3v2.4.0-structure.html)).
+musefs finds
 the tags at both ends of the file, and none of their bytes is served as audio
 ([#767](https://github.com/Sohex/musefs/issues/767),
 [#768](https://github.com/Sohex/musefs/issues/768)):
@@ -82,7 +83,9 @@ Two things at the end of a file are not recognised:
 - **The `SEEK` frame** (frames §4.29) is not followed. It points at a further
   tag within the stream, and musefs looks for tags only at the two ends of the
   file. The layout the frame exists for, a prepended tag plus an appended one,
-  is found by the footer search regardless.
+  is found by the footer search regardless. §5 requires the prepended tag of
+  that layout to have a `SEEK` frame, but its suggested search ends by looking
+  for a footer from the back of the file, and that step is the one musefs takes.
 - **APEv2 tags.** An APEv2 tag at the end of an MP3 stays inside the audio
   region, and so does an appended ID3v2 tag in front of it, because the footer
   search starts at the end of the file and stops at the APE footer. An ID3v1
@@ -91,47 +94,85 @@ Two things at the end of a file are not recognised:
 ## Which tag wins
 
 When a file carries more than one ID3v2 tag, their contents are merged in file
-order: the prepended run first, then the appended tags. The rule is §5's:
+order: the prepended run first, then the appended tags. The first tag starts the
+merge. Each tag after it either **updates** what has been merged so far or
+**replaces** it, and which of the two is decided by that tag's own version:
 
-> For every new tag that is found, the old tag should be discarded unless the
-> update flag in the extended header (section 3.2) is set.
+- **A v2.3 tag updates.** ID3v2.3 has no update flag. Its extended header
+  defines only a CRC flag (§3.2), and instead
+  [ID3v2.3.0 §4.19](https://mutagen-specs.readthedocs.io/en/latest/id3/id3v2.3.0.html)
+  makes every later tag an update:
 
-- **A later tag without the update flag replaces everything before it.** This
-  also fits §5's own prepend-and-append layout, in which the prepended tag
-  holds "all vital information" for streaming and the appended tag is the one
-  a reader that reaches the end is meant to keep.
-- **A later tag with the update flag overrides only what it carries.** §3.2
-  defines the flag as "the present tag is an update of a tag found earlier in
-  the present file or stream. If frames defined as unique are found in the
-  present tag, they are to override any corresponding ones found in the earlier
-  tag." Uniqueness comes from the
-  [ID3v2.4.0 frames](https://id3.org/id3v2.4.0-frames) document, applied at the
-  grain the store keeps:
-  - text, `TXXX`, `COMM` and `USLT` frames override by store key, compared
-    case-insensitively as the store compares keys. A `TXXX` is therefore
-    unique by its description, and a `COMM`/`USLT` by its language and
-    descriptor;
-  - a `POPM` overrides `rating` and `playcount` together, since both come from
-    one frame;
-  - an `APIC` overrides the pictures with the same description;
-  - `UFID`, `AENC`, `RVA2` and `EQU2` override by their owner or identification
-    string;
-  - the frames allowed once per tag (`MCDI`, `ETCO`, `MLLT`, `SYTC`, `RVRB`,
-    `PCNT`, `RBUF`, `POSS`, `OWNE`, `SEEK`, `ASPI`, and every URL frame but
-    `WXXX`, `WCOM` and `WOAR`) override by frame id;
-  - any other binary frame is kept from both tags, with byte-identical copies
-    collapsed. That includes the frames unique by a descriptor musefs does not
-    decode (`GEOB`, `WXXX`, `SYLT`, `USER`, `ENCR`, `GRID`), which can
-    consequently appear twice.
+  > Every tag that is picked up after the initial/first tag is to be
+  > considered as an update of the previous one. E.g. if there is a "TIT2"
+  > frame in the first received tag and one in the second tag, then the first
+  > should be 'replaced' with the second.
+
+- **A v2.2 tag updates too.** The
+  [ID3v2.2 document](https://mutagen-specs.readthedocs.io/en/latest/id3/id3v2.2.html)
+  (`id3v2-00`) says nothing about a file or stream carrying more than one tag,
+  so musefs applies the rule of v2.3, its successor.
+- **A v2.4 tag updates only when it carries the update flag, and otherwise
+  replaces everything merged before it.**
+  [ID3v2.4.0 structure §5](https://mutagen-specs.readthedocs.io/en/latest/id3/id3v2.4.0-structure.html):
+
+  > For every new tag that is found, the old tag should be discarded unless the
+  > update flag in the extended header (section 3.2) is set.
+
+  Replacing also fits §5's own prepend-and-append layout, in which the
+  prepended tag holds "all vital information" for streaming and the appended
+  tag is the one a reader that reaches the end is meant to keep.
+- **Only the later tag's version counts, not the versions before it.** A v2.4
+  tag without the flag after a v2.3 tag replaces it; a v2.3 tag after a v2.4
+  tag updates it.
+
+An update overrides only what it carries. §3.2 of the v2.4 structure document
+defines the flag as "the present tag is an update of a tag found earlier in the
+present file or stream. If frames defined as unique are found in the present
+tag, they are to override any corresponding ones found in the earlier tag."
+Which frames are unique, and by what, each frames document states frame by
+frame: §4 of the v2.3 document, and the
+[ID3v2.4.0 frames](https://mutagen-specs.readthedocs.io/en/latest/id3/id3v2.4.0-frames.html)
+document. The two agree except where noted below. musefs applies them at the
+grain the store keeps:
+
+- text, `TXXX`, `COMM` and `USLT` frames override by store key, compared
+  case-insensitively as the store compares keys. A `TXXX` is therefore unique
+  by its description, and a `COMM`/`USLT` by its language and descriptor;
+- a `POPM` overrides `rating` and `playcount` together, since both come from
+  one frame. Both versions allow one `POPM` per email address, but the store
+  does not keep the address;
+- an `APIC` overrides the pictures with the same description;
+- `UFID`, `AENC`, `RVA2` and `EQU2` override by their owner or identification
+  string;
+- the frames allowed once per tag override by frame id: `MCDI`, `ETCO`, `MLLT`,
+  `SYTC`, `RVRB`, `PCNT`, `RBUF`, `POSS`, `OWNE`, `SEEK`, `ASPI`, every URL
+  frame but `WXXX`, `WCOM` and `WOAR`, and the frames only v2.3 defines, `IPLS`,
+  `RVAD` and `EQUA`;
+- `USER` depends on the version. v2.3 says "There may only be one "USER" frame
+  in a tag", so a v2.3 update's `USER` overrides every earlier one. v2.4 allows
+  one per language, which musefs does not decode, so a v2.4 update's `USER` is
+  treated like the frames below;
+- any other binary frame is kept from both tags, with byte-identical copies
+  collapsed. That includes the frames unique by a descriptor musefs does not
+  decode (`GEOB`, `WXXX`, `SYLT`, `ENCR`, `GRID`), which can consequently
+  appear twice;
+- a v2.2 tag's binary frames are not extracted (see below), so a v2.2 update
+  overrides text keys and pictures only.
+
+Three more points about the order and the tags merged:
+
 - **Position decides which tag is later.** §5 finds a prepended tag first and
   appended tags by scanning backwards, but §3.2 defines an update against a tag
   "found earlier in the present file or stream", and in a stream, the case the
   flag was designed for, tags arrive in file order. So several appended tags are
   merged front to back, the same as a prepended run.
-- **A prepended run follows the same rule.** ID3v2.3 and earlier have no update
-  flag, so in a run of older tags the last tag wins outright; a v2.4 tag in the
-  run can still mark itself an update. A player that reads only the first tag
-  will show the first tag's metadata for such a file.
+- **A prepended run follows the same rule, as musefs reads the specs.** The
+  v2.4 document does not address several prepended tags back to back: §5
+  describes one prepended tag, one appended tag, or one of each. Merging such a
+  run in file order is musefs's reading. v2.3's §4.19 speaks of tags picked up
+  one after another in a stream, whatever their position. A player that reads
+  only the first tag will show that tag's metadata for such a file.
 - **A tag musefs cannot read discards nothing.** A tag the allocation guard
   refuses (see below) contributes no tags, and it does not wipe out the tags
   before it either: replacing readable metadata with none would lose
