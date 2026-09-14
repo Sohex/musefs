@@ -18,6 +18,10 @@ ones is the job of `musefs revalidate` — see
 [Maintenance](maintenance.md#refreshing-the-store-musefs-revalidate).) It takes
 one or more files or directories, and `--jobs N` controls probe parallelism. `--follow-symlinks` walks symlinked
 files and directories (off by default, so symlinks are logged and skipped).
+A followed link is judged by the file it points at, not by its own name: a link
+named `track` or `notes.txt` that points at a FLAC is scanned as that FLAC, and
+one named `song.flac` that points at a text file counts as skipped. It is stored
+under the path it resolves to.
 `--quiet` (`-q`) suppresses the per-target summary for scripting; scan
 failures still surface on stderr (raise detail with `-v`/`-vv`, or
 `RUST_LOG=info`).
