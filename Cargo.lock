@@ -997,6 +997,7 @@ dependencies = [
  "musefs-db",
  "musefs-fuse",
  "rusqlite",
+ "rustix",
  "signal-hook",
  "tempfile",
  "uzers",

@@ -768,49 +768,136 @@ pub fn run_vacuum(db: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The peak free space an upgrade of a `footprint`-byte store needs on one
-/// filesystem, as `copies` whole copies of it.
+/// The free space an upgrade of a `footprint`-byte store needs on each
+/// filesystem it writes to, in the order store, snapshot, temporary files.
 ///
-/// SQLite stages a rewritten page in the write-ahead log before committing it,
-/// so a migration that touches every row transiently has the store on disk
-/// twice; a snapshot alongside it is another whole copy. Both are estimates
-/// from the store's current size, which is the only number available before the
-/// work is done — deliberately not padded, since the point is to refuse a run
-/// that would fail part-way through rather than to reserve headroom.
-fn space_needed(footprint: u64, copies: u64) -> u64 {
-    footprint.saturating_mul(copies)
+/// The run passes through phases, and each leaves copies of the store on disk
+/// at its peak, measured on a library-shaped store (#705):
+///
+/// 1. the row check copies every row into a temporary database in SQLite's
+///    temporary directory — the store once — and deletes it again;
+/// 2. the snapshot writes a compacted copy, at most the store once, which stays;
+/// 3. the upgrade rebuilds every table in one transaction under a rollback
+///    journal: the file grows by a copy of its tables while the journal holds the
+///    original of every page overwritten, twice the store beside it until the
+///    commit;
+/// 4. a vacuum keeps that grown file while it writes the compacted store to the
+///    write-ahead log — twice the store beside it again — and builds the copy in
+///    a temporary database first, the store once more in the temporary directory.
+///
+/// A filesystem needs its largest phase, adding up whatever that phase puts on
+/// it; the snapshot phase alone is never the largest, since the upgrade keeps
+/// the snapshot and adds to it. Copies of the store's current size are the only
+/// estimate available before the work is done, and they are deliberately not
+/// padded: the point is to refuse a run that would fail part-way through, not to
+/// reserve headroom.
+fn space_requirements<D: Clone + PartialEq>(
+    footprint: u64,
+    store: &D,
+    snapshot: Option<&D>,
+    temp: &D,
+    vacuum: bool,
+) -> Vec<(D, u64)> {
+    let mut phases: Vec<Vec<(&D, u64)>> = vec![vec![(temp, 1)]];
+    let mut upgrade: Vec<(&D, u64)> = snapshot.map(|d| (d, 1)).into_iter().collect();
+    upgrade.push((store, 2));
+    if vacuum {
+        let mut compaction = upgrade.clone();
+        compaction.push((temp, 1));
+        phases.push(compaction);
+    }
+    phases.push(upgrade);
+
+    let mut filesystems = vec![store.clone()];
+    for fs in snapshot.into_iter().chain([temp]) {
+        if !filesystems.contains(fs) {
+            filesystems.push(fs.clone());
+        }
+    }
+    filesystems
+        .into_iter()
+        .map(|fs| {
+            let copies = phases
+                .iter()
+                .map(|phase| {
+                    phase
+                        .iter()
+                        .filter(|(on, _)| **on == fs)
+                        .map(|(_, copies)| copies)
+                        .sum::<u64>()
+                })
+                .max()
+                .unwrap_or(0);
+            (fs, footprint.saturating_mul(copies))
+        })
+        .collect()
 }
 
-/// Free space on the filesystem holding `path`'s directory. `path` itself need
-/// not exist; its parent must.
-fn free_space_for(path: &Path) -> Result<u64> {
-    let dir = path
-        .parent()
+/// A filesystem the upgrade writes to: the device holding a directory, or the
+/// directory itself where it cannot be stat'd.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Filesystem {
+    Device(u64),
+    Unknown(PathBuf),
+}
+
+/// The filesystem holding `dir`. Decided by device, not by directory: a
+/// `--snapshot` elsewhere on the store's disk draws on the same free space.
+fn filesystem_of(dir: &Path) -> Filesystem {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(dir).map_or_else(
+        |_| Filesystem::Unknown(dir.to_path_buf()),
+        |meta| Filesystem::Device(meta.dev()),
+    )
+}
+
+/// The directory `path` sits in, `.` for a bare file name.
+fn parent_dir(path: &Path) -> &Path {
+    path.parent()
         .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
+        .unwrap_or(Path::new("."))
+}
+
+/// The directory SQLite writes its temporary databases to: the row check's, and
+/// a vacuum's working copy.
+///
+/// SQLite's unix VFS takes the first of `SQLITE_TMPDIR`, `TMPDIR`, `/var/tmp`,
+/// `/usr/tmp` and `/tmp` that is a directory the process can write to and
+/// search, and `.` when none is (`unixTempFileDir`). It reads the environment
+/// each time it creates one, so this finds the directory it will use.
+fn sqlite_temp_dir() -> PathBuf {
+    use rustix::fs::{Access, access};
+    sqlite_temp_dir_from(
+        |var| std::env::var_os(var),
+        |dir| dir.is_dir() && access(dir, Access::WRITE_OK | Access::EXEC_OK).is_ok(),
+    )
+}
+
+/// [`sqlite_temp_dir`]'s order, over any environment and test of a directory.
+fn sqlite_temp_dir_from(
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    usable: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    ["SQLITE_TMPDIR", "TMPDIR"]
+        .into_iter()
+        .filter_map(|var| env(var).map(PathBuf::from))
+        .chain(["/var/tmp", "/usr/tmp", "/tmp"].map(PathBuf::from))
+        .find(|dir| usable(dir))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Free space on the filesystem holding `dir`.
+fn free_space_in(dir: &Path) -> Result<u64> {
     fs4::available_space(dir).with_context(|| format!("checking free space on {}", dir.display()))
 }
 
-/// Whether `a` and `b` would be written to the same filesystem, judged by the
-/// device of the directories they sit in. Where either directory cannot be
-/// stat'd, or on a platform without device ids, it falls back to the two being
-/// the same directory.
-fn same_filesystem(a: &Path, b: &Path) -> bool {
-    let dir = |p: &Path| {
-        p.parent()
-            .filter(|d| !d.as_os_str().is_empty())
-            .unwrap_or(Path::new("."))
-            .to_path_buf()
-    };
-    let (dir_a, dir_b) = (dir(a), dir(b));
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if let (Ok(meta_a), Ok(meta_b)) = (std::fs::metadata(&dir_a), std::fs::metadata(&dir_b)) {
-            return meta_a.dev() == meta_b.dev();
-        }
-    }
-    dir_a == dir_b
+/// What `migrate` asks of the disks it is about to write to: a seam, so a test
+/// can stand in a filesystem with less room than the one it runs on.
+struct Disks<'a> {
+    /// Free space on the filesystem holding a directory.
+    available: &'a dyn Fn(&Path) -> Result<u64>,
+    /// The directory SQLite writes its temporary databases to.
+    temp_dir: &'a dyn Fn() -> PathBuf,
 }
 
 /// Where a snapshot goes when the user did not say: the store's own path with
@@ -861,6 +948,17 @@ fn common_library_root(paths: &[PathBuf]) -> Option<PathBuf> {
 /// (#750): the store is upgraded either way, but a script chaining on the exit
 /// status must be able to tell a partial revalidate from a clean one.
 pub fn run_migrate(args: &MigrateArgs) -> Result<u64> {
+    run_migrate_on(
+        args,
+        &Disks {
+            available: &free_space_in,
+            temp_dir: &sqlite_temp_dir,
+        },
+    )
+}
+
+/// [`run_migrate`] against `disks`.
+fn run_migrate_on(args: &MigrateArgs, disks: &Disks<'_>) -> Result<u64> {
     // The parser refuses these combinations, but this function is public and
     // its arguments are plain fields, so it enforces them itself. The first one
     // guards the only destructive step: `--repair` deletes rows, and the
@@ -914,6 +1012,23 @@ pub fn run_migrate(args: &MigrateArgs) -> Result<u64> {
          than this one will no longer open it."
     );
 
+    // Checking the rows copies every one of them into a temporary database, so
+    // the room for that is checked before the check runs rather than with the
+    // rest below.
+    let footprint = store_footprint(db);
+    let temp_dir = (disks.temp_dir)();
+    let temp_free = (disks.available)(&temp_dir)?;
+    if temp_free < footprint {
+        anyhow::bail!(
+            "not enough free space for SQLite's temporary files in {}: checking the \
+             store's rows needs about {}, have {}. Free some space there, or point \
+             SQLITE_TMPDIR at a directory with room. Nothing has been changed",
+            temp_dir.display(),
+            HumanBytes(footprint),
+            HumanBytes(temp_free)
+        );
+    }
+
     // The rows the new shapes refuse, before anything is copied or written.
     // Ordered here deliberately: a user who is going to be stopped should be
     // stopped before being asked about disk, snapshots or confirmation.
@@ -941,7 +1056,6 @@ pub fn run_migrate(args: &MigrateArgs) -> Result<u64> {
         }
     }
 
-    let footprint = store_footprint(db);
     let snapshot = if args.no_snapshot {
         None
     } else {
@@ -975,39 +1089,68 @@ pub fn run_migrate(args: &MigrateArgs) -> Result<u64> {
         );
     }
 
-    // The store's own filesystem carries the rewrite, and the snapshot too when
-    // the snapshot lands on that same filesystem. That is decided by device, not
-    // by directory: a `--snapshot` elsewhere on the same disk draws on the same
-    // free space. A snapshot on another filesystem is checked on its own.
-    let snapshot_shares_store_fs = snapshot.as_ref().is_some_and(|d| same_filesystem(d, db));
-    let copies = 1 + u64::from(snapshot_shares_store_fs);
-    let needed = space_needed(footprint, copies);
-    let available = free_space_for(db)?;
+    // Every filesystem the run writes to has to hold its largest phase. An
+    // unanswered vacuum offer counts when there is a terminal to put it to,
+    // since it may be accepted; off one it declines itself.
+    let vacuum = args.vacuum.unwrap_or_else(prompt::interactive);
+    let store_dir = parent_dir(db);
+    let snapshot_dir = snapshot.as_deref().map(parent_dir);
+    let store_fs = filesystem_of(store_dir);
+    let snapshot_fs = snapshot_dir.map(filesystem_of);
+    let temp_fs = filesystem_of(&temp_dir);
     println!(
-        "store is {}; the upgrade needs about {} free and has {}.",
-        HumanBytes(footprint),
-        HumanBytes(needed),
-        HumanBytes(available)
+        "store is {}; the upgrade needs, on each filesystem it writes to:",
+        HumanBytes(footprint)
     );
-    if available < needed {
-        anyhow::bail!(
-            "not enough free space on {}: need about {}, have {}. Free some space, \
-             or pass --no-snapshot to skip the copy",
-            db.parent().unwrap_or(Path::new(".")).display(),
-            HumanBytes(needed),
-            HumanBytes(available)
-        );
-    }
-    if let Some(dest) = &snapshot
-        && !snapshot_shares_store_fs
+    for (fs, need) in
+        space_requirements(footprint, &store_fs, snapshot_fs.as_ref(), &temp_fs, vacuum)
     {
-        let there = free_space_for(dest)?;
-        if there < footprint {
+        let (has_store, has_snapshot, has_temp) = (
+            store_fs == fs,
+            snapshot_fs.as_ref() == Some(&fs),
+            temp_fs == fs,
+        );
+        let dir = match snapshot_dir {
+            _ if has_store => store_dir,
+            Some(snapshot_dir) if has_snapshot => snapshot_dir,
+            _ => temp_dir.as_path(),
+        };
+        let roles = [
+            (has_store, "the store"),
+            (has_snapshot, "the snapshot"),
+            (has_temp, "SQLite's temporary files"),
+        ]
+        .into_iter()
+        .filter_map(|(here, role)| here.then_some(role))
+        .collect::<Vec<_>>()
+        .join(", ");
+        let have = (disks.available)(dir)?;
+        println!(
+            "  {} ({roles}): about {} free, has {}",
+            dir.display(),
+            HumanBytes(need),
+            HumanBytes(have)
+        );
+        if have < need {
+            let mut ways = vec!["free some space there"];
+            if has_snapshot {
+                ways.push(
+                    "pass --no-snapshot to skip the copy, or --snapshot PATH to put it elsewhere",
+                );
+            }
+            if vacuum && (has_store || has_temp) {
+                ways.push("pass --vacuum=false to skip the compaction");
+            }
+            if has_temp {
+                ways.push("point SQLITE_TMPDIR at a filesystem with room");
+            }
             anyhow::bail!(
-                "not enough free space for the snapshot at {}: need about {}, have {}",
-                dest.display(),
-                HumanBytes(footprint),
-                HumanBytes(there)
+                "not enough free space on {} ({roles}): need about {}, have {}. To go \
+                 ahead, {}. Nothing has been changed",
+                dir.display(),
+                HumanBytes(need),
+                HumanBytes(have),
+                ways.join("; or ")
             );
         }
     }
@@ -1311,13 +1454,172 @@ mod tests {
         assert_eq!(revalidate_owed_warning(&db, store).unwrap(), None);
     }
 
+    /// #705: each filesystem needs its largest phase, adding up what that phase
+    /// puts on it. Everything on one filesystem with a snapshot is three copies
+    /// of the store, four with a vacuum — what the measured runs peaked at.
     #[test]
-    fn space_needed_scales_with_the_copies_and_saturates() {
-        assert_eq!(space_needed(100, 1), 100);
-        assert_eq!(space_needed(100, 2), 200);
+    fn space_requirements_add_up_each_phase_where_it_writes() {
+        const F: u64 = 1000;
+        let req = |snapshot: Option<&u8>, temp: &u8, vacuum| {
+            space_requirements(F, &0u8, snapshot, temp, vacuum)
+        };
+        assert_eq!(req(Some(&0), &0, false), vec![(0, 3 * F)]);
+        assert_eq!(req(Some(&0), &0, true), vec![(0, 4 * F)]);
+        // Without a snapshot the rebuild alone outgrows the row check.
+        assert_eq!(req(None, &0, false), vec![(0, 2 * F)]);
+        assert_eq!(req(None, &0, true), vec![(0, 3 * F)]);
+        // A snapshot on its own filesystem is one copy there, none beside the store.
+        assert_eq!(req(Some(&1), &0, false), vec![(0, 2 * F), (1, F)]);
+        // Temporary files elsewhere: the row check and a vacuum's working copy
+        // are each the store once, and never there at the same time.
+        assert_eq!(req(Some(&0), &2, true), vec![(0, 3 * F), (2, F)]);
+        assert_eq!(req(Some(&1), &2, false), vec![(0, 2 * F), (1, F), (2, F)]);
+        // A vacuum's working copy lands on the snapshot's filesystem with it.
+        assert_eq!(req(Some(&1), &1, true), vec![(0, 2 * F), (1, 2 * F)]);
         // A nonsense footprint must not wrap the estimate to a small number and
         // wave through a run that cannot fit.
-        assert_eq!(space_needed(u64::MAX, 2), u64::MAX);
+        assert_eq!(
+            space_requirements(u64::MAX, &0u8, Some(&0), &0, true),
+            vec![(0, u64::MAX)]
+        );
+    }
+
+    /// The row check and a vacuum write where SQLite puts temporary files, which
+    /// is often a RAM-backed `/tmp`. The pre-flight has to find the same
+    /// directory SQLite will, in SQLite's order.
+    #[test]
+    fn sqlite_temp_dir_is_found_the_way_sqlite_finds_it() {
+        fn env(
+            pairs: &'static [(&'static str, &'static str)],
+        ) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+            move |var| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == var)
+                    .map(|(_, v)| std::ffi::OsString::from(v))
+            }
+        }
+        let any = |_: &Path| true;
+        assert_eq!(
+            sqlite_temp_dir_from(env(&[("SQLITE_TMPDIR", "/a"), ("TMPDIR", "/b")]), any),
+            PathBuf::from("/a")
+        );
+        assert_eq!(
+            sqlite_temp_dir_from(env(&[("TMPDIR", "/b")]), any),
+            PathBuf::from("/b")
+        );
+        assert_eq!(
+            sqlite_temp_dir_from(env(&[]), any),
+            PathBuf::from("/var/tmp")
+        );
+        // A directory it cannot use is passed over, in order, down to `.`.
+        assert_eq!(
+            sqlite_temp_dir_from(env(&[("SQLITE_TMPDIR", "/a")]), |d| {
+                d != Path::new("/a") && d != Path::new("/var/tmp")
+            }),
+            PathBuf::from("/usr/tmp")
+        );
+        assert_eq!(
+            sqlite_temp_dir_from(env(&[("TMPDIR", "/b")]), |_| false),
+            PathBuf::from(".")
+        );
+    }
+
+    /// #705: a filesystem without the room its largest phase needs is refused
+    /// before anything is written — no snapshot, no rewrite — naming the ways
+    /// out. The boundary is exact: the same run with that room completes.
+    #[test]
+    fn migrate_refuses_up_front_when_a_filesystem_is_short() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("library.db");
+        musefs_db::seed_store_at_version(&db, musefs_db::LATEST_VERSION - 1).unwrap();
+        let version = |path: &Path| -> i64 {
+            rusqlite::Connection::open(path)
+                .unwrap()
+                .pragma_query_value(None, "user_version", |r| r.get(0))
+                .unwrap()
+        };
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .unwrap();
+        let before = std::fs::read(&db).unwrap();
+        let untouched = |what: &str| {
+            assert_eq!(
+                std::fs::read(&db).unwrap(),
+                before,
+                "{what}: store untouched"
+            );
+            let names: Vec<String> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            assert!(
+                !names.iter().any(|n| n.contains(".bak")),
+                "{what}: no snapshot written: {names:?}"
+            );
+        };
+        let cli = Cli::parse_from([
+            "musefs",
+            "migrate",
+            "--db",
+            db.to_str().unwrap(),
+            "--yes",
+            "--jobs",
+            "1",
+        ]);
+        let Command::Migrate(args) = cli.command else {
+            panic!("expected Migrate");
+        };
+        let temp = dir.path().join("tmp");
+        std::fs::create_dir(&temp).unwrap();
+        let temp_dir = || temp.clone();
+
+        // The row check's temporary database, refused before it is built.
+        let err = run_migrate_on(
+            &args,
+            &Disks {
+                available: &|d| {
+                    Ok(if d == temp {
+                        store_footprint(&db) - 1
+                    } else {
+                        u64::MAX
+                    })
+                },
+                temp_dir: &temp_dir,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("SQLITE_TMPDIR"), "{err}");
+        untouched("short of temporary space");
+
+        // One filesystem for everything, with a snapshot and no vacuum: three
+        // copies of the store at the rebuild's peak.
+        let err = run_migrate_on(
+            &args,
+            &Disks {
+                available: &|_| Ok(3 * store_footprint(&db) - 1),
+                temp_dir: &temp_dir,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not enough free space on"), "{err}");
+        assert!(err.contains("--no-snapshot"), "{err}");
+        assert_eq!(version(&db), musefs_db::LATEST_VERSION - 1);
+        untouched("one byte short");
+
+        run_migrate_on(
+            &args,
+            &Disks {
+                available: &|_| Ok(3 * store_footprint(&db)),
+                temp_dir: &temp_dir,
+            },
+        )
+        .unwrap();
+        assert_eq!(version(&db), musefs_db::LATEST_VERSION);
     }
 
     #[test]
@@ -1337,24 +1639,25 @@ mod tests {
     /// the same free space as the rewrite, so the pre-flight has to count both
     /// against it; one on another filesystem does not.
     #[test]
-    fn same_filesystem_is_decided_by_device_not_directory() {
+    fn filesystems_are_told_apart_by_device_not_directory() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("db")).unwrap();
         std::fs::create_dir(dir.path().join("backups")).unwrap();
-        assert!(
-            same_filesystem(
-                &dir.path().join("backups/library.db.v3.bak"),
-                &dir.path().join("db/library.db")
-            ),
+        assert_eq!(
+            filesystem_of(&dir.path().join("backups")),
+            filesystem_of(&dir.path().join("db")),
             "different directories on one filesystem"
         );
         #[cfg(target_os = "linux")]
-        assert!(
-            !same_filesystem(
-                Path::new("/proc/library.db.v3.bak"),
-                &dir.path().join("db/library.db")
-            ),
+        assert_ne!(
+            filesystem_of(Path::new("/proc")),
+            filesystem_of(&dir.path().join("db")),
             "procfs is another filesystem"
+        );
+        // A directory that cannot be stat'd is only ever the same as itself.
+        assert_eq!(
+            filesystem_of(Path::new("/nonexistent/musefs")),
+            Filesystem::Unknown(PathBuf::from("/nonexistent/musefs"))
         );
     }
 

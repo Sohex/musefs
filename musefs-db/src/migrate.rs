@@ -490,17 +490,33 @@ impl PendingMigration {
     /// store. The identity check runs here, against the shape the migration was
     /// supposed to produce.
     ///
-    /// This is where the connection stops being a migration handle and becomes
-    /// an ordinary [`Db`], so it picks up the one pragma [`Db::open`] sets that
-    /// the pre-flight had no use for: write-ahead logging, which is what keeps
-    /// a reader and a writer off each other's backs. A musefs store is already
-    /// in WAL — the mode is persistent and every other open sets it — so this
-    /// is belt and braces for a store that arrived some other way.
+    /// The rebuild runs under a rollback journal, not the write-ahead log the
+    /// store otherwise uses, because of what each has to hold until the one
+    /// transaction commits (#705). The upgrade copies every table twice, so the
+    /// log would carry every page written — about twice the store — on top of
+    /// the file growing by a copy of its tables, and a checkpoint then copies it
+    /// all back in. A rollback journal holds only the original content of the
+    /// pages the transaction overwrites, at most the store once. Measured on a
+    /// library-shaped store, the store's own filesystem peaks at three times
+    /// the store instead of four. Both commit atomically: a run killed part-way
+    /// leaves a hot journal, which the next open of the store by any SQLite
+    /// rolls back before reading, leaving the store as it was.
+    ///
+    /// This is also where the connection stops being a migration handle and
+    /// becomes an ordinary [`Db`], so it goes back to write-ahead logging, the
+    /// mode [`Db::open`] sets and every musefs store is in — whether or not the
+    /// migration succeeded, so a refused upgrade leaves the store in the mode it
+    /// found it in.
     pub fn apply(mut self) -> Result<Db> {
         let _: String = self
             .conn
-            .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
-        schema::migrate_all(&mut self.conn)?;
+            .query_row("PRAGMA journal_mode = DELETE", [], |r| r.get(0))?;
+        let migrated = schema::migrate_all(&mut self.conn);
+        let restored = self
+            .conn
+            .query_row("PRAGMA journal_mode = WAL", [], |r| r.get::<_, String>(0));
+        migrated?;
+        restored?;
         schema::validate_identity(&self.conn)?;
         Ok(Db::from_migrated(self.conn, self.path))
     }
@@ -734,6 +750,78 @@ mod snapshot_tests {
         // procfs has no fsync, so syncing a directory there is EINVAL.
         #[cfg(target_os = "linux")]
         super::sync_dir(Path::new("/proc")).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod apply_tests {
+    use std::path::Path;
+
+    use super::PendingMigration;
+
+    fn store_at_v3_with_art(path: &Path, bytes: usize) {
+        crate::schema::seed_store_at_version(path, 3).unwrap();
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute(
+                "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
+                 VALUES (?1, 'image/png', 1, 1, ?2, ?3)",
+                rusqlite::params!["b".repeat(64), bytes, vec![7u8; bytes]],
+            )
+            .unwrap();
+    }
+
+    fn journal_mode(path: &Path) -> String {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// The rebuild writes every table twice in one transaction. Logged through
+    /// the WAL, every one of those pages would sit in `-wal` beside the store,
+    /// on top of the file's own growth; journalled, the log stays empty (#705).
+    /// The store is back in write-ahead logging afterwards.
+    #[test]
+    fn the_upgrade_is_journalled_rather_than_logged_through_the_wal() {
+        const ART: usize = 2 * 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.db");
+        store_at_v3_with_art(&path, ART);
+
+        let db = PendingMigration::open(&path).unwrap().apply().unwrap();
+        let mut wal = path.as_os_str().to_os_string();
+        wal.push("-wal");
+        let logged = std::fs::metadata(&wal).map_or(0, |m| m.len());
+        assert!(
+            logged < (ART / 4) as u64,
+            "the upgrade must not stage its rewrite in the WAL: {logged} bytes"
+        );
+        drop(db);
+        assert_eq!(journal_mode(&path), "wal");
+    }
+
+    /// An upgrade that fails part-way goes back to write-ahead logging too, so a
+    /// refused store is left in the mode it was found in.
+    #[test]
+    fn a_failed_upgrade_leaves_the_store_in_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.db");
+        store_at_v3_with_art(&path, 16);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
+        // Filed under a digest that is not lowercase hex, which V4 refuses.
+        conn.execute(
+            "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
+             VALUES (?1, 'image/png', 1, 1, 1, X'00')",
+            [&"B".repeat(64)],
+        )
+        .unwrap();
+        drop(conn);
+
+        PendingMigration::open(&path).unwrap().apply().unwrap_err();
+        assert_eq!(journal_mode(&path), "wal");
     }
 }
 

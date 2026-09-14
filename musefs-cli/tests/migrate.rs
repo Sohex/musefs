@@ -123,7 +123,7 @@ fn an_occupied_snapshot_destination_is_refused_before_anything_changes() {
 
     assert!(err.contains("already exists"), "{err}");
     assert!(err.contains("--no-snapshot"), "{err}");
-    assert_eq!(user_version(&db), LATEST_VERSION - 1, "store untouched");
+    assert_eq!(user_version(&db), LATEST_VERSION - 1, "store not upgraded");
     assert_eq!(std::fs::read(&dest).unwrap(), b"not a database");
 }
 
@@ -139,7 +139,7 @@ fn without_yes_and_without_a_terminal_it_refuses_and_names_the_flag() {
     let err = run_migrate(&migrate_args).unwrap_err().to_string();
 
     assert!(err.contains("--yes"), "{err}");
-    assert_eq!(user_version(&db), LATEST_VERSION - 1, "store untouched");
+    assert_eq!(user_version(&db), LATEST_VERSION - 1, "store not upgraded");
 }
 
 /// Running it twice is what a provisioning script does. The second run is a
@@ -188,7 +188,7 @@ fn a_store_another_connection_is_using_is_refused() {
     let err = run_migrate(&args(&db)).unwrap_err().to_string();
 
     assert!(err.contains("in use"), "{err}");
-    assert_eq!(user_version(&db), LATEST_VERSION - 1, "store untouched");
+    assert_eq!(user_version(&db), LATEST_VERSION - 1, "store not upgraded");
     assert!(
         !dir.path()
             .join(format!("library.db.v{}.bak", LATEST_VERSION - 1))
@@ -240,7 +240,7 @@ fn a_store_with_a_refused_row_is_not_upgraded_without_repair() {
     assert_eq!(
         user_version(&db),
         before,
-        "the store is untouched: the refusal comes before anything is written"
+        "the store is not upgraded: the refusal comes before anything is written"
     );
     assert!(
         !dir.path()
