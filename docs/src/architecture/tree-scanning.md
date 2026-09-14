@@ -105,7 +105,10 @@ trip or a head seek rather than a microsecond — one per track per traversal, o
 every traversal after the first. Resolve, `open`, and the per-handle read path
 keep validating unconditionally, so a silently replaced backing is still caught
 before musefs serves a single byte of it, and the cold traversal that populates the cache
-stats regardless. What the flag trades away is the freshness of the one
+stats regardless. That covers the reads musefs serves. A read the kernel answers
+itself never reaches it: a `StructureOnly` handle on a passthrough-capable kernel
+is checked only at `open`, and a page cached under `--keep-cache` is caught only
+at the next `open` (see [serving](serving.md)). What the flag trades away is the freshness of the one
 metadata surface that can outrun a backing change: between such a change and
 the next `open`, a `stat` reports the pre-change size and mtime. Off by
 default. `musefs_trust_backing_mtime` in `.musefs-metrics` reports the flag

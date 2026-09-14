@@ -247,7 +247,7 @@ progress looks the same.
   unknown case. A row scanned before this fix keeps its wrong `audio_offset`
   until a revalidate re-probes the file, which the first default-tier revalidate
   after the 2.0.0 upgrade does. A `--checksum=none` revalidate skips an
-  unchanged file wherever musefs records no inode (see
+  unchanged file on a filesystem whose inode numbers musefs does not record (see
   [Freshness](../architecture/tree-scanning.md#freshness-two-version-counters)),
   so run it at the default tier. Unlike a chained Ogg, the file itself parses, so the
   re-probe corrects the row rather than refusing it. The revalidate fixes only

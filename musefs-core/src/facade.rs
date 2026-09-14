@@ -69,6 +69,9 @@ pub struct MountConfig {
     /// Scoped to `getattr` alone: `open` and the read paths validate
     /// unconditionally, so a changed backing is still caught before musefs
     /// serves any byte of it and the `BackingChanged` guarantee is untouched.
+    /// Reads the kernel answers without musefs are outside that either way: a
+    /// `StructureOnly` passthrough handle is validated at `open` only, and pages
+    /// cached under `--keep-cache` never reach the read path.
     /// What the flag
     /// trades away is the freshness of the size and mtime a `stat` reports
     /// between the change and the next `open`.
@@ -582,8 +585,9 @@ impl Musefs {
                 // network round trip rather than a microsecond (#668). The
                 // opt-out stops here: the miss path below still stats, and so do
                 // `open` and the read paths, so musefs serves no byte of a
-                // changed backing file. Pages the kernel cached under
-                // `--keep-cache` never reach it, and are not its to police.
+                // changed backing file. Reads the kernel answers itself never
+                // reach it: pages cached under `--keep-cache`, and a
+                // `StructureOnly` passthrough handle, validated at `open` only.
                 if self.config.trust_backing_mtime {
                     return Ok((e.total_len, e.mtime));
                 }

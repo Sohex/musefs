@@ -160,7 +160,7 @@ library, or run `musefs revalidate /path/to/music --db library.db` yourself. The
 upgrade leaves several things only a revalidate puts right, and it is the
 **first** revalidate that does it, as long as it runs at the default checksum
 tier or above, as the offer does. A `--checksum=none` revalidate skips an
-unchanged file wherever musefs records no inode (see
+unchanged file on a filesystem whose inode numbers musefs does not record (see
 [Freshness](architecture/tree-scanning.md#freshness-two-version-counters)), so
 there it restores neither picture metadata nor an Ogg FLAC's bounds.
 
