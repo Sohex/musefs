@@ -1,3 +1,5 @@
+import os
+
 from musefs_common import SyncStats
 from musefs_common.contract import normalize_rows
 
@@ -102,8 +104,13 @@ def test_build_records_beets_path_is_utf8_safe_for_non_unicode_paths(fake_item):
     records, _ = _core.build_records([item], fields=None, stats=stats)
     value = dict(records[0].pairs)["beets_path"]
     value.encode("utf-8")  # must not raise
-    # Replaced, not dropped: the byte's position stays visible in the value.
-    assert value == "Art\ufffdist/Album/01 Song"
+    # Replaced, not dropped: the byte's position stays visible in the value. What
+    # it becomes depends on the filesystem encoding: under UTF-8 the byte decodes
+    # to a lone surrogate, which must become U+FFFD; under a single-byte encoding
+    # such as Latin-1 it decodes to a real character, which is already valid.
+    decoded = os.fsdecode(b"\xff")
+    expected = "\ufffd" if decoded == "\udcff" else decoded
+    assert value == f"Art{expected}ist/Album/01 Song"
 
 
 def test_build_records_uses_real_beets_destination(tmp_path):
