@@ -150,8 +150,85 @@ impl PendingMigration {
     /// This is the remedy that makes the upgrade reversible: one `VACUUM INTO`
     /// against a read transaction, which on a reference-shaped library measures
     /// under two seconds.
+    ///
+    /// The copy is written under a temporary name beside `dest`, synced, and
+    /// only then given `dest`'s name, with the directory synced after it. So
+    /// `dest` only ever names a complete snapshot. A run killed part-way through
+    /// leaves the temporary file instead, which
+    /// [`PendingMigration::clear_partial_snapshots`] recognises and removes,
+    /// rather than a torn file that looks like a snapshot to anyone restoring
+    /// from it and blocks the rerun from writing a real one.
     pub fn snapshot_to(&self, dest: &Path) -> Result<()> {
-        maintenance::snapshot_into(&self.conn, dest, OP)
+        self.snapshot_via(dest, |_| Ok(()))
+    }
+
+    /// [`PendingMigration::snapshot_to`], running `before_publish` in the window
+    /// between the finished, synced copy and its move into place — the window a
+    /// kill has to land in for the promise above to matter.
+    fn snapshot_via(
+        &self,
+        dest: &Path,
+        before_publish: impl FnOnce(&Path) -> std::io::Result<()>,
+    ) -> Result<()> {
+        let refuse = |source| crate::DbError::Snapshot {
+            path: dest.to_path_buf(),
+            source,
+        };
+        // Checked here, against the name the caller gave, rather than left to
+        // the copy: the temporary name is the caller's plus a suffix, so it would
+        // be refused just the same, but the refusal would name a file the caller
+        // never asked for.
+        if dest.to_str().is_none() {
+            return Err(crate::DbError::Sqlite(rusqlite::Error::InvalidPath(
+                dest.to_path_buf(),
+            )));
+        }
+        // Checked before the copy rather than left to the rename, so a
+        // destination that is taken costs nothing to refuse.
+        if std::fs::symlink_metadata(dest).is_ok() {
+            return Err(refuse(snapshot_exists()));
+        }
+        let partial = partial_snapshot_path(dest);
+        let written = maintenance::snapshot_into(&self.conn, &partial, OP)
+            .and_then(|()| publish_snapshot(&partial, dest, before_publish).map_err(refuse));
+        if written.is_err() {
+            // Whatever there is of it can never become a snapshot. Best effort:
+            // a copy this could not remove is cleared by the next run.
+            let _ = std::fs::remove_file(&partial);
+        }
+        written
+    }
+
+    /// Remove every file an interrupted snapshot to `dest` left under its
+    /// temporary name, and return their paths.
+    ///
+    /// Such a file is never a snapshot: a copy only takes `dest`'s name once it
+    /// is complete, so one still under the temporary name was cut off before
+    /// that, or was never synced. Nothing else is touched, including `dest`.
+    pub fn clear_partial_snapshots(dest: &Path) -> std::io::Result<Vec<PathBuf>> {
+        let mut removed = Vec::new();
+        let Some(name) = dest.file_name().and_then(|n| n.to_str()) else {
+            return Ok(removed);
+        };
+        let prefix = format!("{name}{PARTIAL_SNAPSHOT}");
+        let entries = match std::fs::read_dir(parent_dir(dest)) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(removed),
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let is_partial = entry.file_name().to_str().is_some_and(|n| {
+                n.strip_prefix(&prefix).is_some_and(|tag| {
+                    !tag.is_empty() && tag.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+                })
+            });
+            if is_partial {
+                std::fs::remove_file(entry.path())?;
+                removed.push(entry.path());
+            }
+        }
+        Ok(removed)
     }
 
     /// The tables V4 refills, **in the order a repair must delete from them**,
@@ -429,6 +506,91 @@ impl PendingMigration {
     }
 }
 
+/// What a snapshot being written carries after its destination's file name, then
+/// a unique numeric tag. Unique because `VACUUM INTO` refuses a destination that
+/// exists; recognisable so the next run can clear one a kill left behind.
+const PARTIAL_SNAPSHOT: &str = ".partial-";
+
+/// The directory `path` sits in, `.` for a bare file name.
+fn parent_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+/// A name beside `dest` that no other snapshot in progress uses.
+fn partial_snapshot_path(dest: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let mut p = dest.as_os_str().to_os_string();
+    p.push(format!(
+        "{PARTIAL_SNAPSHOT}{}-{}-{nanos}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    PathBuf::from(p)
+}
+
+fn snapshot_exists() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "the snapshot destination already exists",
+    )
+}
+
+/// Give the finished copy at `partial` the name `dest`, never replacing a file
+/// already there, and make the name durable.
+fn publish_snapshot(
+    partial: &Path,
+    dest: &Path,
+    before_publish: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    // `VACUUM INTO` does not sync what it writes. Without this, a crash after
+    // the rename could leave the name pointing at pages that never reached disk.
+    std::fs::File::open(partial)?.sync_all()?;
+    before_publish(partial)?;
+    // A hard link is the portable rename that refuses to replace: it fails when
+    // `dest` exists, where `rename` would silently overwrite it.
+    if std::fs::hard_link(partial, dest).is_ok() {
+        // The snapshot is in place under both names. A temporary name this
+        // could not remove is only a second link to a complete copy, and the
+        // next run clears it.
+        let _ = std::fs::remove_file(partial);
+    } else {
+        // Refused because `dest` is taken, or by a filesystem without hard links
+        // (FAT, exFAT, some network shares). A taken name stays refused;
+        // otherwise the copy is renamed into place after all. The command holds
+        // the store throughout, so only a writer unrelated to musefs could take
+        // the name in between.
+        if std::fs::symlink_metadata(dest).is_ok() {
+            return Err(snapshot_exists());
+        }
+        std::fs::rename(partial, dest)?;
+    }
+    sync_dir(parent_dir(dest))
+}
+
+/// Make the names in `dir` durable, so a snapshot just given its name keeps it
+/// through a crash.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    match std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+        // Some filesystems cannot sync a directory and say so. The complete copy
+        // is under its name either way; only the name's durability is at stake.
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(())
+        }
+        synced => synced,
+    }
+}
+
 impl Db {
     /// Adopt the connection a completed [`PendingMigration`] leaves behind.
     /// Private to the crate: every other route to a `Db` goes through an open
@@ -439,6 +601,139 @@ impl Db {
             path: Some(path),
             _mode: PhantomData,
         }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use std::path::{Path, PathBuf};
+
+    use super::{PARTIAL_SNAPSHOT, PendingMigration};
+
+    fn store_at_v3(dir: &Path) -> PathBuf {
+        let path = dir.join("s.db");
+        crate::schema::seed_store_at_version(&path, 3).unwrap();
+        path
+    }
+
+    fn user_version(path: &Path) -> i64 {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap()
+    }
+
+    fn partials(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.contains(PARTIAL_SNAPSHOT))
+            .collect()
+    }
+
+    /// A run cut off after the copy is written but before it is named leaves the
+    /// snapshot's name free: nothing under it is ever a partial copy. The copy is
+    /// cleaned up, and the rerun writes a complete snapshot.
+    #[test]
+    fn a_snapshot_interrupted_before_it_is_named_leaves_the_name_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_at_v3(dir.path());
+        let dest = dir.path().join("s.db.v3.bak");
+        let pending = PendingMigration::open(&store).unwrap();
+
+        let err = pending
+            .snapshot_via(&dest, |partial| {
+                assert!(
+                    !dest.exists(),
+                    "the snapshot's name must stay free until the copy is complete"
+                );
+                assert_eq!(user_version(partial), 3, "the copy itself is complete");
+                Err(std::io::Error::other("killed"))
+            })
+            .unwrap_err();
+        assert!(matches!(err, crate::DbError::Snapshot { .. }), "{err:?}");
+        assert!(!dest.exists(), "an interrupted snapshot is never named");
+        assert!(partials(dir.path()).is_empty(), "nor left behind");
+
+        pending.snapshot_to(&dest).unwrap();
+        assert_eq!(user_version(&dest), 3);
+        assert!(partials(dir.path()).is_empty());
+    }
+
+    /// A kill during `VACUUM INTO` itself leaves a torn file under the temporary
+    /// name. The next run recognises it and removes it — and nothing that merely
+    /// shares the snapshot's name — and then completes.
+    #[test]
+    fn a_torn_partial_is_cleared_and_the_rerun_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_at_v3(dir.path());
+        let dest = dir.path().join("s.db.v3.bak");
+        let torn = dir
+            .path()
+            .join(format!("s.db.v3.bak{PARTIAL_SNAPSHOT}4242-0-17"));
+        std::fs::write(&torn, b"half a database").unwrap();
+        let notes = dir.path().join("s.db.v3.bak.partial-notes");
+        std::fs::write(&notes, b"mine").unwrap();
+
+        let removed = PendingMigration::clear_partial_snapshots(&dest).unwrap();
+        assert_eq!(removed, vec![torn.clone()]);
+        assert!(!torn.exists());
+        assert!(notes.exists(), "a file musefs did not name is not touched");
+
+        PendingMigration::open(&store)
+            .unwrap()
+            .snapshot_to(&dest)
+            .unwrap();
+        assert_eq!(user_version(&dest), 3);
+    }
+
+    /// The destination is still never replaced, and refusing it leaves no copy.
+    #[test]
+    fn an_existing_snapshot_is_never_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_at_v3(dir.path());
+        let dest = dir.path().join("s.db.v3.bak");
+        std::fs::write(&dest, b"an older snapshot").unwrap();
+
+        let pending = PendingMigration::open(&store).unwrap();
+        pending.snapshot_to(&dest).unwrap_err();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"an older snapshot");
+        // Taken between the check and the rename, it is refused there too.
+        std::fs::remove_file(&dest).unwrap();
+        let err = pending
+            .snapshot_via(&dest, |_| std::fs::write(&dest, b"a racing writer"))
+            .unwrap_err();
+        assert!(matches!(err, crate::DbError::Snapshot { .. }), "{err:?}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"a racing writer");
+        assert!(partials(dir.path()).is_empty());
+    }
+
+    /// Beside a directory that is not there, there is nothing to clear. One that
+    /// cannot be listed is an error, not a quiet "nothing found" that would leave
+    /// a torn copy in place.
+    #[test]
+    fn clearing_needs_a_directory_it_can_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent").join("s.db.v3.bak");
+        assert_eq!(
+            PendingMigration::clear_partial_snapshots(&missing).unwrap(),
+            Vec::<PathBuf>::new()
+        );
+        let file = dir.path().join("not-a-directory");
+        std::fs::write(&file, b"").unwrap();
+        PendingMigration::clear_partial_snapshots(&file.join("s.db.v3.bak")).unwrap_err();
+    }
+
+    /// A filesystem that cannot sync a directory at all is tolerated: the copy is
+    /// already complete under its name. Any other failure is not.
+    #[test]
+    fn syncing_the_directory_tolerates_only_a_filesystem_that_cannot() {
+        let dir = tempfile::tempdir().unwrap();
+        super::sync_dir(dir.path()).unwrap();
+        super::sync_dir(&dir.path().join("absent")).unwrap_err();
+        // procfs has no fsync, so syncing a directory there is EINVAL.
+        #[cfg(target_os = "linux")]
+        super::sync_dir(Path::new("/proc")).unwrap();
     }
 }
 

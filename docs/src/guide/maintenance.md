@@ -242,6 +242,13 @@ that file is your store exactly as it was. Put it somewhere else with
 `--snapshot PATH`, or skip it with `--no-snapshot`. `migrate` refuses to
 overwrite an existing snapshot.
 
+The copy is written under a temporary name beside the snapshot's —
+`library.db.v2.bak.partial-<numbers>` — synced to disk, and only then renamed
+into place, so a file under the snapshot's own name is always complete. A run
+that is killed or crashes while copying leaves the temporary file instead. It
+can never be a usable snapshot, so the next `migrate` removes it, says so, and
+takes the snapshot again.
+
 The free-space figure it reports accounts for the snapshot and for SQLite
 staging the rewritten pages before committing them. If the filesystem is short,
 the command refuses up front rather than failing part-way through.

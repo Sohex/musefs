@@ -951,6 +951,20 @@ pub fn run_migrate(args: &MigrateArgs) -> Result<u64> {
                 .unwrap_or_else(|| default_snapshot_path(db, from)),
         )
     };
+    if let Some(dest) = &snapshot {
+        // A run killed while writing its snapshot leaves the copy under a
+        // temporary name beside it, never under `dest`. That copy can never be
+        // finished, so it goes before anything is decided about the destination.
+        let cleared = PendingMigration::clear_partial_snapshots(dest).with_context(|| {
+            format!("removing an interrupted snapshot beside {}", dest.display())
+        })?;
+        for leftover in cleared {
+            println!(
+                "removed {}: an incomplete snapshot an interrupted run left behind.",
+                leftover.display()
+            );
+        }
+    }
     if let Some(dest) = &snapshot
         && dest.exists()
     {

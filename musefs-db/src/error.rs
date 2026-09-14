@@ -86,6 +86,14 @@ pub enum DbError {
         count: usize,
         max: usize,
     },
+    /// A `musefs migrate` snapshot was copied but could not be synced or given
+    /// its name. The store is unchanged and nothing is left under `path`.
+    #[error("finishing the snapshot at {}", path.display())]
+    Snapshot {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 impl DbError {

@@ -88,6 +88,26 @@ fn a_named_snapshot_goes_where_it_was_asked_to() {
     assert_eq!(user_version(&dest), LATEST_VERSION - 1);
 }
 
+/// A run killed while writing its snapshot leaves the copy under a temporary
+/// name beside it, never under the snapshot's own, so a torn file cannot pass
+/// for a snapshot or block the rerun. The rerun removes it and completes.
+#[test]
+fn an_interrupted_snapshot_is_cleared_and_the_rerun_completes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = gated_store(dir.path());
+    let snapshot = dir
+        .path()
+        .join(format!("library.db.v{}.bak", LATEST_VERSION - 1));
+    let torn = PathBuf::from(format!("{}.partial-4242-0-17", snapshot.display()));
+    std::fs::write(&torn, b"half a database").unwrap();
+
+    run_migrate(&args(&db)).unwrap();
+
+    assert!(!torn.exists(), "the torn copy is removed");
+    assert_eq!(user_version(&snapshot), LATEST_VERSION - 1);
+    assert_eq!(user_version(&db), LATEST_VERSION);
+}
+
 /// Overwriting a backup is exactly the thing a backup exists to prevent, and
 /// the refusal has to name the way out.
 #[test]
