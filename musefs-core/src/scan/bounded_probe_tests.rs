@@ -109,6 +109,84 @@ fn a_flac_past_the_probe_ceiling_trims_the_trailer_at_its_real_end() {
     );
 }
 
+/// Rewrite the one stored row into the shape the whole-buffer fallback used to
+/// store: every field as a scan records it now, except an audio region that
+/// stops at the probe ceiling. Returns the track id.
+fn plant_cut_short_at_the_ceiling(db: &Db) -> i64 {
+    let t = db.list_tracks().unwrap().remove(0);
+    db.upsert_track(&musefs_db::NewTrack {
+        backing_path: t.backing_path,
+        format: t.format,
+        audio_offset: t.bounds.audio_offset(),
+        audio_length: MAX_PROBE_BYTES - t.bounds.audio_offset(),
+        backing_size: t.backing_size,
+        backing_mtime_ns: t.backing_mtime_ns,
+        backing_ctime_ns: t.backing_ctime_ns,
+        backing_ino: t.backing_ino,
+    })
+    .unwrap();
+    t.id
+}
+
+/// The upgrade path for rows the fallback cut short. Nothing else about such a
+/// row asks for a re-probe — its stamp, checksums and structural blocks all
+/// describe the file — so without this a library upgraded past the fix would
+/// go on serving those files truncated, and the only way out would be a
+/// `scan --force` that overwrites their curated tags and art. A revalidate
+/// re-probes the row, which refreshes the bounds and leaves curation alone,
+/// and does so once: the corrected row no longer looks cut short.
+#[test]
+fn revalidate_re_probes_a_row_the_probe_ceiling_cut_short_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cut-short.flac");
+    let front = flac_front_with_pictures(5, 100 << 10);
+    let len = 100 << 20;
+    write_sparse(&path, &front, len, &[0xFF, 0xF8]);
+    let db = Db::open_in_memory().unwrap();
+    scan_directory(&db, dir.path()).unwrap();
+    let id = plant_cut_short_at_the_ceiling(&db);
+
+    let s = revalidate(&db, dir.path()).unwrap();
+    assert_eq!(
+        (s.updated, s.unchanged),
+        (1, 0),
+        "the cut-short row is re-probed"
+    );
+    let t = db.get_track(id).unwrap().unwrap();
+    assert_eq!(
+        (t.bounds.audio_offset(), t.bounds.audio_length()),
+        (front.len() as u64, len - front.len() as u64),
+        "and its audio runs to the end of the file again"
+    );
+
+    let s = revalidate(&db, dir.path()).unwrap();
+    assert_eq!(
+        (s.updated, s.unchanged),
+        (0, 1),
+        "a corrected row is not re-probed on every revalidate"
+    );
+}
+
+/// The criterion's allowance, from the other side: a FLAC's audio legitimately
+/// stops 128 bytes short of a large file when an ID3v1 trailer follows it, and
+/// a correct row like that must not be re-probed on every revalidate.
+#[test]
+fn revalidate_leaves_a_correct_row_past_the_probe_ceiling_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("trailer-past-ceiling.flac");
+    let mut front = b"ID3\x04\x00\x00\x00\x00\x00\x0A".to_vec();
+    front.extend_from_slice(&[0u8; 10]);
+    front.extend(flac_front_with_pictures(5, 100 << 10));
+    let mut trailer = b"TAG".to_vec();
+    trailer.resize(128, b' ');
+    write_sparse(&path, &front, 100 << 20, &trailer);
+    let db = Db::open_in_memory().unwrap();
+    scan_directory(&db, dir.path()).unwrap();
+
+    let s = revalidate(&db, dir.path()).unwrap();
+    assert_eq!((s.updated, s.unchanged), (0, 1));
+}
+
 #[test]
 fn scan_counts_unreadable_file_as_failed_and_continues() {
     let dir = tempfile::tempdir().unwrap();

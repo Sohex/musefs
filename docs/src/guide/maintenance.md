@@ -10,7 +10,10 @@ data — audio byte range, content checksums, and FLAC structural blocks — whi
 re-probes an unchanged file whose row lacks something a probe records: the
 checksum the `--checksum` tier asks for, a FLAC file's structural blocks, or an
 inode on a filesystem whose inode numbers musefs records — which, after
-[`musefs migrate`](#upgrading-the-store-musefs-migrate), is every row there. Other
+[`musefs migrate`](#upgrading-the-store-musefs-migrate), is every row there. It
+also re-probes, once, a FLAC or Ogg file over 64 MiB whose stored audio stops
+short of the end of the file, which is how an earlier scan stored a large file
+with a lot of embedded art: served cut short, with nothing to say so. Other
 unchanged files are skipped, and files not yet in the store are ignored
 (ingesting new files is `scan`'s job — see [Scanning](scanning.md)).
 

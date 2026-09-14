@@ -207,11 +207,11 @@ exclude_re = [
     # scan.failed + skip_failed` sum is also insensitive to `+`->`-` (the `+`->`*`
     # variant IS caught, so only `-` is excluded here).
     # guard: op="+=" fn="revalidate_in" rows=2
-'musefs-core/src/scan\.rs:2956:29:',
+'musefs-core/src/scan\.rs:2969:29:',
     # guard: op="+=" fn="revalidate_in" rows=2
-'musefs-core/src/scan\.rs:2968:33:',
+'musefs-core/src/scan\.rs:2981:33:',
     # guard: op="+" fn="revalidate_in" rows=1
-'musefs-core/src/scan\.rs:3084:29: replace \+ with -',
+'musefs-core/src/scan\.rs:3098:29: replace \+ with -',
     # Phase 2 ID3 binary tags: classify_binary_frame's POPM counter fold
     # `(a << 8) | b` -> `(a << 8) ^ b`. The accumulator is left-shifted by 8 before
     # each combine, so its low byte is always zero where `b` lands; `|` and `^` are

@@ -288,7 +288,12 @@ the stamp *cannot* fully decide: a FLAC missing its structural blocks, a row
 below the requested checksum tier, and a row with no recorded inode on a
 filesystem whose inode numbers are recorded. That one is what makes it the
 repopulation path for a store upgraded to v4, where every row starts without
-one. New files are
+one. It re-probes, once, a FLAC or Ogg row for a file over the 64 MiB probe
+ceiling whose audio stops more than 128 bytes short of the file's end: no
+correct probe of those formats leaves more than an ID3v1 trailer out, and that
+is the shape an earlier probe stored when it cut such a file's audio short at
+the ceiling. The re-probe refreshes the bounds and leaves curated tags and art
+alone, and a corrected row no longer matches. New files are
 ignored: `revalidate` only touches rows that already exist in the store.
 Deletion is opt-in via `--prune`, which removes tracks under the scanned root
 whose backing file is gone, or is present but refused as unsupported (a chained

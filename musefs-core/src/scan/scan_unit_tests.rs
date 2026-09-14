@@ -671,6 +671,47 @@ fn records_same_bytes_needs_no_inode_where_neither_side_has_one() {
     );
 }
 
+/// The revalidate re-probe for rows an earlier scan cut short, at each edge of
+/// its criterion: the formats whose correct probe runs the audio to the file's
+/// end, a file over the ceiling, and an audio end short by more than an ID3v1
+/// trailer.
+#[test]
+fn a_row_cut_short_at_the_ceiling_is_recognised_and_a_correct_one_is_not() {
+    let big = MAX_PROBE_BYTES + (1 << 20);
+    for format in [Format::Flac, Format::Opus, Format::Vorbis, Format::OggFlac] {
+        assert!(
+            cut_short_at_the_ceiling(format, big, MAX_PROBE_BYTES),
+            "{format:?} ending at the ceiling"
+        );
+        assert!(
+            !cut_short_at_the_ceiling(format, big, big),
+            "{format:?} ending at the end of the file"
+        );
+        assert!(
+            !cut_short_at_the_ceiling(format, big, big - 128),
+            "{format:?} short by exactly an ID3v1 trailer"
+        );
+        assert!(
+            cut_short_at_the_ceiling(format, big, big - 129),
+            "{format:?} short by more than a trailer"
+        );
+        assert!(
+            !cut_short_at_the_ceiling(format, MAX_PROBE_BYTES, 0),
+            "{format:?} not over the ceiling"
+        );
+        assert!(
+            cut_short_at_the_ceiling(format, MAX_PROBE_BYTES + 1, 0),
+            "{format:?} one byte over the ceiling"
+        );
+    }
+    for format in [Format::Mp3, Format::M4a, Format::Wav] {
+        assert!(
+            !cut_short_at_the_ceiling(format, big, MAX_PROBE_BYTES),
+            "{format:?} is not a format the ceiling cut short"
+        );
+    }
+}
+
 /// `(fingerprint, content_hash)` for the one track in `db`.
 fn stored_checksums(db: &Db) -> (Option<String>, Option<String>) {
     let t = db.list_tracks().unwrap().remove(0);

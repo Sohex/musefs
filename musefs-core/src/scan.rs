@@ -2918,23 +2918,36 @@ fn revalidate_in(
     }
     db.apply_bulk_pragmas_self()?;
 
-    // Main-thread pre-dispatch skip pass: load existing
-    // (path -> stamp, id, format, has_fingerprint, has_content_hash) once,
-    // stat each candidate, keep only changed files. Workers stay DB-free.
-    let existing: HashMap<PathBuf, (crate::freshness::BackingStamp, i64, Format, bool, bool)> = db
+    /// What the skip pass needs to know about one stored row.
+    #[derive(Clone, Copy)]
+    struct Stored {
+        stamp: BackingStamp,
+        id: i64,
+        format: Format,
+        has_fingerprint: bool,
+        has_content_hash: bool,
+        /// Where the stored audio region ends: `audio_offset + audio_length`.
+        audio_end: u64,
+    }
+
+    // Main-thread pre-dispatch skip pass: load each existing row's `Stored`
+    // once, stat each candidate, keep only changed files. Workers stay DB-free.
+    let existing: HashMap<PathBuf, Stored> = db
         .list_tracks()?
         .into_iter()
         .map(|t| {
-            (
-                t.backing_path.clone(),
-                (
-                    crate::freshness::BackingStamp::from_track(&t),
-                    t.id,
-                    t.format,
-                    t.fingerprint.is_some(),
-                    t.content_hash.is_some(),
-                ),
-            )
+            let stored = Stored {
+                stamp: BackingStamp::from_track(&t),
+                id: t.id,
+                format: t.format,
+                has_fingerprint: t.fingerprint.is_some(),
+                has_content_hash: t.content_hash.is_some(),
+                audio_end: t
+                    .bounds
+                    .audio_offset()
+                    .saturating_add(t.bounds.audio_length()),
+            };
+            (t.backing_path, stored)
         })
         .collect();
     // Legacy backfill (spec §1): FLAC tracks scanned under V1 have no structural
@@ -2972,14 +2985,13 @@ fn revalidate_in(
         } else {
             path.clone()
         };
-        if let Some((stamp, id, format, has_fingerprint, has_content_hash)) =
-            existing.get(&key).copied()
-        {
-            let needs_backfill = format == Format::Flac && !have_structural.contains(&id);
+        if let Some(row) = existing.get(&key).copied() {
+            let stamp = row.stamp;
+            let needs_backfill = row.format == Format::Flac && !have_structural.contains(&row.id);
             let needs_checksum = match opts.checksum {
                 ChecksumTier::None => false,
-                ChecksumTier::Fingerprint => !has_fingerprint,
-                ChecksumTier::Full => !has_fingerprint || !has_content_hash,
+                ChecksumTier::Fingerprint => !row.has_fingerprint,
+                ChecksumTier::Full => !row.has_fingerprint || !row.has_content_hash,
             };
             // A row with no recorded inode is one this build cannot fully
             // validate (#674): `matches_live` has to ignore the field, so the
@@ -2999,10 +3011,12 @@ fn revalidate_in(
             // that is slower, never wrong, and only reachable on a filesystem
             // whose stat is malformed.
             let needs_ino = stamp.ino.is_none() && inodes.at_path(&path, &meta);
+            let needs_bounds = cut_short_at_the_ceiling(row.format, stamp.size, row.audio_end);
             if stamp.matches_live(&crate::freshness::BackingStamp::from_metadata(&meta))
                 && !needs_backfill
                 && !needs_checksum
                 && !needs_ino
+                && !needs_bounds
             {
                 unchanged += 1;
                 continue;
@@ -3084,6 +3098,32 @@ fn revalidate_in(
         failed: scan.failed + skip_failed,
         raced: scan.raced,
     })
+}
+
+/// The most a correct FLAC probe leaves between the end of the audio and the end
+/// of the file: an ID3v1 trailer. A correct Ogg probe leaves nothing.
+const ID3V1_TRAILER_BYTES: u64 = 128;
+
+/// Does this stored row look like one an earlier scan cut short at the probe
+/// ceiling?
+///
+/// That scan's probe fell back, past eight widening retries, to parsing its
+/// first [`MAX_PROBE_BYTES`] as though they were the whole file, so a FLAC or
+/// Ogg file larger than that was stored with its audio ending at the ceiling.
+/// Nothing else about such a row asks `revalidate` to re-probe it — its stamp,
+/// checksums and structural blocks all describe the file — so this does, as the
+/// FLAC structural backfill does, refreshing the bounds and leaving curated tags
+/// and art alone. A correct probe of those formats takes the audio to the end of
+/// the file, less at most an ID3v1 trailer on a FLAC, so a correct row never
+/// matches and a re-probed one stops matching: each row is re-probed once. MP3
+/// is left out, since its bounds may legitimately leave out more than a
+/// trailer.
+fn cut_short_at_the_ceiling(format: Format, backing_size: u64, audio_end: u64) -> bool {
+    matches!(
+        format,
+        Format::Flac | Format::Opus | Format::Vorbis | Format::OggFlac
+    ) && backing_size > MAX_PROBE_BYTES
+        && backing_size.saturating_sub(audio_end) > ID3V1_TRAILER_BYTES
 }
 
 /// Back-compat shim used by the CLI and existing tests.
