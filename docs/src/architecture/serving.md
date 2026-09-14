@@ -239,7 +239,7 @@ Nothing in the store holds nanoseconds. `updated_at` is still whole seconds, and
 the sub-second part is derived where the timestamp is built, so no column claims
 a precision nobody wrote.
 
-**A pre-epoch backing file is served as one.** An archival rip or a restored
+**A pre-epoch backing file is stored as one.** An archival rip or a restored
 backup can carry an mtime before 1970, and the store accepts it from v4 on
 ([#696](https://github.com/Sohex/musefs/issues/696)). A synthetic directory has
 no row and therefore no timestamp; it reports the mount time. Those two cases

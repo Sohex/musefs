@@ -85,8 +85,9 @@ box and serves `[ftyp][regenerated moov][mdat header][mdat payload]`:
          Δ = new mdat payload offset − old
 ```
 
-1. The scan keeps `moov`'s structural children and drops its old `udta`, save
-   for a `chpl` chapter list, which is carried through. A fresh
+1. Synthesis (`mp4::synthesize_layout`) keeps `moov`'s structural children
+   and drops its old `udta`, save for a `chpl` chapter list, which is carried
+   through. A fresh
    `udta`/`meta`/`ilst` is built from the DB: inline box framing, with
    each opaque `----` value and each cover image spliced in as streamed
    `BinaryTag`/`ArtImage` segments. Every enclosing box size accounts for

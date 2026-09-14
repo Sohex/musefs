@@ -16,8 +16,8 @@ Registry:
 recent stable release only — prereleases publish only version-pinned tags.
 
 **Upgrading from 1.x.** The floating tags now pull 2.0.0, which refuses a store
-written by 1.x until `musefs migrate` has upgraded it: `mount`, `scan` and
-`revalidate` exit with an error naming the command. Stop the musefs container
+written by 1.x until `musefs migrate` has upgraded it: `mount`, `scan`,
+`revalidate` and `vacuum` exit with an error naming the command. Stop the musefs container
 first, since `migrate` refuses a store another container still has open, then
 run it once against the store volume (the image's entrypoint is `musefs`):
 
@@ -46,19 +46,20 @@ gotchas below.
 
 ### Required flags
 
-musefs mounts via FUSE, so the container needs `/dev/fuse` and the matching
-capability:
+musefs mounts via FUSE, so a container running `mount` needs `/dev/fuse` and
+the matching capability:
 
 ```bash
 docker run --rm \
   --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
   -v /path/to/library:/library:ro \
   -v /path/to/store:/store \
-  ghcr.io/sohex/musefs:latest scan /library --db /store/musefs.db
+  ghcr.io/sohex/musefs:latest mount /mnt/musefs --db /store/musefs.db
 ```
 
 Without `--device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined`
-the mount cannot be established.
+the mount cannot be established. `scan`, `revalidate`, `vacuum` and `migrate`
+mount nothing and need none of these flags.
 
 > **Note:** The apparmor flag may or may not be necessary depending on how your system is configured.
 
