@@ -483,6 +483,19 @@ mod tests {
         );
     }
 
+    /// The one assertion that pins `fs_type`'s decoding. Every other test sees
+    /// an ordinary filesystem, where any value but FAT's or exFAT's reads the
+    /// same, so a `fs_type` answering the wrong number would pass them all.
+    /// `/proc` is procfs on every Linux system and container, so its magic is
+    /// a value known in advance.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fs_type_decodes_the_magic_statfs_reports() {
+        /// `PROC_SUPER_MAGIC` from `linux/magic.h`.
+        const PROC_SUPER_MAGIC: u64 = 0x9fa0;
+        assert_eq!(fs_type(rustix::fs::statfs("/proc")), Some(PROC_SUPER_MAGIC));
+    }
+
     /// Answered yes on every platform for an ordinary filesystem: on Linux by
     /// asking it, and elsewhere without asking at all.
     #[test]
