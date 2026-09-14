@@ -256,6 +256,10 @@ fn a_revalidate_with_failures_is_reported_to_the_caller() {
     // probe refuses it, which is a failure, not a crash.
     let broken = library.join("broken.flac");
     std::fs::write(&broken, b"not a flac at all").unwrap();
+    // Canonical, as a scan stores it: revalidate keys the files it walks on
+    // their canonical paths, and on macOS the temp directory is behind the
+    // `/var` -> `/private/var` symlink.
+    let broken = std::fs::canonicalize(&broken).unwrap();
 
     let db = gated_store(dir.path());
     let conn = rusqlite::Connection::open(&db).unwrap();
