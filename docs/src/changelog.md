@@ -651,6 +651,12 @@ see the [Release notes](release-notes.md).
 
 ### Fixed
 
+- **`musefs migrate` exits `2` when the revalidate it ran counted failures**
+  ([#750](https://github.com/Sohex/musefs/issues/750)). It discarded the count
+  and exited `0`, so `musefs migrate --yes --revalidate && …` treated a partial
+  revalidate as a clean one, while `musefs revalidate` run on its own exits `2`
+  for the same result. The store upgrade has succeeded either way, and the run
+  says so before exiting. `musefs_cli::run_migrate` returns the failure count.
 - **A chained Ogg file stored by 1.3.0 no longer fails every revalidate for
   good.** 2.0.0 refuses chained Ogg at scan time, which left the rows an older
   binary stored with no way out: `revalidate` re-probed each one, was refused,

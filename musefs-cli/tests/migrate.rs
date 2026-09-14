@@ -42,7 +42,11 @@ fn a_gated_store_is_snapshotted_and_upgraded() {
     let dir = tempfile::tempdir().unwrap();
     let db = gated_store(dir.path());
 
-    run_migrate(&args(&db)).unwrap();
+    assert_eq!(
+        run_migrate(&args(&db)).unwrap(),
+        0,
+        "no tracks, so no revalidate and nothing failed"
+    );
 
     assert_eq!(user_version(&db), LATEST_VERSION);
     // The snapshot is the remedy that makes this reversible, so it has to be
@@ -238,4 +242,38 @@ fn repair_deletes_the_refused_row_and_upgrades() {
     let tags = store.get_tags(1).unwrap();
     assert_eq!(tags.len(), 1, "the clean tag survived: {tags:?}");
     assert_eq!(tags[0].key, "artist");
+}
+
+/// #750: the revalidate `migrate` runs on request counts a file it cannot
+/// process as failed, and `migrate` hands that count back so the command exits
+/// `2`, as `revalidate` would. The store is upgraded all the same.
+#[test]
+fn a_revalidate_with_failures_is_reported_to_the_caller() {
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path().join("lib");
+    std::fs::create_dir(&library).unwrap();
+    // A supported extension over bytes that parse as nothing: the revalidate's
+    // probe refuses it, which is a failure, not a crash.
+    let broken = library.join("broken.flac");
+    std::fs::write(&broken, b"not a flac at all").unwrap();
+
+    let db = gated_store(dir.path());
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+         backing_size, backing_mtime_ns, backing_ctime_ns, updated_at) \
+         VALUES (CAST(?1 AS BLOB), 'flac', 0, 0, 0, 0, 0, 0)",
+        [broken.to_str().expect("tempdir paths are UTF-8")],
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut migrate_args = args(&db);
+    migrate_args.revalidate = Some(true);
+    assert_eq!(run_migrate(&migrate_args).unwrap(), 1);
+    assert_eq!(
+        user_version(&db),
+        LATEST_VERSION,
+        "the upgrade itself landed"
+    );
 }

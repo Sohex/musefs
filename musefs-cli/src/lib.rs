@@ -804,7 +804,12 @@ fn common_library_root(paths: &[PathBuf]) -> Option<PathBuf> {
 /// The order is the point: everything that can refuse the run does so before
 /// anything is written, the user is told what is about to happen and agrees to
 /// it, a snapshot makes it reversible, and only then does the store change.
-pub fn run_migrate(args: &MigrateArgs) -> Result<()> {
+///
+/// Returns how many files the follow-up revalidate counted as failed, zero when
+/// none ran, so the caller can exit `2` the way `revalidate` itself does
+/// (#750): the store is upgraded either way, but a script chaining on the exit
+/// status must be able to tell a partial revalidate from a clean one.
+pub fn run_migrate(args: &MigrateArgs) -> Result<u64> {
     let db = args.db.as_path();
     if !db.exists() {
         anyhow::bail!(
@@ -821,7 +826,7 @@ pub fn run_migrate(args: &MigrateArgs) -> Result<()> {
             "{} is already at schema version {to}; nothing to migrate.",
             db.display()
         );
-        return Ok(());
+        return Ok(0);
     }
 
     // Refuse a store somebody else is using before reporting anything, so the
@@ -944,7 +949,7 @@ pub fn run_migrate(args: &MigrateArgs) -> Result<()> {
         }
         if !prompt::confirm(&format!("Upgrade {} now?", db.display()), false)? {
             println!("aborted; the store is unchanged.");
-            return Ok(());
+            return Ok(0);
         }
     }
 
@@ -1006,6 +1011,7 @@ pub fn run_migrate(args: &MigrateArgs) -> Result<()> {
     };
     drop(store);
 
+    let mut failed = 0u64;
     if owed > 0 {
         println!(
             "{owed} track(s) now carry no fingerprint; a revalidate recomputes them and \
@@ -1017,7 +1023,7 @@ pub fn run_migrate(args: &MigrateArgs) -> Result<()> {
             .map(|r| format!("Revalidate {} now?", r.display()));
         match (root, offer) {
             (Some(root), Some(question)) if prompt::decide(args.revalidate, &question, false)? => {
-                run_revalidate(
+                failed = run_revalidate(
                     db,
                     &[root],
                     false,
@@ -1026,6 +1032,12 @@ pub fn run_migrate(args: &MigrateArgs) -> Result<()> {
                     false,
                     ChecksumMode::Fingerprint,
                 )?;
+                if failed > 0 {
+                    println!(
+                        "the store is upgraded, but the revalidate counted {failed} failed \
+                         file(s); this run exits 2, as `musefs revalidate` would."
+                    );
+                }
             }
             (Some(root), _) => println!(
                 "  run later: musefs revalidate {} --db {}",
@@ -1038,7 +1050,7 @@ pub fn run_migrate(args: &MigrateArgs) -> Result<()> {
             ),
         }
     }
-    Ok(())
+    Ok(failed)
 }
 
 /// Print a sample of the paths a `mount --dry-run` would expose, walking the
@@ -1159,7 +1171,17 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         }
         Command::Mount(args) => run_mount(&args).map(|()| ExitCode::SUCCESS),
         Command::Vacuum { db } => run_vacuum(&db).map(|()| ExitCode::SUCCESS),
-        Command::Migrate(args) => run_migrate(&args).map(|()| ExitCode::SUCCESS),
+        Command::Migrate(args) => {
+            // The store upgrade succeeded if this returns at all; a failure
+            // count comes from the revalidate it offered, and marks the run
+            // partial exactly as `revalidate`'s own does (#750).
+            let failed = run_migrate(&args)?;
+            Ok(if failed > 0 {
+                ExitCode::from(2)
+            } else {
+                ExitCode::SUCCESS
+            })
+        }
     }
 }
 

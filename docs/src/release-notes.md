@@ -102,8 +102,8 @@ A few files need more than that:
   and `revalidate` exits `2` while any remain. Until they are removed, reads
   into a chain's second stream fail with `EIO`. `musefs revalidate --prune`
   removes them. The run that does so still exits `2`, and the next one does not.
-  `migrate`'s offer never prunes, and it exits `0` whatever its revalidate
-  counted.
+  `migrate`'s offer never prunes; if its revalidate counts failures,
+  `migrate` exits `2` ([#750]).
 - **Two files whose names differed only in non-UTF-8 bytes** ([#680]). 1.3.0
   merged them into one track under a mangled path and served neither. A `scan`
   adds both as new tracks; `revalidate --prune` removes the merged row, along
@@ -247,6 +247,7 @@ directly.
 [#746]: https://github.com/Sohex/musefs/issues/746
 [#747]: https://github.com/Sohex/musefs/issues/747
 [#749]: https://github.com/Sohex/musefs/issues/749
+[#750]: https://github.com/Sohex/musefs/issues/750
 [#751]: https://github.com/Sohex/musefs/issues/751
 
 ## v1.3.0

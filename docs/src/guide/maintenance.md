@@ -212,8 +212,9 @@ re-identified after a move.
 
 The 2.0.0 upgrade leaves more than fingerprints for that revalidate: it records
 each file's inode, and restores each file's own picture metadata. The offer
-never prunes, and whatever the revalidate counts as failed, `migrate` still
-exits `0`. The
+never prunes. If the revalidate counts any file as failed, `migrate` exits `2`
+once it is done, as `revalidate` itself would, even though the store is
+upgraded ([#750](https://github.com/Sohex/musefs/issues/750)). The
 [release notes](../release-notes.md#upgrading-from-v130) list what else the
 first revalidate changes, including every synthesized file's modification time.
 
@@ -230,7 +231,7 @@ The two offers decline themselves unless you ask for them:
 | `--snapshot PATH` | Write the snapshot here instead of beside the store. |
 | `--no-snapshot` | Take no snapshot. The upgrade is then not reversible. |
 | `--vacuum` / `--vacuum=false` | Compact afterwards, or do not. Omit to be asked. |
-| `--revalidate` / `--revalidate=false` | Revalidate afterwards, or do not. Omit to be asked. |
+| `--revalidate` / `--revalidate=false` | Revalidate afterwards, or do not. Omit to be asked. A revalidate that counts failures makes `migrate` exit `2`. |
 | `--jobs N` | Probe worker threads for that revalidate. |
 
 Running it against a store that is already current reports so and changes
