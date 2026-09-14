@@ -459,6 +459,21 @@ see the [Release notes](release-notes.md).
   cost a gated migration of its own, for a robustness fix nobody would schedule
   one for.
 
+  **Its rows become immutable too**
+  ([#759](https://github.com/Sohex/musefs/issues/759)). The table had insert and
+  delete triggers only, on V1's reasoning that the owned writer replaces by
+  delete-then-insert and no `UPDATE` path exists. That is true of musefs and not
+  of SQL: rewriting a row's `body` changed a served FLAC-header input without
+  bumping `content_version`, and changing its `track_id` moved one between
+  tracks without bumping either owner, so a cached layout kept serving the old
+  header. `structural_blocks_reject_update` now refuses every update — there is
+  no legitimate one to let through — the way art content and tag and link
+  ownership already are, and a new `structural_blocks_au` bumps both the old and
+  the new owner for a writer that drops the refusal. V1's other claim, that the
+  over-bump from a byte-identical re-probe is harmless churn, stopped holding
+  once the served mtime derived from `content_version` (#725); V1's text is
+  frozen, so the correction lives in V4's comments.
+
 - **`art` is rebuilt by the same migration** — the third of the four, and the
   one with an ordering constraint the others did not have. `track_art.art_id`
   references `art(id)` with **no** `ON DELETE CASCADE`, so with foreign keys

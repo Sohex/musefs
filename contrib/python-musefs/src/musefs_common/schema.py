@@ -884,6 +884,31 @@ END;
 CREATE TRIGGER structural_blocks_ad AFTER DELETE ON structural_blocks BEGIN
     UPDATE tracks SET content_version = content_version + 1 WHERE id = OLD.track_id;
 END;
+-- V1 shipped only the two triggers above, reasoning that the owned writer
+-- replaces by DELETE-then-INSERT so no UPDATE path exists, and that the
+-- resulting over-bump on a byte-identical re-probe is harmless churn. Neither
+-- holds any more. SQL has an UPDATE path whatever musefs does: rewriting `body`
+-- changed a served FLAC-header input without bumping `content_version`, and
+-- changing `track_id` moved one between tracks without bumping either owner, so
+-- a cached layout kept serving the old header (#759). And a bump is no longer
+-- invisible churn: the served mtime derives from `content_version` (#725),
+-- which is why the owned writer now leaves an identical set alone (#757).
+--
+-- So an in-place update is refused outright -- no WHEN guard, since there is no
+-- legitimate one to let through -- the way art content (#719) and row ownership
+-- (#717) already are. The AFTER UPDATE bump covers both owners anyway, so the
+-- invalidation stays correct against a writer that drops the refusal through
+-- `writable_schema`.
+CREATE TRIGGER structural_blocks_au AFTER UPDATE ON structural_blocks BEGIN
+    UPDATE tracks SET content_version = content_version + 1
+    WHERE id IN (OLD.track_id, NEW.track_id);
+END;
+CREATE TRIGGER structural_blocks_reject_update
+BEFORE UPDATE ON structural_blocks
+BEGIN
+    SELECT RAISE(ABORT,
+        'structural_blocks rows are immutable; delete the row and insert its replacement');
+END;
 
 CREATE TRIGGER art_ad AFTER DELETE ON art BEGIN
     UPDATE tracks SET content_version = content_version + 1,

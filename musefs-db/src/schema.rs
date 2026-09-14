@@ -882,6 +882,31 @@ END;
 CREATE TRIGGER structural_blocks_ad AFTER DELETE ON structural_blocks BEGIN
     UPDATE tracks SET content_version = content_version + 1 WHERE id = OLD.track_id;
 END;
+-- V1 shipped only the two triggers above, reasoning that the owned writer
+-- replaces by DELETE-then-INSERT so no UPDATE path exists, and that the
+-- resulting over-bump on a byte-identical re-probe is harmless churn. Neither
+-- holds any more. SQL has an UPDATE path whatever musefs does: rewriting `body`
+-- changed a served FLAC-header input without bumping `content_version`, and
+-- changing `track_id` moved one between tracks without bumping either owner, so
+-- a cached layout kept serving the old header (#759). And a bump is no longer
+-- invisible churn: the served mtime derives from `content_version` (#725),
+-- which is why the owned writer now leaves an identical set alone (#757).
+--
+-- So an in-place update is refused outright -- no WHEN guard, since there is no
+-- legitimate one to let through -- the way art content (#719) and row ownership
+-- (#717) already are. The AFTER UPDATE bump covers both owners anyway, so the
+-- invalidation stays correct against a writer that drops the refusal through
+-- `writable_schema`.
+CREATE TRIGGER structural_blocks_au AFTER UPDATE ON structural_blocks BEGIN
+    UPDATE tracks SET content_version = content_version + 1
+    WHERE id IN (OLD.track_id, NEW.track_id);
+END;
+CREATE TRIGGER structural_blocks_reject_update
+BEFORE UPDATE ON structural_blocks
+BEGIN
+    SELECT RAISE(ABORT,
+        'structural_blocks rows are immutable; delete the row and insert its replacement');
+END;
 
 CREATE TRIGGER art_ad AFTER DELETE ON art BEGIN
     UPDATE tracks SET content_version = content_version + 1,
@@ -4293,7 +4318,9 @@ mod constraint_tests {
             "art_ad",
             "tracks_geometry_au",
             "structural_blocks_ai",
+            "structural_blocks_au",
             "structural_blocks_ad",
+            "structural_blocks_reject_update",
             "tags_reject_reparent",
             "track_art_reject_reparent",
             "tracks_reject_rekey",
@@ -4303,7 +4330,7 @@ mod constraint_tests {
                 "missing trigger on fresh DB: {expected}"
             );
         }
-        assert_eq!(names.len(), 18, "unexpected trigger count: {names:?}");
+        assert_eq!(names.len(), 20, "unexpected trigger count: {names:?}");
     }
 
     #[test]
@@ -4705,5 +4732,101 @@ mod track_id_immutability_tests {
         conn.execute("UPDATE tracks SET id = 99 WHERE id = 1", [])
             .unwrap();
         assert_eq!(logged(&conn), vec![1, 99]);
+    }
+}
+
+/// `structural_blocks` rows are replaced, never updated (#759).
+#[cfg(test)]
+mod structural_blocks_immutability_tests {
+    use rusqlite::Connection;
+
+    /// Two tracks, the first holding one STREAMINFO block.
+    fn migrated_with_a_block() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        super::migrate(&mut conn).unwrap();
+        for path in ["/a.flac", "/b.flac"] {
+            conn.execute(
+                "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+                 backing_size, backing_mtime_ns, updated_at) \
+                 VALUES (?1,'flac',0,1,1,0,0)",
+                [path.as_bytes()],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
+             VALUES (1, 'STREAMINFO', 0, X'0102')",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn versions(conn: &Connection) -> (i64, i64) {
+        conn.query_row(
+            "SELECT (SELECT content_version FROM tracks WHERE id = 1), \
+                    (SELECT content_version FROM tracks WHERE id = 2)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn an_in_place_update_is_refused() {
+        let conn = migrated_with_a_block();
+        for sql in [
+            "UPDATE structural_blocks SET body = X'FFFF'",
+            "UPDATE structural_blocks SET track_id = 2",
+        ] {
+            let err = conn.execute(sql, []).unwrap_err().to_string();
+            assert!(
+                err.contains("structural_blocks rows are immutable"),
+                "{sql}: {err}"
+            );
+        }
+    }
+
+    /// Delete-then-insert is the owned writer's path, and stays open.
+    #[test]
+    fn delete_then_insert_still_replaces_a_block() {
+        let conn = migrated_with_a_block();
+        conn.execute("DELETE FROM structural_blocks WHERE track_id = 1", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
+             VALUES (1, 'STREAMINFO', 0, X'FFFF')",
+            [],
+        )
+        .unwrap();
+    }
+
+    /// The bump is correct on its own terms: against a writer that dropped the
+    /// refusal, a rewritten body invalidates its owner and a reparented block
+    /// invalidates both tracks.
+    #[test]
+    fn with_the_refusal_dropped_an_update_bumps_every_owner() {
+        let conn = migrated_with_a_block();
+        conn.execute_batch("DROP TRIGGER structural_blocks_reject_update")
+            .unwrap();
+
+        let (a, b) = versions(&conn);
+        conn.execute("UPDATE structural_blocks SET body = X'FFFF'", [])
+            .unwrap();
+        assert_eq!(
+            versions(&conn),
+            (a + 1, b),
+            "a body rewrite bumps its owner"
+        );
+
+        let (a, b) = versions(&conn);
+        conn.execute("UPDATE structural_blocks SET track_id = 2", [])
+            .unwrap();
+        assert_eq!(
+            versions(&conn),
+            (a + 1, b + 1),
+            "a reparent bumps both owners"
+        );
     }
 }

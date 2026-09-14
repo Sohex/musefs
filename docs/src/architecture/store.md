@@ -36,10 +36,11 @@ plugins under `contrib/` write tags and art here out-of-band.
   bytes: `art_reject_content_update` (art is content-addressed and immutable),
   `art_ad` (a deleted art row bumps referencing tracks so an orphan rebuilds to
   a clean serve-time error), `tracks_geometry_au` (scanner-owned geometry
-  changes), and `structural_blocks_ai`/`_ad`. `tags_reject_reparent` and
-  `track_art_reject_reparent` make row ownership immutable, and
-  `tracks_reject_rekey` makes a track's id immutable, for the same reason art
-  content is.
+  changes), and `structural_blocks_ai`/`_au`/`_ad`. `tags_reject_reparent` and
+  `track_art_reject_reparent` make row ownership immutable,
+  `tracks_reject_rekey` makes a track's id immutable, and
+  `structural_blocks_reject_update` makes a structural block immutable, for the
+  same reason art content is.
 
 ### Transparent and gated migrations
 
@@ -332,6 +333,15 @@ stop a rekey: a childless track has nothing referencing its old id. The
 changelog trigger records the old id as well as a changed new one regardless,
 so a writer that drops the refusal still leaves the mount's refresh able to see
 the old id go.
+
+**And a structural block is replaced, never updated.** `structural_blocks` is
+scanner-owned, so no external writer should touch it at all, but SQL permits an
+`UPDATE` whatever the contract says, and an in-place rewrite of `body` or
+`track_id` changed what a FLAC header is synthesized from without invalidating
+either track ([#759](https://github.com/Sohex/musefs/issues/759)).
+`structural_blocks_reject_update` aborts every `UPDATE` on the table; the
+scanner already replaces a track's blocks by delete-then-insert. The update
+trigger bumps both the old and the new owner regardless.
 
 **Text and binary tag rows have independent ordinal spaces.** `tags` has no
 primary key; a unique index on `(track_id, key, ordinal, (value_blob IS NULL))`
