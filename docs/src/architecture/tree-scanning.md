@@ -60,8 +60,10 @@ It covers the reads that reach musefs, which is not every read. With
 `--keep-cache`, on by default, a read the kernel can satisfy from its page cache
 never becomes a FUSE request, so no re-stat runs for it. An in-place rewrite of a
 backing file behind a file that is already open and cached is therefore not seen
-by those cached reads; the next open resolves the file again, detects the change
-and fails with `EIO`. That is deliberate rather than an oversight: bypassing the
+by those cached reads. The next open resolves the file again, and fails with `EIO`
+if the rewrite moved the freshness stamp — size, mtime, ctime or inode. A
+same-size rewrite in place on a filesystem with coarse timestamps can leave all
+four unchanged, and then no open catches it either (see above). That is deliberate rather than an oversight: bypassing the
 page cache would give up the one measured storage win in the benchmarks, and an
 in-place rewrite of a backing file is outside the contract to begin with.
 

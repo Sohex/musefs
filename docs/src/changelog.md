@@ -732,7 +732,9 @@ see the [Release notes](release-notes.md).
   `--keep-cache`, on by default, a read the kernel serves from its page cache
   never does. So an in-place rewrite of a backing file behind a file that is
   already open and cached is caught at the next open — which fails with `EIO` —
-  rather than on those cached reads. The behaviour is unchanged and deliberate;
+  rather than on those cached reads, provided the rewrite moved the file's size,
+  mtime, ctime or inode; a same-size rewrite in place on a filesystem with
+  coarse timestamps can move none of them, and then no open catches it. The behaviour is unchanged and deliberate;
   the architecture page and the tuning table now say so.
 
 - **`musefs vacuum` refuses a store a mount has open, as it always said it did**
