@@ -5,7 +5,7 @@ use std::io::Cursor;
 
 use common::{fmt_pcm_16bit_mono, resolve_layout};
 use id3::TagLike;
-use musefs_format::wav::{WavScan, synthesize_layout};
+use musefs_format::wav::{ByteOrder, WavScan, synthesize_layout};
 use musefs_format::{ArtInput, BlobLen, PictureType, Segment, TagInput};
 
 #[test]
@@ -16,6 +16,7 @@ fn synthesizes_valid_riff_and_preserves_audio() {
     let scan = WavScan {
         fmt: fmt_pcm_16bit_mono(),
         fact: None,
+        byte_order: ByteOrder::Little,
     };
     let tags = vec![
         TagInput::new("title", "Wave Song"),
@@ -50,6 +51,7 @@ fn embeds_full_fidelity_id3_tag_with_art() {
     let scan = WavScan {
         fmt: fmt_pcm_16bit_mono(),
         fact: None,
+        byte_order: ByteOrder::Little,
     };
     let tags = vec![
         TagInput::new("title", "Cover Test"),
@@ -101,6 +103,7 @@ fn emits_native_info_chunk_for_mapped_tags() {
     let scan = WavScan {
         fmt: fmt_pcm_16bit_mono(),
         fact: None,
+        byte_order: ByteOrder::Little,
     };
     let tags = vec![
         TagInput::new("title", "Hello"),
@@ -125,6 +128,7 @@ fn pads_odd_data_payload_to_word_boundary() {
     let scan = WavScan {
         fmt: fmt_pcm_16bit_mono(),
         fact: None,
+        byte_order: ByteOrder::Little,
     };
     let layout = synthesize_layout(&scan, 0, audio.len() as u64, &[], &[], &[]).unwrap();
     let bytes = resolve_layout(&layout, &audio, &HashMap::new(), &HashMap::new());
@@ -147,6 +151,7 @@ fn rejects_audio_over_32bit() {
     let scan = WavScan {
         fmt: fmt_pcm_16bit_mono(),
         fact: None,
+        byte_order: ByteOrder::Little,
     };
     let res = synthesize_layout(&scan, 0, u64::from(u32::MAX) + 1, &[], &[], &[]);
     assert_eq!(res, Err(musefs_format::FormatError::TooLarge));
@@ -179,6 +184,7 @@ fn keeps_real_art_when_mixed_with_empty() {
     let scan = WavScan {
         fmt: fmt_pcm_16bit_mono(),
         fact: None,
+        byte_order: ByteOrder::Little,
     };
     let tags = vec![TagInput::new("title", "Mixed")];
     let arts = vec![ArtInput {
