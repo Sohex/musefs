@@ -239,6 +239,8 @@ what changed underneath:
   it does not ([#724]).
 - A tag or picture link cannot be moved to another track by updating its
   `track_id`; delete it and insert it under the new one ([#717]).
+- A track's `id` cannot be changed once assigned. It is the identity the mount's
+  refresh keys on, so the store refuses the update ([#762]).
 
 The scan-flag changes above need no plugin update: the packages have called the
 `revalidate` subcommand since their 1.2.0 and pass neither `--fast` nor
@@ -326,6 +328,7 @@ directly.
 [#749]: https://github.com/Sohex/musefs/issues/749
 [#750]: https://github.com/Sohex/musefs/issues/750
 [#751]: https://github.com/Sohex/musefs/issues/751
+[#762]: https://github.com/Sohex/musefs/issues/762
 
 ## v1.3.0
 

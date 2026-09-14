@@ -781,8 +781,9 @@ DROP TABLE art_hold_v4;
 
 -- 6. Recreate the indexes and the thirteen triggers the drops took with them,
 -- plus what the new shapes add. Verbatim except where noted: `tracks_geometry_au`
--- gains `backing_ino`, the two `_au` bumps widen to both owners, and two
--- reparent-refusal triggers are new.
+-- gains `backing_ino`, `tracks_changelog_au` logs the old id too, the two `_au`
+-- bumps widen to both owners, and two reparent-refusal triggers and a rekey
+-- refusal are new.
 CREATE INDEX tracks_fingerprint_idx ON tracks(fingerprint);
 
 -- The reverse art -> track_art edge, which went with the DROP TABLE above. Bulk
@@ -809,8 +810,14 @@ CREATE UNIQUE INDEX tags_ordinal_idx
 CREATE TRIGGER tracks_changelog_ai AFTER INSERT ON tracks BEGIN
     INSERT INTO track_changes (track_id) VALUES (NEW.id);
 END;
+-- The old id first, and the new one only when it differs (#762). A rekey is
+-- refused below, but the refresh only removes an id the log names, so logging
+-- `NEW.id` alone left a ghost for the old id in the live tree against any
+-- writer that got past the refusal. The second insert is conditional so an
+-- ordinary update still spends one ring slot rather than two.
 CREATE TRIGGER tracks_changelog_au AFTER UPDATE ON tracks BEGIN
-    INSERT INTO track_changes (track_id) VALUES (NEW.id);
+    INSERT INTO track_changes (track_id) VALUES (OLD.id);
+    INSERT INTO track_changes (track_id) SELECT NEW.id WHERE NEW.id <> OLD.id;
 END;
 CREATE TRIGGER tracks_changelog_ad AFTER DELETE ON tracks BEGIN
     INSERT INTO track_changes (track_id) VALUES (OLD.id);
@@ -930,6 +937,18 @@ WHEN NEW.track_id <> OLD.track_id
 BEGIN
     SELECT RAISE(ABORT,
         'art link ownership is immutable; delete the row and insert it under the new track');
+END;
+
+-- A track's id is immutable for the same reason (#762). The incremental refresh
+-- keys on it -- which is why it is AUTOINCREMENT and never handed back out
+-- (#678) -- and foreign keys do not protect it: a childless track has nothing
+-- referencing its old id, so it could be rekeyed freely, onto a deleted id
+-- included. The WHEN guard is load-bearing, as it is for the reparent refusals.
+CREATE TRIGGER tracks_reject_rekey
+BEFORE UPDATE OF id ON tracks
+WHEN NEW.id <> OLD.id
+BEGIN
+    SELECT RAISE(ABORT, 'track ids are immutable; delete the row and insert a new one');
 END;
 
 PRAGMA user_version = 4;

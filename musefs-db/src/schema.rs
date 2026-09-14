@@ -776,8 +776,9 @@ DROP TABLE art_hold_v4;
 
 -- 6. Recreate the indexes and the thirteen triggers the drops took with them,
 -- plus what the new shapes add. Verbatim except where noted: `tracks_geometry_au`
--- gains `backing_ino`, the two `_au` bumps widen to both owners, and two
--- reparent-refusal triggers are new.
+-- gains `backing_ino`, `tracks_changelog_au` logs the old id too, the two `_au`
+-- bumps widen to both owners, and two reparent-refusal triggers and a rekey
+-- refusal are new.
 CREATE INDEX tracks_fingerprint_idx ON tracks(fingerprint);
 
 -- The reverse art -> track_art edge, which went with the DROP TABLE above. Bulk
@@ -804,8 +805,14 @@ CREATE UNIQUE INDEX tags_ordinal_idx
 CREATE TRIGGER tracks_changelog_ai AFTER INSERT ON tracks BEGIN
     INSERT INTO track_changes (track_id) VALUES (NEW.id);
 END;
+-- The old id first, and the new one only when it differs (#762). A rekey is
+-- refused below, but the refresh only removes an id the log names, so logging
+-- `NEW.id` alone left a ghost for the old id in the live tree against any
+-- writer that got past the refusal. The second insert is conditional so an
+-- ordinary update still spends one ring slot rather than two.
 CREATE TRIGGER tracks_changelog_au AFTER UPDATE ON tracks BEGIN
-    INSERT INTO track_changes (track_id) VALUES (NEW.id);
+    INSERT INTO track_changes (track_id) VALUES (OLD.id);
+    INSERT INTO track_changes (track_id) SELECT NEW.id WHERE NEW.id <> OLD.id;
 END;
 CREATE TRIGGER tracks_changelog_ad AFTER DELETE ON tracks BEGIN
     INSERT INTO track_changes (track_id) VALUES (OLD.id);
@@ -925,6 +932,18 @@ WHEN NEW.track_id <> OLD.track_id
 BEGIN
     SELECT RAISE(ABORT,
         'art link ownership is immutable; delete the row and insert it under the new track');
+END;
+
+-- A track's id is immutable for the same reason (#762). The incremental refresh
+-- keys on it -- which is why it is AUTOINCREMENT and never handed back out
+-- (#678) -- and foreign keys do not protect it: a childless track has nothing
+-- referencing its old id, so it could be rekeyed freely, onto a deleted id
+-- included. The WHEN guard is load-bearing, as it is for the reparent refusals.
+CREATE TRIGGER tracks_reject_rekey
+BEFORE UPDATE OF id ON tracks
+WHEN NEW.id <> OLD.id
+BEGIN
+    SELECT RAISE(ABORT, 'track ids are immutable; delete the row and insert a new one');
 END;
 
 ";
@@ -4277,13 +4296,14 @@ mod constraint_tests {
             "structural_blocks_ad",
             "tags_reject_reparent",
             "track_art_reject_reparent",
+            "tracks_reject_rekey",
         ] {
             assert!(
                 names.iter().any(|n| n == expected),
                 "missing trigger on fresh DB: {expected}"
             );
         }
-        assert_eq!(names.len(), 17, "unexpected trigger count: {names:?}");
+        assert_eq!(names.len(), 18, "unexpected trigger count: {names:?}");
     }
 
     #[test]
@@ -4613,5 +4633,77 @@ mod art_immutability_tests {
             })
             .unwrap();
         assert_eq!(cv1, cv0, "deleting an unreferenced art row must not bump");
+    }
+}
+
+/// `tracks.id` is the identity the incremental refresh keys on (#678), so it
+/// cannot be rewritten in place (#762).
+#[cfg(test)]
+mod track_id_immutability_tests {
+    use rusqlite::Connection;
+
+    /// Foreign keys ON, as `Db::configure` opens the real connection. A
+    /// childless track is the shape enforcement does not protect: with no
+    /// child to reference the old id, nothing but the trigger stands in the way.
+    fn migrated_with_track() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        super::migrate(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime_ns, updated_at) \
+             VALUES (CAST('/a.flac' AS BLOB),'flac',0,1,1,0,0)",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM track_changes", []).unwrap();
+        conn
+    }
+
+    fn logged(conn: &Connection) -> Vec<i64> {
+        conn.prepare("SELECT track_id FROM track_changes ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_rekey_is_refused() {
+        let conn = migrated_with_track();
+        let err = conn
+            .execute("UPDATE tracks SET id = 99 WHERE id = 1", [])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("track ids are immutable"), "{err}");
+    }
+
+    /// The `WHEN` guard: `BEFORE UPDATE OF id` fires whenever the column is
+    /// named in a `SET` list, so a writer rewriting a row wholesale without
+    /// moving it must still get through.
+    #[test]
+    fn naming_id_without_changing_it_is_allowed() {
+        let conn = migrated_with_track();
+        conn.execute("UPDATE tracks SET id = id, updated_at = 5 WHERE id = 1", [])
+            .unwrap();
+        assert_eq!(
+            logged(&conn),
+            vec![1],
+            "an ordinary update spends one ring slot, not two"
+        );
+    }
+
+    /// The changelog is correct on its own terms: against a writer that has
+    /// dropped the refusal, a rekey still names the id that went away, which
+    /// is the one the incremental refresh has to remove.
+    #[test]
+    fn with_the_refusal_dropped_a_rekey_logs_both_ids() {
+        let conn = migrated_with_track();
+        conn.execute_batch("DROP TRIGGER tracks_reject_rekey")
+            .unwrap();
+        conn.execute("UPDATE tracks SET id = 99 WHERE id = 1", [])
+            .unwrap();
+        assert_eq!(logged(&conn), vec![1, 99]);
     }
 }

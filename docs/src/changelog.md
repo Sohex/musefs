@@ -274,6 +274,20 @@ see the [Release notes](release-notes.md).
     mount kept listing the pruned track and never showed the new one until it
     was remounted. Reading the ghost returned `EIO` rather than the wrong audio,
     because the backing stamp guard still failed closed.
+
+    An id that is an identity must also not change, and nothing refused
+    `UPDATE tracks SET id = …`
+    ([#762](https://github.com/Sohex/musefs/issues/762)). Foreign keys stop it
+    for a track with children, but a childless track — a file with no tags, art
+    or structural blocks — rekeyed freely, including onto an id that had been
+    deleted, which is #678's reuse through a different door. And
+    `tracks_changelog_au` logged only `NEW.id`, so the refresh classified the
+    new id as an addition and never saw the old one leave: the mount listed a
+    ghost for the old id beside the rekeyed track. `tracks_reject_rekey` now
+    refuses a changed id, in the shape of #717's reparent refusals, and the
+    changelog trigger logs `OLD.id` and, only when it differs, `NEW.id` — so
+    the refresh is correct on its own terms against a writer that drops the
+    refusal, while an ordinary update still spends one ring slot rather than two.
   - `tracks.backing_path` becomes a `BLOB`
     ([#680](https://github.com/Sohex/musefs/issues/680)), and so does the Rust
     model — see the Fixed entry below for the half that stops the mangling. The

@@ -37,8 +37,9 @@ plugins under `contrib/` write tags and art here out-of-band.
   `art_ad` (a deleted art row bumps referencing tracks so an orphan rebuilds to
   a clean serve-time error), `tracks_geometry_au` (scanner-owned geometry
   changes), and `structural_blocks_ai`/`_ad`. `tags_reject_reparent` and
-  `track_art_reject_reparent` make row ownership immutable, for the same reason
-  art content is.
+  `track_art_reject_reparent` make row ownership immutable, and
+  `tracks_reject_rekey` makes a track's id immutable, for the same reason art
+  content is.
 
 ### Transparent and gated migrations
 
@@ -321,6 +322,16 @@ bump both the old and the new owner regardless, so the accounting is correct on
 its own terms rather than only because the refusal forbids the case.) Naming
 `track_id` in a `SET` list without changing its value is not a reparent and is
 allowed.
+
+**So is a track's id.** `tracks.id` is the identity the incremental refresh
+keys on — the reason it is `AUTOINCREMENT` and never handed back out
+([#678](https://github.com/Sohex/musefs/issues/678)) — and `tracks_reject_rekey`
+aborts any `UPDATE` that changes it
+([#762](https://github.com/Sohex/musefs/issues/762)). Foreign keys alone did not
+stop a rekey: a childless track has nothing referencing its old id. The
+changelog trigger records the old id as well as a changed new one regardless,
+so a writer that drops the refusal still leaves the mount's refresh able to see
+the old id go.
 
 **Text and binary tag rows have independent ordinal spaces.** `tags` has no
 primary key; a unique index on `(track_id, key, ordinal, (value_blob IS NULL))`

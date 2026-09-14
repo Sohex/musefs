@@ -415,6 +415,63 @@ fn pruned_ring_prefix_is_a_gap_and_full_rebuild_recovers_lost_change() {
     );
 }
 
+/// A track id rewritten in place must leave the live tree the way a fresh open
+/// would see it (#762). The schema refuses the rekey, so this drops the refusal
+/// for the one statement — the shape a `writable_schema` writer produces — and
+/// checks that the changelog alone still carries the refresh to the right tree.
+/// Before it logged `OLD.id`, the incremental path saw the new id as an addition
+/// and never saw the old one leave, so the mount listed both.
+#[test]
+fn a_rekeyed_track_leaves_no_ghost_in_the_live_tree() {
+    let target = small_corpus(2);
+    let db_path = target.db_path.clone();
+    let corpus = target.corpus_dir.clone();
+    let db = Db::open(&db_path).unwrap();
+    scan_directory(&db, &corpus).unwrap();
+    let fs = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+    let ids: Vec<i64> = db.list_tracks().unwrap().iter().map(|t| t.id).collect();
+
+    // Childless first: with foreign keys enforced, a track that still has
+    // children cannot be rekeyed at all.
+    let raw = rusqlite::Connection::open(&db_path).unwrap();
+    raw.pragma_update(None, "foreign_keys", true).unwrap();
+    for table in ["tags", "track_art", "structural_blocks"] {
+        raw.execute(
+            &format!("DELETE FROM {table} WHERE track_id = ?1"),
+            [ids[0]],
+        )
+        .unwrap();
+    }
+    assert!(fs.poll_refresh().unwrap());
+
+    let refusal: Vec<String> = raw
+        .prepare("SELECT sql FROM sqlite_master WHERE name = 'tracks_reject_rekey'")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    raw.execute_batch("DROP TRIGGER IF EXISTS tracks_reject_rekey")
+        .unwrap();
+    raw.execute(
+        "UPDATE tracks SET id = (SELECT max(id) FROM tracks) + 100 WHERE id = ?1",
+        [ids[0]],
+    )
+    .unwrap();
+    // Restored verbatim, so the reference open below passes schema identity.
+    for sql in &refusal {
+        raw.execute_batch(sql).unwrap();
+    }
+
+    assert!(fs.poll_refresh().unwrap());
+    let reference = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+    assert_eq!(
+        tree_fingerprint(&fs).into_keys().collect::<Vec<_>>(),
+        tree_fingerprint(&reference).into_keys().collect::<Vec<_>>(),
+        "the old id must leave the tree when the row is rekeyed"
+    );
+}
+
 #[test]
 fn empty_ring_with_zero_watermark_polls_incremental() {
     // A data_version bump with no changelog rows and no watermark (the ring was
