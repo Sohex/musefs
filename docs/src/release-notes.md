@@ -47,7 +47,9 @@ store upgrade is one-way without the snapshot `migrate` takes.
 - **A scan survives a rejected file** ([#662]). A row the store refuses fails
   that one file, and the scan runs to completion and exits `2`.
 - **Hardening across the serve path and the store**:
-  - backing changes are validated after the read, not before ([#682]);
+  - backing changes are validated after the read, not before ([#682]), and an
+    open file drops the read-ahead it cached before a backing rewrite once the
+    row is restamped to match;
   - an over-cap directory listing stays stable across a refresh ([#695]);
   - metadata work on the worker pool is admission-controlled ([#694]);
   - content-addressed art is verified ([#724]);

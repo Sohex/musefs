@@ -199,8 +199,8 @@ see the [Release notes](release-notes.md).
 - **The serve path no longer zero-fills buffers a read is about to overwrite**
   ([#670](https://github.com/Sohex/musefs/issues/670)). Each backing-audio
   segment and Ogg audio page a read touched was zero-filled and then overwritten
-  by the positioned read, and each read-ahead window was allocated zeroed and then
-  filled — about 1.7 µs per 128 KiB segment and 69 µs per 8 MiB window as
+  by the positioned read, and each read-ahead window, whether a read or the
+  background prefetch filled it, was allocated zeroed and then filled — about 1.7 µs per 128 KiB segment and 69 µs per 8 MiB window as
   measured in the issue, roughly 18% of a page-cached fill. Those reads now land
   in the buffer's uninitialized spare capacity instead, committed by one audited
   `unsafe` `set_len` covering only the bytes `pread` reports initialized, and a
@@ -818,6 +818,23 @@ see the [Release notes](release-notes.md).
 
 ### Fixed
 
+- **An open file no longer serves read-ahead cached before a backing rewrite**
+  once the row is restamped. A handle's read-ahead windows are keyed by backing
+  offset alone, and a read's post-read check validates the held descriptor
+  against the stamp its layout names. After an in-place rewrite of the backing
+  file (same inode), reads correctly failed with `BackingChanged`; but once
+  `musefs revalidate` or `scan --force` restamped the row, the handle re-resolved,
+  its descriptor matched the new stamp, and a read landing in a window cached
+  before the rewrite served those old bytes behind the new header — a file that
+  matched neither version, and with `--keep-cache` the `content_version` bump sent
+  the kernel straight to it. A handle publishing a layout resolved against a
+  different stamp now bumps its epoch (refusing a prefetch dispatched before the
+  rewrite), drops and uncharges its cached windows, and resets its prefetch
+  watermark, in that order, before the new layout is served. A re-tag, which
+  keeps the stamp, keeps the windows. The bug predates 2.0.0. The rule #682
+  settled, that a detected backing change outranks the read's own error, is now
+  pinned on both read paths too.
+
 - **`--follow-symlinks` judges a link by the file it points at**
   ([#766](https://github.com/Sohex/musefs/issues/766)). The walk checked the
   extension of the link's own name, but the worker canonicalized the path and
@@ -961,7 +978,9 @@ see the [Release notes](release-notes.md).
   rather than on those cached reads, provided the rewrite moved the file's size,
   mtime, ctime or inode; a same-size rewrite in place on a filesystem with
   coarse timestamps can move none of them, and then no open catches it. The behaviour is unchanged and deliberate;
-  the architecture page and the tuning table now say so.
+  the architecture page and the tuning table now say so, and so do the
+  `--keep-cache` and `--trust-backing-mtime` help, which had claimed no stale
+  byte is ever served.
 
 - **`musefs vacuum` refuses a store a mount has open, as it always said it did**
   ([#721](https://github.com/Sohex/musefs/issues/721)). It relied on `VACUUM`

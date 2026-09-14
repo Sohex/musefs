@@ -278,7 +278,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The serve path no longer zero-fills buffers a read is about to overwrite
   ([#670](https://github.com/Sohex/musefs/issues/670)). Backing-audio segments,
-  Ogg audio pages and read-ahead windows were zero-filled and then overwritten
+  Ogg audio pages and read-ahead windows, whether a read or the background
+  prefetch filled them, were zero-filled and then overwritten
   by the positioned read; the bytes now land in the buffer's uninitialized
   capacity, committed only as far as `pread` reports. Against high-latency
   backing nothing visible changes; against page-cached or NVMe reads it is one
@@ -441,6 +442,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **An open file no longer serves read-ahead cached before a backing rewrite**
+  once the row is restamped. A handle's read-ahead windows are keyed by backing
+  offset alone. After an in-place rewrite of the backing file, reads correctly
+  failed with `BackingChanged`; but once `musefs revalidate` or `scan --force`
+  restamped the row, the held descriptor matched the new stamp again, and a read
+  landing in a window cached before the rewrite served those old bytes behind the
+  new header, a file matching neither version. A handle that re-resolves onto a
+  new stamp now drops its cached windows and refuses in-flight prefetches first.
+  The bug predates 2.0.0.
+
 - **`--follow-symlinks` judges a link by the file it points at**
   ([#766](https://github.com/Sohex/musefs/issues/766)). The walk checked the
   extension of the link's own name but probed its target, so a recursive scan
@@ -568,7 +579,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   musefs ([#683](https://github.com/Sohex/musefs/issues/683)). With
   `--keep-cache`, a page-cache hit never does, so an in-place backing rewrite
   behind an open, cached file is caught at the next open, and only if the
-  rewrite changed the file's size, mtime, ctime or inode.
+  rewrite changed the file's size, mtime, ctime or inode. The `--keep-cache`
+  and `--trust-backing-mtime` help now say the same instead of claiming no stale
+  byte is ever served.
 
 - **A synthesized file's mtime now moves whenever its bytes do, and a pre-epoch
   backing file is stored and served.** Two fixes in the same type, because both are
