@@ -367,6 +367,35 @@ fn emit_interop_fixtures() {
         });
     }
 
+    // MP3 whose backing carries a prepended tag, an appended ID3v2.4 tag with
+    // its footer, and an ID3v1 trailer (#768). The served file must carry the
+    // synthesized front tag and none of the three.
+    {
+        let bytes = fixtures::mp3_with_front_and_back_tags();
+        let b = musefs_format::mp3::locate_audio(&bytes).unwrap();
+        let (ao, al) = emit(
+            &dir.join("src_multi.mp3"),
+            &dir.join("out_multi.mp3"),
+            &bytes,
+            Format::Mp3,
+            b.audio_offset,
+            b.audio_length,
+            &PICTURES,
+        );
+        manifest.push(ManifestRow {
+            file: "out_multi.mp3",
+            source_file: "src_multi.mp3",
+            title: "Interop Title",
+            artist: "Interop Artist",
+            source_audio_offset: b.audio_offset,
+            source_audio_length: b.audio_length,
+            synth_audio_offset: ao,
+            synth_audio_length: al,
+            ogg_payload_only: false,
+            covr_count: 0,
+        });
+    }
+
     // MP4 (audio = mdat payload) — use the richer local fixture so that
     // mutagen.mp4.MP4 can open the synthesized output (requires mdhd + stsd).
     {
