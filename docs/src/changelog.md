@@ -191,6 +191,12 @@ see the [Release notes](release-notes.md).
   already holds; an inode with none recorded gets a size past `i64::MAX`, which
   the kernel refuses to link since Linux 5.5 (and 5.4.3, 4.19.89, 4.14.159,
   4.9.207, 4.4.207 and 3.16.85), so the name is listed and nothing is cached.
+  Those attributes are recorded only once the kernel negotiates `readdirplus`,
+  and a record goes at the kernel's `FORGET`, which Linux sends for every lookup
+  count a reply hands it. The record is bounded by the file inodes the kernel
+  caches, at about 150 to 300 bytes each. A kernel without `readdirplus`, such as
+  FreeBSD's, keeps none, since it can answer a `lookup` it never links and never
+  forgets.
 
 - `--trust-backing-mtime` skips the backing re-stat that `getattr` performs on
   a metadata-cache hit, serving the cached size and mtime instead. Off by

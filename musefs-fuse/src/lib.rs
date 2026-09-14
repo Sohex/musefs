@@ -1191,22 +1191,50 @@ fn unlinkable_plus_entry(child: u64, kind: FileType, style: &AttrStyle) -> PlusE
 /// Recorded wherever a reply carries a file's attrs — `lookup`, `getattr`, and
 /// each `readdirplus` entry added to a page — before that reply goes out, so the
 /// kernel's `FORGET` for it always lands after the record. Dropped where the
-/// kernel stops holding them: at `FORGET`, which the kernel sends only when it
-/// evicts the inode, and when a refresh invalidates the inode, whose attrs the
-/// kernel then discards. Directories are not recorded: their attrs are static,
-/// and a directory entry never needs the fallback.
+/// kernel stops holding them: at `FORGET`, and when a refresh invalidates the
+/// inode, whose attrs the kernel then discards. Directories are not recorded:
+/// their attrs are static, and a directory entry never needs the fallback.
+///
+/// Linux sends `FORGET` with the inode's whole lookup count when it evicts the
+/// inode (`fuse_evict_inode`), and with a count of one for an entry it was sent
+/// but could not link (`fuse_force_forget` after `fuse_direntplus_link` fails,
+/// or `fuse_lookup_name` when `fuse_iget` does). So every count a reply hands
+/// the kernel comes back, and the map holds at most the file inodes the kernel
+/// caches, which it sheds under memory pressure. The second kind can drop a
+/// record for an inode the kernel still holds through an earlier count. That
+/// costs the inode only its fallback, which then becomes the size the kernel
+/// refuses, and never keeps a record the kernel has let go.
+///
+/// Nothing is recorded until [`SentAttrs::start_recording`], which `init` calls
+/// only when the kernel negotiates `readdirplus`, the one op the record serves.
+/// FreeBSD's fusefs never does, and it can answer a `lookup` it then fails to
+/// link without ever sending `FORGET` (`fuse_vnop_lookup`), which would leave
+/// that inode's record behind for good.
+///
+/// An entry is a `u64` key and a 120-byte `FileAttr`: 129 bytes of table with
+/// its control byte, about 150 to 300 at the map's load factor, against the
+/// tree's own ~1.3 KB per track.
 ///
 /// Two replies for one inode can reach the kernel in the other order from the
 /// one they were recorded in, so the record may be the earlier or the later of
 /// two real attr sets for the file. Either is the file's own, which is all the
 /// fallback needs: never the out-of-range size.
 #[derive(Default)]
-struct SentAttrs(Mutex<std::collections::HashMap<u64, FileAttr>>);
+struct SentAttrs {
+    attrs: Mutex<std::collections::HashMap<u64, FileAttr>>,
+    recording: std::sync::atomic::AtomicBool,
+}
 
 impl SentAttrs {
-    /// Note `attr` as what the kernel is about to hold, if it is a file's.
+    /// The kernel negotiated `readdirplus`: from now on, replies are recorded.
+    fn start_recording(&self) {
+        self.recording.store(true, Ordering::Relaxed);
+    }
+
+    /// Note `attr` as what the kernel is about to hold, if it is a file's and
+    /// the fallback can ever be needed.
     fn record(&self, attr: &FileAttr) {
-        if attr.kind == FileType::RegularFile {
+        if attr.kind == FileType::RegularFile && self.recording.load(Ordering::Relaxed) {
             self.map().insert(attr.ino.0, *attr);
         }
     }
@@ -1222,7 +1250,7 @@ impl SentAttrs {
     }
 
     fn map(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<u64, FileAttr>> {
-        self.0
+        self.attrs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -1805,8 +1833,14 @@ impl Filesystem for MusefsFs {
         // for a bare `ls`, since each entry carries ~128 bytes of attrs and so
         // fewer of them fit in a page (#667). Requested separately: without the
         // handler below the kernel would never send the op anyway, and without
-        // AUTO it would send it for every listing.
-        let _ = config.add_capabilities(InitFlags::FUSE_DO_READDIRPLUS);
+        // AUTO it would send it for every listing. The attrs fallback serves only
+        // this op, so replies are recorded only if the kernel will send it.
+        if config
+            .add_capabilities(InitFlags::FUSE_DO_READDIRPLUS)
+            .is_ok()
+        {
+            self.sent_attrs.start_recording();
+        }
         let _ = config.add_capabilities(InitFlags::FUSE_READDIRPLUS_AUTO);
         // Kernel passthrough (Linux-only) is requested by the platform module;
         // off Linux this is a no-op and reads are served through the daemon.
@@ -2095,9 +2129,10 @@ impl Filesystem for MusefsFs {
         reply.ok();
     }
 
-    /// The kernel evicted `ino`: it sends `FORGET` only then, with the inode's
-    /// whole lookup count, so it holds no attrs for the inode any more and the
-    /// last ones sent are no fallback. fuser's `batch_forget` calls this per node.
+    /// The kernel evicted `ino`, or could not link an entry it was sent for it.
+    /// Either way the record goes, even if the kernel still holds the inode
+    /// through an earlier count (see `SentAttrs`). fuser's `batch_forget`
+    /// calls this per node.
     fn forget(&self, _req: &Request, ino: INodeNo, _nlookup: u64) {
         self.sent_attrs.forget(ino.0);
     }
@@ -3681,6 +3716,7 @@ mod tests {
     fn sent_attrs_hold_the_last_file_attrs_until_forgotten() {
         let style = test_style();
         let sent = SentAttrs::default();
+        sent.start_recording();
         assert!(sent.last(9).is_none(), "nothing sent yet");
 
         sent.record(&file_attr(9, 100));
@@ -3705,6 +3741,28 @@ mod tests {
         assert!(sent.last(9).is_none(), "a forgotten inode has no fallback");
         sent.forget(9);
         assert!(sent.last(9).is_none(), "forgetting twice is harmless");
+    }
+
+    /// The record exists only for the `readdirplus` fallback, so where the kernel
+    /// did not negotiate `readdirplus` nothing is recorded. FreeBSD's fusefs is
+    /// one such kernel, and it can also answer a `lookup` it then never links and
+    /// never forgets, which would leave an entry behind for good.
+    #[test]
+    fn sent_attrs_record_nothing_until_readdirplus_is_negotiated() {
+        let sent = SentAttrs::default();
+        sent.record(&file_attr(9, 100));
+        assert!(
+            sent.last(9).is_none(),
+            "a kernel that never sends readdirplus never needs the fallback"
+        );
+
+        sent.start_recording();
+        sent.record(&file_attr(9, 100));
+        assert_eq!(
+            sent.last(9).map(|attr| attr.size),
+            Some(100),
+            "once readdirplus is negotiated, replies are recorded"
+        );
     }
 
     /// A page's first entry that cannot be resolved goes out with the attrs musefs
@@ -3746,6 +3804,7 @@ mod tests {
     fn plus_entry_for_uses_the_record_only_for_an_entry_without_attrs() {
         let style = test_style();
         let sent = SentAttrs::default();
+        sent.start_recording();
         sent.record(&file_attr(9, 4242));
 
         let resolved = PlusEntry {

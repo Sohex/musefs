@@ -182,8 +182,15 @@ which is what a transient failure, a blip on an NFS backing, needs. An entry
 that still cannot be resolved as a page's first is listed with the attributes
 musefs last sent the kernel for that inode, and a zero TTL. The mount keeps
 those attributes for every file inode from each `lookup`, `getattr` and
-`readdirplus` reply, and drops them when the kernel forgets the inode, which it
-does only on eviction, or when a refresh invalidates it. If the kernel holds
+`readdirplus` reply, once the kernel has negotiated `readdirplus` at all, and
+drops them when the kernel forgets the inode or a refresh invalidates it. Linux
+sends that `FORGET` when it evicts the inode, and also for an entry it was sent
+but could not link, so every count a reply hands it comes back. The record
+therefore never outgrows the file inodes the kernel caches, at about 150 to 300
+bytes each against the tree's ~1.3 KB per track. A kernel that never negotiates
+`readdirplus`, such as FreeBSD's, never gets a record, which also matters
+because FreeBSD can answer a `lookup` it then fails to link without sending
+`FORGET`. If the kernel holds
 attributes for the inode at all, it holds those, so linking them changes
 nothing, and the zero TTL sends the client's next access back to `getattr` and
 its real error. The file neither vanishes from `ls` nor stalls the listing.
