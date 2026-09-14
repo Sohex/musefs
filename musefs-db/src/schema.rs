@@ -1208,15 +1208,23 @@ enum GatePolicy {
 /// That is the same "creating versus upgrading" distinction the announcement
 /// below already draws for its log level (#706).
 fn reachable(current: i64, policy: GatePolicy) -> i64 {
+    reachable_in(MIGRATIONS, current, policy)
+}
+
+/// [`reachable`] over any migration table, so the rule can be tested against a
+/// shape this build does not ship yet: a transparent step after an applied
+/// gate, which the first migration after 2.0.0 will be.
+fn reachable_in(migrations: &[Migration], current: i64, policy: GatePolicy) -> i64 {
+    let latest = i64::try_from(migrations.len()).expect("a migration count fits an i64");
     if current == 0 || policy == GatePolicy::Bypass {
-        return LATEST_VERSION;
+        return latest;
     }
-    for (target, migration) in (1i64..).zip(MIGRATIONS) {
+    for (target, migration) in (1i64..).zip(migrations) {
         if target > current && migration.gate.is_gated() {
             return current;
         }
     }
-    LATEST_VERSION
+    latest
 }
 
 /// The refusal a gated step raises, naming the version reached and the command
@@ -1716,6 +1724,26 @@ mod gate_tests {
         // A store older than the wall sees the transparent steps too.
         assert_eq!(super::pending(1).len(), 3);
         assert!(!super::pending(1)[0].gated);
+    }
+
+    /// The rule over a table this build does not ship: a transparent step after
+    /// the gate, as the first post-2.0.0 migration will be. A store behind the
+    /// gate stays put; one whose gated step is already applied takes the later
+    /// transparent step on open, like any other.
+    #[test]
+    fn a_transparent_step_after_an_applied_gate_still_applies_on_open() {
+        let table = [
+            super::Migration::new("", super::Gate::Transparent, "1.0.0", "before"),
+            super::Migration::new("", super::Gate::Gated, "2.0.0", "the gate"),
+            super::Migration::new("", super::Gate::Transparent, "2.1.0", "after"),
+        ];
+        assert_eq!(super::reachable_in(&table, 1, GatePolicy::Enforce), 1);
+        assert_eq!(
+            super::reachable_in(&table, 2, GatePolicy::Enforce),
+            3,
+            "an applied gated step is not pending"
+        );
+        assert_eq!(super::reachable_in(&table, 3, GatePolicy::Enforce), 3);
     }
 
     #[test]
