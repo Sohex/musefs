@@ -185,7 +185,12 @@ malformed *shapes* at commit, so an external writer cannot persist them:
 - an `art.byte_len` over `MAX_ART_BYTES`;
 - a `track_art.mime` over 255 chars or `description` over 8 KiB, or either one,
   or an `art.sha256`, containing NUL;
-- a `backing_path` that is not a non-empty `BLOB`, or that contains a NUL byte;
+- a `backing_path` that is not a non-empty `BLOB`, that contains a NUL byte, or
+  that is over 64 KiB (`MAX_BACKING_PATH_BYTES`,
+  [#758](https://github.com/Sohex/musefs/issues/758)) — a portable ceiling past
+  any platform's `PATH_MAX`, so it refuses no path that could be opened. Every
+  reader of the column also re-checks the cap from `length(backing_path)` before
+  loading the path, for a store written with its constraints off;
 - a `structural_blocks` row with an unknown `kind`, negative `ordinal`, or `body`
   over the FLAC 24-bit block limit.
 

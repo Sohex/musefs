@@ -525,8 +525,14 @@ CREATE TABLE tracks (
     -- `tracks_geometry_au`, and the Rust freshness stamp), never ordered or
     -- summed, so the encoding costs nothing it is used for.
     backing_ino      INTEGER NOT NULL DEFAULT 0,
+    -- The upper bound is 64 KiB (#758), a portable ceiling rather than any
+    -- platform's PATH_MAX: no path past the OS limit can be opened to serve, and
+    -- without a bound a crafted row chose the size of the allocation every reader
+    -- makes, getattr included. The readers re-check it from length() before
+    -- loading the path, for a store written with its constraints off.
     CHECK (typeof(backing_path) = 'blob'
            AND length(backing_path) > 0
+           AND length(backing_path) <= 65536
            AND instr(backing_path, x'00') = 0),
     -- The IN list is strictly stronger than a typeof CHECK would be: no
     -- non-TEXT value compares equal to any of these, so the storage class is

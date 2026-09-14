@@ -1145,6 +1145,37 @@ fn ingest_bulk_rejects_a_file_with_an_oversize_binary_tag() {
     assert!(err.to_string().contains("SYLT"), "{err}");
 }
 
+/// #758: a path over `MAX_BACKING_PATH_BYTES` fails that one file on the batch
+/// ingest path. It is the store's `CHECK` that refuses it, so it classifies as a
+/// store rejection — which the scan counts as one failed file and carries on
+/// past, rather than aborting the run.
+#[test]
+fn ingest_bulk_fails_only_the_file_whose_path_is_over_the_cap() {
+    let db = Db::open_in_memory().unwrap();
+    let cap = usize::try_from(musefs_db::limits::MAX_BACKING_PATH_BYTES).unwrap();
+    let over = std::path::PathBuf::from(format!("/{}", "a".repeat(cap)));
+    {
+        let mut bw = db.bulk_writer().unwrap();
+        let err = ingest_bulk(
+            &mut bw,
+            &over,
+            BackingStamp {
+                size: 1,
+                mtime_ns: 0,
+                ctime_ns: 0,
+                ino: None,
+            },
+            probed_with_pictures(Vec::new()),
+        )
+        .expect_err("a path over the cap must fail the file");
+        assert!(super::is_store_rejection(&err), "{err}");
+    }
+    assert!(
+        db.list_tracks().unwrap().is_empty(),
+        "the refused file leaves no row behind"
+    );
+}
+
 fn picture_of_len(len: usize) -> EmbeddedPicture {
     EmbeddedPicture {
         mime: "image/jpeg".to_string(),

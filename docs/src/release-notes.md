@@ -109,7 +109,8 @@ constraints off:
   column, a fractional number where an integer belongs;
 - an embedded NUL in a tag key, a picture's MIME type or description, or an art
   row's digest;
-- a picture dimension past `u32`, or an empty `backing_path`;
+- a picture dimension past `u32`, an empty `backing_path`, or one over 64 KiB
+  ([#758]);
 - an art row whose digest is not 64 lowercase hex characters ([#761]);
 - a tag, picture link or structural block whose track is gone, or a link whose
   image is.
@@ -237,7 +238,8 @@ has the package side. For anything writing to the store without them, this is
 what changed underneath:
 
 - `tracks.backing_path` is a `BLOB` holding the filesystem's bytes, not text
-  ([#680]). Bind paths as bytes; a text value is refused. The helpers'
+  ([#680]), of at most 64 KiB ([#758]). Bind paths as bytes; a text value is
+  refused. The helpers'
   `path_param` and `path_value` do this, and `realpath_key` returns a non-UTF-8
   name as the string `os.fsdecode` gives, not a lossy one.
 - A picture's MIME type and dimensions describe one file's embedding, so they
@@ -342,6 +344,7 @@ directly.
 [#749]: https://github.com/Sohex/musefs/issues/749
 [#750]: https://github.com/Sohex/musefs/issues/750
 [#751]: https://github.com/Sohex/musefs/issues/751
+[#758]: https://github.com/Sohex/musefs/issues/758
 [#761]: https://github.com/Sohex/musefs/issues/761
 [#762]: https://github.com/Sohex/musefs/issues/762
 

@@ -299,6 +299,18 @@ see the [Release notes](release-notes.md).
     declaring the column `BLOB` is an affinity and would still accept `TEXT`
     through the same door
     ([#718](https://github.com/Sohex/musefs/issues/718)).
+
+    The column gains an upper bound as well, 64 KiB
+    ([#758](https://github.com/Sohex/musefs/issues/758)). It had none, and every
+    reader loads the whole path — `get_track` on every resolve, `track_identity`
+    on `getattr`, `list_backing_paths` for every row at once during a scan — so
+    a crafted but schema-valid store chose the size of that allocation, before
+    the OS could refuse a path no one can open. The ceiling is portable rather
+    than a platform's `PATH_MAX`, which the store's one shape cannot encode, and
+    nothing past the OS limit could be served anyway. Every reader checks
+    `length(backing_path)` before reading the value, which is the half that
+    protects a store written with its constraints off; a scanned path over the
+    cap fails that one file.
   - `tracks.backing_ino` is added
     ([#674](https://github.com/Sohex/musefs/issues/674)). On filesystems that
     truncate sub-second timestamps — ext3, HFS+, some SMB and NFS mounts — a
