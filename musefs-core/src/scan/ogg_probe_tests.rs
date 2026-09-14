@@ -293,11 +293,133 @@ fn revalidate_prune_spares_a_refused_file_rewritten_since_the_refusal() {
     assert!(db.list_tracks().unwrap().is_empty());
 }
 
+/// An Opus header region over 4 MiB, from a comment carrying a long text tag,
+/// plus one audio page. Returns the bytes and the header region's length.
+///
+/// Over 4 MiB because that is where the probe's widening used to run out of
+/// retries from a 64-byte window, and hand the file to a whole-buffer fallback
+/// that parsed the wrong length of it: the tests below scan with that window,
+/// which keeps the fixture a few megabytes rather than the 8 MiB the default
+/// window needed. Real files get there with a few megabytes of base64 cover art.
+fn opus_with_a_large_header(serial: u32) -> (Vec<u8>, u64) {
+    let head = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".to_vec();
+    let long = "x".repeat(4 << 20 | 1 << 19);
+    let mut tags = b"OpusTags".to_vec();
+    tags.extend_from_slice(&vorbis_body_with(&[("comment", &long)]));
+    let (mut bytes, pages) = build_header_pub(serial, &[&head, &tags]);
+    let header_len = bytes.len() as u64;
+    let (audio, _) = lace_packet_pub(serial, pages, false, 960, &[0u8; 100]);
+    bytes.extend_from_slice(&audio);
+    (bytes, header_len)
+}
+
+/// Scan options with the 64-byte first window [`opus_with_a_large_header`]
+/// is sized for.
+fn small_window() -> ScanOptions {
+    ScanOptions {
+        window: 64,
+        ..ScanOptions::default()
+    }
+}
+
+/// Write `front` at the start of a sparse file `len` bytes long, and `tail` at
+/// its very end.
+fn write_sparse(path: &std::path::Path, front: &[u8], len: u64, tail: &[u8]) {
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::File::create(path).unwrap();
+    f.set_len(len).unwrap();
+    f.write_all_at(front, 0).unwrap();
+    f.write_all_at(tail, len - tail.len() as u64).unwrap();
+}
+
+/// An Ogg file past the probe ceiling whose header region takes the widening a
+/// while to cover. The whole-buffer fallback it used to reach took the 64 MiB
+/// buffer's length for the file's, so the stored audio region stopped at the
+/// ceiling and the mount served the file cut short.
 #[test]
-fn scan_ingests_an_oggflac_whose_header_count_is_unknown() {
-    // A zero following-packet count means "unknown", not "none": the real
-    // VORBIS_COMMENT still follows. Reading it as "none" left the tags inside
-    // the audio region, un-ingested and replayed by synthesis (#723).
+fn an_ogg_past_the_probe_ceiling_keeps_its_whole_audio_region() {
+    let (front, header_len) = opus_with_a_large_header(0x1234);
+    // The stream's own final page, ending on the file's last byte.
+    let (last, _) = lace_packet_pub(0x1234, 9, false, 48_000, &[0u8; 100]);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("large-header.opus");
+    let len = 100 << 20;
+    write_sparse(&path, &front, len, &last);
+
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    let stats = crate::scan_directory_with(&db, &path, &small_window()).unwrap();
+    assert_eq!((stats.scanned, stats.failed), (1, 0), "{stats:?}");
+    let t = db.list_tracks().unwrap().remove(0);
+    assert_eq!(
+        (t.bounds.audio_offset(), t.bounds.audio_length()),
+        (header_len, len - header_len),
+        "the audio runs to the end of the file, not to the probe ceiling"
+    );
+}
+
+/// The chain check (#722) reads the file's final page. The fallback ran it on
+/// the last page-sized window of its 64 MiB buffer instead — sparse zeros in
+/// the middle of this file, which prove nothing — and so stored a chain whose
+/// second stream sits past the ceiling.
+#[test]
+fn the_chain_check_reads_the_real_final_page_past_the_probe_ceiling() {
+    crate::warn_limit::log_capture::install();
+    let (front, _) = opus_with_a_large_header(0x1234);
+    let (foreign, _) = lace_packet_pub(0x5678, 3, false, 48_000, &[1u8; 100]);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("large-header-chained-far.opus");
+    write_sparse(&path, &front, 100 << 20, &foreign);
+
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    let stats = crate::scan_directory_with(&db, &path, &small_window()).unwrap();
+    assert_eq!((stats.scanned, stats.failed), (0, 1), "{stats:?}");
+    let logged =
+        crate::warn_limit::log_capture::messages_containing("large-header-chained-far.opus");
+    assert!(
+        logged.iter().any(|m| m.contains("chained Ogg")),
+        "{logged:?}"
+    );
+}
+
+/// #747 prunes a stored file refused as *unsupported*, and only that. A chained
+/// Ogg whose header region sent the probe to the whole-buffer fallback was
+/// refused there as *unparseable* instead, so `revalidate --prune` could never
+/// remove its row.
+#[test]
+fn a_chained_ogg_with_a_large_header_is_refused_as_unsupported_and_pruned() {
+    let (mut bytes, _) = opus_with_a_large_header(0x1234);
+    // A second, small link under its own serial, as in `chained_opus_bytes`.
+    let head = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".to_vec();
+    let mut tags = b"OpusTags".to_vec();
+    tags.extend_from_slice(&vorbis_body_empty());
+    let (link, link_pages) = build_header_pub(0x5678, &[&head, &tags]);
+    bytes.extend_from_slice(&link);
+    let (link_audio, _) = lace_packet_pub(0x5678, link_pages, false, 960, &[1u8; 100]);
+    bytes.extend_from_slice(&link_audio);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("large-header-chained.opus");
+    std::fs::write(&path, &bytes).unwrap();
+    drop(bytes);
+
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    plant_stored_row(&db, &path);
+    let opts = ScanOptions {
+        prune: true,
+        ..small_window()
+    };
+    let stats = crate::revalidate_with(&db, dir.path(), &opts).unwrap();
+    assert_eq!(
+        (stats.failed, stats.pruned),
+        (1, 1),
+        "refused for its shape, so --prune removes it"
+    );
+    assert!(db.list_tracks().unwrap().is_empty());
+}
+
+/// The FLAC-in-Ogg file #723 is about — a mapping packet whose following-packet
+/// count is zero, then a VORBIS_COMMENT flagged last — plus one audio page.
+/// Returns the bytes and the length of the true header region.
+fn oggflac_with_unknown_count() -> (Vec<u8>, usize) {
     let mut streaminfo = Vec::new();
     streaminfo.push(0u8); // STREAMINFO, not the last block
     streaminfo.extend_from_slice(&34u32.to_be_bytes()[1..]); // 24-bit length
@@ -320,6 +442,103 @@ fn scan_ingests_an_oggflac_whose_header_count_is_unknown() {
     let header_len = bytes.len();
     let (audio, _) = lace_packet_pub(0x4321, pages, false, 4096, &[0xFFu8, 0xF8, 0x69, 0x18]);
     bytes.extend_from_slice(&audio);
+    (bytes, header_len)
+}
+
+/// Plant the row 1.3.0 stored for [`oggflac_with_unknown_count`]: it read the
+/// zero count as "none", so its audio region starts right after the mapping
+/// packet's page, and V4 left it with no inode and no fingerprint. Returns the
+/// track id and that 1.3.0 `audio_offset`.
+fn plant_1_3_0_oggflac_row(db: &musefs_db::Db, path: &std::path::Path) -> (i64, u64) {
+    let bytes = std::fs::read(path).unwrap();
+    let cut = musefs_format::ogg::parse_page(&bytes, 0)
+        .unwrap()
+        .total_len() as u64;
+    let meta = std::fs::metadata(path).unwrap();
+    let stamp = BackingStamp::from_metadata(&meta);
+    let id = db
+        .upsert_track(&musefs_db::NewTrack {
+            backing_path: std::fs::canonicalize(path).unwrap(),
+            format: Format::OggFlac,
+            audio_offset: cut,
+            audio_length: meta.len() - cut,
+            backing_size: stamp.size,
+            backing_mtime_ns: stamp.mtime_ns,
+            backing_ctime_ns: stamp.ctime_ns,
+            backing_ino: None,
+        })
+        .unwrap();
+    (id, cut)
+}
+
+/// #723's upgrade edge. A row 1.3.0 stored for a zero-count OggFLAC has its
+/// audio region starting right after the mapping packet, and the serve path
+/// re-parses exactly that region. The discovery walk ran off its end, so every
+/// read was EIO until a re-probe corrected the row — and a `--checksum none`
+/// revalidate on a filesystem where no inode is recorded never re-probes it.
+/// Until one does, the file serves as it did under 1.3.0.
+#[test]
+fn a_1_3_0_row_for_an_unknown_count_oggflac_still_serves() {
+    let (bytes, _) = oggflac_with_unknown_count();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unknown-count-1.3.0.oga");
+    std::fs::write(&path, &bytes).unwrap();
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    let (id, _) = plant_1_3_0_oggflac_row(&db, &path);
+
+    {
+        let _fat = crate::freshness::pretend_no_inodes();
+        let stats = crate::revalidate_with(
+            &db,
+            dir.path(),
+            &ScanOptions {
+                checksum: ChecksumTier::None,
+                ..ScanOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            (stats.unchanged, stats.updated),
+            (1, 0),
+            "nothing about the row asks this pass to re-probe it"
+        );
+    }
+
+    let resolved = crate::HeaderCache::new(crate::Mode::Synthesis)
+        .resolve(&db, id)
+        .expect("the stored region parses");
+    let served = crate::reader::read_at(&resolved, &db, 0, resolved.total_len).unwrap();
+    assert_eq!(served.len() as u64, resolved.total_len);
+}
+
+/// #723's other test gap: the re-probe that corrects a 1.3.0 row. The file
+/// parses, so unlike a chained Ogg the revalidate rewrites the row's bounds to
+/// the true header region instead of refusing it.
+#[test]
+fn a_revalidate_corrects_the_audio_offset_1_3_0_stored() {
+    let (bytes, header_len) = oggflac_with_unknown_count();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unknown-count-revalidated.oga");
+    std::fs::write(&path, &bytes).unwrap();
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    let (id, cut) = plant_1_3_0_oggflac_row(&db, &path);
+    assert!(cut < header_len as u64, "the planted row is the short one");
+
+    let stats = crate::revalidate(&db, dir.path()).unwrap();
+    assert_eq!((stats.updated, stats.failed), (1, 0));
+    let t = db.get_track(id).unwrap().unwrap();
+    assert_eq!(
+        (t.bounds.audio_offset(), t.bounds.audio_length()),
+        (header_len as u64, (bytes.len() - header_len) as u64)
+    );
+}
+
+#[test]
+fn scan_ingests_an_oggflac_whose_header_count_is_unknown() {
+    // A zero following-packet count means "unknown", not "none": the real
+    // VORBIS_COMMENT still follows. Reading it as "none" left the tags inside
+    // the audio region, un-ingested and replayed by synthesis (#723).
+    let (bytes, header_len) = oggflac_with_unknown_count();
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("unknown-count.oga");

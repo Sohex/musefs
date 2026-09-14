@@ -544,10 +544,17 @@ fn fingerprint_tier_move_confirms_against_the_stored_hash() {
 /// default (fingerprint-tier) revalidate re-probes it to record the inode. It
 /// must not keep that hash on the strength of a stamp whose inode wildcard proves
 /// nothing about the bytes the hash was computed over.
+///
+/// All of that holds where the filesystem keeps inode numbers musefs records.
+/// Where it keeps none, nothing about the row asks for a re-probe and none is
+/// made, so the row is left as it is — a state no store reaches there in
+/// practice, since the V4 upgrade clears every content hash. The expectation
+/// is derived from this test's own tempdir, so it says which case it checked.
 #[test]
 fn revalidate_does_not_keep_a_content_hash_an_unrecorded_inode_cannot_vouch_for() {
     let dir = tempfile::tempdir().unwrap();
     write_a_flac(dir.path(), "a.flac", &[0xAB; 64]);
+    let keeps = musefs_core::freshness::filesystem_keeps_inodes_for_test(dir.path());
     let db = Db::open_in_memory().unwrap();
     scan_directory_with(&db, dir.path(), &opts(ChecksumTier::Fingerprint)).unwrap();
     let track = db.list_tracks().unwrap().remove(0);
@@ -576,12 +583,28 @@ fn revalidate_does_not_keep_a_content_hash_an_unrecorded_inode_cannot_vouch_for(
 
     let stats =
         musefs_core::revalidate_with(&db, dir.path(), &opts(ChecksumTier::Fingerprint)).unwrap();
-    assert_eq!(stats.updated, 1, "an unrecorded inode forces the re-probe");
+    assert_eq!(
+        stats.updated,
+        u64::from(keeps),
+        "an unrecorded inode forces the re-probe exactly where one can be recorded"
+    );
 
     let after = db.get_track(track.id).unwrap().unwrap();
-    assert!(after.backing_ino.is_some(), "the inode is recorded now");
     assert_eq!(
-        after.content_hash, None,
-        "a hash the stamp cannot vouch for is cleared, not carried"
+        after.backing_ino.is_some(),
+        keeps,
+        "the inode is recorded now where the filesystem keeps inode numbers"
     );
+    if keeps {
+        assert_eq!(
+            after.content_hash, None,
+            "a hash the stamp cannot vouch for is cleared, not carried"
+        );
+    } else {
+        assert_eq!(
+            after.content_hash.as_deref(),
+            Some(stale.as_str()),
+            "a row nothing re-probes is left exactly as it was"
+        );
+    }
 }

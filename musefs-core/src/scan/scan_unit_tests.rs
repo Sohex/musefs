@@ -32,6 +32,31 @@ fn write_temp(name: &str, bytes: &[u8]) -> (tempfile::TempDir, std::fs::File) {
 // kills scan L172 Ok(None) constant, L178 Ok(Some) value
 // kills scan L176 `file_len - 128`→`/` (offset 0 vs 1 shifts the bytes)
 // kills scan L175 buf init [0;128]/[1;128] constants (exact bytes asserted)
+/// Each widening takes what the probe asked for, but never less than twice
+/// what it already had, and never more than the ceiling. The doubling is what
+/// keeps a file whose metadata spans many blocks from walking toward the
+/// ceiling one exact block at a time.
+#[test]
+fn widening_asks_for_at_least_double_and_stops_at_the_ceiling() {
+    const CAP: u64 = 1 << 20;
+    assert_eq!(
+        widened(100, 110, CAP),
+        200,
+        "a small ask still doubles the window"
+    );
+    assert_eq!(
+        widened(100, 5000, CAP),
+        5000,
+        "a large ask is met in one step"
+    );
+    assert_eq!(
+        widened(CAP / 2 + 1, CAP / 2 + 2, CAP),
+        CAP,
+        "doubling is capped"
+    );
+    assert_eq!(widened(100, CAP * 4, CAP), CAP, "so is the ask");
+}
+
 #[test]
 fn read_tail_128_exact_128_bytes() {
     // Distinct, position-sensitive pattern: byte[i] = i (0..=127).
@@ -307,7 +332,13 @@ fn probe_file_fails_file_with_oversized_mp4_covr() {
     std::fs::write(&path, &bytes).unwrap();
     assert!(
         matches!(
-            probe_file(&path, 0, ChecksumTier::Fingerprint).unwrap(),
+            probe_file(
+                &path,
+                0,
+                ChecksumTier::Fingerprint,
+                &InodeKeeping::default()
+            )
+            .unwrap(),
             ProbeOutcome::Failed(_)
         ),
         "an oversized covr must fail the file, not yield a track without its art"
@@ -323,7 +354,13 @@ fn probe_file_fails_file_with_oversized_mp4_binary_freeform() {
     std::fs::write(&path, &bytes).unwrap();
     assert!(
         matches!(
-            probe_file(&path, 0, ChecksumTier::Fingerprint).unwrap(),
+            probe_file(
+                &path,
+                0,
+                ChecksumTier::Fingerprint,
+                &InodeKeeping::default()
+            )
+            .unwrap(),
             ProbeOutcome::Failed(_)
         ),
         "an oversized `----` value must fail the file"
@@ -339,7 +376,14 @@ fn probe_file_keeps_mp4_covr_at_cap() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("at_cap_art.m4a");
     std::fs::write(&path, &bytes).unwrap();
-    let probed = match probe_file(&path, 0, ChecksumTier::Fingerprint).unwrap() {
+    let probed = match probe_file(
+        &path,
+        0,
+        ChecksumTier::Fingerprint,
+        &InodeKeeping::default(),
+    )
+    .unwrap()
+    {
         ProbeOutcome::Probed(p, _, _) => p,
         other => panic!("expected Probed, got {other:?}"),
     };
@@ -677,6 +721,188 @@ fn records_same_bytes_needs_every_field_to_agree() {
     }
 }
 
+/// Where the filesystem keeps no inode numbers, the probe records none, so the
+/// live stamp has no inode either — and then the other three fields plus the
+/// geometry decide. A cheap pass over an unchanged file there must keep what
+/// an expensive one computed ("a cheap pass never undoes an expensive one").
+/// A stored row with no inode beside a live stamp that has one is still not
+/// proof: that is the upgraded row the test above covers.
+#[test]
+fn records_same_bytes_needs_no_inode_where_neither_side_has_one() {
+    let unit = unit_with("/m/b.flac", None);
+    assert_eq!(unit.stamp.ino, None, "the probe recorded no inode");
+    let db = Db::open_in_memory().unwrap();
+    let id = db
+        .upsert_track(&NewTrack {
+            backing_path: unit.abs_path.clone(),
+            format: Format::Flac,
+            audio_offset: 0,
+            audio_length: 0,
+            backing_size: unit.stamp.size,
+            backing_mtime_ns: unit.stamp.mtime_ns,
+            backing_ctime_ns: unit.stamp.ctime_ns,
+            backing_ino: None,
+        })
+        .unwrap();
+    let stored = db.get_track(id).unwrap().expect("the row just written");
+    assert!(
+        records_same_bytes(&unit, Some(&stored)),
+        "neither side records an inode, and everything else agrees"
+    );
+
+    let mut live_has_one = unit_with("/m/b.flac", None);
+    live_has_one.stamp.ino = Some(7);
+    assert!(
+        !records_same_bytes(&live_has_one, Some(&stored)),
+        "an unrecorded stored inode cannot vouch for a file whose filesystem keeps them"
+    );
+
+    let mut grown = unit_with("/m/b.flac", None);
+    grown.stamp.size += 1;
+    assert!(
+        !records_same_bytes(&grown, Some(&stored)),
+        "no inode on either side excuses nothing else"
+    );
+}
+
+/// The revalidate re-probe for rows an earlier scan cut short, at each edge of
+/// its criterion: the formats whose correct probe runs the audio to the file's
+/// end, a file over the ceiling, and an audio end short by more than an ID3v1
+/// trailer.
+#[test]
+fn a_row_cut_short_at_the_ceiling_is_recognised_and_a_correct_one_is_not() {
+    let big = MAX_PROBE_BYTES + (1 << 20);
+    for format in [Format::Flac, Format::Opus, Format::Vorbis, Format::OggFlac] {
+        assert!(
+            cut_short_at_the_ceiling(format, big, MAX_PROBE_BYTES),
+            "{format:?} ending at the ceiling"
+        );
+        assert!(
+            !cut_short_at_the_ceiling(format, big, big),
+            "{format:?} ending at the end of the file"
+        );
+        assert!(
+            !cut_short_at_the_ceiling(format, big, big - 128),
+            "{format:?} short by exactly an ID3v1 trailer"
+        );
+        assert!(
+            cut_short_at_the_ceiling(format, big, big - 129),
+            "{format:?} short by more than a trailer"
+        );
+        assert!(
+            !cut_short_at_the_ceiling(format, MAX_PROBE_BYTES, 0),
+            "{format:?} not over the ceiling"
+        );
+        assert!(
+            cut_short_at_the_ceiling(format, MAX_PROBE_BYTES + 1, 0),
+            "{format:?} one byte over the ceiling"
+        );
+    }
+    for format in [Format::Mp3, Format::M4a, Format::Wav] {
+        assert!(
+            !cut_short_at_the_ceiling(format, big, MAX_PROBE_BYTES),
+            "{format:?} is not a format the ceiling cut short"
+        );
+    }
+}
+
+/// `(fingerprint, content_hash)` for the one track in `db`.
+fn stored_checksums(db: &Db) -> (Option<String>, Option<String>) {
+    let t = db.list_tracks().unwrap().remove(0);
+    (t.fingerprint, t.content_hash)
+}
+
+/// A pass that answers `keeps` for the filesystem `path` is on, standing in for
+/// one that keeps no inode numbers (or does) whatever the suite runs on. Unlike
+/// `pretend_no_inodes`, the answer reaches the scan's probe workers.
+fn pass_answering(path: &std::path::Path, keeps: bool) -> Arc<InodeKeeping> {
+    use std::os::unix::fs::MetadataExt;
+    let inodes = Arc::new(InodeKeeping::default());
+    inodes.pretend(std::fs::metadata(path).unwrap().dev(), keeps);
+    inodes
+}
+
+/// #689's rule, on a filesystem that keeps no inode numbers: a `scan --force`
+/// below the full tier used to clear the `content_hash` a `--checksum full`
+/// pass computed, and `--checksum none` the fingerprint too — disabling move
+/// recovery — because keeping a checksum required a recorded inode that no
+/// pass there can ever record.
+#[test]
+fn a_cheap_rescan_keeps_the_checksums_of_an_unchanged_file_where_no_inode_is_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unchanged-no-inode.m4a");
+    std::fs::write(&path, mp4_with_covr(13, &[0xFF; 8])).unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let pass = |checksum: ChecksumTier, force: bool| {
+        let opts = ScanOptions {
+            checksum,
+            force,
+            ..ScanOptions::default()
+        };
+        scan_directory_in(&db, dir.path(), &opts, &pass_answering(&path, false)).unwrap()
+    };
+
+    pass(ChecksumTier::Full, false);
+    assert_eq!(db.list_tracks().unwrap()[0].backing_ino, None);
+    let full = stored_checksums(&db);
+    assert!(full.0.is_some() && full.1.is_some(), "{full:?}");
+
+    assert_eq!(pass(ChecksumTier::Fingerprint, true).scanned, 1);
+    assert_eq!(
+        stored_checksums(&db),
+        full,
+        "a fingerprint-tier rescan of an unchanged file keeps its full hash"
+    );
+    assert_eq!(pass(ChecksumTier::None, true).scanned, 1);
+    assert_eq!(
+        stored_checksums(&db),
+        full,
+        "and a none-tier rescan keeps its fingerprint too"
+    );
+}
+
+/// The other direction, which the rule must keep: on a filesystem that keeps
+/// inode numbers, a row with none recorded is what an upgraded store holds, and
+/// a stamp agreeing on the other three fields cannot vouch for its hash.
+#[test]
+fn a_cheap_rescan_clears_the_checksums_an_unrecorded_inode_cannot_vouch_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("upgraded-row.m4a");
+    std::fs::write(&path, mp4_with_covr(13, &[0xFF; 8])).unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let pass = |checksum: ChecksumTier, force: bool| {
+        let opts = ScanOptions {
+            checksum,
+            force,
+            ..ScanOptions::default()
+        };
+        scan_directory_in(&db, dir.path(), &opts, &pass_answering(&path, true)).unwrap()
+    };
+
+    pass(ChecksumTier::Full, false);
+    let t = db.list_tracks().unwrap().remove(0);
+    assert!(t.backing_ino.is_some(), "the inode is recorded");
+    db.upsert_track(&NewTrack {
+        backing_path: t.backing_path,
+        format: t.format,
+        audio_offset: t.bounds.audio_offset(),
+        audio_length: t.bounds.audio_length(),
+        backing_size: t.backing_size,
+        backing_mtime_ns: t.backing_mtime_ns,
+        backing_ctime_ns: t.backing_ctime_ns,
+        backing_ino: None,
+    })
+    .unwrap();
+
+    pass(ChecksumTier::Fingerprint, true);
+    let (fingerprint, content_hash) = stored_checksums(&db);
+    assert!(fingerprint.is_some(), "the pass computed a fingerprint");
+    assert_eq!(
+        content_hash, None,
+        "a hash an unrecorded inode cannot vouch for is cleared"
+    );
+}
+
 #[test]
 fn checksum_tier_defaults_to_fingerprint() {
     assert_eq!(ScanOptions::default().checksum, ChecksumTier::Fingerprint);
@@ -714,9 +940,9 @@ fn unit_with(abs_path: &str, fingerprint: Option<String>) -> Unit {
 }
 
 // Exercises the `&Db: TrackSink` ingest path: a fresh insert must persist the
-// unit's fingerprint via `Db::set_track_checksums` (kills the `&Db`
-// `set_track_checksums -> Ok(())` mutant — without the write the row's
-// fingerprint stays NULL).
+// unit's fingerprint through `Db::upsert_track_with_checksums`, the one
+// statement that writes the row and its checksums together — without the
+// checksums in that write the row's fingerprint stays NULL.
 #[test]
 fn ingest_unit_db_path_sets_checksums_on_fresh_insert() {
     let db = Db::open_in_memory().unwrap();
@@ -1075,14 +1301,16 @@ fn hash_confirm_refuses_a_file_that_no_longer_matches_the_stamp() {
 }
 
 /// #757: the retarget confirm compares against the stamp the probe recorded, so
-/// it has to record the same way. Otherwise every confirm on FAT would compare a
-/// stamp without an inode against one with, and refuse.
+/// it has to record the same way — as that stamp says, without asking the
+/// filesystem again. Otherwise every confirm where no inode is recorded would
+/// compare a stamp without an inode against one with, and refuse. No seam: the
+/// filesystem this runs on may keep inode numbers, and the confirm must accept
+/// the stamp anyway.
 #[test]
 fn hash_confirm_accepts_a_stamp_recorded_without_the_inode() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("f.bin");
     std::fs::write(&path, b"abc").unwrap();
-    let _fat = crate::freshness::pretend_no_inodes();
     let stamp = BackingStamp::from_metadata(&std::fs::metadata(&path).unwrap()).recordable(false);
     assert_eq!(
         hash_confirm(&path, stamp).unwrap().as_deref(),
@@ -1099,15 +1327,25 @@ fn probe_records_the_inode_only_where_the_filesystem_keeps_one() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.m4a");
     std::fs::write(&path, mp4_with_covr(13, &[0xFF; 8])).unwrap();
-    let recorded_ino = || match probe_file(&path, 0, ChecksumTier::Fingerprint).unwrap() {
+    let recorded_ino = || match probe_file(
+        &path,
+        0,
+        ChecksumTier::Fingerprint,
+        &InodeKeeping::default(),
+    )
+    .unwrap()
+    {
         ProbeOutcome::Probed(_, stamp, _) => stamp.ino,
         other => panic!("expected Probed, got {other:?}"),
     };
 
+    // Decided the way a scan decides it, for the filesystem this test runs on.
+    let expected = crate::freshness::filesystem_keeps_inodes_for_test(dir.path())
+        .then(|| std::fs::metadata(&path).unwrap().ino());
     assert_eq!(
         recorded_ino(),
-        Some(std::fs::metadata(&path).unwrap().ino()),
-        "a filesystem that keeps inode numbers gets its inode recorded"
+        expected,
+        "the inode is recorded exactly where the filesystem keeps inode numbers"
     );
     let _fat = crate::freshness::pretend_no_inodes();
     assert_eq!(
@@ -1160,6 +1398,57 @@ fn a_checksum_that_cannot_be_produced_fails_the_file() {
     assert_eq!(
         checksums_of(&f, &probed, ChecksumTier::None).unwrap(),
         Checksums::default()
+    );
+}
+
+/// #690's routing end to end, which the test above checks only in pieces: a
+/// file that parses and then cannot be hashed leaves `probe_file` as a
+/// `Checksum` failure carrying its stamp, and a scan counts it in
+/// `ScanStats::failed` — the number the CLI turns into exit status 2 — with no
+/// row written for it.
+#[test]
+fn a_file_that_parses_and_cannot_be_hashed_fails_the_scan_for_that_file() {
+    crate::warn_limit::log_capture::install();
+    let dir = tempfile::tempdir().unwrap();
+    let path = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .join("checksum-fault.m4a");
+    std::fs::write(&path, mp4_with_covr(13, &[0xFF; 8])).unwrap();
+
+    struct FaultGuard;
+    impl Drop for FaultGuard {
+        fn drop(&mut self) {
+            set_checksum_fault(None);
+        }
+    }
+    set_checksum_fault(Some(path.clone()));
+    let _guard = FaultGuard;
+
+    match probe_file(&path, WINDOW, ChecksumTier::Full, &InodeKeeping::default()).unwrap() {
+        ProbeOutcome::Failed(f) => {
+            assert_eq!(f.reason, SkipReason::Checksum);
+            assert!(f.message.contains("checksum failed"), "{}", f.message);
+            assert!(f.stamp.is_some(), "the verdict came from a held file");
+        }
+        other => panic!("expected a checksum failure, got {other:?}"),
+    }
+
+    let db = Db::open_in_memory().unwrap();
+    let stats = scan_directory_with(
+        &db,
+        dir.path(),
+        &ScanOptions {
+            checksum: ChecksumTier::Full,
+            ..ScanOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!((stats.scanned, stats.failed), (0, 1), "{stats:?}");
+    assert!(db.list_tracks().unwrap().is_empty(), "nothing is stored");
+    let logged = crate::warn_limit::log_capture::messages_containing("checksum-fault.m4a");
+    assert!(
+        logged.iter().any(|m| m.contains("checksum failed")),
+        "{logged:?}"
     );
 }
 

@@ -58,15 +58,21 @@ is weaker there. That check normally
 compares a file's size, modification time, change time and inode number. FAT
 stores the modification time in two-second steps and exFAT in 10 ms steps, both
 report the change time as the modification time, and neither keeps inode
-numbers stable. On Linux musefs detects both filesystems and records no inode
-for their files. What is left is size plus a coarse modification time: a
-same-size replacement or rewrite inside that window goes undetected, and the
-file is served with metadata laid out for its old content. Other platforms
-record whatever inode number the filesystem reports, so there the check is only
-as reliable as that number is across remounts.
-Filesystems with real timestamps and stable inode numbers, such as ext4, btrfs
-and XFS, get the full check; see
-[freshness](../architecture/tree-scanning.md) for how it works.
+numbers stable, so musefs records no inode for their files. What is left is size
+plus a coarse modification time: a same-size replacement or rewrite inside that
+window goes undetected, and the file is served with metadata laid out for its
+old content.
+
+musefs records an inode only on filesystems it knows keep their inode numbers
+across a remount, such as ext4, btrfs, XFS, ZFS, APFS and NFS. Network shares
+over SMB, FUSE mounts (sshfs, rclone, s3fs) and overlayfs record none either,
+because their numbers can change with a remount: recording them would make every
+file on the mount fail to open after each remount until a revalidate. Those keep
+their real timestamps, so they lose only the inode's protection against a
+same-size replacement inside the timestamp resolution. Filesystems with real
+timestamps and stable inode numbers get the full check; see
+[freshness](../architecture/tree-scanning.md) for how it works and the full
+list.
 
 > **Note:** On Ubuntu 24.04+ (libfuse ≥ 3.17) the `fusermount3` AppArmor
 > profile only permits unprivileged mounts under whitelisted prefixes

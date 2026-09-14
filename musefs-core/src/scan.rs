@@ -7,7 +7,7 @@ use musefs_format::{EmbeddedBinaryTag, EmbeddedPicture, Extent, flac, mp3, mp4, 
 
 use crate::byte_budget::ByteBudget;
 use crate::error::Result;
-use crate::freshness::BackingStamp;
+use crate::freshness::{BackingStamp, InodeKeeping};
 use musefs_db::limits::{
     MAX_ART_DESCRIPTION_LEN, MAX_ART_MIME_LEN, MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN,
 };
@@ -20,10 +20,12 @@ const BATCH_FILES: usize = 256;
 const BATCH_BYTES: u64 = 64 << 20; // 64 MiB
 
 /// Initial bounded-read window. Sized to cover most files' metadata in one read;
-/// larger metadata (e.g. embedded cover art) triggers a precise `NeedMore` widen.
+/// larger metadata (e.g. embedded cover art) triggers a `NeedMore` widen.
 const WINDOW: usize = 1 << 16; // 64 KiB
-/// Cap on widen iterations before falling back to a full-buffer read.
-const MAX_WIDEN_RETRIES: usize = 8;
+/// A bound the widening loop in [`probe_body`] cannot outrun, not a budget a
+/// file spends: every step at least doubles the window (see [`widened`]), so
+/// reaching [`MAX_PROBE_BYTES`] from a one-byte window takes 27 of them.
+const MAX_WIDEN_STEPS: usize = 64;
 /// Hard ceiling on bytes read to probe one file. Real audio metadata fits far
 /// below this, so a file still unparsed past the cap is treated as malformed
 /// rather than read whole into RAM. Guards against a multi-GB file misnamed with
@@ -118,6 +120,28 @@ fn clear_after_resolve_hook() {
     *AFTER_RESOLVE_HOOK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+/// A checksum I/O error injected into one probed path's checksum reads (#690),
+/// standing in for a read that fails partway through a file that parsed — which
+/// the suite cannot provoke on a real filesystem. Process-wide and keyed by path
+/// for the same reason as the resolve hook above.
+#[cfg(test)]
+static CHECKSUM_FAULT: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+fn checksum_fault(probed: &Path) -> Option<std::io::Error> {
+    CHECKSUM_FAULT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_deref()
+        .is_some_and(|p| p == probed)
+        .then(|| std::io::Error::other("injected checksum read failure"))
+}
+#[cfg(test)]
+fn set_checksum_fault(path: Option<PathBuf>) {
+    *CHECKSUM_FAULT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = path;
 }
 
 /// A progress event emitted during a scan or revalidate. Borrows the current
@@ -880,7 +904,10 @@ fn fill_absent_keys(tags: &mut Vec<(String, String)>, fallback: Vec<(String, Str
 }
 
 /// Full-buffer probe (legacy path). Retained as the reference implementation the
-/// bounded path is checked against (see the equivalence property test).
+/// bounded path is checked against (see the equivalence property test); the
+/// bounded probe no longer falls back on it, since over a prefix cut short at
+/// the probe ceiling it takes the prefix's end for the file's.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn probe_full(path: &Path, bytes: &[u8]) -> Option<Probed> {
     if has_ext(path, "flac") {
         Some(flac_probed(bytes, &flac::locate_audio(bytes).ok()?))
@@ -933,21 +960,42 @@ pub(crate) fn probe_full(path: &Path, bytes: &[u8]) -> Option<Probed> {
     }
 }
 
-/// Read `[0, len)` of `path` into a buffer, counting the read. A short read at
-/// EOF is fine (`len` may exceed the file size).
-fn read_window(file: &std::fs::File, len: usize) -> std::io::Result<Vec<u8>> {
+/// Grow `prefix`, the file's bytes from offset 0, toward `len` bytes, reading
+/// only the part it does not hold yet, and counting the read. A short read is
+/// fine: the probe sees a shorter prefix, asks for more, and the next widening
+/// reads on from wherever this one stopped. `len` must not be below
+/// `prefix.len()`.
+fn extend_window(file: &std::fs::File, prefix: &mut Vec<u8>, len: u64) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt;
-    let mut buf = vec![0u8; len];
-    let n = file.read_at(&mut buf, 0)?;
-    buf.truncate(n);
+    let start = prefix.len();
+    prefix.resize(usize_from(len), 0);
+    let n = file.read_at(&mut prefix[start..], start as u64)?;
+    prefix.truncate(start + n);
     crate::metrics::on_scan_read(n as u64);
-    Ok(buf)
+    Ok(())
+}
+
+/// The window to read after a probe over `have` bytes answered
+/// `NeedMore { up_to }`: what it asked for, but at least twice what it had, and
+/// never past `cap`.
+///
+/// The doubling is what keeps a file with large metadata out of trouble. FLAC
+/// asks for exactly the end of the next block header or body, so growing to
+/// `up_to` alone cost two reads per block past the first window; a few large
+/// cover scans used up the eight retries the probe allowed, and the
+/// whole-buffer fallback behind them took its 64 MiB buffer's length for the
+/// file's, storing the audio region of any larger file cut short at the
+/// ceiling. Doubling covers any metadata below the ceiling in a few dozen
+/// steps at most, each read only what the window lacks, so the probe needs no
+/// fallback at all.
+fn widened(have: u64, up_to: u64, cap: u64) -> u64 {
+    up_to.max(have.saturating_mul(2)).min(cap)
 }
 
 /// Append exactly `len` bytes read at `offset` to `out`, counting the read.
 ///
 /// `read_exact_at` rather than a tolerated short read (which is what
-/// [`read_window`] wants for a probe prefix that may run past EOF): the only
+/// `extend_window` wants for a probe prefix that may run past EOF): the only
 /// caller feeds this to a content fingerprint, which has to be deterministic,
 /// so a window that cannot be filled is an error rather than a shorter sample.
 /// Every window asked for lies inside the declared audio region, which the
@@ -1053,14 +1101,21 @@ fn read_mp3_tail(file: &std::fs::File, file_len: u64) -> std::io::Result<Option<
 /// counted as `failed` — and `ProbeOutcome::Raced` if the file changed under us.
 /// A race outranks a failure, since a torn probe says nothing about whether the
 /// settled file would parse or hash.
-fn probe_file(path: &Path, window: usize, tier: ChecksumTier) -> std::io::Result<ProbeOutcome> {
+fn probe_file(
+    path: &Path,
+    window: usize,
+    tier: ChecksumTier,
+    inodes: &InodeKeeping,
+) -> std::io::Result<ProbeOutcome> {
     let file = std::fs::File::open(path)?;
     crate::metrics::on_scan_open();
-    // Asked once: both stats below read this descriptor, so the filesystem
-    // cannot change between them, and on FAT neither may record an inode the
-    // next remount renumbers (#757).
-    let keeps_inodes = crate::freshness::keeps_inodes(&file);
-    let s1 = BackingStamp::from_metadata(&file.metadata()?).recordable(keeps_inodes);
+    let meta = file.metadata()?;
+    // Asked once per filesystem per pass: both stats below read this
+    // descriptor, so the filesystem cannot change between them, and where it
+    // renumbers files neither may record an inode the next remount changes
+    // (#757).
+    let keeps_inodes = inodes.of_file(&file, &meta);
+    let s1 = BackingStamp::from_metadata(&meta).recordable(keeps_inodes);
     #[cfg(test)]
     fire_after_s1();
 
@@ -1068,10 +1123,15 @@ fn probe_file(path: &Path, window: usize, tier: ChecksumTier) -> std::io::Result
     // Inside the sandwich: the s2 check below covers the checksum reads too.
     let settled = match probed {
         ProbeBody::Failed(f) => Err(f),
-        ProbeBody::Parsed(p) => match checksums_of(&file, &p, tier) {
-            Ok(c) => Ok((p, c)),
-            Err(e) => Err(checksum_failure(path, &e)),
-        },
+        ProbeBody::Parsed(p) => {
+            let checksums = checksums_of(&file, &p, tier);
+            #[cfg(test)]
+            let checksums = checksum_fault(path).map_or(checksums, Err);
+            match checksums {
+                Ok(c) => Ok((p, c)),
+                Err(e) => Err(checksum_failure(path, &e)),
+            }
+        }
     };
 
     let s2 = BackingStamp::from_metadata(&file.metadata()?).recordable(keeps_inodes);
@@ -1132,9 +1192,10 @@ fn probe_file_caught(
     path: &Path,
     window: usize,
     tier: ChecksumTier,
+    inodes: &InodeKeeping,
 ) -> std::io::Result<ProbeOutcome> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        probe_file(path, window, tier)
+        probe_file(path, window, tier, inodes)
     })) {
         Ok(res) => res,
         Err(payload) => {
@@ -1207,8 +1268,8 @@ fn probe_body(
     // Never read past the probe ceiling, however large the file or whatever a
     // (possibly corrupt) header asks for via `NeedMore`.
     let probe_cap = file_len.min(MAX_PROBE_BYTES);
-    let mut want = usize_from((window as u64).min(probe_cap));
-    let mut prefix = read_window(file, want)?;
+    let mut prefix = Vec::new();
+    extend_window(file, &mut prefix, (window as u64).min(probe_cap))?;
     // Only the FLAC arm of probe_prefix consumes the 128-byte ID3v1 tail, for the
     // rare file that puts an ID3v2 tag in front of the `fLaC` marker (#602) — a
     // stock .flac still pays no tail read (#67), and .ogg/.wav never do. The
@@ -1232,7 +1293,7 @@ fn probe_body(
     } else {
         None
     };
-    for _ in 0..MAX_WIDEN_RETRIES {
+    for _ in 0..MAX_WIDEN_STEPS {
         match probe_prefix(
             path,
             &prefix,
@@ -1256,25 +1317,20 @@ fn probe_body(
             }
             Probe::NeedMore(up_to) => {
                 // Read everything we're willing to probe? Widening can't help.
-                if want as u64 >= probe_cap {
+                let have = prefix.len() as u64;
+                if have >= probe_cap {
                     break;
                 }
-                // Grow to at least `up_to` (capped at `probe_cap`), always making
-                // progress (`+1`), then retry.
-                want = usize_from(up_to.min(probe_cap))
-                    .max(want + 1)
-                    .min(usize_from(probe_cap));
-                prefix = read_window(file, want)?;
+                extend_window(file, &mut prefix, widened(have, up_to, probe_cap))?;
             }
         }
     }
-    // Fallback: full-buffer probe over the bytes we were willing to read.
-    if (prefix.len() as u64) < probe_cap {
-        prefix = read_window(file, usize_from(probe_cap))?;
-    }
-    if let Some(p) = probe_full(path, &prefix) {
-        return Ok(ProbeBody::Parsed(p));
-    }
+    // Nothing parsed within the ceiling. There is no whole-buffer re-parse to
+    // fall back on: the dispatch above has already judged every byte up to the
+    // ceiling, against the real file length and the real tails, and a re-parse
+    // of the same prefix could only agree with it — or, for a file longer than
+    // the ceiling, mistake the prefix's end for the file's, which stored the
+    // audio region cut short and ran the Ogg chain check mid-file.
     // A WAV whose `data` payload runs past the probe ceiling fails the strict
     // full-buffer parse (the payload isn't present to bound), yet its `fmt `/`data`
     // headers sit at the front: trust the declared bounds and serve the audio,
@@ -1824,7 +1880,16 @@ fn structural_blocks_from(blocks: Vec<(String, Vec<u8>)>) -> Vec<musefs_db::Stru
 /// concrete type path (`Db::`/`BulkWriter::`), which names the inherent method
 /// unambiguously so the same-named trait method can't recurse into itself.
 trait TrackSink {
-    fn upsert_track(&mut self, t: &NewTrack) -> musefs_db::Result<i64>;
+    /// Write the track row and its checksums in one statement. One statement is
+    /// the point: the store bumps `content_version` for a changed ctime unless a
+    /// checksum written by the same statement vouches for the bytes, and a
+    /// trigger sees only the statement that fired it.
+    fn upsert_track_with_checksums(
+        &mut self,
+        t: &NewTrack,
+        fingerprint: ChecksumWrite<'_>,
+        content_hash: ChecksumWrite<'_>,
+    ) -> musefs_db::Result<i64>;
     fn replace_tags(&mut self, track_id: i64, tags: &[Tag]) -> musefs_db::Result<()>;
     fn set_binary_tags(
         &mut self,
@@ -1843,12 +1908,6 @@ trait TrackSink {
         track_id: i64,
         pictures: &[EmbeddedArt],
     ) -> musefs_db::Result<usize>;
-    fn set_track_checksums(
-        &mut self,
-        track_id: i64,
-        fingerprint: ChecksumWrite<'_>,
-        content_hash: ChecksumWrite<'_>,
-    ) -> musefs_db::Result<()>;
     /// The row already stored at `path`, if any. Returns the whole row rather
     /// than a bool because the ingest paths decide their [`ChecksumWrite`]
     /// intents by comparing the stored stamp and geometry against the probe's.
@@ -1868,8 +1927,13 @@ trait TrackSink {
 }
 
 impl TrackSink for &Db {
-    fn upsert_track(&mut self, t: &NewTrack) -> musefs_db::Result<i64> {
-        Db::upsert_track(self, t)
+    fn upsert_track_with_checksums(
+        &mut self,
+        t: &NewTrack,
+        fingerprint: ChecksumWrite<'_>,
+        content_hash: ChecksumWrite<'_>,
+    ) -> musefs_db::Result<i64> {
+        Db::upsert_track_with_checksums(self, t, fingerprint, content_hash)
     }
     fn replace_tags(&mut self, track_id: i64, tags: &[Tag]) -> musefs_db::Result<()> {
         Db::replace_tags(self, track_id, tags)
@@ -1900,14 +1964,6 @@ impl TrackSink for &Db {
         pictures: &[EmbeddedArt],
     ) -> musefs_db::Result<usize> {
         Db::refresh_embedded_art(self, track_id, pictures)
-    }
-    fn set_track_checksums(
-        &mut self,
-        track_id: i64,
-        fingerprint: ChecksumWrite<'_>,
-        content_hash: ChecksumWrite<'_>,
-    ) -> musefs_db::Result<()> {
-        Db::set_track_checksums(self, track_id, fingerprint, content_hash)
     }
     fn existing_track(&mut self, path: &Path) -> musefs_db::Result<Option<musefs_db::Track>> {
         Db::get_track_by_path(self, path)
@@ -1942,8 +1998,13 @@ impl TrackSink for &Db {
 }
 
 impl TrackSink for &mut musefs_db::BulkWriter<'_> {
-    fn upsert_track(&mut self, t: &NewTrack) -> musefs_db::Result<i64> {
-        musefs_db::BulkWriter::upsert_track(self, t)
+    fn upsert_track_with_checksums(
+        &mut self,
+        t: &NewTrack,
+        fingerprint: ChecksumWrite<'_>,
+        content_hash: ChecksumWrite<'_>,
+    ) -> musefs_db::Result<i64> {
+        musefs_db::BulkWriter::upsert_track_with_checksums(self, t, fingerprint, content_hash)
     }
     fn replace_tags(&mut self, track_id: i64, tags: &[Tag]) -> musefs_db::Result<()> {
         musefs_db::BulkWriter::replace_tags(self, track_id, tags)
@@ -1974,14 +2035,6 @@ impl TrackSink for &mut musefs_db::BulkWriter<'_> {
         pictures: &[EmbeddedArt],
     ) -> musefs_db::Result<usize> {
         musefs_db::BulkWriter::refresh_embedded_art(self, track_id, pictures)
-    }
-    fn set_track_checksums(
-        &mut self,
-        track_id: i64,
-        fingerprint: ChecksumWrite<'_>,
-        content_hash: ChecksumWrite<'_>,
-    ) -> musefs_db::Result<()> {
-        musefs_db::BulkWriter::set_track_checksums(self, track_id, fingerprint, content_hash)
     }
     fn existing_track(&mut self, path: &Path) -> musefs_db::Result<Option<musefs_db::Track>> {
         musefs_db::BulkWriter::get_track_by_path(self, path)
@@ -2035,17 +2088,20 @@ fn ingest_into(
     // writing a row the `CHECK` will reject mid-transaction.
     check_storable(abs_path, &probed)?;
 
-    let track_id = w.upsert_track(&NewTrack {
-        backing_path: abs_path.to_path_buf(),
-        format: probed.format,
-        audio_offset: probed.audio_offset,
-        audio_length: probed.audio_length,
-        backing_size: stamp.size,
-        backing_mtime_ns: stamp.mtime_ns,
-        backing_ctime_ns: stamp.ctime_ns,
-        backing_ino: stamp.ino,
-    })?;
-    w.set_track_checksums(track_id, fingerprint, content_hash)?;
+    let track_id = w.upsert_track_with_checksums(
+        &NewTrack {
+            backing_path: abs_path.to_path_buf(),
+            format: probed.format,
+            audio_offset: probed.audio_offset,
+            audio_length: probed.audio_length,
+            backing_size: stamp.size,
+            backing_mtime_ns: stamp.mtime_ns,
+            backing_ctime_ns: stamp.ctime_ns,
+            backing_ino: stamp.ino,
+        },
+        fingerprint,
+        content_hash,
+    )?;
 
     // Text rows first, then binary rows continuing the same per-key counters —
     // the `tags` primary key spans both classes (see `next_ordinal`).
@@ -2118,17 +2174,23 @@ fn refresh_structural_into(
     fingerprint: ChecksumWrite<'_>,
     content_hash: ChecksumWrite<'_>,
 ) -> Result<()> {
-    let track_id = w.upsert_track(&NewTrack {
-        backing_path: abs_path.to_path_buf(),
-        format: probed.format,
-        audio_offset: probed.audio_offset,
-        audio_length: probed.audio_length,
-        backing_size: stamp.size,
-        backing_mtime_ns: stamp.mtime_ns,
-        backing_ctime_ns: stamp.ctime_ns,
-        backing_ino: stamp.ino,
-    })?;
-    w.set_track_checksums(track_id, fingerprint, content_hash)?;
+    // One statement for the stamp and its checksums, as in `ingest_into`: a
+    // re-probe of a file whose ctime moved bumps `content_version` exactly when no
+    // checksum written with the new stamp vouches for the bytes.
+    let track_id = w.upsert_track_with_checksums(
+        &NewTrack {
+            backing_path: abs_path.to_path_buf(),
+            format: probed.format,
+            audio_offset: probed.audio_offset,
+            audio_length: probed.audio_length,
+            backing_size: stamp.size,
+            backing_mtime_ns: stamp.mtime_ns,
+            backing_ctime_ns: stamp.ctime_ns,
+            backing_ino: stamp.ino,
+        },
+        fingerprint,
+        content_hash,
+    )?;
     let structural_blocks = structural_blocks_from(probed.structural_blocks);
     w.set_structural_blocks(track_id, &structural_blocks)?;
     // The V4 migration could only copy each blob's shared metadata onto every
@@ -2176,16 +2238,25 @@ fn is_store_rejection(e: &crate::error::CoreError) -> bool {
 /// `Keep`: a pass below the `full` tier must not leave the previous bytes'
 /// `content_hash` sitting beside the new ones (#689).
 ///
-/// The stored row must have recorded an inode. `matches_live` lets an
-/// unrecorded one match any live inode, which is right for "is this row still
-/// safe to serve" and too weak for "have these bytes been proved the same":
-/// every row an upgraded store starts with has none, and a stamp that agrees
-/// on the other three fields cannot vouch for a hash an older musefs may already
-/// have left stale. Such a row's uncomputed checksums are cleared instead.
+/// The stored row must record an inode exactly when the probe did. The probe
+/// records one only where the filesystem's inode numbers are kept (#757), so
+/// there an unrecorded stored inode is not proof: `matches_live` lets it match
+/// any live inode, which is right for "is this row still safe to serve" and too
+/// weak for "have these bytes been proved the same". Every row an upgraded store
+/// starts with has none, and a stamp agreeing on the other three fields cannot
+/// vouch for a hash an older musefs may have left stale, so such a row's
+/// uncomputed checksums are cleared.
+///
+/// Where the filesystem's inode numbers are not recorded, neither side has one
+/// and the other fields decide. Demanding one there cleared the checksums of
+/// every unchanged file on every cheap pass — a `--checksum none` rescan even
+/// took the fingerprint that move recovery needs — and it guarded against
+/// nothing: the V4 migration clears every stored hash and fingerprint, so no
+/// value an older musefs wrote survives to be vouched for.
 fn records_same_bytes(unit: &Unit, existing: Option<&musefs_db::Track>) -> bool {
     existing.is_some_and(|t| {
         let stored = BackingStamp::from_track(t);
-        stored.ino.is_some()
+        stored.ino.is_some() == unit.stamp.ino.is_some()
             && stored.matches_live(&unit.stamp)
             && t.format == unit.probed.format
             && t.bounds.audio_offset() == unit.probed.audio_offset
@@ -2386,6 +2457,17 @@ fn ingest_bulk(
 /// (#651), and their per-file warns are capped per reason so a whole unreadable
 /// subtree cannot scale the log with the library.
 pub fn scan_directory_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<ScanStats> {
+    scan_directory_in(db, root, opts, &Arc::default())
+}
+
+/// [`scan_directory_with`], asking whether each filesystem keeps inode numbers
+/// through `inodes`, which a test can hold to see what the pass asked.
+fn scan_directory_in(
+    db: &Db,
+    root: &Path,
+    opts: &ScanOptions,
+    inodes: &Arc<InodeKeeping>,
+) -> Result<ScanStats> {
     // Canonicalize the root once. Every path the walk yields is then already
     // absolute and symlink-free — i.e. canonical — so the workers need not
     // canonicalize each probed file (#440). With symlinks followed that holds
@@ -2435,6 +2517,7 @@ pub fn scan_directory_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<S
         WritePolicy::Full,
         &failures,
         &Arc::default(),
+        inodes,
     )?;
     // skipped is tallied during the walk, not the pipeline
     stats.skipped = tally.total;
@@ -2499,6 +2582,7 @@ fn run_pipeline(
     policy: WritePolicy,
     failures: &Arc<FailureTally>,
     unsupported: &Arc<std::sync::Mutex<Vec<(PathBuf, BackingStamp)>>>,
+    inodes: &Arc<InodeKeeping>,
 ) -> Result<ScanStats> {
     use std::sync::atomic::AtomicUsize;
 
@@ -2530,6 +2614,7 @@ fn run_pipeline(
         let raced = Arc::clone(&raced);
         let failures = Arc::clone(failures);
         let unsupported = Arc::clone(unsupported);
+        let inodes = Arc::clone(inodes);
         workers.push(std::thread::spawn(move || {
             loop {
                 let i = cursor.fetch_add(1, Ordering::Relaxed);
@@ -2544,7 +2629,7 @@ fn run_pipeline(
                 let abs_path = path.clone();
                 #[cfg(test)]
                 fire_after_resolve(path);
-                match probe_file_caught(&abs_path, window, tier) {
+                match probe_file_caught(&abs_path, window, tier, &inodes) {
                     Ok(ProbeOutcome::Probed(probed, stamp, checksums)) => {
                         // Reject an over-cap file here, before its payload is
                         // charged to the budget and buffered into a batch: a
@@ -2884,6 +2969,17 @@ pub fn scan_directory_full_oracle(db: &Db, root: &Path) -> Result<ScanStats> {
 /// is unchanged since the refusing probe (#747). It still counts in `failed`
 /// for that pass: the file was refused.
 pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<RevalidateStats> {
+    revalidate_in(db, root, opts, &Arc::default())
+}
+
+/// [`revalidate_with`], asking whether each filesystem keeps inode numbers
+/// through `inodes`, which a test can hold to see what the pass asked.
+fn revalidate_in(
+    db: &Db,
+    root: &Path,
+    opts: &ScanOptions,
+    inodes: &Arc<InodeKeeping>,
+) -> Result<RevalidateStats> {
     // Canonicalize once; see scan_directory_with (#440). The prune pass below reuses
     // this canonical root for its `starts_with` scope check.
     let canon = std::fs::canonicalize(root)?;
@@ -2905,23 +3001,36 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
     }
     db.apply_bulk_pragmas_self()?;
 
-    // Main-thread pre-dispatch skip pass: load existing
-    // (path -> stamp, id, format, has_fingerprint, has_content_hash) once,
-    // stat each candidate, keep only changed files. Workers stay DB-free.
-    let existing: HashMap<PathBuf, (crate::freshness::BackingStamp, i64, Format, bool, bool)> = db
+    /// What the skip pass needs to know about one stored row.
+    #[derive(Clone, Copy)]
+    struct Stored {
+        stamp: BackingStamp,
+        id: i64,
+        format: Format,
+        has_fingerprint: bool,
+        has_content_hash: bool,
+        /// Where the stored audio region ends: `audio_offset + audio_length`.
+        audio_end: u64,
+    }
+
+    // Main-thread pre-dispatch skip pass: load each existing row's `Stored`
+    // once, stat each candidate, keep only changed files. Workers stay DB-free.
+    let existing: HashMap<PathBuf, Stored> = db
         .list_tracks()?
         .into_iter()
         .map(|t| {
-            (
-                t.backing_path.clone(),
-                (
-                    crate::freshness::BackingStamp::from_track(&t),
-                    t.id,
-                    t.format,
-                    t.fingerprint.is_some(),
-                    t.content_hash.is_some(),
-                ),
-            )
+            let stored = Stored {
+                stamp: BackingStamp::from_track(&t),
+                id: t.id,
+                format: t.format,
+                has_fingerprint: t.fingerprint.is_some(),
+                has_content_hash: t.content_hash.is_some(),
+                audio_end: t
+                    .bounds
+                    .audio_offset()
+                    .saturating_add(t.bounds.audio_length()),
+            };
+            (t.backing_path, stored)
         })
         .collect();
     // Legacy backfill (spec §1): FLAC tracks scanned under V1 have no structural
@@ -2946,14 +3055,13 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
         };
         // The walk yields canonical paths, followed or not (#766), so the walked
         // path is the stored `backing_path` it is looked up under.
-        if let Some((stamp, id, format, has_fingerprint, has_content_hash)) =
-            existing.get(&path).copied()
-        {
-            let needs_backfill = format == Format::Flac && !have_structural.contains(&id);
+        if let Some(row) = existing.get(&path).copied() {
+            let stamp = row.stamp;
+            let needs_backfill = row.format == Format::Flac && !have_structural.contains(&row.id);
             let needs_checksum = match opts.checksum {
                 ChecksumTier::None => false,
-                ChecksumTier::Fingerprint => !has_fingerprint,
-                ChecksumTier::Full => !has_fingerprint || !has_content_hash,
+                ChecksumTier::Fingerprint => !row.has_fingerprint,
+                ChecksumTier::Full => !row.has_fingerprint || !row.has_content_hash,
             };
             // A row with no recorded inode is one this build cannot fully
             // validate (#674): `matches_live` has to ignore the field, so the
@@ -2963,8 +3071,8 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
             // store migrated into V4, alongside the structural and checksum
             // backfills it already covered.
             //
-            // Not on a filesystem that keeps no inode numbers (#757): on FAT or
-            // exFAT a re-probe records none either, so re-probing would never
+            // Not where the filesystem's inode numbers are not recorded (#757):
+            // there a re-probe records none either, so re-probing would never
             // converge, and would rewrite the row — moving its served mtime —
             // on every pass. The filesystem is asked live rather than the
             // answer stored, so the model needs no third state for "cannot be
@@ -2972,11 +3080,13 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
             // A stat that supplies no inode at all still re-probes each pass;
             // that is slower, never wrong, and only reachable on a filesystem
             // whose stat is malformed.
-            let needs_ino = stamp.ino.is_none() && crate::freshness::keeps_inodes_at(&path);
+            let needs_ino = stamp.ino.is_none() && inodes.at_path(&path, &meta);
+            let needs_bounds = cut_short_at_the_ceiling(row.format, stamp.size, row.audio_end);
             if stamp.matches_live(&crate::freshness::BackingStamp::from_metadata(&meta))
                 && !needs_backfill
                 && !needs_checksum
                 && !needs_ino
+                && !needs_bounds
             {
                 unchanged += 1;
                 continue;
@@ -3000,6 +3110,7 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
         WritePolicy::StructuralOnly,
         &failures,
         &unsupported,
+        inodes,
     )?;
     let refused = std::mem::take(
         &mut *unsupported
@@ -3017,11 +3128,11 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
         #[cfg(test)]
         fire_hook(&BEFORE_PRUNE_REFUSED_HOOK);
         for (path, stamp) in refused {
-            // The probe recorded `stamp`, so compare the way it records (#757).
+            // The probe recorded `stamp`, so compare the way it recorded it
+            // (#757): with an inode exactly when it holds one, which needs no
+            // second question to the filesystem.
             let as_refused = std::fs::metadata(&path).is_ok_and(|meta| {
-                BackingStamp::from_metadata(&meta)
-                    .recordable(crate::freshness::keeps_inodes_at(&path))
-                    == stamp
+                BackingStamp::from_metadata(&meta).recordable(stamp.ino.is_some()) == stamp
             });
             if as_refused && let Some(track) = db.get_track_by_path(&path)? {
                 db.delete_track(track.id)?;
@@ -3057,6 +3168,32 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
         failed: scan.failed + skip_failed,
         raced: scan.raced,
     })
+}
+
+/// The most a correct FLAC probe leaves between the end of the audio and the end
+/// of the file: an ID3v1 trailer. A correct Ogg probe leaves nothing.
+const ID3V1_TRAILER_BYTES: u64 = 128;
+
+/// Does this stored row look like one an earlier scan cut short at the probe
+/// ceiling?
+///
+/// That scan's probe fell back, past eight widening retries, to parsing its
+/// first [`MAX_PROBE_BYTES`] as though they were the whole file, so a FLAC or
+/// Ogg file larger than that was stored with its audio ending at the ceiling.
+/// Nothing else about such a row asks `revalidate` to re-probe it — its stamp,
+/// checksums and structural blocks all describe the file — so this does, as the
+/// FLAC structural backfill does, refreshing the bounds and leaving curated tags
+/// and art alone. A correct probe of those formats takes the audio to the end of
+/// the file, less at most an ID3v1 trailer on a FLAC, so a correct row never
+/// matches and a re-probed one stops matching: each row is re-probed once. MP3
+/// is left out, since its bounds may legitimately leave out more than a
+/// trailer.
+fn cut_short_at_the_ceiling(format: Format, backing_size: u64, audio_end: u64) -> bool {
+    matches!(
+        format,
+        Format::Flac | Format::Opus | Format::Vorbis | Format::OggFlac
+    ) && backing_size > MAX_PROBE_BYTES
+        && backing_size.saturating_sub(audio_end) > ID3V1_TRAILER_BYTES
 }
 
 /// [`revalidate_with`] at the default options. Test scaffolding, behind
@@ -3215,8 +3352,10 @@ fn hash_confirm(path: &Path, expect: BackingStamp) -> std::io::Result<Option<Str
     let file = std::fs::File::open(path)?;
     crate::metrics::on_scan_open();
     // `expect` is a stamp the probe recorded, so this side records the same way
-    // (#757): on FAT it holds no inode, and a live one would never equal it.
-    let keeps_inodes = crate::freshness::keeps_inodes(&file);
+    // (#757): where the filesystem's inode numbers are not recorded it holds
+    // none, and a live one would never equal it. Whether it holds one says how
+    // the probe recorded it, so the filesystem need not be asked again.
+    let keeps_inodes = expect.ino.is_some();
     if BackingStamp::from_metadata(&file.metadata()?).recordable(keeps_inodes) != expect {
         return Ok(None);
     }
