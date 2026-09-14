@@ -26,7 +26,8 @@ almost every tagger actually produces, writing a temporary file and renaming
 over the original.
 
 A stored inode of zero means "not recorded" — every row a store migrated into
-v4 carries, until a scan or `musefs revalidate` fills it in — and such a
+v4 carries, until `musefs revalidate` (or a `scan --force` of the file) fills it
+in, since a plain `scan` leaves tracked rows alone — and such a
 row is compared on the other three fields alone rather than failing closed on a
 field the store has nothing to say about. `revalidate` re-probes exactly those
 rows, which is what makes it the repopulation path for an upgraded store. The
@@ -164,7 +165,7 @@ offset/length, tags, pictures, structural blocks) on a parallel probe
 pipeline feeding a single DB writer, committing in batches. Probing reads
 are bounded — the scanner never slurps whole files — and ingestion caps
 per-item sizes (`MAX_ART_BYTES`, `MAX_BINARY_TAG_BYTES`, and the store's
-`tags.key`/`tags.value`/`art.mime`/`track_art.description` limits) so a crafted
+`tags.key`/`tags.value`/`track_art.mime`/`track_art.description` limits) so a crafted
 file cannot balloon the store.
 
 `check_storable` applies every one of those caps in a single place, before

@@ -12,6 +12,8 @@ see the [Release notes](release-notes.md).
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-09-14
+
 ### Added
 
 - **`musefs migrate --repair`, and the row-rejection pre-flight it exists for.**
@@ -156,6 +158,22 @@ see the [Release notes](release-notes.md).
   than it can log" look identical. Since the limiter moved into `musefs-core`
   ([#650](https://github.com/Sohex/musefs/issues/650)) the counter covers the
   synthesis warns too, not just the FUSE errno path.
+
+- `--workers` (env `MUSEFS_WORKERS`) sizes the FUSE worker pool explicitly
+  ([#631](https://github.com/Sohex/musefs/issues/631)). The default stays auto,
+  twice the CPU count, because the work is I/O-bound, but each worker lazily
+  opens its own read-only SQLite connection, so steady-state memory scales with
+  the pool rather than with the library alone. A many-core host serving few
+  concurrent readers can now cap that component instead of paying for
+  connections it never uses.
+
+- `musefs_process_resident_bytes` (Linux) reports the whole process's resident
+  set, and `musefs_sqlite_memory_bytes` what SQLite holds across all connections
+  ([#631](https://github.com/Sohex/musefs/issues/631)). SQLite allocates through
+  libc rather than the global allocator, so the jemalloc `musefs_alloc_*` gauges
+  never saw it: a full-library walk grew the process by hundreds of megabytes
+  while those gauges barely moved, and the metrics surface could not say how
+  much memory the daemon was using.
 
 ### Changed
 
@@ -502,8 +520,9 @@ see the [Release notes](release-notes.md).
   includes sampled audio), so a value computed by an earlier musefs claims to be
   something this build no longer produces. Nulling is honest and costs nothing
   that leaving them would have saved: an old value cannot match a new one
-  either. The next `scan` or `revalidate` recomputes them — `revalidate` already
-  re-probes a row missing the checksum its tier asks for — and until then those
+  either. The next `revalidate` recomputes them — it re-probes a row missing the
+  checksum its tier asks for, which a plain `scan` of a tracked file does not —
+  and until then those
   rows cannot be move-recovered, exactly as an unfingerprinted row never could.
   `content_hash` is untouched; it is a full-file SHA-256 and its meaning has not
   changed. Like every migration this is one-way: the store will no longer open
@@ -544,70 +563,10 @@ see the [Release notes](release-notes.md).
   `track_art.description` from 1 KiB to 8 KiB (schema `MIGRATION_V3`). The new
   tag cap is FLAC's 24-bit metadata-block ceiling — the largest tag synthesis
   could ever serve — so the store no longer refuses a tag the format itself can
-  carry. Existing stores upgrade in place, and automatically, on the next
-  `musefs scan` or `musefs mount`: both open the store read-write and run the
-  migration, which only widens the constraints and so carries every existing row
-  across. No rescan of audio is needed and nothing has to be regenerated.
-- A backing file whose metadata exceeds a store limit now fails **that file**
-  instead of being stored with the offending part quietly dropped. Oversize
-  embedded art and binary tags were previously omitted from an otherwise-stored
-  track with only a `warn` to show for it, which is easy to lose in a scan of
-  ten thousand files and leaves a mount silently missing data. Such a file is
-  now logged with its path, what was too big, its size and the limit, counted
-  `failed`, and skipped; the rest of the directory scans normally.
-- The virtual tree interns each node name into one shared `Arc<str>` rather than
-  storing it separately in `Node.name`, `Node.rendered_name`, the `children` key
-  and both `rendered_children` keys ([#617](https://github.com/Sohex/musefs/issues/617)). Measured over 200,000
-  tracks / 222,001 nodes: ~1713 to ~1284 bytes per track (~84 MiB, -25%), with
-  tree build 10-15% faster from the removed allocations. A case-insensitive
-  mount saves more, since `folded_children` held a sixth copy. The tuning guide
-  gained a "Memory footprint" section. The full rendered paths were still stored
-  twice at this point; the next entry shares those as well.
-- Each entry's rendered path is stored once and shared between the inode
-  allocator's map key and `TrackRenderState.path`, rather than allocated
-  independently by each ([#629](https://github.com/Sohex/musefs/issues/629)). Measured over 200,000 tracks with
-  41-byte paths: 1150 to 1078 bytes per track (-6%); with 137-byte paths the
-  saving is -14%. What it removes is exactly one whole path per track, so the
-  gain tracks path length and template depth rather than track count — a flat
-  `--template` gains little. Sharing is conditional: a disambiguated leaf keeps
-  its own allocation, since keying it on the path its bare-named sibling already
-  interned would collapse two nodes onto one inode.
-- Full tree rebuilds and the head of every scan read projected columns instead
-  of materializing a whole `Track` per row ([#621](https://github.com/Sohex/musefs/issues/621)) — roughly 40 MB of
-  transient allocation on a 200,000-track store, on a path already holding a
-  pool connection.
-- The serve-path warn rate limiter is process-wide instead of FUSE-local
-  ([#650](https://github.com/Sohex/musefs/issues/650)). It bounds failure warns
-  to a burst of 10 per 30-second window, but it lived in `musefs-fuse` and was
-  reachable only from the errno-reply path, so the warns synthesis itself emits
-  bypassed it: a dropped Vorbis tag key (once per header-cache miss, and that
-  cache is byte-budgeted, so an evicting library re-warns for the same track
-  indefinitely), art over the byte cap, and a failed art-blob read — the last
-  fires per art *window*, so one bad blob produced many lines for one file. The
-  limiter now lives in `musefs-core` next to `telemetry.rs` and both crates
-  share one budget, which is the right unit: the operator's concern is total
-  serve-path log volume, not per-crate volume. Only the budget is shared, not
-  the attribution: the emit side is the `musefs_core::serve_warn!` macro, so
-  each record still takes its target from the call site's own module and
-  per-crate `RUST_LOG` filtering (`RUST_LOG=warn,musefs_fuse=debug`) reaches
-  exactly what it did before.
-- `readdir`'s unknown-`fh` fallback runs on the worker pool instead of inline on
-  the fuser dispatch thread ([#623](https://github.com/Sohex/musefs/issues/623)), matching the offload every other
-  blocking operation already used. This matters more now that over-cap `opendir`
-  makes that fallback the normal path for large directories.
-- Scan failures are now broken down by reason and their per-file warnings capped
-  ([#651](https://github.com/Sohex/musefs/issues/651)). A scan that ends
-  `failed 37` also logs `failed 37: unparseable=30, io=5, oversize=2` (and
-  `walk errors N: …` for directories the walk could not read), so the number
-  that drives the exit-2 partial-failure signal explains itself instead of
-  having to be reconstructed from N individual lines. The per-file messages
-  themselves are capped at ten per reason per scan, the rest dropping to
-  `debug` — an unreadable subtree or a share that went away mid-scan no longer
-  emits one warning per file. The existing per-extension skip breakdown moves
-  from `warn` to `info` (so it now needs `-v` / `RUST_LOG=info`): cover art and
-  `.cue` sidecars are the normal contents of a music library, and a warning on
-  every healthy scan only teaches operators to tune warnings out. The `skipped`
-  count itself is unchanged and still printed in the per-target summary.
+  carry. The step only widens constraints, so it carries every existing row across
+  and needs no rescan. On its own it would apply on any open, but in 2.0.0 it
+  sits ahead of the gated migration, so `musefs migrate` applies it with the rest
+  ([#749](https://github.com/Sohex/musefs/issues/749)).
 
 ### Removed
 
@@ -1543,7 +1502,8 @@ First public release.
   `synthesis` / `structure-only` mount modes, auto-refresh, `scan` /
   `scan --revalidate`). Never published publicly; superseded by 0.2.0.
 
-[Unreleased]: https://github.com/Sohex/musefs/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/Sohex/musefs/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/Sohex/musefs/releases/tag/v2.0.0
 [1.3.0]: https://github.com/Sohex/musefs/releases/tag/v1.3.0
 [1.2.0]: https://github.com/Sohex/musefs/releases/tag/v1.2.0
 [1.1.0]: https://github.com/Sohex/musefs/releases/tag/v1.1.0

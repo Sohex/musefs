@@ -308,7 +308,7 @@ pub enum Command {
     /// Some schema changes are too invasive to apply as a side effect of
     /// opening the store: they rewrite data, transiently need the store's size
     /// again in free disk, and end compatibility with older musefs builds.
-    /// Those are refused by `mount`, `scan` and `vacuum`, and applied here,
+    /// Those are refused by `mount`, `scan`, `revalidate` and `vacuum`, and applied here,
     /// after reporting what they will do. Run it while unmounted. A snapshot is
     /// taken first unless `--no-snapshot`, so the upgrade stays reversible.
     Migrate(MigrateArgs),

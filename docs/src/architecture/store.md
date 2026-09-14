@@ -8,8 +8,9 @@ scanner-owned `fingerprint`/`content_hash` columns, `MIGRATION_V3`, which
 widens the `tags.value` and `track_art.description` caps, and `MIGRATION_V4`,
 which rebuilds every core table — a never-reused `AUTOINCREMENT` id, the
 path as bytes, an inode stamp, storage-class constraints throughout, independent
-ordinal spaces for text and binary tags, the picture's description moved off the
-shared blob and onto the art link, immutable row ownership, and the retirement of
+ordinal spaces for text and binary tags, the picture's MIME type and dimensions
+moved off the shared blob and onto the art link (which also gains depth and
+colour count), immutable row ownership, and the retirement of
 every fingerprint written
 before the value included sampled audio); `user_version` records the schema
 version (4).
@@ -97,7 +98,8 @@ integer and `st_ino` is a full `u64`, so some encoding is forced; this one is a
 bijection, and the column is only ever compared for equality (the invalidation
 trigger, and the Rust freshness stamp), never ordered or summed. Zero is the
 sentinel for "not recorded", which every row in a store upgraded to v4 carries
-until a scan fills it in. A reader decoding this column must cast the bit
+until `musefs revalidate` (or a `scan --force` of the file) fills it in; a plain
+`scan` leaves tracked rows alone. A reader decoding this column must cast the bit
 pattern back rather than treat a negative value as invalid.
 
 **`backing_path` is bytes, not text.** From schema v4 it is a `BLOB` and the
@@ -164,18 +166,19 @@ malformed *shapes* at commit, so an external writer cannot persist them:
 - a `tags.key` over 256 chars or `tags.value` over 16 MiB − 1 bytes (FLAC's
   24-bit metadata-block ceiling — the largest tag synthesis could serve, so the
   store never refuses a tag the format could carry);
-- `tags.key` must be non-empty and contain no ASCII control characters (a DB
-  `CHECK` enforces this, rejecting violating writes — with one blind spot: an
-  embedded NUL terminates SQLite's `length()`/`GLOB`, so a key like `a\0b` slips
-  the `CHECK`. The scanner's own floor drops it before insert, and the Vorbis
-  path rejects it on synthesis; see **The NUL blind spot** below for what the
-  readers do about a row an external writer plants). Additionally, only keys within the Vorbis
+- `tags.key` must be non-empty and contain no ASCII control characters or NUL
+  (a DB `CHECK` enforces this, rejecting violating writes; the NUL test is an
+  explicit `instr(key, char(0)) = 0` from schema v4, because an embedded NUL
+  terminates SQLite's `length()`/`GLOB` and a key like `a\0b` slipped the older
+  `CHECK` — see **The NUL blind spot** below). Additionally, only keys within the Vorbis
   field-name grammar (ASCII `0x20`–`0x7D`, excluding `=`) survive FLAC/Ogg
   synthesis — others are dropped and logged. MP3/M4A custom keys may use the
   wider set (e.g. `=`, `:`, spaces, non-ASCII).
 - a `value_blob` over `MAX_BINARY_TAG_BYTES`;
 - an `art.byte_len` over `MAX_ART_BYTES`;
-- a `track_art.mime` over 255 chars or `description` over 8 KiB;
+- a `track_art.mime` over 255 chars or `description` over 8 KiB, or either one,
+  or an `art.sha256`, containing NUL;
+- a `backing_path` that is not a non-empty `BLOB`, or that contains a NUL byte;
 - a `structural_blocks` row with an unknown `kind`, negative `ordinal`, or `body`
   over the FLAC 24-bit block limit.
 
@@ -200,8 +203,10 @@ it.
 
 The ceiling does not narrow what a field may hold: a `tags.key` of 256
 four-byte characters sits exactly on both bounds and reads back intact. Nor is
-it a ban on NUL — a short NUL-bearing value still reads. Forbidding NUL outright
-in the `CHECK`s is a schema change, and rides the 2.0.0 store migration.
+it a ban on NUL — a short NUL-bearing value still reads. Schema v4 forbids NUL
+outright in these `CHECK`s ([#693](https://github.com/Sohex/musefs/issues/693)),
+so a store that passed `musefs migrate` holds no such row; the readers keep the
+guard for a store written with its constraints turned off.
 
 `get_art` is the one reader that materializes a whole `art` row, image blob
 included, rather than streaming it. It therefore guards both of its unbounded
