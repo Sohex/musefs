@@ -279,7 +279,13 @@ see the [Release notes](release-notes.md).
   `musefs migrate`; `StoreInUse` names its operation; `ArtDigestMismatch`,
   `DerivedStateStale`, `TrackIdentity` (replacing
   `Db::track_version_and_path`), `refresh_embedded_art`/`EmbeddedArt` and
-  `count_tracks_awaiting_revalidate` are new. `Segment::OggAudio`,
+  `count_tracks_awaiting_revalidate` are new, as are
+  `Db::upsert_track_with_checksums` and `BulkWriter::upsert_track_with_checksums`,
+  `DbError::WrongStorageClass`, `DbError::AmbiguousDuplicatePath`,
+  `limits::MAX_ROW_BYTES`, `DuplicatePath` with `Rejections::duplicates` and
+  `Rejections::relinked`, and for MP3 `mp3::read_metadata`/`Mp3Metadata` (every
+  ID3v2 tag at either end, merged), `mp3::locate_trailer`/`Mp3Trailer` and
+  `Mp3Bounds::id3v2_tags`. `Segment::OggAudio`,
   `FuseTelemetry`, `render_prometheus`, the virtual tree's name types and
   `DbError::FieldTooLarge` change shape too. The
   [release notes](release-notes.md#upgrading-from-v130) list every break.
@@ -824,6 +830,76 @@ see the [Release notes](release-notes.md).
   `test-support` ([#751](https://github.com/Sohex/musefs/issues/751)).
 
 ### Fixed
+
+- **Upgrading a 1.0.0 store no longer drops long tags.** The schema step that
+  made `tags.value`'s cap count bytes (version 2, shipped in 1.1.0) rebuilt the
+  table at 256 KiB and filtered its refill to match, deleting every tag past it.
+  1.0.0's character-counted cap had admitted such a tag, and its read guard
+  counted characters too, so it was stored and served: a multibyte lyrics tag of
+  a few hundred kilobytes, for one. `musefs migrate` applies versions 2 to 4
+  together and its pre-flight checks rows only against version 4, which would
+  have kept the row, so the loss went unreported and survived only in the
+  snapshot. Since no step applies while a gated one is pending
+  ([#749](https://github.com/Sohex/musefs/issues/749)), version 2 now only ever
+  runs inside `migrate` beside version 3's widening, so it rebuilds at that
+  widened 16 MiB − 1 cap and a store still at version 1 keeps every tag. Stores
+  already past version 2 are unaffected.
+
+- **`musefs vacuum` no longer holds the store after being refused.** Claiming the
+  store sets exclusive locking mode before it tries the lock; when another
+  connection had the store open the claim failed, `vacuum` returned early, and
+  the connection stayed exclusive, so its next statement locked everything else
+  out ([#721](https://github.com/Sohex/musefs/issues/721)). The previous mode is
+  restored on the refused path too.
+
+- **A track deleted before the upgrade keeps its id retired.** The version 4
+  rebuild left `sqlite_sequence` at the highest id still standing, so a track
+  deleted from the top of the range before `musefs migrate` could have its id
+  handed out again while the old `track_changes` ring still named it
+  ([#678](https://github.com/Sohex/musefs/issues/678)). The sequence is now raised
+  to the highest integer id that ring holds, including when every track was
+  deleted. The identity check ignores `sqlite_%` tables, so a migrated store
+  still compares equal to a fresh one.
+
+- **A rewrite that changes only a file's ctime invalidates its synthesized
+  file.** `tracks_geometry_au` bumped `content_version` on a change of format,
+  bounds, size, mtime or inode, but not ctime, so a same-size rewrite that put the
+  old mtime back left the served mtime unmoved, and under `--keep-cache` the
+  kernel kept serving pages from before it. A ctime change now bumps too, unless
+  a fingerprint or content hash that was already stored is written again
+  unchanged in the same statement: that proves the bytes, so a chmod or a link
+  change does not bring back the churn #757 removed. A first fingerprint proves
+  nothing and does not stop the bump. `Db::upsert_track_with_checksums` writes the
+  stamp and both checksums in one statement so the trigger can see both.
+
+- **Reading a hostile store row is bounded where the value is loaded**
+  ([#693](https://github.com/Sohex/musefs/issues/693),
+  [#758](https://github.com/Sohex/musefs/issues/758)). The reader guards decided
+  from projected lengths, but `sqlite3_step` materializes every selected column
+  before any guard sees the row, so a crafted 200 MB value was loaded in full
+  (and a TEXT path with an early NUL passed `length()` while being loaded). Every
+  `Db` connection now sets `SQLITE_LIMIT_LENGTH` to `limits::MAX_ROW_BYTES`
+  (16 MiB + 1117 bytes, the widest record a schema-valid row makes), so SQLite
+  refuses a value past it with `SQLITE_TOOBIG` as the row is stepped. A store
+  still behind a gated upgrade gets no limit until `apply` has run, so the
+  pre-flight can report an oversized legacy row. The `backing_path` projections
+  check `typeof` before `length()`, so a path over its cap or not stored as a
+  BLOB is refused (`DbError::WrongStorageClass`) without being loaded; measured,
+  a path read now stays under 3 MiB of SQLite memory against a 12 MiB hostile
+  path.
+
+- **`musefs migrate --repair` is less destructive and all-or-nothing**
+  ([#705](https://github.com/Sohex/musefs/issues/705),
+  [#761](https://github.com/Sohex/musefs/issues/761)). A picture link to an art row
+  with a non-canonical digest now moves onto a correctly filed row holding
+  byte-identical data (`Rejections::relinked`) instead of being deleted with it.
+  The same path stored as both TEXT and BLOB, which the rebuild's cast makes
+  collide, is reported as a duplicate with both ids (`Rejections::duplicates`);
+  `--repair` keeps the row carrying tags or picture links (the older one when
+  neither does) and refuses with `DbError::AmbiguousDuplicatePath` when both do,
+  where it used to keep whichever the probe inserted first. And `repair` now only
+  plans: `apply` carries the deletes out inside the migration's own transaction,
+  so an upgrade that fails, on a full disk say, rolls them back too.
 
 - **An MP3 that begins with more than one ID3v2 tag scans**
   ([#767](https://github.com/Sohex/musefs/issues/767)). `mp3::locate_audio` and

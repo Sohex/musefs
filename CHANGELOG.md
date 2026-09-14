@@ -273,7 +273,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and `PendingMigration` drives `musefs migrate`; `StoreInUse` names its
   operation, and `ArtDigestMismatch`, `DerivedStateStale`, `TrackIdentity`,
   `refresh_embedded_art`/`EmbeddedArt` and `count_tracks_awaiting_revalidate`
-  are new. `Segment::OggAudio`, `FuseTelemetry`, `render_prometheus`, the
+  are new, as are `Db::upsert_track_with_checksums` (and its `BulkWriter` twin),
+  `DbError::WrongStorageClass`, `DbError::AmbiguousDuplicatePath`,
+  `limits::MAX_ROW_BYTES`, `DuplicatePath` with `Rejections::{duplicates,
+  relinked}`, and for MP3 `mp3::read_metadata`/`Mp3Metadata`,
+  `mp3::locate_trailer`/`Mp3Trailer` and `Mp3Bounds::id3v2_tags`.
+  `Segment::OggAudio`, `FuseTelemetry`, `render_prometheus`, the
   virtual tree's name types and `DbError::FieldTooLarge` change shape too. The
   [release notes](https://sohex.github.io/musefs/release-notes.html#upgrading-from-v130)
   list every break.
@@ -440,6 +445,47 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   outside the test suites called them.
 
 ### Fixed
+
+- **Upgrading a 1.0.0 store no longer drops long tags.** The 1.1.0 step that made
+  `tags.value`'s cap count bytes rebuilt the table at 256 KiB and deleted every
+  tag past it, which 1.0.0's character-counted cap had admitted and served (a
+  multibyte lyrics tag, for one). `musefs migrate` reported nothing, since the
+  step after it would have kept the row. That step now rebuilds at the widened
+  16 MiB − 1 cap, so a store still at schema version 1 keeps every tag.
+
+- **`musefs vacuum` no longer holds the store after being refused.** When another
+  connection had the store open, the refused claim left the vacuuming connection
+  in exclusive locking mode, so its next statement locked everything else out
+  ([#721](https://github.com/Sohex/musefs/issues/721)).
+
+- **A track deleted before the upgrade keeps its id retired.** The rebuild set
+  the id sequence to the highest id still standing, so a track deleted from the
+  top of the range before `musefs migrate` could have its id handed out again,
+  while the changelog still named it for the old track
+  ([#678](https://github.com/Sohex/musefs/issues/678)).
+
+- **A rewrite that changes only a file's ctime invalidates its synthesized
+  file**, unless a fingerprint or content hash written with the new stamp proves
+  the bytes unchanged. A same-size rewrite that restored its mtime left
+  `content_version` and the served mtime untouched, so a kernel page cache kept
+  serving the old bytes; a chmod still does not bump.
+
+- **Reading a hostile store row is bounded where the value is loaded.** Every
+  connection limits a string, blob or row to the widest the schema admits
+  (16 MiB + 1117 bytes), so SQLite refuses anything larger instead of loading it
+  before musefs's own length guards run; and the `backing_path` readers refuse a
+  path over its cap, or not stored as bytes, without loading it
+  ([#693](https://github.com/Sohex/musefs/issues/693),
+  [#758](https://github.com/Sohex/musefs/issues/758)).
+
+- **`musefs migrate --repair` is less destructive and all-or-nothing**
+  ([#705](https://github.com/Sohex/musefs/issues/705),
+  [#761](https://github.com/Sohex/musefs/issues/761)). A picture link to an art row
+  with a non-canonical digest moves onto a correctly filed row holding the same
+  bytes instead of being deleted; a path stored twice (as text and as bytes)
+  keeps the row carrying tags or picture links, and is refused for you to
+  resolve when both do; and the deletes run inside the upgrade's transaction, so
+  an upgrade that fails leaves the store unchanged.
 
 - **An MP3 that begins with more than one ID3v2 tag scans**
   ([#767](https://github.com/Sohex/musefs/issues/767)). Both audio locators

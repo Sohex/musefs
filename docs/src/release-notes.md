@@ -114,18 +114,26 @@ constraints off:
   ([#758]);
 - an art row whose digest is not 64 lowercase hex characters ([#761]);
 - a tag, picture link or structural block whose track is gone, or a link whose
-  image is.
+  image is;
+- the same `backing_path` stored twice, once as text and once as bytes: before
+  2.0.0 nothing compared the two spellings, and the upgrade stores both as bytes.
 
 Fix the rows with whatever wrote them, or pass `--repair` to have `migrate`
 delete them. It does so after the confirmation and the snapshot, so the rows are
-still in the copy — which is why `--repair` refuses `--no-snapshot`. Deleting a
-track takes its tags and picture links with it, and the report counts those too.
+still in the copy — which is why `--repair` refuses `--no-snapshot` — and as part
+of the upgrade's own transaction, so if the upgrade then fails nothing has been
+deleted. Deleting a track takes its tags and picture links with it, and the
+report counts those too. For a path stored twice, `--repair` keeps the row
+carrying tags or picture links (the older one when neither does); when both
+carry some, it refuses and names both track ids, and you delete the one you do
+not want first.
 
 An art row with a non-canonical digest can only have come from a tool other than
 musefs or its plugins, which have always written lowercase. `--repair` deletes
-that row **and every picture link to it**, so each track using it loses that
-picture. It is not lowercased for you, because a correctly filed row for the
-same image may already exist. Fixing it by hand first means inserting a
+that row. Where a correctly filed row for the same image already exists, each
+picture link moves onto it and the track keeps the picture; otherwise the links
+are deleted with the row and **each track using it loses that picture**. The row
+is not lowercased for you, because a correctly filed twin may already exist. Fixing it by hand first means inserting a
 correctly filed row, relinking each `track_art` row to it and deleting the old
 one — art rows cannot be updated — and the
 [maintenance guide](guide/maintenance.md#rows-the-new-schema-refuses) walks
