@@ -214,8 +214,9 @@ external writer cannot persist them:
   that is over 64 KiB (`MAX_BACKING_PATH_BYTES`,
   [#758](https://github.com/Sohex/musefs/issues/758)) — a portable ceiling past
   any platform's `PATH_MAX`, so it refuses no path that could be opened. Every
-  reader of the column also re-checks the cap from `length(backing_path)` before
-  loading the path, for a store written with its constraints off;
+  reader of the column also projects its storage class first, so a path over the
+  cap, or a value that is not a `BLOB` at all, comes back NULL and is refused
+  without being loaded, for a store written with its constraints off;
 - from schema v4, a value of the wrong storage class. Every integer column of
   `tracks`, `tags`, `track_art`, `art` and `structural_blocks` must hold an
   integer; `tags.key` and `value`, `track_art.mime` and `description`,
@@ -250,7 +251,20 @@ because that is UTF-8's widest scalar value. The byte bound is the one that
 matters against a hostile row: `Row::get::<String>` allocates the column's full
 byte length, so without it a NUL-prefixed field is an unbounded allocation on
 the serve path. Rejection is decided from the two lengths alone, never from the
-value, so an over-cap field provably cannot be materialized in order to reject
+value, so the guard never copies an over-cap field into Rust to reject it.
+
+That bounds Rust's copy, not SQLite's. `sqlite3_step` materializes every column
+a statement selects as it lands on a row, before any guard sees it, and
+`length()` on TEXT walks the value to count it. What bounds that is the length
+limit every connection carries: `SQLITE_LIMIT_LENGTH`, set to `MAX_ROW_BYTES`,
+the widest row the schema admits (a tag value at its cap beside a key at its
+byte ceiling, just over 16 MiB). SQLite refuses a string or blob past it with
+`SQLITE_TOOBIG` rather than loading it, so reading a hostile row costs no more
+than a legitimate one already can. The `backing_path` readers go further, since
+a path is read on every `getattr` and its cap is far below that limit: they
+project the column storage class first, as above. The one connection without
+the limit is `musefs migrate`'s, until the upgrade has run: the pre-v4 schema
+bounds no row, and the pre-flight has to report such a row rather than fail on
 it.
 
 The ceiling does not narrow what a field may hold: a `tags.key` of 256

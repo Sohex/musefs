@@ -58,6 +58,9 @@ impl Rejections {
 /// pre-flight needs — the versions, the steps, whether anyone else has the
 /// store open, and a snapshot — plus [`PendingMigration::apply`], which runs
 /// the migration and hands back an ordinary `Db`.
+///
+/// The connection carries no length limit ([`crate::bound_lengths`]) until the
+/// upgrade has run, since the store's rows are not yet bounded by anything.
 #[derive(Debug)]
 pub struct PendingMigration {
     conn: Connection,
@@ -413,17 +416,19 @@ impl PendingMigration {
     /// supposed to produce.
     ///
     /// This is where the connection stops being a migration handle and becomes
-    /// an ordinary [`Db`], so it picks up the one pragma [`Db::open`] sets that
-    /// the pre-flight had no use for: write-ahead logging, which is what keeps
-    /// a reader and a writer off each other's backs. A musefs store is already
-    /// in WAL — the mode is persistent and every other open sets it — so this
-    /// is belt and braces for a store that arrived some other way.
+    /// an ordinary [`Db`], so it picks up what [`Db::open`] sets that the
+    /// pre-flight had no use for. Write-ahead logging, which is what keeps a
+    /// reader and a writer off each other's backs: a musefs store is already in
+    /// WAL — the mode is persistent and every other open sets it — so this is
+    /// belt and braces for a store that arrived some other way. And the length
+    /// limit, which a store past V4's constraints can carry.
     pub fn apply(mut self) -> Result<Db> {
         let _: String = self
             .conn
             .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
         schema::migrate_all(&mut self.conn)?;
         schema::validate_identity(&self.conn)?;
+        crate::bound_lengths(&self.conn)?;
         Ok(Db::from_migrated(self.conn, self.path))
     }
 }
@@ -796,6 +801,39 @@ mod rejection_tests {
             vec!["/lib/a.flac".len(), cap],
             "the clean row and the one at the cap"
         );
+    }
+
+    /// The pre-V4 schema bounds no row: `backing_path` has no cap, and the text
+    /// caps stop counting at a NUL. So the migration handle carries no length
+    /// limit, and a legacy row past it is reported and repaired like any other
+    /// refused row instead of failing the pre-flight. The store it hands on has
+    /// been through V4's constraints, and carries the limit.
+    #[test]
+    fn a_legacy_row_past_the_length_limit_is_reported_not_fatal() {
+        use rusqlite::limits::Limit;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.db");
+        let conn = store_at_v3(&path);
+        let long = crate::limits::MAX_ROW_BYTES + 1;
+        conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime_ns, backing_ctime_ns, updated_at) \
+             VALUES ('/' || substr(replace(hex(zeroblob(?1)), '0', 'a'), 1, ?1), \
+                     'flac', 0, 0, 0, 0, 0, 0)",
+            [long],
+        )
+        .unwrap();
+        drop(conn);
+
+        let pending = PendingMigration::open(&path).unwrap();
+        let limit = |conn: &Connection| i64::from(conn.limit(Limit::SQLITE_LIMIT_LENGTH).unwrap());
+        assert!(limit(&pending.conn) > long);
+        let found = pending.inspect_rejections().unwrap();
+        assert_eq!(found.total(), 1, "{found:?}");
+        pending.repair().unwrap();
+        let db = pending.apply().unwrap();
+        assert_eq!(limit(&db.conn), crate::limits::MAX_ROW_BYTES);
+        assert_eq!(db.list_tracks().unwrap().len(), 1);
     }
 
     /// A V1 store has no checksum columns at all, so the probe's `tracks`

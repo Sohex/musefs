@@ -60,6 +60,15 @@ pub enum DbError {
         /// thing. Mirrors `musefs_core::CoreError::TrackFieldTooLarge`.
         unit: &'static str,
     },
+    /// A value of the wrong storage class, which only a store written with its
+    /// constraints off can hold: V4 pins every column's class with a `CHECK`.
+    /// Refused from `typeof()`, so the value is never loaded to find out.
+    #[error("{table}.{field} is not a {expected} (crafted or corrupt DB)")]
+    WrongStorageClass {
+        table: &'static str,
+        field: &'static str,
+        expected: &'static str,
+    },
     #[error("structural block for track {track_id} is invalid: {detail} (crafted or corrupt DB)")]
     InvalidStructuralBlock { track_id: i64, detail: String },
     /// An `art` row is filed under a `sha256` its own bytes do not hash to, so

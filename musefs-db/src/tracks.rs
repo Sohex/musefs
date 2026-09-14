@@ -1,8 +1,27 @@
 use crate::error::check_field_bytes;
 use crate::limits::MAX_BACKING_PATH_BYTES;
 use crate::models::{ChecksumWrite, Format, NewTrack, Track, TrackBounds};
-use crate::{Db, ReadWrite, Result};
+use crate::{Db, DbError, ReadWrite, Result};
 use rusqlite::{Row, params};
+
+/// The two `backing_path` columns every reader of the path projects (#758).
+///
+/// `sqlite3_step` materializes every column a statement selects before the row
+/// reaches a guard, so the bound has to be in the SQL. The path comes back NULL,
+/// which is nothing to load, unless it is a BLOB within
+/// `limits::MAX_BACKING_PATH_BYTES`. Its length is taken only from a BLOB, and
+/// reads -1 for anything else: `length()` on TEXT walks the value to count it,
+/// and a NUL-truncated TEXT path counted 1 and passed. `check_backing_path_len`
+/// then refuses the row from that length alone. The literal is pinned to the
+/// constant by `the_projection_withholds_an_over_cap_or_non_blob_path`.
+macro_rules! backing_path_cols {
+    () => {
+        "CASE WHEN typeof(backing_path) = 'blob' THEN length(backing_path) ELSE -1 END \
+         AS backing_path_len, \
+         CASE WHEN typeof(backing_path) = 'blob' AND length(backing_path) <= 65536 \
+         THEN backing_path END AS backing_path"
+    };
+}
 
 /// Build a `SELECT <track columns> FROM tracks <tail>` as a compile-time string
 /// literal, so every track read shares one column list (kept in lockstep with
@@ -14,15 +33,14 @@ use rusqlite::{Row, params};
 /// as the bytes it is — no cast either way. The cast this used to carry was
 /// sound only while every stored path had come from a Rust `String`; a path is
 /// an arbitrary byte string on Unix, and the whole point of the byte-typed
-/// model is that such a path round-trips instead of being mangled.
-///
-/// `backing_path_len` rides beside it so `row_to_track` can refuse an over-cap
-/// path before loading it (#758).
+/// model is that such a path round-trips instead of being mangled. Its two
+/// columns are `backing_path_cols!`'s.
 macro_rules! track_select {
     ($tail:literal) => {
         concat!(
-            "SELECT id, length(backing_path) AS backing_path_len, backing_path, format, \
-             audio_offset, audio_length, \
+            "SELECT id, ",
+            backing_path_cols!(),
+            ", format, audio_offset, audio_length, \
              backing_size, backing_mtime_ns, backing_ctime_ns, backing_ino, \
              content_version, updated_at, \
              fingerprint, content_hash \
@@ -44,12 +62,22 @@ fn parse_format_col(fmt: &str) -> rusqlite::Result<Format> {
     })
 }
 
-/// Refuse a `backing_path` over the cap from its projected `length()`, before the
-/// value is read (#758). Every reader of the column materializes it — into a
-/// `PathBuf`, on `getattr` among others — so without this a crafted store chose
-/// the size of that allocation; the V4 `CHECK` cannot protect a store written
-/// with its constraints off. The column is a BLOB, so `length()` counts bytes.
+/// What `backing_path_cols!` reads as the length of a value that is not a BLOB.
+const NOT_A_BLOB: i64 = -1;
+
+/// Refuse a `backing_path` from its projected length, before the value is read
+/// (#758): a BLOB over the cap, or a value that is not a BLOB at all. Every
+/// reader of the column materializes it — into a `PathBuf`, on `getattr` among
+/// others — so without this a crafted store chose the size of that allocation;
+/// the V4 `CHECK` cannot protect a store written with its constraints off.
 fn check_backing_path_len(len: i64) -> Result<()> {
+    if len == NOT_A_BLOB {
+        return Err(DbError::WrongStorageClass {
+            table: "tracks",
+            field: "backing_path",
+            expected: "BLOB",
+        });
+    }
     check_field_bytes("tracks", "backing_path", len, MAX_BACKING_PATH_BYTES)
 }
 
@@ -289,14 +317,14 @@ impl<M> Db<M> {
     /// allocation on a 200k-track store, on a path already holding a connection.
     /// Unordered by design; the caller collects into a set.
     pub fn list_backing_paths(&self) -> Result<Vec<std::path::PathBuf>> {
-        let mut stmt = self
-            .conn
-            .prepare_cached("SELECT length(backing_path), backing_path FROM tracks")?;
+        let mut stmt =
+            self.conn
+                .prepare_cached(concat!("SELECT ", backing_path_cols!(), " FROM tracks"))?;
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
-            check_backing_path_len(r.get(0)?)?;
-            out.push(crate::models::path_from_col(r.get(1)?));
+            check_backing_path_len(r.get("backing_path_len")?)?;
+            out.push(crate::models::path_from_col(r.get("backing_path")?));
         }
         Ok(out)
     }
@@ -348,18 +376,22 @@ impl<M> Db<M> {
     pub fn track_identity(&self, id: i64) -> Result<Option<crate::TrackIdentity>> {
         crate::query_optional(
             &self.conn,
-            "SELECT length(backing_path), content_version, backing_path, backing_size, \
-             backing_mtime_ns, backing_ctime_ns, backing_ino FROM tracks WHERE id = ?1",
+            concat!(
+                "SELECT ",
+                backing_path_cols!(),
+                ", content_version, backing_size, backing_mtime_ns, backing_ctime_ns, \
+                 backing_ino FROM tracks WHERE id = ?1"
+            ),
             params![id],
             |r| {
-                check_backing_path_len(r.get(0)?)?;
+                check_backing_path_len(r.get("backing_path_len")?)?;
                 Ok(crate::TrackIdentity {
-                    content_version: r.get(1)?,
-                    backing_path: crate::models::path_from_col(r.get(2)?),
-                    backing_size: r.get(3)?,
-                    backing_mtime_ns: r.get(4)?,
-                    backing_ctime_ns: r.get(5)?,
-                    backing_ino: crate::models::ino_from_col(r.get(6)?),
+                    content_version: r.get("content_version")?,
+                    backing_path: crate::models::path_from_col(r.get("backing_path")?),
+                    backing_size: r.get("backing_size")?,
+                    backing_mtime_ns: r.get("backing_mtime_ns")?,
+                    backing_ctime_ns: r.get("backing_ctime_ns")?,
+                    backing_ino: crate::models::ino_from_col(r.get("backing_ino")?),
                 })
             },
         )
@@ -663,6 +695,60 @@ mod negative_audio_bounds_tests {
         assert!(
             db.get_track(id).is_err(),
             "audio_offset + audio_length > backing_size must fail row-read"
+        );
+    }
+}
+
+#[cfg(test)]
+mod backing_path_projection_tests {
+    use crate::Db;
+    use crate::limits::MAX_BACKING_PATH_BYTES;
+    use rusqlite::types::Type;
+
+    /// #758 in the SQL itself, where the bound has to be: `sqlite3_step` loads
+    /// every column it selects before the row reaches a guard. The path column
+    /// comes back NULL, which is nothing to load, for a BLOB over the cap and for
+    /// anything that is not a BLOB. A non-BLOB's length reads -1 rather than
+    /// `length()`, because `length()` on TEXT walks the value to count it, and a
+    /// NUL-truncated one would read 1 and pass the guard.
+    #[test]
+    fn the_projection_withholds_an_over_cap_or_non_blob_path() {
+        let db = Db::open_in_memory().unwrap();
+        let cap = MAX_BACKING_PATH_BYTES;
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
+        for value in [
+            "zeroblob(?1)",
+            "zeroblob(?1 + 1)",
+            "'/' || char(0) || substr(replace(hex(zeroblob(?1)), '0', 'a'), 1, ?1)",
+        ] {
+            db.conn
+                .execute(
+                    &format!(
+                        "INSERT INTO tracks (backing_path, format, audio_offset, \
+                         audio_length, backing_size, backing_mtime_ns, updated_at) \
+                         VALUES ({value}, 'flac', 0, 0, 0, 0, 0)"
+                    ),
+                    [cap],
+                )
+                .unwrap();
+        }
+        let seen: Vec<(i64, Type)> = (1..=3)
+            .map(|id: i64| {
+                db.conn
+                    .query_row(track_select!("WHERE id = ?1"), [id], |r| {
+                        Ok((
+                            r.get("backing_path_len")?,
+                            r.get_ref("backing_path")?.data_type(),
+                        ))
+                    })
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            vec![(cap, Type::Blob), (cap + 1, Type::Null), (-1, Type::Null)]
         );
     }
 }

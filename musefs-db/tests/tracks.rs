@@ -343,6 +343,54 @@ fn every_backing_path_reader_refuses_an_over_cap_path() {
     refused("list_backing_paths", db.list_backing_paths());
 }
 
+/// A `backing_path` that is not a BLOB is refused by every reader from its
+/// storage class, before the value is loaded. The one planted here is TEXT with a
+/// NUL near its start, whose `length()` reads 1, well under the cap: the length
+/// check alone passed it, and loaded it to find out it was not bytes.
+/// `get_track_by_path` is not among the readers: it binds the path as bytes, and
+/// SQLite never compares TEXT equal to a BLOB, so it finds no row to refuse.
+#[test]
+fn every_backing_path_reader_refuses_a_path_that_is_not_a_blob() {
+    use musefs_db::DbError;
+
+    fn refused<T>(reader: &str, got: musefs_db::Result<T>) {
+        match got {
+            Err(DbError::WrongStorageClass {
+                table: "tracks",
+                field: "backing_path",
+                ..
+            }) => {}
+            Err(other) => panic!("{reader} refused with the wrong error: {other}"),
+            Ok(_) => panic!("{reader} loaded the TEXT path"),
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("s.db");
+    let db = Db::open(&store).unwrap();
+    let fingerprint = "a".repeat(64);
+    let raw = rusqlite::Connection::open(&store).unwrap();
+    raw.pragma_update(None, "ignore_check_constraints", true)
+        .unwrap();
+    raw.execute(
+        "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+         backing_size, backing_mtime_ns, updated_at, fingerprint) \
+         VALUES ('/' || char(0) || 'lib/a.flac', 'flac', 0, 0, 0, 0, 0, ?1)",
+        [&fingerprint],
+    )
+    .unwrap();
+    let id = raw.last_insert_rowid();
+
+    refused("get_track", db.get_track(id));
+    refused("list_tracks", db.list_tracks());
+    refused(
+        "tracks_by_fingerprint",
+        db.tracks_by_fingerprint(&fingerprint),
+    );
+    refused("track_identity", db.track_identity(id));
+    refused("list_backing_paths", db.list_backing_paths());
+}
+
 /// The cap is inclusive: a path exactly at it stores and reads back, and one
 /// byte more is refused at the write.
 #[test]
