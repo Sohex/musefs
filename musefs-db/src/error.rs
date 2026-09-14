@@ -15,7 +15,9 @@ pub enum DbError {
     },
     #[error(
         "database schema does not match the version musefs expects (mismatch at {object}); \
-         regenerate the store by running `musefs scan` against the library"
+         the store was altered by something other than musefs. Restore it from a \
+         `musefs migrate` snapshot, or move it aside and let `musefs scan` build a new \
+         store (the old store's curated tags and art do not carry over)"
     )]
     SchemaMismatch { object: String },
     #[error(
