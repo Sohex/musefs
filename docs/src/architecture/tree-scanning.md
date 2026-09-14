@@ -241,16 +241,33 @@ it did not cover text tags at all — an over-cap `tags.value` reached the DB
 the limit (#644).
 
 Symlinks are **not followed by default**: a symlinked file or directory is
-logged (`RUST_LOG=info`/`warn`) and skipped, which keeps the walk immune to
+logged (`RUST_LOG=debug`) and skipped, which keeps the walk immune to
 directory-symlink cycles. Passing `--follow-symlinks` resolves them — symlinked
 audio files and directories are scanned — guarded by a visited `(dev, ino)` set
 so symlink cycles terminate, and by a second file-level `(dev, ino)` set so a
 file reached via both a real path and a symlink is ingested once rather than
 upserting its canonical track row twice. Because that set keys on `(dev, ino)`,
 multiple hardlinks to the same inode are likewise collapsed to a single track
-under `--follow-symlinks`. Broken symlinks are logged and skipped without
-aborting the scan. The `root` argument is always followed regardless of the
-flag; only links encountered during recursion are gated.
+under `--follow-symlinks`. Broken or looping symlinks are logged and counted as
+`symlink` walk errors without aborting the scan. The `root` argument is always
+followed regardless of the flag; only links encountered during recursion are
+gated.
+
+The walk resolves each link it follows exactly once, to its canonical path, and
+hands that path on: the **target** decides eligibility, not the link's name.
+`track -> song.flac` and `notes.txt -> song.flac` are scanned as the FLAC;
+`song.flac -> cover.jpg` is a `jpg` skip; `song.flac -> song.mp3` is scanned as
+the MP3. A link is therefore ingested the same whether the walk reaches it or it
+is passed as the scan root, which is canonicalized the same way
+([#766](https://github.com/Sohex/musefs/issues/766)). A followed directory is
+descended through its resolved path, so every file under it is yielded
+canonical too. That resolved path is the one the already-present check, the
+`revalidate` lookup and the probe use, and the one stored as `backing_path`:
+nothing resolves it a second time, so a link retargeted mid-scan cannot pair
+one target's geometry with another's path
+([#684](https://github.com/Sohex/musefs/issues/684)). Without the flag the walk
+yields paths under the canonicalized root that are canonical by construction,
+and nothing is resolved at all.
 
 `revalidate` is the maintenance pass: it re-probes only files whose
 `(size, mtime_ns, ctime_ns, ino)` freshness stamp changed — a ctime-only move

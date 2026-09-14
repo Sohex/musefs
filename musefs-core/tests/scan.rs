@@ -1,6 +1,6 @@
 mod common;
 use common::{make_flac, set_mtime, streaminfo_body, vorbis_comment_body, write_flac};
-use musefs_core::{ScanOptions, revalidate, scan_directory, scan_directory_with};
+use musefs_core::{ScanOptions, revalidate, revalidate_with, scan_directory, scan_directory_with};
 use musefs_db::{Db, Tag};
 
 #[test]
@@ -959,4 +959,196 @@ fn two_paths_differing_only_in_invalid_utf8_stay_two_tracks() {
     };
     assert_eq!(title(&a).as_deref(), Some("A"));
     assert_eq!(title(&b).as_deref(), Some("B"));
+}
+
+// === --follow-symlinks: the resolved target decides eligibility (#766) ===
+
+fn following() -> ScanOptions {
+    let mut opts = ScanOptions::default();
+    opts.follow_symlinks = true;
+    opts
+}
+
+/// What a scan did and stored, in a comparable form: `(scanned, skipped,
+/// failed)` and the sorted `(backing_path, format)` rows.
+type Outcome = (
+    (u64, u64, u64),
+    Vec<(std::path::PathBuf, musefs_db::Format)>,
+);
+
+fn outcome(root: &std::path::Path, opts: &ScanOptions) -> Outcome {
+    let db = Db::open_in_memory().unwrap();
+    let stats = scan_directory_with(&db, root, opts).unwrap();
+    let mut rows: Vec<_> = db
+        .list_tracks()
+        .unwrap()
+        .into_iter()
+        .map(|t| (t.backing_path, t.format))
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    ((stats.scanned, stats.skipped, stats.failed), rows)
+}
+
+/// The file behind each link shape the issue names: `(link name, target name)`,
+/// a FLAC, an MP3, or a text file with no extension.
+fn write_target(path: &std::path::Path) {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("flac") => {
+            write_flac(path, &["TITLE=T"], &[0xAA; 32]);
+        }
+        Some("mp3") => {
+            common::write_mp3(path, &[0xFF, 0xFB, 1, 2, 3, 4, 5, 6]);
+        }
+        _ => std::fs::write(path, b"not audio").unwrap(),
+    }
+}
+
+const LINK_SHAPES: [(&str, &str); 4] = [
+    ("track", "song.flac"),
+    ("nice.txt", "song.flac"),
+    ("nice.flac", "song.mp3"),
+    ("nice.flac", "noext"),
+];
+
+/// A library holding the one link `library/<link> -> targets/<target>`.
+fn library_with_link(link: &str, target: &str) -> (tempfile::TempDir, tempfile::TempDir) {
+    let library = tempfile::tempdir().unwrap();
+    let targets = tempfile::tempdir().unwrap();
+    write_target(&targets.path().join(target));
+    std::os::unix::fs::symlink(targets.path().join(target), library.path().join(link)).unwrap();
+    (library, targets)
+}
+
+/// #766: the same link is ingestible or not independently of whether it was the
+/// scan root. A recursive scan decides by the target, as the root scan always
+/// did, for every shape in the issue.
+#[test]
+fn follow_symlinks_a_link_scans_the_same_as_root_or_walked() {
+    for (link, target) in LINK_SHAPES {
+        let (library, _targets) = library_with_link(link, target);
+        assert_eq!(
+            outcome(library.path(), &following()),
+            outcome(&library.path().join(link), &following()),
+            "{link} -> {target}: walking the library and scanning the link differ"
+        );
+    }
+}
+
+/// #766: `library/track -> song.flac` is scanned as the FLAC, under its target's
+/// canonical path.
+#[test]
+fn follow_symlinks_scans_an_extensionless_link_to_flac() {
+    let (library, targets) = library_with_link("track", "song.flac");
+    let canonical = std::fs::canonicalize(targets.path().join("song.flac")).unwrap();
+    assert_eq!(
+        outcome(library.path(), &following()),
+        ((1, 0, 0), vec![(canonical, musefs_db::Format::Flac)])
+    );
+}
+
+/// #766: `nice.txt -> song.flac` is scanned, not tallied as an unsupported skip.
+#[test]
+fn follow_symlinks_scans_a_txt_link_to_flac() {
+    let (library, targets) = library_with_link("nice.txt", "song.flac");
+    let canonical = std::fs::canonicalize(targets.path().join("song.flac")).unwrap();
+    assert_eq!(
+        outcome(library.path(), &following()),
+        ((1, 0, 0), vec![(canonical, musefs_db::Format::Flac)])
+    );
+}
+
+/// #766: `nice.flac -> song.mp3` is an MP3, stored under the MP3's path.
+#[test]
+fn follow_symlinks_scans_a_flac_named_link_to_mp3_as_mp3() {
+    let (library, targets) = library_with_link("nice.flac", "song.mp3");
+    let canonical = std::fs::canonicalize(targets.path().join("song.mp3")).unwrap();
+    assert_eq!(
+        outcome(library.path(), &following()),
+        ((1, 0, 0), vec![(canonical, musefs_db::Format::Mp3)])
+    );
+}
+
+/// #766: `nice.flac -> noext` is a skip of a non-audio file, not a supported
+/// file that fails to probe (which would also reach the exit-2 signal).
+#[test]
+fn follow_symlinks_skips_a_flac_named_link_to_a_non_audio_file() {
+    let (library, _targets) = library_with_link("nice.flac", "noext");
+    assert_eq!(outcome(library.path(), &following()), ((0, 1, 0), vec![]));
+}
+
+/// #766 with #302: links to one target under names of every kind — none, `.txt`,
+/// `.flac` — are one file and ingest once.
+#[test]
+fn follow_symlinks_dedups_links_to_one_target_whatever_their_names() {
+    let library = tempfile::tempdir().unwrap();
+    let targets = tempfile::tempdir().unwrap();
+    let song = targets.path().join("song.flac");
+    write_target(&song);
+    for link in ["track", "nice.txt", "nice.flac"] {
+        std::os::unix::fs::symlink(&song, library.path().join(link)).unwrap();
+    }
+    assert_eq!(
+        outcome(library.path(), &following()),
+        (
+            (1, 0, 0),
+            vec![(
+                std::fs::canonicalize(&song).unwrap(),
+                musefs_db::Format::Flac
+            )]
+        )
+    );
+}
+
+/// #766: the path the walk resolves is the stored `backing_path`, and a second
+/// scan and a revalidate key on the same path: every followed track is already
+/// present, then unchanged.
+#[test]
+fn follow_symlinks_rescan_and_revalidate_key_on_the_resolved_path() {
+    let library = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    write_target(&library.path().join("real.flac"));
+    let album = elsewhere.path().join("album");
+    std::fs::create_dir(&album).unwrap();
+    write_target(&album.join("a.flac"));
+    write_target(&elsewhere.path().join("song.flac"));
+    std::os::unix::fs::symlink(&album, library.path().join("mirror")).unwrap();
+    std::os::unix::fs::symlink(
+        elsewhere.path().join("song.flac"),
+        library.path().join("track"),
+    )
+    .unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    let first = scan_directory_with(&db, library.path(), &following()).unwrap();
+    assert_eq!((first.scanned, first.skipped, first.failed), (3, 0, 0));
+    let mut stored: Vec<_> = db
+        .list_tracks()
+        .unwrap()
+        .into_iter()
+        .map(|t| t.backing_path)
+        .collect();
+    stored.sort();
+    let mut expected: Vec<_> = [
+        library.path().join("real.flac"),
+        album.join("a.flac"),
+        elsewhere.path().join("song.flac"),
+    ]
+    .iter()
+    .map(|p| std::fs::canonicalize(p).unwrap())
+    .collect();
+    expected.sort();
+    assert_eq!(stored, expected);
+
+    let again = scan_directory_with(&db, library.path(), &following()).unwrap();
+    assert_eq!((again.scanned, again.already_present), (0, 3));
+
+    let revalidated = revalidate_with(&db, library.path(), &following()).unwrap();
+    assert_eq!(
+        (
+            revalidated.updated,
+            revalidated.unchanged,
+            revalidated.failed
+        ),
+        (0, 3, 0)
+    );
 }
