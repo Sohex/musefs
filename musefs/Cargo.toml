@@ -31,6 +31,10 @@ log = { version = "0.4", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+# Writes the row an upgrade leaves owed a revalidate, which no command produces,
+# for the process-level #705 warning test, and (`test-support`) seeds a store an
+# older musefs left behind.
+musefs-db = { path = "../musefs-db", features = ["test-support"] }
 rustix = { version = "1", features = ["process"] }
 
 [lints]

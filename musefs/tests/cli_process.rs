@@ -239,24 +239,34 @@ fn scan_revalidate_flag_is_a_usage_error() {
 #[test]
 fn retired_revalidate_env_is_refused() {
     let (_dir, target, db) = library_with_one_flac();
-    let out = musefs()
-        .arg("scan")
-        .arg(&target)
-        .arg("--db")
-        .arg(&db)
-        .env("MUSEFS_REVALIDATE", "true")
-        .output()
-        .unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success(), "stderr: {stderr}");
-    assert!(
-        stderr.contains("MUSEFS_REVALIDATE") && stderr.contains("`revalidate` subcommand"),
-        "the refusal should name the variable and its replacement, stderr: {stderr}"
-    );
-    assert!(
-        !db.exists(),
-        "a refused scan must not have created the store"
-    );
+    // Any non-empty value, `false` and `0` included: the refusal is about the
+    // variable still being set, not about what it asks for. Reading `false` as
+    // "off" would carry on silently for exactly the unit files that most need
+    // telling that the variable no longer does anything.
+    for value in ["true", "false", "0"] {
+        let out = musefs()
+            .arg("scan")
+            .arg(&target)
+            .arg("--db")
+            .arg(&db)
+            .env("MUSEFS_REVALIDATE", value)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "MUSEFS_REVALIDATE={value}, stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("MUSEFS_REVALIDATE") && stderr.contains("`revalidate` subcommand"),
+            "MUSEFS_REVALIDATE={value}: the refusal should name the variable and its \
+             replacement, stderr: {stderr}"
+        );
+        assert!(
+            !db.exists(),
+            "MUSEFS_REVALIDATE={value}: a refused scan must not have created the store"
+        );
+    }
 
     // Empty is unset, as it is for every variable clap reads.
     let out = musefs()
@@ -272,6 +282,89 @@ fn retired_revalidate_env_is_refused() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// What `mount`, `scan` and `revalidate` print while a track awaits the
+/// revalidate an upgrade left owed.
+const OWED_REVALIDATE: &str = "have not been re-probed since the store was upgraded";
+
+/// Run `musefs` with `args` and hand back its stderr, having checked it
+/// succeeded.
+fn stderr_of_success(args: &[&std::ffi::OsStr]) -> String {
+    let out = musefs().args(args).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "musefs {args:?}, stderr: {stderr}");
+    stderr
+}
+
+/// #705: while any track awaits its re-probe, each of the three commands that
+/// open the store for ordinary work says so on stderr — `migrate`'s one report
+/// scrolls away and the gap does not. Once a revalidate has re-probed the track,
+/// none of them does.
+///
+/// `mount` is reached through `--dry-run`, which opens the store and warns
+/// exactly as a mount does and stops before FUSE, so this needs no `/dev/fuse`.
+/// `scan` and `revalidate` are pointed at an empty directory, so they leave the
+/// owed row as it is.
+#[test]
+fn every_store_command_warns_of_an_owed_revalidate_until_it_has_run() {
+    let (dir, library, db) = library_with_one_flac();
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    // The row an upgrade leaves: neither a fingerprint nor an inode. Canonical,
+    // as a scan stores it, so a revalidate of `library` reaches it.
+    let track = std::fs::canonicalize(library.join("a.flac")).unwrap();
+    musefs_db::Db::open(&db)
+        .unwrap()
+        .upsert_track(&musefs_db::NewTrack {
+            backing_path: track,
+            format: musefs_db::Format::Flac,
+            audio_offset: 0,
+            audio_length: 1,
+            backing_size: 1,
+            backing_mtime_ns: 0,
+            backing_ctime_ns: 0,
+            backing_ino: None,
+        })
+        .unwrap();
+
+    let (db, elsewhere, library) = (db.as_os_str(), elsewhere.as_os_str(), library.as_os_str());
+    let commands: [(&str, Vec<&std::ffi::OsStr>); 3] = [
+        (
+            "mount",
+            vec!["mount".as_ref(), "--db".as_ref(), db, "--dry-run".as_ref()],
+        ),
+        (
+            "scan",
+            vec!["scan".as_ref(), elsewhere, "--db".as_ref(), db],
+        ),
+        (
+            "revalidate",
+            vec!["revalidate".as_ref(), elsewhere, "--db".as_ref(), db],
+        ),
+    ];
+
+    for (name, args) in &commands {
+        let stderr = stderr_of_success(args);
+        assert!(
+            stderr.contains(OWED_REVALIDATE) && stderr.contains("1 track(s)"),
+            "`{name}` must warn while a revalidate is owed, stderr: {stderr}"
+        );
+    }
+
+    // The revalidate that re-probes the track does not warn about it afterwards.
+    let stderr = stderr_of_success(&["revalidate".as_ref(), library, "--db".as_ref(), db]);
+    assert!(
+        !stderr.contains(OWED_REVALIDATE),
+        "the revalidate that re-probed every track must not warn, stderr: {stderr}"
+    );
+    for (name, args) in &commands {
+        let stderr = stderr_of_success(args);
+        assert!(
+            !stderr.contains(OWED_REVALIDATE),
+            "`{name}` must not warn once every track is re-probed, stderr: {stderr}"
+        );
+    }
 }
 
 #[test]

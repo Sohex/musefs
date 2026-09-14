@@ -975,6 +975,7 @@ dependencies = [
  "env_logger",
  "log",
  "musefs-cli",
+ "musefs-db",
  "musefs-fuse",
  "rustix",
  "tempfile",
