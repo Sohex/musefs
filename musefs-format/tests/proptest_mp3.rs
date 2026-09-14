@@ -234,6 +234,55 @@ fn test_tag(title: &str, artist: Option<&str>, update: bool, footer: bool) -> Ve
     tag
 }
 
+/// What a prepended tag in the generated run is. An appended tag is always v2.4,
+/// since only v2.4 defines the footer that places one after the audio.
+#[derive(Debug, Clone, Copy)]
+enum Leading {
+    V22,
+    V23,
+    V24 { update: bool, footer: bool },
+}
+
+impl Leading {
+    /// Does this tag update the tags before it, rather than replace them? v2.2 and
+    /// v2.3 tags always do (ID3v2.3.0 §4.19); a v2.4 tag only with the update
+    /// flag (ID3v2.4.0 structure §5).
+    fn updates(self) -> bool {
+        match self {
+            Self::V22 | Self::V23 => true,
+            Self::V24 { update, .. } => update,
+        }
+    }
+}
+
+/// A v2.2 or v2.3 text tag with `title` and maybe `artist`, in ISO-8859-1: v2.2
+/// frames have three-character ids and 24-bit sizes, v2.3 frames plain 32-bit
+/// sizes and two flag bytes.
+fn legacy_tag(version: u8, title: &str, artist: Option<&str>) -> Vec<u8> {
+    let (title_id, artist_id): (&[u8], &[u8]) = if version == 2 {
+        (b"TT2", b"TP1")
+    } else {
+        (b"TIT2", b"TPE1")
+    };
+    let mut body = Vec::new();
+    for (id, value) in std::iter::once((title_id, title)).chain(artist.map(|a| (artist_id, a))) {
+        let size = u32::try_from(value.len() + 1).unwrap().to_be_bytes();
+        body.extend_from_slice(id);
+        if version == 2 {
+            body.extend_from_slice(&size[1..]);
+        } else {
+            body.extend_from_slice(&size);
+            body.extend_from_slice(&[0, 0]);
+        }
+        body.push(0);
+        body.extend_from_slice(value.as_bytes());
+    }
+    let mut tag = vec![b'I', b'D', b'3', version, 0, 0];
+    tag.extend_from_slice(&syncsafe(u32::try_from(body.len()).unwrap()));
+    tag.extend(body);
+    tag
+}
+
 /// Probe `file` the way the scan does: a 138-byte tail and a `window`-byte
 /// prefix, each widened on `NeedMore`. Returns the bounds and the final prefix
 /// and tail lengths.
@@ -261,20 +310,29 @@ fn locate_windowed(file: &[u8], window: usize) -> (mp3::Mp3Bounds, usize, usize)
     }
 }
 
-type TagSpec = (String, Option<String>, bool);
-
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
-    /// #767/#768: any run of prepended tags, any appended tags, and an ID3v1
-    /// trailer on either side of them. The audio region is exactly the audio;
-    /// a windowed probe agrees with the whole-buffer one; and the merged tags
-    /// follow §5 — each tag in file order replaces what came before, unless it
-    /// is an update, which overrides only the keys it carries.
+    /// #767/#768: any run of prepended v2.2, v2.3 and v2.4 tags, any appended
+    /// tags, and an ID3v1 trailer on either side of them. The audio region is
+    /// exactly the audio; a windowed probe agrees with the whole-buffer one; and
+    /// the merged tags follow the specs in file order: a v2.2 or v2.3 tag, or a
+    /// v2.4 tag flagged as an update, overrides only the keys it carries
+    /// (ID3v2.3.0 §4.19, ID3v2.4.0 structure §3.2); any other v2.4 tag replaces
+    /// what came before (§5).
     #[test]
     fn tags_at_both_ends_are_located_and_merged_in_file_order(
         leading in proptest::collection::vec(
-            (("[a-z]{1,8}", proptest::option::of("[a-z]{1,8}"), any::<bool>()), any::<bool>()),
+            (
+                "[a-z]{1,8}",
+                proptest::option::of("[a-z]{1,8}"),
+                prop_oneof![
+                    Just(Leading::V22),
+                    Just(Leading::V23),
+                    (any::<bool>(), any::<bool>())
+                        .prop_map(|(update, footer)| Leading::V24 { update, footer }),
+                ],
+            ),
             0..4,
         ),
         appended in proptest::collection::vec(
@@ -291,8 +349,12 @@ proptest! {
         window in 1usize..200,
     ) {
         let mut file = Vec::new();
-        for ((title, artist, update), footer) in &leading {
-            file.extend(test_tag(title, artist.as_deref(), *update, *footer));
+        for (title, artist, kind) in &leading {
+            file.extend(match *kind {
+                Leading::V22 => legacy_tag(2, title, artist.as_deref()),
+                Leading::V23 => legacy_tag(3, title, artist.as_deref()),
+                Leading::V24 { update, footer } => test_tag(title, artist.as_deref(), update, footer),
+            });
         }
         let audio_offset = file.len() as u64;
         let mut audio = vec![0xFF, 0xFB];
@@ -318,10 +380,13 @@ proptest! {
         let partial = mp3::read_metadata(&file[..prefix_len], &file[file.len() - tail_len..], len, &windowed);
         prop_assert_eq!(&partial, &whole);
 
-        let in_order: Vec<&TagSpec> = leading.iter().map(|(spec, _)| spec).chain(appended.iter()).collect();
+        let in_order = leading
+            .iter()
+            .map(|(title, artist, kind)| (title, artist, kind.updates()))
+            .chain(appended.iter().map(|(title, artist, update)| (title, artist, *update)));
         let mut model = std::collections::BTreeMap::new();
-        for (title, artist, update) in in_order {
-            if !update {
+        for (title, artist, updates) in in_order {
+            if !updates {
                 model.clear();
             }
             model.insert("title".to_string(), title.clone());
