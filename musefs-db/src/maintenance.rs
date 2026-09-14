@@ -34,6 +34,17 @@ pub(crate) fn claim_exclusive(conn: &Connection, op: &'static str) -> Result<()>
     Ok(())
 }
 
+/// Hand a claim back: return `conn` to `NORMAL` locking. SQLite drops the
+/// exclusive locks only on the next access to the database file, so one is made
+/// here rather than left to whatever the caller does next.
+fn release_exclusive(conn: &Connection) -> Result<()> {
+    conn.pragma_update(None, "locking_mode", "normal")?;
+    conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+        r.get::<_, i64>(0)
+    })?;
+    Ok(())
+}
+
 /// Write a compacted, consistent copy of the store to `dest` in one statement.
 ///
 /// `VACUUM INTO` runs against a read transaction, so it neither blocks a
@@ -67,18 +78,30 @@ impl Db<ReadWrite> {
     /// ([`claim_exclusive`]), and refused with [`DbError::StoreInUse`] if anything
     /// else has it open (#721). Mapping a busy `VACUUM` alone was not that check:
     /// in WAL mode a mount idle between reads holds no lock, so the rewrite ran
-    /// underneath it. The claim is held until this `Db` is dropped, which is also
-    /// why the checkpoint's result row can be discarded — with no other connection
-    /// attached, nothing can leave it unable to finish.
+    /// underneath it. The claim is held through the vacuum and the checkpoint,
+    /// which is also why the checkpoint's result row can be discarded — with no
+    /// other connection attached, nothing can leave it unable to finish.
+    ///
+    /// Afterwards the connection goes back to the locking mode it was in, so a
+    /// long-lived caller does not keep every other reader locked out for as long
+    /// as the `Db` stays open. A caller that already held the store — `musefs
+    /// migrate` vacuums under its own claim — keeps it.
     pub fn vacuum(&self) -> Result<()> {
+        let mode: String = self
+            .conn
+            .pragma_query_value(None, "locking_mode", |r| r.get(0))?;
         claim_exclusive(&self.conn, "vacuuming")?;
-        self.conn
+        let vacuumed = self
+            .conn
             .execute_batch("VACUUM")
-            .map_err(|e| map_busy(e, "vacuuming"))?;
-        self.conn
-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
-            .map_err(|e| map_busy(e, "vacuuming"))?;
-        Ok(())
+            .and_then(|()| self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)"))
+            .map_err(|e| map_busy(e, "vacuuming"));
+        let released = if mode.eq_ignore_ascii_case("exclusive") {
+            Ok(())
+        } else {
+            release_exclusive(&self.conn)
+        };
+        vacuumed.and(released)
     }
 }
 
@@ -161,6 +184,50 @@ mod tests {
     /// that did a read and went idle, which is what a mount looks like between
     /// serving two files, and a read-only one, which is what most of a mount's
     /// connections are. The vacuum used to run to completion under both.
+    /// A vacuum hands the store back when it is done: another connection can
+    /// take a write lock afterwards, rather than finding the store held for as
+    /// long as this `Db` stays open.
+    #[test]
+    fn vacuum_releases_the_store_when_it_is_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let db = Db::open(&path).unwrap();
+        db.vacuum().unwrap();
+
+        let mode: String = db
+            .conn
+            .pragma_query_value(None, "locking_mode", |r| r.get(0))
+            .unwrap();
+        assert!(mode.eq_ignore_ascii_case("normal"), "locking_mode {mode}");
+        let other = rusqlite::Connection::open(&path).unwrap();
+        other
+            .busy_timeout(std::time::Duration::from_millis(200))
+            .unwrap();
+        other
+            .execute_batch("BEGIN IMMEDIATE; COMMIT")
+            .expect("the vacuuming connection no longer holds the store");
+    }
+
+    /// Under a claim its caller already holds, as `migrate`'s is, the vacuum
+    /// leaves the claim in place.
+    #[test]
+    fn vacuum_keeps_a_claim_the_caller_already_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let db = Db::open(&path).unwrap();
+        super::claim_exclusive(&db.conn, "migrating").unwrap();
+        db.vacuum().unwrap();
+
+        let other = rusqlite::Connection::open(&path).unwrap();
+        other
+            .busy_timeout(std::time::Duration::from_millis(50))
+            .unwrap();
+        assert!(
+            other.execute_batch("BEGIN IMMEDIATE; COMMIT").is_err(),
+            "the caller's claim must survive the vacuum"
+        );
+    }
+
     #[test]
     fn vacuum_refuses_a_store_another_connection_has_open() {
         let dir = tempfile::tempdir().unwrap();
