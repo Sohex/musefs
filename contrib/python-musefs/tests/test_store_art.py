@@ -107,6 +107,26 @@ def test_replace_track_art_sets_and_replaces_front_cover(db_path):
         conn.close()
 
 
+def test_replace_track_art_stores_the_dimensions_a_row_states(db_path):
+    """A six-field row carries the link's width and height (musefs #737); a
+    four-field row, beside it, still states none."""
+    conn = connect(db_path)
+    try:
+        tid = insert_track(conn, "/m/a.flac")
+        a = upsert_art(conn, JPEG)
+        b = upsert_art(conn, PNG)
+        replace_track_art(conn, tid, [(a, 3, "", "image/jpeg", 1200, 800), (b, 4, "", "image/png")])
+        conn.commit()
+        rows = conn.execute(
+            "SELECT art_id, width, height, depth, colors FROM track_art "
+            "WHERE track_id=? ORDER BY ordinal",
+            (tid,),
+        ).fetchall()
+        assert rows == [(a, 1200, 800, 0, 0), (b, None, None, 0, 0)]
+    finally:
+        conn.close()
+
+
 def test_replace_track_art_multiple_rows_ordered(db_path):
     conn = connect(db_path)
     try:

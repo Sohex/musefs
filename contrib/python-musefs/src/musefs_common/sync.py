@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from .constants import MAX_ART_BYTES
 from .store import (
     _savepoint,
+    image_dimensions,
     merge_tags,
     replace_tags,
     replace_track_art,
@@ -62,7 +63,8 @@ def sync_one(conn, record, stats, *, dry_run=False, merge=False):
     scanner-written binary tags survive. Art is replaced when at least one image is
     within ``MAX_ART_BYTES``; each over-cap image bumps ``skipped_art``, and if
     every provided image is over cap any scan-seeded ``track_art`` is left
-    untouched.
+    untouched. Each linked picture's width and height come from its own PNG or
+    JPEG header (:func:`image_dimensions`), unset where the header gives none.
 
     A record whose tags or art violate a store CHECK constraint (key/value/mime
     length, ``picture_type`` range, control chars, ...) is rolled back through its
@@ -92,15 +94,19 @@ def sync_one(conn, record, stats, *, dry_run=False, merge=False):
                 else:
                     replace_tags(conn, track_id, record.pairs)
                 if will_link_art:
-                    arts = [
-                        (
+                    arts = []
+                    for img in kept:
+                        # The image's own header states its dimensions where it
+                        # can; anything unreadable links them unset (#737).
+                        width, height = image_dimensions(img.data) or (None, None)
+                        arts.append((
                             upsert_art(conn, img.data),
                             img.picture_type,
                             img.description,
                             img.mime,
-                        )
-                        for img in kept
-                    ]
+                            width,
+                            height,
+                        ))
                     replace_track_art(conn, track_id, arts)
         except sqlite3.IntegrityError as err:
             stats.skipped_invalid += 1

@@ -95,6 +95,17 @@ and these packages adhere to [Semantic Versioning](https://semver.org/spec/v2.0.
 
 ### Added
 
+- **Synced art states its dimensions** (musefs #737). `sync_files` linked a
+  plugin's art with `width` and `height` unset, so a FLAC whose picture a plugin
+  replaced served a block declaring no dimensions until the file was rescanned.
+  It now reads them from each image's own header — PNG's `IHDR`, a JPEG's
+  start-of-frame — with the new `image_dimensions(data)`, which decodes nothing
+  and needs no dependency. `replace_track_art` accepts
+  `(art_id, picture_type, description, mime, width, height)` rows alongside the
+  four-field ones, which still leave them unset. A WebP, an unreadable header or
+  a zero dimension stays `NULL`, and bit depth and colour count are still not
+  written.
+
 - **`musefs_common.path_param` / `musefs_common.path_value`** — the
   `backing_path` boundary encode and decode. See the change above.
 - **`musefs_common.ScanResult`** — what a completed `run_scan` did. Carries

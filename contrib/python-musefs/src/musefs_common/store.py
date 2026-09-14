@@ -2,6 +2,7 @@ import contextlib
 import hashlib
 import os
 import sqlite3
+import struct
 from dataclasses import dataclass
 
 from .constants import EXPECTED_USER_VERSION
@@ -343,6 +344,95 @@ def sniff_mime(data, path):
     return _EXT_MIME.get(ext, "application/octet-stream")
 
 
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+# The start-of-frame markers, which carry the frame's dimensions: every C0-CF
+# except DHT (C4), JPG (C8) and DAC (CC), which share the range and do not.
+_JPEG_SOF = frozenset((
+    0xC0,
+    0xC1,
+    0xC2,
+    0xC3,
+    0xC5,
+    0xC6,
+    0xC7,
+    0xC9,
+    0xCA,
+    0xCB,
+    0xCD,
+    0xCE,
+    0xCF,
+))
+# Markers that stand alone, with no length field: RST0-RST7 and TEM.
+_JPEG_STANDALONE = frozenset(range(0xD0, 0xD8)) | {0x01}
+# PNG caps a dimension at 2**31 - 1; the same bound keeps a JPEG's inside the
+# column's range.
+_MAX_DIMENSION = 2**31 - 1
+
+
+def image_dimensions(data):
+    """``(width, height)`` from a PNG or JPEG header, or ``None``.
+
+    Reads header bytes only, with no decoder and no dependency: PNG's ``IHDR``
+    chunk, which the format requires to come first, and a JPEG's start-of-frame
+    segment, found by walking the marker segments ahead of the image data.
+    Anything else — WebP, an unrecognised format, a truncated or malformed
+    header, a zero dimension — is ``None``, which is how ``track_art`` spells
+    "not stated" (musefs #737). Bit depth and colour count are not read."""
+    if data[:8] == _PNG_SIGNATURE:
+        return _png_dimensions(data)
+    if data[:2] == b"\xff\xd8":
+        return _jpeg_dimensions(data)
+    return None
+
+
+def _checked_dimensions(width, height):
+    if 0 < width <= _MAX_DIMENSION and 0 < height <= _MAX_DIMENSION:
+        return (width, height)
+    return None
+
+
+def _png_dimensions(data):
+    # Signature (8), then the IHDR chunk: length (4) = 13, type (4), width (4),
+    # height (4), big-endian.
+    if len(data) < 24 or data[8:12] != struct.pack(">I", 13) or data[12:16] != b"IHDR":
+        return None
+    width, height = struct.unpack(">II", data[16:24])
+    return _checked_dimensions(width, height)
+
+
+def _jpeg_dimensions(data):
+    i = 2  # past SOI
+    end = len(data)
+    while i < end:
+        if data[i] != 0xFF:
+            return None
+        # Any number of 0xFF fill bytes may precede a marker.
+        while i < end and data[i] == 0xFF:
+            i += 1
+        if i >= end:
+            return None
+        marker = data[i]
+        i += 1
+        if marker in (0xD9, 0xDA):
+            # End of image, or the image data itself: no frame header came first.
+            return None
+        if marker in _JPEG_STANDALONE:
+            continue
+        if i + 2 > end:
+            return None
+        (length,) = struct.unpack(">H", data[i : i + 2])
+        if length < 2 or i + length > end:
+            return None
+        if marker in _JPEG_SOF:
+            # Length (2), precision (1), height (2), width (2).
+            if length < 7:
+                return None
+            height, width = struct.unpack(">HH", data[i + 3 : i + 7])
+            return _checked_dimensions(width, height)
+        i += length
+    return None
+
+
 def upsert_art(conn, data):
     """Content-address ``data`` by sha256 and return its art id, inserting only
     if new (mirrors musefs Db::upsert_art).
@@ -376,8 +466,9 @@ def upsert_art(conn, data):
 
 def replace_track_art(conn, track_id, arts):
     """Replace the track's art rows. ``arts`` is an ordered list of
-    ``(art_id, picture_type, description, mime)``; each row's ``ordinal`` is its
-    list index.
+    ``(art_id, picture_type, description, mime)`` or
+    ``(art_id, picture_type, description, mime, width, height)``; each row's
+    ``ordinal`` is its list index.
 
     ``mime`` describes *this* link, not the image bytes. From schema v4 it lives
     on ``track_art`` rather than ``art``, because two files can hold
@@ -386,21 +477,32 @@ def replace_track_art(conn, track_id, arts):
     It is what musefs writes into the synthesized picture block, so a link
     without one serves an empty MIME type.
 
-    The link's ``width``/``height``/``depth``/``colors`` are left unset. They
-    describe the embedding too, but reading them means decoding the image, which
-    no writer using this library does; unset is how both the FLAC picture block
-    and musefs spell "not stated".
+    ``width`` and ``height`` describe the embedding too, and a six-field row
+    states them; ``None`` in either, or a four-field row, leaves it unset.
+    :func:`image_dimensions` reads them from a PNG or JPEG header without
+    decoding, which is how :func:`sync_one` fills them (musefs #737). ``depth``
+    and ``colors`` are always left unset: unset is how both the FLAC picture
+    block and musefs spell "not stated".
 
     Atomic via an internal savepoint (see ``_savepoint``): the DELETE and the
     re-insert either both land or neither does, even on an autocommit
     connection."""
+    rows = [_track_art_row(track_id, i, art) for i, art in enumerate(arts)]
     with _savepoint(conn, "musefs_replace_track_art"):
         conn.execute("DELETE FROM track_art WHERE track_id = ?", (track_id,))
         conn.executemany(
             "INSERT INTO track_art (track_id, art_id, picture_type, description, "
-            "mime, ordinal) VALUES (?, ?, ?, ?, ?, ?)",
-            [
-                (track_id, art_id, picture_type, description, mime, i)
-                for i, (art_id, picture_type, description, mime) in enumerate(arts)
-            ],
+            "mime, width, height, ordinal) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
         )
+
+
+def _track_art_row(track_id, ordinal, art):
+    """One ``track_art`` insert from a four- or six-field ``replace_track_art``
+    row."""
+    if len(art) == 4:
+        art_id, picture_type, description, mime = art
+        width = height = None
+    else:
+        art_id, picture_type, description, mime, width, height = art
+    return (track_id, art_id, picture_type, description, mime, width, height, ordinal)
