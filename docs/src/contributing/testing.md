@@ -109,9 +109,12 @@ a while it ran in no job at all, and a guard that skipped hid it
 
 The reader and DB error paths are exercised under simulated runtime faults.
 `musefs_core::metrics::set_backing_fault(BackingFault::{Eio,ShortRead})`
-(behind the `metrics` feature) installs a process-global fault at the positioned
-backing-read site, cleared by the returned RAII guard. Because it is global, the
-tests run in their own `metrics`-gated binaries.
+installs a process-global fault at the positioned backing-read site, cleared by
+the returned RAII guard. It is test scaffolding: it needs both the `metrics`
+feature and `musefs-core`'s `test-support`, which the self-dev-dependency and
+`musefs-fuse`'s dev-dependency switch on, so a build of the published `metrics`
+feature does not carry it. Because it is global, the tests run in their own
+`metrics`-gated binaries.
 
 ```bash
 cargo test -p musefs-core --features metrics --test reader_faults
