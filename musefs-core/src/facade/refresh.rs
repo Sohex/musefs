@@ -192,7 +192,7 @@ impl Musefs {
         let tree = VirtualTree::build_with_ci(&entries, &mut alloc, self.config.case_insensitive);
         alloc.prune_retired(&tree);
         drop(alloc);
-        self.tree.store(Arc::new(tree));
+        self.publish_tree(tree);
         Ok(snapshot)
     }
 
@@ -353,7 +353,7 @@ impl Musefs {
         }
 
         let mut alloc = crate::lock::lock_or_flag(&self.inodes, &self.needs_rebuild, "inodes");
-        let mut tree = (*self.tree.load_full()).clone(); // O(1) im clone
+        let mut tree = self.tree.load_full().tree.clone(); // O(1) im clone
         let applied = if self.force_apply_fail.swap(false, Ordering::AcqRel) {
             Err(crate::tree::RebuildError::TestInjected) // test injection
         } else {
@@ -401,7 +401,7 @@ impl Musefs {
             }
         };
         alloc.prune_retired(&tree);
-        self.tree.store(Arc::new(tree));
+        self.publish_tree(tree);
         drop(alloc);
         drop(snap);
         Ok(Some(IncrementalOutcome {

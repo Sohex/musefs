@@ -558,10 +558,12 @@ const MAX_STATELESS_LISTINGS: usize = 64;
 /// the tag, so each later page reads the same listing.
 #[derive(Default)]
 struct StatelessListings {
-    /// The generation new enumerations are tagged with. Held because a
-    /// snapshot's id is a heap address, unique only while the snapshot lives:
-    /// without the pin, a later tree at the same address would inherit the tag.
-    current: Option<(TreeSnapshot, u32)>,
+    /// The [`TreeSnapshot::generation`] new enumerations are tagged with, and its
+    /// tag. It only ever advances: a generation number is never reused, so
+    /// nothing needs pinning, and it is ordered, so a worker still holding a
+    /// snapshot from before a refresh cannot re-tag the current generation back
+    /// to its own.
+    current: Option<(u64, u32)>,
     /// The last tag minted. Tags start at 1; 0 means untagged.
     last_tag: u32,
     /// `((directory inode, tag), listing)`, least recently used first.
@@ -569,17 +571,24 @@ struct StatelessListings {
 }
 
 impl StatelessListings {
-    /// The tag for `snapshot`'s generation, minting a new one unless it is the
-    /// generation the current tag stands for.
-    fn tag_for(&mut self, snapshot: &TreeSnapshot) -> u32 {
-        if let Some((held, tag)) = &self.current
-            && held.id() == snapshot.id()
-        {
-            return *tag;
+    /// The tag for `generation`: the current tag if it is the current
+    /// generation, a newly minted one if it is newer, and `None` if it is older.
+    ///
+    /// Older means the caller loaded its snapshot before a refresh that another
+    /// enumeration has since tagged. Minting for it would move `current` back,
+    /// and the enumeration paging the newer generation would then find its tag
+    /// replaced — refused as stale the moment its listing was evicted, though
+    /// nothing it was paging had changed.
+    fn tag_for(&mut self, generation: u64) -> Option<u32> {
+        match self.current {
+            Some((held, tag)) if held == generation => Some(tag),
+            Some((held, _)) if held > generation => None,
+            _ => {
+                self.last_tag = self.last_tag.checked_add(1).unwrap_or(1);
+                self.current = Some((generation, self.last_tag));
+                Some(self.last_tag)
+            }
         }
-        self.last_tag = self.last_tag.checked_add(1).unwrap_or(1);
-        self.current = Some((snapshot.clone(), self.last_tag));
-        self.last_tag
     }
 
     /// The listing pinned for `(ino, tag)`, marked most recently used.
@@ -646,16 +655,23 @@ fn stale_enumeration(op: &str, ino: u64) -> fuser::Errno {
 ///   replaced is [`StatelessPage::Stale`]. Paging the new generation at the old
 ///   index was exactly the duplicate-or-skip this cache exists to prevent.
 ///
-/// `build` supplies a listing when one is not pinned already, and runs without
-/// the cache lock held.
+/// `snapshot` is the one the worker loaded. If a refresh has published a newer
+/// generation and another enumeration has already tagged it, `snapshot` is
+/// behind the current tag, and `latest` supplies the newer tree instead — which
+/// is at least as new, because publication only moves forward.
+///
+/// `build` supplies a listing from the snapshot the page is on when one is not
+/// pinned already, and runs without the cache lock held.
 fn stateless_page<E>(
     listings: &Mutex<StatelessListings>,
     ino: u64,
     offset: u64,
     snapshot: &TreeSnapshot,
-    build: impl FnOnce() -> Result<Arc<DirListing>, E>,
+    latest: impl FnOnce() -> TreeSnapshot,
+    build: impl FnOnce(&TreeSnapshot) -> Result<Arc<DirListing>, E>,
 ) -> Result<StatelessPage, E> {
     let (tag, index) = split_dir_cookie(offset);
+    let mut reloaded = None;
     let current = {
         let mut guard = listings
             .lock()
@@ -665,7 +681,16 @@ fn stateless_page<E>(
         {
             return Ok(StatelessPage::Page(listing, PageStart { index, tag }));
         }
-        let current = guard.tag_for(snapshot);
+        let current = if let Some(current) = guard.tag_for(snapshot.generation()) {
+            current
+        } else {
+            let fresh = latest();
+            let current = guard
+                .tag_for(fresh.generation())
+                .expect("a snapshot loaded after the current tag's is at least as new");
+            reloaded = Some(fresh);
+            current
+        };
         if tag != 0 && tag != current {
             return Ok(StatelessPage::Stale);
         }
@@ -680,7 +705,7 @@ fn stateless_page<E>(
         }
         current
     };
-    let listing = build()?;
+    let listing = build(reloaded.as_ref().unwrap_or(snapshot))?;
     listings
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1883,8 +1908,9 @@ impl Filesystem for MusefsFs {
             let stateless = Arc::clone(&self.stateless_listings);
             let expose_metrics = self.config.expose_metrics;
             return self.pool.submit("readdir", move || {
-                let snapshot = core.tree_snapshot();
-                let page = stateless_page(&stateless, ino.0, offset, &snapshot, || {
+                let loaded = core.tree_snapshot();
+                let latest = || core.tree_snapshot();
+                let page = stateless_page(&stateless, ino.0, offset, &loaded, latest, |snapshot| {
                     // An over-cap open is exactly the case where some *other*
                     // handle usually holds this directory's listing already, so
                     // probe the index before walking the tree again (#675). A hit
@@ -1902,7 +1928,7 @@ impl Filesystem for MusefsFs {
                         "readdir",
                         ino.0,
                         std::panic::AssertUnwindSafe(|| {
-                            build_dir_listing(&snapshot, ino.0, expose_metrics)
+                            build_dir_listing(snapshot, ino.0, expose_metrics)
                         }),
                     )
                     .map(Arc::new)
@@ -1971,8 +1997,9 @@ impl Filesystem for MusefsFs {
             let stateless = Arc::clone(&self.stateless_listings);
             let pool = self.pool.clone();
             return self.pool.submit("readdirplus", move || {
-                let snapshot = core.tree_snapshot();
-                let page = stateless_page(&stateless, ino.0, offset, &snapshot, || {
+                let loaded = core.tree_snapshot();
+                let latest = || core.tree_snapshot();
+                let page = stateless_page(&stateless, ino.0, offset, &loaded, latest, |snapshot| {
                     if let Some(listing) = shared_listing(
                         &handles
                             .lock()
@@ -1985,7 +2012,7 @@ impl Filesystem for MusefsFs {
                         "readdirplus",
                         ino.0,
                         std::panic::AssertUnwindSafe(|| {
-                            build_dir_listing(&snapshot, ino.0, expose_metrics)
+                            build_dir_listing(snapshot, ino.0, expose_metrics)
                         }),
                     )
                     .map(Arc::new)
@@ -2501,11 +2528,11 @@ mod tests {
     fn stateless_listings_tag_per_generation_and_evict_the_least_recently_used() {
         let (_d, fs, snapshot) = test_snapshot();
         let mut listings = StatelessListings::default();
-        let tag = listings.tag_for(&snapshot);
+        let tag = listings.tag_for(snapshot.generation()).unwrap();
         assert_ne!(tag, 0, "0 is reserved for untagged cookies");
         assert_eq!(
-            listings.tag_for(&fs.core.tree_snapshot()),
-            tag,
+            listings.tag_for(fs.core.tree_snapshot().generation()),
+            Some(tag),
             "the same generation keeps its tag"
         );
         let cap = u64::try_from(MAX_STATELESS_LISTINGS).unwrap();
@@ -2571,12 +2598,7 @@ mod tests {
         let listings = Mutex::new(StatelessListings::default());
 
         let first = fs.core.tree_snapshot();
-        let (listing, page) = page_of(
-            stateless_page(&listings, artist, 0, &first, || {
-                build_dir_listing(&first, artist, false).map(Arc::new)
-            })
-            .unwrap(),
-        );
+        let (listing, page) = page_of(page_on(&fs, &listings, artist, 0, &first));
         assert_eq!(page.index, 0);
         let all = names(&listing, 0);
         assert_eq!(all.len(), 4, "{all:?}");
@@ -2588,12 +2610,7 @@ mod tests {
         add("a");
         assert!(fs.core.poll_refresh().unwrap());
         let second = fs.core.tree_snapshot();
-        let (listing, resumed) = page_of(
-            stateless_page(&listings, artist, resume, &second, || {
-                build_dir_listing(&second, artist, false).map(Arc::new)
-            })
-            .unwrap(),
-        );
+        let (listing, resumed) = page_of(page_on(&fs, &listings, artist, resume, &second));
         assert_eq!(
             resumed.tag, page.tag,
             "the enumeration stays on its generation"
@@ -2604,12 +2621,7 @@ mod tests {
             "no b twice, no c skipped"
         );
 
-        let (listing, fresh) = page_of(
-            stateless_page(&listings, artist, 0, &second, || {
-                build_dir_listing(&second, artist, false).map(Arc::new)
-            })
-            .unwrap(),
-        );
+        let (listing, fresh) = page_of(page_on(&fs, &listings, artist, 0, &second));
         assert_ne!(
             fresh.tag, page.tag,
             "a new enumeration takes the new generation"
@@ -2617,6 +2629,45 @@ mod tests {
         let now = names(&listing, 0);
         assert_eq!(now.len(), 5, "{now:?}");
         assert!(now[2].starts_with('a'), "{now:?}");
+    }
+
+    /// [`stateless_page`] as the handlers call it, over `fs`'s tree, for a
+    /// worker that loaded `loaded`.
+    fn page_on(
+        fs: &MusefsFs,
+        listings: &Mutex<StatelessListings>,
+        ino: u64,
+        offset: u64,
+        loaded: &TreeSnapshot,
+    ) -> StatelessPage {
+        stateless_page(
+            listings,
+            ino,
+            offset,
+            loaded,
+            || fs.core.tree_snapshot(),
+            |snapshot| build_dir_listing(snapshot, ino, false).map(Arc::new),
+        )
+        .unwrap()
+    }
+
+    /// #695: the current generation's tag only ever moves forward. A generation
+    /// older than the current one gets no tag at all, and leaves the current one
+    /// where it was.
+    #[test]
+    fn stateless_tags_only_ever_advance() {
+        let mut listings = StatelessListings::default();
+        let five = listings.tag_for(5).expect("the first generation is tagged");
+        assert_eq!(listings.tag_for(5), Some(five), "the same generation");
+        assert_eq!(
+            listings.tag_for(4),
+            None,
+            "an older generation must not take the tag"
+        );
+        assert_eq!(listings.tag_for(5), Some(five), "nor move it");
+        let six = listings.tag_for(6).expect("a newer generation is tagged");
+        assert_ne!(six, five, "a newer generation is a new tag");
+        assert_eq!(listings.tag_for(5), None, "and the old one stays behind it");
     }
 
     /// The page a [`stateless_page`] resolved to, failing the test on a stale one.
@@ -2677,12 +2728,7 @@ mod tests {
         let listings = Mutex::new(StatelessListings::default());
 
         let snapshot = fs.core.tree_snapshot();
-        let (listing, page) = page_of(
-            stateless_page(&listings, artist, 0, &snapshot, || {
-                build_dir_listing(&snapshot, artist, false).map(Arc::new)
-            })
-            .unwrap(),
-        );
+        let (listing, page) = page_of(page_on(&fs, &listings, artist, 0, &snapshot));
         let resume = dir_cookie(page.tag, 3);
         pin_a_cap_of_others(&listings, page.tag);
         assert!(
@@ -2691,12 +2737,7 @@ mod tests {
         );
 
         let same = fs.core.tree_snapshot();
-        let (rebuilt, resumed) = page_of(
-            stateless_page(&listings, artist, resume, &same, || {
-                build_dir_listing(&same, artist, false).map(Arc::new)
-            })
-            .unwrap(),
-        );
+        let (rebuilt, resumed) = page_of(page_on(&fs, &listings, artist, resume, &same));
         assert_eq!((resumed.tag, resumed.index), (page.tag, 3));
         assert_eq!(*rebuilt, *listing, "the same generation's listing, rebuilt");
     }
@@ -2718,12 +2759,7 @@ mod tests {
         let listings = Mutex::new(StatelessListings::default());
 
         let first = fs.core.tree_snapshot();
-        let (_, page) = page_of(
-            stateless_page(&listings, artist, 0, &first, || {
-                build_dir_listing(&first, artist, false).map(Arc::new)
-            })
-            .unwrap(),
-        );
+        let (_, page) = page_of(page_on(&fs, &listings, artist, 0, &first));
         // The kernel took ".", "..", b, and hands back the cookie after b.
         let resume = dir_cookie(page.tag, 3);
         pin_a_cap_of_others(&listings, page.tag);
@@ -2731,22 +2767,58 @@ mod tests {
         add_art_track(dir.path(), &db, "a");
         assert!(fs.core.poll_refresh().unwrap());
         let second = fs.core.tree_snapshot();
-        let outcome = stateless_page(&listings, artist, resume, &second, || {
-            build_dir_listing(&second, artist, false).map(Arc::new)
-        })
-        .unwrap();
+        let outcome = page_on(&fs, &listings, artist, resume, &second);
         assert!(
             matches!(outcome, StatelessPage::Stale),
             "an unresumable cookie must not be paged against the new generation"
         );
 
-        let (_, fresh) = page_of(
-            stateless_page(&listings, artist, 0, &second, || {
-                build_dir_listing(&second, artist, false).map(Arc::new)
-            })
-            .unwrap(),
-        );
+        let (_, fresh) = page_of(page_on(&fs, &listings, artist, 0, &second));
         assert_ne!(fresh.tag, page.tag, "a new enumeration is unaffected");
+    }
+
+    /// A worker can start a fresh enumeration on a snapshot it loaded before a
+    /// refresh that another enumeration has already tagged. That must not
+    /// re-tag the current generation back to the old one: the enumeration on the
+    /// new generation would then find its tag replaced, and once its listing
+    /// was evicted its next page would be refused as stale although nothing it
+    /// was paging has changed.
+    #[test]
+    fn a_worker_on_an_older_snapshot_cannot_move_the_tag_backwards() {
+        let (dir, fs) = test_fs();
+        let db = musefs_db::Db::open(dir.path().join("m.db")).unwrap();
+        add_art_track(dir.path(), &db, "b");
+        add_art_track(dir.path(), &db, "c");
+        assert!(fs.core.poll_refresh().unwrap());
+        let artist = fs
+            .core
+            .lookup(musefs_core::VirtualTree::ROOT, "Art")
+            .unwrap();
+        let older = fs.core.tree_snapshot();
+        add_art_track(dir.path(), &db, "a");
+        assert!(fs.core.poll_refresh().unwrap());
+        let newer = fs.core.tree_snapshot();
+        let listings = Mutex::new(StatelessListings::default());
+
+        let (_, page) = page_of(page_on(&fs, &listings, artist, 0, &newer));
+        let resume = dir_cookie(page.tag, 3);
+        pin_a_cap_of_others(&listings, page.tag);
+
+        // The late worker: a fresh enumeration of another directory, on the
+        // pre-refresh snapshot it loaded. It is served the newer generation.
+        let root = musefs_core::VirtualTree::ROOT;
+        let (_, late) = page_of(page_on(&fs, &listings, root, 0, &older));
+        assert_eq!(
+            late.tag, page.tag,
+            "the late worker reloads onto the newer tree"
+        );
+
+        let (_, resumed) = page_of(page_on(&fs, &listings, artist, resume, &newer));
+        assert_eq!(
+            (resumed.tag, resumed.index),
+            (page.tag, 3),
+            "the current generation keeps its tag, so its enumeration resumes"
+        );
     }
 
     #[test]

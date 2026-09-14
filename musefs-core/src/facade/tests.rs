@@ -1370,6 +1370,38 @@ fn tree_snapshot_id_distinguishes_generations_and_not_clones() {
         "a rebuilt tree is a different generation and must not reuse the name of \
          the one still pinned by `before`"
     );
+
+    // The generation orders what the id only tells apart. The FUSE layer's
+    // stateless listings rely on the order to never re-tag the current
+    // generation back to one a late worker loaded before the refresh.
+    assert_eq!(
+        before.generation(),
+        before.clone().generation(),
+        "clones pin one generation"
+    );
+    assert!(
+        after.generation() > before.generation(),
+        "a refresh publishes a newer generation: {} after {}",
+        after.generation(),
+        before.generation()
+    );
+    assert_eq!(
+        fs.tree_snapshot().generation(),
+        after.generation(),
+        "loading again without a refresh is the same generation"
+    );
+    {
+        let db = musefs_db::Db::open(&db_path).unwrap();
+        let track_id = db.list_tracks().unwrap().into_iter().next().unwrap().id;
+        db.replace_tags(track_id, &[musefs_db::Tag::new("artist", "Pix", 0)])
+            .unwrap();
+    }
+    assert!(fs.poll_refresh().unwrap());
+    assert_eq!(
+        fs.tree_snapshot().generation(),
+        after.generation() + 1,
+        "each publish is exactly one generation on"
+    );
 }
 
 /// A one-track mount over a backing file the caller is about to change out of
