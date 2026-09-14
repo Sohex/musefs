@@ -13,7 +13,7 @@ mod maintenance;
 mod migrate;
 mod models;
 mod schema;
-pub use migrate::PendingMigration;
+pub use migrate::{DuplicatePath, PendingMigration, Rejections, TableRejections};
 #[cfg(any(test, feature = "test-support"))]
 pub use schema::seed_store_at_version;
 pub use schema::{LATEST_VERSION, PendingStep};

@@ -140,7 +140,7 @@ fn carry_out(conn: &Connection, plan: &Findings) -> Result<()> {
 /// store open, and a snapshot — plus [`PendingMigration::apply`], which runs
 /// the migration and hands back an ordinary `Db`.
 ///
-/// The connection carries no length limit ([`crate::bound_lengths`]) until the
+/// The connection carries no length limit (`crate::bound_lengths`) until the
 /// upgrade has run, since the store's rows are not yet bounded by anything.
 #[derive(Debug)]
 pub struct PendingMigration {

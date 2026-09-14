@@ -41,7 +41,7 @@ pub struct Mp3Metadata {
 ///
 /// - A tag without the update flag replaces everything merged before it.
 /// - A tag with the update flag overrides only its unique frames (see
-///   [`Mp3Metadata::update_with`]).
+///   `Mp3Metadata::update_with`).
 /// - A tag the allocation guard will not parse contributes nothing and replaces
 ///   nothing: discarding tags that could be read for one that cannot would lose
 ///   metadata the file does carry.

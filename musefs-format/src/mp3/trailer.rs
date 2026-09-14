@@ -35,7 +35,7 @@ pub struct Mp3Trailer {
 
 /// Walk the tags trailing an MP3's audio, backwards from the end of the file:
 /// appended ID3v2.4 tags, each found by a footer that agrees with its header
-/// (see [`id3v2::appended_tag_start`]), and at most one ID3v1 trailer, either
+/// (see `id3v2::appended_tag_start`), and at most one ID3v1 trailer, either
 /// after them, where §5 places it, or before them, where a writer appending at
 /// end of file leaves it.
 ///
@@ -44,7 +44,7 @@ pub struct Mp3Trailer {
 /// see; [`super::locate_audio_bounded`] keeps only those after the frame sync.
 /// `NeedMore { up_to }` counts back from the end of the file: retry with the
 /// file's last `up_to` bytes, which is always more than `tail` holds. More than
-/// [`id3v2::MAX_APPENDED_TAGS`] appended tags, or a `tail` longer than the file,
+/// `id3v2::MAX_APPENDED_TAGS` appended tags, or a `tail` longer than the file,
 /// is `Malformed`.
 pub fn locate_trailer(tail: &[u8], file_len: u64) -> Result<Extent<Mp3Trailer>> {
     let tail_start = file_len
