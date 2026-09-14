@@ -2136,16 +2136,25 @@ fn is_store_rejection(e: &crate::error::CoreError) -> bool {
 /// `Keep`: a pass below the `full` tier must not leave the previous bytes'
 /// `content_hash` sitting beside the new ones (#689).
 ///
-/// The stored row must have recorded an inode. `matches_live` lets an
-/// unrecorded one match any live inode, which is right for "is this row still
-/// safe to serve" and too weak for "have these bytes been proved the same":
-/// every row an upgraded store starts with has none, and a stamp that agrees
-/// on the other three fields cannot vouch for a hash an older musefs may already
-/// have left stale. Such a row's uncomputed checksums are cleared instead.
+/// The stored row must record an inode exactly when the probe did. The probe
+/// records one only where the filesystem's inode numbers are kept (#757), so
+/// there an unrecorded stored inode is not proof: `matches_live` lets it match
+/// any live inode, which is right for "is this row still safe to serve" and too
+/// weak for "have these bytes been proved the same". Every row an upgraded store
+/// starts with has none, and a stamp agreeing on the other three fields cannot
+/// vouch for a hash an older musefs may have left stale, so such a row's
+/// uncomputed checksums are cleared.
+///
+/// Where the filesystem's inode numbers are not recorded, neither side has one
+/// and the other fields decide. Demanding one there cleared the checksums of
+/// every unchanged file on every cheap pass — a `--checksum none` rescan even
+/// took the fingerprint that move recovery needs — and it guarded against
+/// nothing: the V4 migration clears every stored hash and fingerprint, so no
+/// value an older musefs wrote survives to be vouched for.
 fn records_same_bytes(unit: &Unit, existing: Option<&musefs_db::Track>) -> bool {
     existing.is_some_and(|t| {
         let stored = BackingStamp::from_track(t);
-        stored.ino.is_some()
+        stored.ino.is_some() == unit.stamp.ino.is_some()
             && stored.matches_live(&unit.stamp)
             && t.format == unit.probed.format
             && t.bounds.audio_offset() == unit.probed.audio_offset

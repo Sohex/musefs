@@ -137,7 +137,7 @@ exclude_re = [
     # run_pipeline sync_channel capacity `jobs * 2`: pure throughput/blocking knob;
     # the persisted track set is identical for any positive capacity.
     # guard: op="*" fn="run_pipeline" rows=2
-'musefs-core/src/scan\.rs:2499:46:',
+'musefs-core/src/scan\.rs:2508:46:',
     # probe_body's tail-read predicate
     # `has_ext(mp3) || (has_ext(flac) && has_leading_id3(prefix))`, the inner `&&`
     # (col 66) -> `||`: widening it makes every .flac pay the 128-byte tail read,
@@ -163,30 +163,30 @@ exclude_re = [
     # safely description-anchored. Re-verify these coordinates (via
     # `cargo mutants --list`) after any change that reformats scan.rs.
     # guard: op="+=" fn="run_pipeline" rows=2
-'musefs-core/src/scan\.rs:2643:22:',
+'musefs-core/src/scan\.rs:2652:22:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2737:33:',
+'musefs-core/src/scan\.rs:2746:33:',
     # guard: op="||" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2737:48:',
+'musefs-core/src/scan\.rs:2746:48:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2737:63:',
+'musefs-core/src/scan\.rs:2746:63:',
     # guard: op="+=" fn="run_pipeline" rows=2
-'musefs-core/src/scan\.rs:2751:37:',
+'musefs-core/src/scan\.rs:2760:37:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2753:41:',
+'musefs-core/src/scan\.rs:2762:41:',
     # guard: op="||" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2753:56:',
+'musefs-core/src/scan\.rs:2762:56:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2753:71:',
+'musefs-core/src/scan\.rs:2762:71:',
     # Same cadence class, one level up: each threshold flush is a let-chain
     # (`(len >= BATCH_FILES || batch_bytes >= cap) && let Err(e) = flush(..)`), so
     # `&&`->`||` short-circuits past the mid-loop flush exactly when the threshold
     # IS met — deferring the commit to the flush-on-empty / final flush, which
     # persist the identical track set and still surface a flush error (#618).
     # guard: op="&&" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2738:21:',
+'musefs-core/src/scan\.rs:2747:21:',
     # guard: op="&&" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2754:29:',
+'musefs-core/src/scan\.rs:2763:29:',
     # `ByteBudget::acquire`'s wait guard (`!st.closed && in_flight != 0 && ...`),
     # the FIRST `&&`->`||`. `&&` binds tighter than `||`, so the guard becomes
     # `!closed || (in_flight != 0 && over_cap)` and every reservation against an
@@ -207,11 +207,11 @@ exclude_re = [
     # scan.failed + skip_failed` sum is also insensitive to `+`->`-` (the `+`->`*`
     # variant IS caught, so only `-` is excluded here).
     # guard: op="+=" fn="revalidate_in" rows=2
-'musefs-core/src/scan\.rs:2947:29:',
+'musefs-core/src/scan\.rs:2956:29:',
     # guard: op="+=" fn="revalidate_in" rows=2
-'musefs-core/src/scan\.rs:2959:33:',
+'musefs-core/src/scan\.rs:2968:33:',
     # guard: op="+" fn="revalidate_in" rows=1
-'musefs-core/src/scan\.rs:3075:29: replace \+ with -',
+'musefs-core/src/scan\.rs:3084:29: replace \+ with -',
     # Phase 2 ID3 binary tags: classify_binary_frame's POPM counter fold
     # `(a << 8) | b` -> `(a << 8) ^ b`. The accumulator is left-shifted by 8 before
     # each combine, so its low byte is always zero where `b` lands; `|` and `^` are

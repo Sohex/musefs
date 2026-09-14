@@ -627,6 +627,147 @@ fn records_same_bytes_needs_every_field_to_agree() {
     }
 }
 
+/// Where the filesystem keeps no inode numbers, the probe records none, so the
+/// live stamp has no inode either — and then the other three fields plus the
+/// geometry decide. A cheap pass over an unchanged file there must keep what
+/// an expensive one computed ("a cheap pass never undoes an expensive one").
+/// A stored row with no inode beside a live stamp that has one is still not
+/// proof: that is the upgraded row the test above covers.
+#[test]
+fn records_same_bytes_needs_no_inode_where_neither_side_has_one() {
+    let unit = unit_with("/m/b.flac", None);
+    assert_eq!(unit.stamp.ino, None, "the probe recorded no inode");
+    let db = Db::open_in_memory().unwrap();
+    let id = db
+        .upsert_track(&NewTrack {
+            backing_path: unit.abs_path.clone(),
+            format: Format::Flac,
+            audio_offset: 0,
+            audio_length: 0,
+            backing_size: unit.stamp.size,
+            backing_mtime_ns: unit.stamp.mtime_ns,
+            backing_ctime_ns: unit.stamp.ctime_ns,
+            backing_ino: None,
+        })
+        .unwrap();
+    let stored = db.get_track(id).unwrap().expect("the row just written");
+    assert!(
+        records_same_bytes(&unit, Some(&stored)),
+        "neither side records an inode, and everything else agrees"
+    );
+
+    let mut live_has_one = unit_with("/m/b.flac", None);
+    live_has_one.stamp.ino = Some(7);
+    assert!(
+        !records_same_bytes(&live_has_one, Some(&stored)),
+        "an unrecorded stored inode cannot vouch for a file whose filesystem keeps them"
+    );
+
+    let mut grown = unit_with("/m/b.flac", None);
+    grown.stamp.size += 1;
+    assert!(
+        !records_same_bytes(&grown, Some(&stored)),
+        "no inode on either side excuses nothing else"
+    );
+}
+
+/// `(fingerprint, content_hash)` for the one track in `db`.
+fn stored_checksums(db: &Db) -> (Option<String>, Option<String>) {
+    let t = db.list_tracks().unwrap().remove(0);
+    (t.fingerprint, t.content_hash)
+}
+
+/// A pass that answers `keeps` for the filesystem `path` is on, standing in for
+/// one that keeps no inode numbers (or does) whatever the suite runs on. Unlike
+/// `pretend_no_inodes`, the answer reaches the scan's probe workers.
+fn pass_answering(path: &std::path::Path, keeps: bool) -> Arc<InodeKeeping> {
+    use std::os::unix::fs::MetadataExt;
+    let inodes = Arc::new(InodeKeeping::default());
+    inodes.pretend(std::fs::metadata(path).unwrap().dev(), keeps);
+    inodes
+}
+
+/// #689's rule, on a filesystem that keeps no inode numbers: a `scan --force`
+/// below the full tier used to clear the `content_hash` a `--checksum full`
+/// pass computed, and `--checksum none` the fingerprint too — disabling move
+/// recovery — because keeping a checksum required a recorded inode that no
+/// pass there can ever record.
+#[test]
+fn a_cheap_rescan_keeps_the_checksums_of_an_unchanged_file_where_no_inode_is_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unchanged-no-inode.m4a");
+    std::fs::write(&path, mp4_with_covr(13, &[0xFF; 8])).unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let pass = |checksum: ChecksumTier, force: bool| {
+        let opts = ScanOptions {
+            checksum,
+            force,
+            ..ScanOptions::default()
+        };
+        scan_directory_in(&db, dir.path(), &opts, &pass_answering(&path, false)).unwrap()
+    };
+
+    pass(ChecksumTier::Full, false);
+    assert_eq!(db.list_tracks().unwrap()[0].backing_ino, None);
+    let full = stored_checksums(&db);
+    assert!(full.0.is_some() && full.1.is_some(), "{full:?}");
+
+    assert_eq!(pass(ChecksumTier::Fingerprint, true).scanned, 1);
+    assert_eq!(
+        stored_checksums(&db),
+        full,
+        "a fingerprint-tier rescan of an unchanged file keeps its full hash"
+    );
+    assert_eq!(pass(ChecksumTier::None, true).scanned, 1);
+    assert_eq!(
+        stored_checksums(&db),
+        full,
+        "and a none-tier rescan keeps its fingerprint too"
+    );
+}
+
+/// The other direction, which the rule must keep: on a filesystem that keeps
+/// inode numbers, a row with none recorded is what an upgraded store holds, and
+/// a stamp agreeing on the other three fields cannot vouch for its hash.
+#[test]
+fn a_cheap_rescan_clears_the_checksums_an_unrecorded_inode_cannot_vouch_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("upgraded-row.m4a");
+    std::fs::write(&path, mp4_with_covr(13, &[0xFF; 8])).unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let pass = |checksum: ChecksumTier, force: bool| {
+        let opts = ScanOptions {
+            checksum,
+            force,
+            ..ScanOptions::default()
+        };
+        scan_directory_in(&db, dir.path(), &opts, &pass_answering(&path, true)).unwrap()
+    };
+
+    pass(ChecksumTier::Full, false);
+    let t = db.list_tracks().unwrap().remove(0);
+    assert!(t.backing_ino.is_some(), "the inode is recorded");
+    db.upsert_track(&NewTrack {
+        backing_path: t.backing_path,
+        format: t.format,
+        audio_offset: t.bounds.audio_offset(),
+        audio_length: t.bounds.audio_length(),
+        backing_size: t.backing_size,
+        backing_mtime_ns: t.backing_mtime_ns,
+        backing_ctime_ns: t.backing_ctime_ns,
+        backing_ino: None,
+    })
+    .unwrap();
+
+    pass(ChecksumTier::Fingerprint, true);
+    let (fingerprint, content_hash) = stored_checksums(&db);
+    assert!(fingerprint.is_some(), "the pass computed a fingerprint");
+    assert_eq!(
+        content_hash, None,
+        "a hash an unrecorded inode cannot vouch for is cleared"
+    );
+}
+
 #[test]
 fn checksum_tier_defaults_to_fingerprint() {
     assert_eq!(ScanOptions::default().checksum, ChecksumTier::Fingerprint);

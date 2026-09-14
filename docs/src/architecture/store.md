@@ -157,7 +157,12 @@ hash never leaves a stale one behind: every checksum write carries an explicit
 intent — keep the stored value, set a new one, or clear it — and a pass below
 the `full` tier clears the column whenever it observes that the recorded bytes
 changed. A pass over a file that has not changed keeps what is stored, so a
-cheap pass never undoes an expensive one.
+cheap pass never undoes an expensive one. "Has not changed" is the stamp and the
+parsed geometry agreeing. A stored row with no inode, beside a live file whose
+filesystem records one, does not count as agreeing: that is the row an upgraded
+store holds, and it cannot vouch for a hash an older musefs may have left stale.
+Where the filesystem's inode numbers are not recorded at all, neither side has
+one, and size, mtime, ctime and the geometry decide.
 
 Neither column is `UNIQUE` by design — duplicate-content tracks legitimately
 share both values. On a normal `scan`, when a probed file's path is not yet in
