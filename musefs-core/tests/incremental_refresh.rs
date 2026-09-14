@@ -715,6 +715,12 @@ fn revalidate_reprobes_on_ctime_only_change() {
 /// closes that gap, alongside the structural and checksum backfills it already
 /// covered, so it must re-probe a row whose inode is missing even though every
 /// other field says the file is unchanged.
+///
+/// Only where the filesystem keeps inode numbers musefs records, though: where
+/// it keeps none, no re-probe could fill the field in, so none is attempted.
+/// The expectation is derived from the filesystem this test's tempdir is on,
+/// the same way a scan decides it, so the test states what it expects on ext4
+/// and in a container's overlayfs alike.
 #[test]
 fn revalidate_reprobes_a_row_with_no_recorded_inode() {
     let dir = tempfile::tempdir().unwrap();
@@ -725,12 +731,14 @@ fn revalidate_reprobes_a_row_with_no_recorded_inode() {
         let db = Db::open(&db_path).unwrap();
         scan_directory(&db, dir.path()).unwrap();
     }
+    let keeps = musefs_core::freshness::filesystem_keeps_inodes_for_test(dir.path());
 
     let db = Db::open(&db_path).unwrap();
     let id = db.list_tracks().unwrap()[0].id;
-    assert!(
+    assert_eq!(
         db.get_track(id).unwrap().unwrap().backing_ino.is_some(),
-        "a fresh scan records the inode"
+        keeps,
+        "a fresh scan records the inode exactly where the filesystem keeps inode numbers"
     );
 
     // Rewind the column to the sentinel by upserting the row as a build older
@@ -752,12 +760,17 @@ fn revalidate_reprobes_a_row_with_no_recorded_inode() {
     assert_eq!(db.get_track(id).unwrap().unwrap().backing_ino, None);
 
     // Nothing about the file changed, so only the missing inode can make this
-    // re-probe.
+    // re-probe — and only where one could be recorded.
     let stats = musefs_core::revalidate(&db, dir.path()).unwrap();
-    assert_eq!(stats.updated, 1, "a row with no inode must be re-probed");
-    assert!(
+    assert_eq!(
+        stats.updated,
+        u64::from(keeps),
+        "a row with no inode is re-probed exactly where the filesystem keeps them"
+    );
+    assert_eq!(
         db.get_track(id).unwrap().unwrap().backing_ino.is_some(),
-        "and the re-probe must fill it in"
+        keeps,
+        "and where it is re-probed, the re-probe fills the inode in"
     );
 
     // Idempotent: with the inode recorded, the same file is skipped again.

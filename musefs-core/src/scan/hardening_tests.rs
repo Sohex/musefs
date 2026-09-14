@@ -507,7 +507,12 @@ fn probe_file_caught_isolates_parser_panic_as_failed() {
     let path = dir.path().join("boom.flac");
     write_flac(&path, &["ARTIST=A", "TITLE=T"], None);
     set_after_s1_hook(|| panic!("parser exploded"));
-    let out = probe_file_caught(&path, WINDOW, ChecksumTier::Fingerprint);
+    let out = probe_file_caught(
+        &path,
+        WINDOW,
+        ChecksumTier::Fingerprint,
+        &InodeKeeping::default(),
+    );
     clear_after_s1_hook();
     match out {
         Ok(ProbeOutcome::Failed(f)) => assert_eq!(
@@ -782,7 +787,14 @@ fn probe_reports_unparseable_with_its_reason() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bad.flac");
     std::fs::write(&path, b"not a real audio file").unwrap();
-    match probe_file(&path, WINDOW, ChecksumTier::Fingerprint).unwrap() {
+    match probe_file(
+        &path,
+        WINDOW,
+        ChecksumTier::Fingerprint,
+        &InodeKeeping::default(),
+    )
+    .unwrap()
+    {
         ProbeOutcome::Failed(f) => {
             assert_eq!(f.reason, SkipReason::Unparseable);
             assert!(
@@ -897,13 +909,60 @@ fn revalidate_settles_an_unrecorded_inode_only_where_the_filesystem_keeps_none()
             "an inode the filesystem does not keep is as settled as it gets"
         );
     }
+    // Without the seam, the answer is the filesystem this test runs on.
+    let keeps = crate::freshness::filesystem_keeps_inodes_for_test(dir.path());
     let s = crate::revalidate(&db, dir.path()).unwrap();
     assert_eq!(
         (s.unchanged, s.updated),
-        (0, 1),
-        "where inodes are kept, the missing one is re-probed"
+        if keeps { (0, 1) } else { (1, 0) },
+        "the missing inode is re-probed exactly where the filesystem keeps inode numbers"
     );
-    assert!(db.list_tracks().unwrap()[0].backing_ino.is_some());
+    assert_eq!(db.list_tracks().unwrap()[0].backing_ino.is_some(), keeps);
+}
+
+/// One pass, one query per filesystem. `statfs` is not cached by NFS or SMB
+/// clients, so asking it per file — per probe, and again per row in
+/// revalidate's skip pass — was a network round trip per file on exactly the
+/// mounts where a scan is slowest.
+#[test]
+fn a_pass_asks_each_filesystem_once() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["a", "b", "c"] {
+        let title = format!("TITLE={name}");
+        write_flac(
+            &dir.path().join(format!("{name}.flac")),
+            &["ARTIST=A", title.as_str()],
+            None,
+        );
+    }
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    let inodes: Arc<InodeKeeping> = Arc::default();
+    let s = scan_directory_in(&db, dir.path(), &ScanOptions::default(), &inodes).unwrap();
+    assert_eq!(s.scanned, 3);
+    assert_eq!(inodes.queries(), 1, "three probes, one filesystem");
+
+    // Rows with no inode make the skip pass ask about each of them, and every
+    // row it re-probes asks again from its probe.
+    for t in db.list_tracks().unwrap() {
+        db.upsert_track(&musefs_db::NewTrack {
+            backing_path: t.backing_path,
+            format: t.format,
+            audio_offset: t.bounds.audio_offset(),
+            audio_length: t.bounds.audio_length(),
+            backing_size: t.backing_size,
+            backing_mtime_ns: t.backing_mtime_ns,
+            backing_ctime_ns: t.backing_ctime_ns,
+            backing_ino: None,
+        })
+        .unwrap();
+    }
+    let inodes: Arc<InodeKeeping> = Arc::default();
+    revalidate_in(&db, dir.path(), &ScanOptions::default(), &inodes).unwrap();
+    assert_eq!(
+        inodes.queries(),
+        1,
+        "three skip-pass checks and their re-probes, one filesystem"
+    );
 }
 
 /// #757: re-probing a file that has not changed leaves its served mtime exactly

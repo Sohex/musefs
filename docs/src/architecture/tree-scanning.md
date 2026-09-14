@@ -25,19 +25,38 @@ in-place rewrite, which is a POSIX timestamp limit rather than something musefs
 can fix; it catches the shape almost every tagger actually produces, writing a
 temporary file and renaming over the original.
 
-On Linux, the inode is recorded only where the filesystem keeps one
-([#757](https://github.com/Sohex/musefs/issues/757)); on other platforms the
-question is not asked and the inode is always recorded. FAT and exFAT store no
-inode numbers: Linux assigns one each time a file enters the inode cache, so an
-untouched file reports a different number after a remount, or after eviction.
-The scanner asks the probed descriptor's filesystem (`fstatfs`) and records no
-inode there, and `revalidate` asks the same question live before re-probing a
-row that has none, so such a library converges rather than being rewritten on
-every pass. The answer belongs to the filesystem, so it is asked, not stored. On
-Linux a FAT or exFAT stamp is therefore size plus a coarse mtime — two-second
-steps on FAT, 10 ms on exFAT, with ctime reported as mtime on both — which is
-why the [installation guide](../guide/installation.md) recommends against them
-as backing storage.
+The inode is recorded only where musefs knows the filesystem's inode numbers
+survive a remount ([#757](https://github.com/Sohex/musefs/issues/757)). The
+scanner asks the probed descriptor's filesystem (`statfs`) — once per
+filesystem per pass, since NFS and SMB clients do not cache the answer and a
+query per file was a network round trip per file — and checks it against an
+allowlist: on Linux ext2/3/4, btrfs, XFS, ZFS, F2FS, bcachefs, JFS, ReiserFS,
+NTFS, HFS+, tmpfs, SquashFS, EROFS, ISO 9660, UDF, NFS and CephFS; on macOS
+APFS, HFS+ and NFS; on FreeBSD UFS, ZFS, tmpfs, NFS and ext2fs. Every other
+filesystem records none, and so does one that cannot be asked.
+
+That leaves out FAT and exFAT, which number a file each time it enters the
+inode cache, so an untouched file reports a different number after a remount
+or after eviction. It also leaves out the filesystems whose numbers depend on a
+mount option `statfs` cannot see: SMB and CIFS mounted `noserverino` (which the
+kernel also falls back to on its own), FUSE mounts without `use_ino` (sshfs's
+default, `exfat-fuse`, many `rclone` and `s3fs` mounts, whose numbers are node
+ids reassigned after a remount), 9p, vboxsf, and overlayfs over any of these.
+The trade-off is lopsided. A recorded number that changes after a remount fails
+every serve of an untouched file with `EIO` (`BackingChanged`) until a
+revalidate rewrites the row, and that repeats after every remount. An absent
+number costs only the case the inode exists for: a same-size replacement
+inside the timestamp granularity window. So a filesystem musefs cannot vouch
+for gets the weaker stamp rather than the one that can take the mount dark.
+
+`revalidate` asks the same question before re-probing a row that has no inode,
+so a library where none is recorded converges rather than being rewritten on
+every pass. The answer belongs to the filesystem, so it is asked, not stored.
+Where no inode is recorded the stamp is size, mtime and ctime; on FAT and exFAT
+that is size plus a coarse mtime — two-second steps on FAT, 10 ms on exFAT, with
+ctime reported as mtime on both — which is why the
+[installation guide](../guide/installation.md) recommends against them as
+backing storage.
 
 The stamp does not include the device number either. An inode is unique only
 within one filesystem, so a different filesystem appearing at the backing path —
@@ -54,12 +73,12 @@ copy onto new storage never matches: every file reads as changed until
 
 A stored inode of zero means "not recorded" — every row a store migrated into
 v4 carries, until `musefs revalidate` (or a `scan --force` of the file) fills it
-in, since a plain `scan` leaves tracked rows alone, and, on Linux, every row on
-a filesystem that keeps none — and such a
+in, since a plain `scan` leaves tracked rows alone, and every row on a
+filesystem whose inode numbers musefs does not record — and such a
 row is compared on the other three fields alone rather than failing closed on a
 field the store has nothing to say about. `revalidate` re-probes those rows,
-except, on Linux, where the filesystem keeps no inodes, which is what makes it the
-repopulation path for an upgraded store. The
+except where the filesystem's inode numbers are not recorded, which is what
+makes it the repopulation path for an upgraded store. The
 wildcard is one-directional: it belongs to the *stored* side only, and a live
 stat that cannot produce an inode fails closed against a row that has one,
 rather than being excused in turn. This comparison is therefore deliberately
@@ -266,9 +285,10 @@ flag; only links encountered during recursion are gated.
 (e.g. a forged-mtime in-place rewrite) is still re-probed — and it preserves any
 external tag edits in the DB by refreshing only Layer A. It also re-probes rows
 the stamp *cannot* fully decide: a FLAC missing its structural blocks, a row
-below the requested checksum tier, and a row with no recorded inode. That last
-one is what makes it the repopulation path for a store upgraded to v4, where
-every row starts without one. New files are
+below the requested checksum tier, and a row with no recorded inode on a
+filesystem whose inode numbers are recorded. That one is what makes it the
+repopulation path for a store upgraded to v4, where every row starts without
+one. New files are
 ignored: `revalidate` only touches rows that already exist in the store.
 Deletion is opt-in via `--prune`, which removes tracks under the scanned root
 whose backing file is gone, or is present but refused as unsupported (a chained

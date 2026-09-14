@@ -7,7 +7,7 @@ use musefs_format::{EmbeddedBinaryTag, EmbeddedPicture, Extent, flac, mp3, mp4, 
 
 use crate::byte_budget::ByteBudget;
 use crate::error::Result;
-use crate::freshness::BackingStamp;
+use crate::freshness::{BackingStamp, InodeKeeping};
 use musefs_db::limits::{
     MAX_ART_DESCRIPTION_LEN, MAX_ART_MIME_LEN, MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN,
 };
@@ -1030,14 +1030,21 @@ fn read_tail_128(file: &std::fs::File, file_len: u64) -> std::io::Result<Option<
 /// counted as `failed` — and `ProbeOutcome::Raced` if the file changed under us.
 /// A race outranks a failure, since a torn probe says nothing about whether the
 /// settled file would parse or hash.
-fn probe_file(path: &Path, window: usize, tier: ChecksumTier) -> std::io::Result<ProbeOutcome> {
+fn probe_file(
+    path: &Path,
+    window: usize,
+    tier: ChecksumTier,
+    inodes: &InodeKeeping,
+) -> std::io::Result<ProbeOutcome> {
     let file = std::fs::File::open(path)?;
     crate::metrics::on_scan_open();
-    // Asked once: both stats below read this descriptor, so the filesystem
-    // cannot change between them, and on FAT neither may record an inode the
-    // next remount renumbers (#757).
-    let keeps_inodes = crate::freshness::keeps_inodes(&file);
-    let s1 = BackingStamp::from_metadata(&file.metadata()?).recordable(keeps_inodes);
+    let meta = file.metadata()?;
+    // Asked once per filesystem per pass: both stats below read this
+    // descriptor, so the filesystem cannot change between them, and where it
+    // renumbers files neither may record an inode the next remount changes
+    // (#757).
+    let keeps_inodes = inodes.of_file(&file, &meta);
+    let s1 = BackingStamp::from_metadata(&meta).recordable(keeps_inodes);
     #[cfg(test)]
     fire_after_s1();
 
@@ -1114,9 +1121,10 @@ fn probe_file_caught(
     path: &Path,
     window: usize,
     tier: ChecksumTier,
+    inodes: &InodeKeeping,
 ) -> std::io::Result<ProbeOutcome> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        probe_file(path, window, tier)
+        probe_file(path, window, tier, inodes)
     })) {
         Ok(res) => res,
         Err(payload) => {
@@ -2338,6 +2346,17 @@ fn ingest_bulk(
 /// (#651), and their per-file warns are capped per reason so a whole unreadable
 /// subtree cannot scale the log with the library.
 pub fn scan_directory_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<ScanStats> {
+    scan_directory_in(db, root, opts, &Arc::default())
+}
+
+/// [`scan_directory_with`], asking whether each filesystem keeps inode numbers
+/// through `inodes`, which a test can hold to see what the pass asked.
+fn scan_directory_in(
+    db: &Db,
+    root: &Path,
+    opts: &ScanOptions,
+    inodes: &Arc<InodeKeeping>,
+) -> Result<ScanStats> {
     // Canonicalize the root once. With symlinks unfollowed (the default) every
     // path the walk yields is then already absolute and symlink-free — i.e.
     // canonical — so the workers need not canonicalize each probed file (#440).
@@ -2393,6 +2412,7 @@ pub fn scan_directory_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<S
         WritePolicy::Full,
         &failures,
         &Arc::default(),
+        inodes,
     )?;
     // skipped is tallied during the walk, not the pipeline
     stats.skipped = tally.total;
@@ -2455,6 +2475,7 @@ fn run_pipeline(
     policy: WritePolicy,
     failures: &Arc<FailureTally>,
     unsupported: &Arc<std::sync::Mutex<Vec<(PathBuf, BackingStamp)>>>,
+    inodes: &Arc<InodeKeeping>,
 ) -> Result<ScanStats> {
     use std::sync::atomic::AtomicUsize;
 
@@ -2487,6 +2508,7 @@ fn run_pipeline(
         let raced = Arc::clone(&raced);
         let failures = Arc::clone(failures);
         let unsupported = Arc::clone(unsupported);
+        let inodes = Arc::clone(inodes);
         workers.push(std::thread::spawn(move || {
             loop {
                 let i = cursor.fetch_add(1, Ordering::Relaxed);
@@ -2515,7 +2537,7 @@ fn run_pipeline(
                 };
                 #[cfg(test)]
                 fire_after_resolve(path);
-                match probe_file_caught(&abs_path, window, tier) {
+                match probe_file_caught(&abs_path, window, tier, &inodes) {
                     Ok(ProbeOutcome::Probed(probed, stamp, checksums)) => {
                         // Reject an over-cap file here, before its payload is
                         // charged to the budget and buffered into a batch: a
@@ -2855,6 +2877,17 @@ pub fn scan_directory_full_oracle(db: &Db, root: &Path) -> Result<ScanStats> {
 /// is unchanged since the refusing probe (#747). It still counts in `failed`
 /// for that pass: the file was refused.
 pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<RevalidateStats> {
+    revalidate_in(db, root, opts, &Arc::default())
+}
+
+/// [`revalidate_with`], asking whether each filesystem keeps inode numbers
+/// through `inodes`, which a test can hold to see what the pass asked.
+fn revalidate_in(
+    db: &Db,
+    root: &Path,
+    opts: &ScanOptions,
+    inodes: &Arc<InodeKeeping>,
+) -> Result<RevalidateStats> {
     // Canonicalize once; see scan_directory_with (#440). The prune pass below reuses
     // this canonical root for its `starts_with` scope check.
     let canon = std::fs::canonicalize(root)?;
@@ -2947,8 +2980,8 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
             // store migrated into V4, alongside the structural and checksum
             // backfills it already covered.
             //
-            // Not on a filesystem that keeps no inode numbers (#757): on FAT or
-            // exFAT a re-probe records none either, so re-probing would never
+            // Not where the filesystem's inode numbers are not recorded (#757):
+            // there a re-probe records none either, so re-probing would never
             // converge, and would rewrite the row — moving its served mtime —
             // on every pass. The filesystem is asked live rather than the
             // answer stored, so the model needs no third state for "cannot be
@@ -2956,7 +2989,7 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
             // A stat that supplies no inode at all still re-probes each pass;
             // that is slower, never wrong, and only reachable on a filesystem
             // whose stat is malformed.
-            let needs_ino = stamp.ino.is_none() && crate::freshness::keeps_inodes_at(&path);
+            let needs_ino = stamp.ino.is_none() && inodes.at_path(&path, &meta);
             if stamp.matches_live(&crate::freshness::BackingStamp::from_metadata(&meta))
                 && !needs_backfill
                 && !needs_checksum
@@ -2984,6 +3017,7 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
         WritePolicy::StructuralOnly,
         &failures,
         &unsupported,
+        inodes,
     )?;
     let refused = std::mem::take(
         &mut *unsupported
@@ -3001,11 +3035,11 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
         #[cfg(test)]
         fire_hook(&BEFORE_PRUNE_REFUSED_HOOK);
         for (path, stamp) in refused {
-            // The probe recorded `stamp`, so compare the way it records (#757).
+            // The probe recorded `stamp`, so compare the way it recorded it
+            // (#757): with an inode exactly when it holds one, which needs no
+            // second question to the filesystem.
             let as_refused = std::fs::metadata(&path).is_ok_and(|meta| {
-                BackingStamp::from_metadata(&meta)
-                    .recordable(crate::freshness::keeps_inodes_at(&path))
-                    == stamp
+                BackingStamp::from_metadata(&meta).recordable(stamp.ino.is_some()) == stamp
             });
             if as_refused && let Some(track) = db.get_track_by_path(&path)? {
                 db.delete_track(track.id)?;
@@ -3197,8 +3231,10 @@ fn hash_confirm(path: &Path, expect: BackingStamp) -> std::io::Result<Option<Str
     let file = std::fs::File::open(path)?;
     crate::metrics::on_scan_open();
     // `expect` is a stamp the probe recorded, so this side records the same way
-    // (#757): on FAT it holds no inode, and a live one would never equal it.
-    let keeps_inodes = crate::freshness::keeps_inodes(&file);
+    // (#757): where the filesystem's inode numbers are not recorded it holds
+    // none, and a live one would never equal it. Whether it holds one says how
+    // the probe recorded it, so the filesystem need not be asked again.
+    let keeps_inodes = expect.ino.is_some();
     if BackingStamp::from_metadata(&file.metadata()?).recordable(keeps_inodes) != expect {
         return Ok(None);
     }

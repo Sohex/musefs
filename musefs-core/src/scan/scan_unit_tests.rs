@@ -238,7 +238,13 @@ fn probe_file_fails_file_with_oversized_mp4_covr() {
     std::fs::write(&path, &bytes).unwrap();
     assert!(
         matches!(
-            probe_file(&path, 0, ChecksumTier::Fingerprint).unwrap(),
+            probe_file(
+                &path,
+                0,
+                ChecksumTier::Fingerprint,
+                &InodeKeeping::default()
+            )
+            .unwrap(),
             ProbeOutcome::Failed(_)
         ),
         "an oversized covr must fail the file, not yield a track without its art"
@@ -254,7 +260,13 @@ fn probe_file_fails_file_with_oversized_mp4_binary_freeform() {
     std::fs::write(&path, &bytes).unwrap();
     assert!(
         matches!(
-            probe_file(&path, 0, ChecksumTier::Fingerprint).unwrap(),
+            probe_file(
+                &path,
+                0,
+                ChecksumTier::Fingerprint,
+                &InodeKeeping::default()
+            )
+            .unwrap(),
             ProbeOutcome::Failed(_)
         ),
         "an oversized `----` value must fail the file"
@@ -270,7 +282,14 @@ fn probe_file_keeps_mp4_covr_at_cap() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("at_cap_art.m4a");
     std::fs::write(&path, &bytes).unwrap();
-    let probed = match probe_file(&path, 0, ChecksumTier::Fingerprint).unwrap() {
+    let probed = match probe_file(
+        &path,
+        0,
+        ChecksumTier::Fingerprint,
+        &InodeKeeping::default(),
+    )
+    .unwrap()
+    {
         ProbeOutcome::Probed(p, _, _) => p,
         other => panic!("expected Probed, got {other:?}"),
     };
@@ -1006,14 +1025,16 @@ fn hash_confirm_refuses_a_file_that_no_longer_matches_the_stamp() {
 }
 
 /// #757: the retarget confirm compares against the stamp the probe recorded, so
-/// it has to record the same way. Otherwise every confirm on FAT would compare a
-/// stamp without an inode against one with, and refuse.
+/// it has to record the same way — as that stamp says, without asking the
+/// filesystem again. Otherwise every confirm where no inode is recorded would
+/// compare a stamp without an inode against one with, and refuse. No seam: the
+/// filesystem this runs on may keep inode numbers, and the confirm must accept
+/// the stamp anyway.
 #[test]
 fn hash_confirm_accepts_a_stamp_recorded_without_the_inode() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("f.bin");
     std::fs::write(&path, b"abc").unwrap();
-    let _fat = crate::freshness::pretend_no_inodes();
     let stamp = BackingStamp::from_metadata(&std::fs::metadata(&path).unwrap()).recordable(false);
     assert_eq!(
         hash_confirm(&path, stamp).unwrap().as_deref(),
@@ -1030,15 +1051,25 @@ fn probe_records_the_inode_only_where_the_filesystem_keeps_one() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.m4a");
     std::fs::write(&path, mp4_with_covr(13, &[0xFF; 8])).unwrap();
-    let recorded_ino = || match probe_file(&path, 0, ChecksumTier::Fingerprint).unwrap() {
+    let recorded_ino = || match probe_file(
+        &path,
+        0,
+        ChecksumTier::Fingerprint,
+        &InodeKeeping::default(),
+    )
+    .unwrap()
+    {
         ProbeOutcome::Probed(_, stamp, _) => stamp.ino,
         other => panic!("expected Probed, got {other:?}"),
     };
 
+    // Decided the way a scan decides it, for the filesystem this test runs on.
+    let expected = crate::freshness::filesystem_keeps_inodes_for_test(dir.path())
+        .then(|| std::fs::metadata(&path).unwrap().ino());
     assert_eq!(
         recorded_ino(),
-        Some(std::fs::metadata(&path).unwrap().ino()),
-        "a filesystem that keeps inode numbers gets its inode recorded"
+        expected,
+        "the inode is recorded exactly where the filesystem keeps inode numbers"
     );
     let _fat = crate::freshness::pretend_no_inodes();
     assert_eq!(
@@ -1117,7 +1148,7 @@ fn a_file_that_parses_and_cannot_be_hashed_fails_the_scan_for_that_file() {
     set_checksum_fault(Some(path.clone()));
     let _guard = FaultGuard;
 
-    match probe_file(&path, WINDOW, ChecksumTier::Full).unwrap() {
+    match probe_file(&path, WINDOW, ChecksumTier::Full, &InodeKeeping::default()).unwrap() {
         ProbeOutcome::Failed(f) => {
             assert_eq!(f.reason, SkipReason::Checksum);
             assert!(f.message.contains("checksum failed"), "{}", f.message);

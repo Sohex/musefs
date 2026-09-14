@@ -270,7 +270,13 @@ fn oversize_unparseable_file_is_skipped_not_read_whole() {
     drop(f);
 
     assert!(matches!(
-        probe_file(&path, WINDOW, ChecksumTier::Fingerprint).unwrap(),
+        probe_file(
+            &path,
+            WINDOW,
+            ChecksumTier::Fingerprint,
+            &InodeKeeping::default()
+        )
+        .unwrap(),
         ProbeOutcome::Failed(_)
     ));
 }
@@ -313,7 +319,14 @@ fn oversize_wav_is_served_via_data_header() {
     f.set_len(file_len).unwrap();
     drop(f);
 
-    let probed = match probe_file(&path, WINDOW, ChecksumTier::Fingerprint).unwrap() {
+    let probed = match probe_file(
+        &path,
+        WINDOW,
+        ChecksumTier::Fingerprint,
+        &InodeKeeping::default(),
+    )
+    .unwrap()
+    {
         ProbeOutcome::Probed(p, _, _) => p,
         other => panic!("expected Probed, got {other:?}"),
     };
@@ -369,7 +382,12 @@ fn probe_file_reports_raced_on_mid_probe_mutation() {
     let pc = path.clone();
     set_after_s1_hook(move || grow(&pc)); // size moves -> S2 != S1
     let _guard = HookGuard;
-    let out = probe_file(&path, WINDOW, ChecksumTier::Fingerprint);
+    let out = probe_file(
+        &path,
+        WINDOW,
+        ChecksumTier::Fingerprint,
+        &InodeKeeping::default(),
+    );
     assert!(matches!(out, Ok(ProbeOutcome::Raced)), "got {out:?}");
 }
 
@@ -394,6 +412,6 @@ fn probe_file_reports_raced_when_the_file_changes_mid_hash() {
     let pc = path.clone();
     set_hook(&DURING_FULL_HASH_HOOK, move || grow(&pc));
     let _guard = HookGuard;
-    let out = probe_file(&path, WINDOW, ChecksumTier::Full);
+    let out = probe_file(&path, WINDOW, ChecksumTier::Full, &InodeKeeping::default());
     assert!(matches!(out, Ok(ProbeOutcome::Raced)), "got {out:?}");
 }

@@ -9,8 +9,8 @@ data — audio byte range, content checksums, and FLAC structural blocks — whi
 **preserving the curated tags, art, and binary tags in the store**. It also
 re-probes an unchanged file whose row lacks something a probe records: the
 checksum the `--checksum` tier asks for, a FLAC file's structural blocks, or an
-inode on a filesystem that keeps inode numbers — which, after
-[`musefs migrate`](#upgrading-the-store-musefs-migrate), is every row. Other
+inode on a filesystem whose inode numbers musefs records — which, after
+[`musefs migrate`](#upgrading-the-store-musefs-migrate), is every row there. Other
 unchanged files are skipped, and files not yet in the store are ignored
 (ingesting new files is `scan`'s job — see [Scanning](scanning.md)).
 
@@ -68,8 +68,8 @@ library onto new storage gives every file a new change time, so every file reads
 as changed: opens fail until a revalidate re-probes them. A file that agrees on
 all four fields cannot be told apart and is served as the original. On
 filesystems with real timestamps that takes a coincidence nothing ordinary
-produces, but on FAT and exFAT under Linux, where only the size and a coarse
-modification time are compared, a copy that preserved its timestamps can agree — one more
+produces, but on FAT and exFAT, where only the size and a coarse modification
+time are compared, a copy that preserved its timestamps can agree — one more
 reason [they are not recommended](installation.md) for the backing library.
 
 ## Compacting the store (`musefs vacuum`)
@@ -257,7 +257,9 @@ fingerprint; the revalidate does. Until it runs, those tracks cannot be
 re-identified after a move.
 
 The 2.0.0 upgrade leaves more than fingerprints for that revalidate: it records
-each file's inode, except on FAT and exFAT under Linux, which keep none, and
+each file's inode, except on filesystems whose inode numbers musefs does not
+record (FAT and exFAT, SMB shares, FUSE mounts and others — see
+[installation](installation.md)), and
 restores each file's own picture metadata. The offer
 never prunes. If the revalidate counts any file as failed, `migrate` exits `2`
 once it is done, as `revalidate` itself would, even though the store is
@@ -277,8 +279,8 @@ track has been re-probed, `mount`, `scan` and `revalidate` each print a warning
 with the number still waiting
 ([#705](https://github.com/Sohex/musefs/issues/705)). A track counts while it
 has neither a fingerprint nor a recorded inode, which is how the upgrade leaves
-every row. A `--checksum none` scan on FAT or exFAT under Linux records
-neither, so its
+every row. A `--checksum none` scan on a filesystem where no inode is recorded
+writes neither, so its
 tracks count too until a revalidate at the default `--checksum` tier
 fingerprints them. A file the revalidate cannot re-probe, such as a chained Ogg
 ([#747](https://github.com/Sohex/musefs/issues/747)), stays counted until
