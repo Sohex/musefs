@@ -36,9 +36,11 @@ pub struct TableRejections {
 /// equal to a BLOB, so a tool binding the path as bytes could add a second row
 /// for a file musefs already had. The upgrade stores every path as bytes, which
 /// makes the two one path, and only one row can keep it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DuplicatePath {
+    /// The path both rows name, as the upgrade stores it.
+    pub path: PathBuf,
     /// The row that keeps the path: the one carrying tags or art links, or the
     /// older one when neither does.
     pub kept: i64,
@@ -486,7 +488,8 @@ impl PendingMigration {
                     (EXISTS (SELECT 1 FROM main.tags WHERE track_id = m.id) \
                      OR EXISTS (SELECT 1 FROM main.track_art WHERE track_id = m.id)) \
                     AND (EXISTS (SELECT 1 FROM main.tags WHERE track_id = p.id) \
-                     OR EXISTS (SELECT 1 FROM main.track_art WHERE track_id = p.id)) \
+                     OR EXISTS (SELECT 1 FROM main.track_art WHERE track_id = p.id)), \
+                    p.backing_path \
              FROM main.tracks m \
              JOIN probe.tracks p ON p.backing_path = CAST(m.backing_path AS BLOB) \
              WHERE m.rowid NOT IN (SELECT rowid FROM probe.tracks)",
@@ -494,6 +497,7 @@ impl PendingMigration {
         let found = stmt
             .query_map([], |r| {
                 Ok(DuplicatePath {
+                    path: crate::models::path_from_col(r.get(3)?),
                     kept: r.get(0)?,
                     refused: r.get(1)?,
                     ambiguous: r.get(2)?,
@@ -633,6 +637,7 @@ impl PendingMigration {
         let found = self.probe()?;
         if let Some(both) = found.duplicates.iter().find(|d| d.ambiguous) {
             return Err(crate::DbError::AmbiguousDuplicatePath {
+                path: both.path.clone(),
                 first: both.kept,
                 second: both.refused,
             });
@@ -1487,6 +1492,7 @@ mod rejection_tests {
             assert_eq!(
                 found.duplicates(),
                 [super::DuplicatePath {
+                    path: std::path::PathBuf::from("/lib/a.flac"),
                     kept,
                     refused,
                     ambiguous: false,
@@ -1516,24 +1522,31 @@ mod rejection_tests {
         assert_eq!(
             found.duplicates(),
             [super::DuplicatePath {
+                path: std::path::PathBuf::from("/lib/a.flac"),
                 kept: 1,
                 refused: 2,
                 ambiguous: true,
             }],
-            "reported, both ids named"
+            "reported, the path and both ids named"
         );
         let err = pending
             .repair()
             .expect_err("two curated rows are not the repair's to choose between");
         assert!(
             matches!(
-                err,
+                &err,
                 crate::DbError::AmbiguousDuplicatePath {
+                    path,
                     first: 1,
                     second: 2
-                }
+                } if path == std::path::Path::new("/lib/a.flac")
             ),
             "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.starts_with("/lib/a.flac is stored twice, as tracks 1 and 2"),
+            "{message}"
         );
         drop(pending);
         let tracks: i64 = Connection::open(&path)

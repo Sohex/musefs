@@ -37,6 +37,9 @@ clap = "4"
 # for the process-level #705 warning test, and (`test-support`) seeds a store an
 # older musefs left behind.
 musefs-db = { path = "../musefs-db", features = ["test-support"] }
+# Plants the rows an older musefs, or a writer with the constraints off, left in
+# a store, for the process-level `migrate --repair` tests.
+rusqlite = { version = "0.40", features = ["bundled"] }
 rustix = { version = "1", features = ["process"] }
 
 [lints]

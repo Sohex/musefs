@@ -900,6 +900,54 @@ struct Disks<'a> {
     temp_dir: &'a dyn Fn() -> PathBuf,
 }
 
+/// The clause a repair report adds for picture links moved rather than deleted.
+fn moved_links(relinked: u64) -> String {
+    if relinked == 0 {
+        String::new()
+    } else {
+        format!(
+            ", and {relinked} picture link(s) moved onto a correctly filed copy of the same image"
+        )
+    }
+}
+
+/// The error an upgrade that failed is reported with: where the store stands
+/// now, read back from the store itself, and where the snapshot is.
+///
+/// The upgrade is one transaction, so a failure inside it leaves the store at
+/// the version it started from, with any repair undone. One after the commit —
+/// the identity check — does not, and saying "rolled back" then would send the
+/// user to the old binary with a store it no longer opens.
+fn upgrade_failed(
+    err: musefs_db::DbError,
+    db: &Path,
+    from: i64,
+    repaired: bool,
+    snapshot: Option<&Path>,
+) -> anyhow::Error {
+    let state = match PendingMigration::open(db).map(|p| p.current_version()) {
+        Ok(now) if now == from => format!(
+            "the upgrade was rolled back, and the store is unchanged at schema version \
+             {from}{}",
+            if repaired {
+                ", the rows --repair was to delete included"
+            } else {
+                ""
+            }
+        ),
+        Ok(now) => format!("the store is now at schema version {now}"),
+        Err(_) => "the store could not be reopened to check its state".to_owned(),
+    };
+    let copy = match snapshot {
+        Some(dest) => format!("the snapshot taken before it is at {}", dest.display()),
+        None => "no snapshot was taken (--no-snapshot)".to_owned(),
+    };
+    anyhow::Error::new(err).context(format!(
+        "upgrading {} failed: {state}; {copy}",
+        db.display()
+    ))
+}
+
 /// Where a snapshot goes when the user did not say: the store's own path with
 /// the version it is being taken from appended, so two upgrades of one store
 /// never collide and the file says what it is.
@@ -1041,6 +1089,35 @@ fn run_migrate_on(args: &MigrateArgs, disks: &Disks<'_>) -> Result<u64> {
         for t in refused.tables() {
             println!("  {}: {} row(s)", t.table, t.rejected);
         }
+        for d in refused.duplicates() {
+            if d.ambiguous {
+                println!(
+                    "  {} is stored twice, as tracks {} and {}, and both carry tags or \
+                     picture links: --repair will not choose which to keep",
+                    d.path.display(),
+                    d.kept,
+                    d.refused
+                );
+            } else {
+                println!(
+                    "  {} is stored twice, as tracks {} and {}: --repair keeps track {} and \
+                     deletes track {}",
+                    d.path.display(),
+                    d.kept,
+                    d.refused,
+                    d.kept,
+                    d.refused
+                );
+            }
+        }
+        if refused.relinked() > 0 {
+            println!(
+                "  {} picture link(s) point at a refused art row with a correctly filed copy \
+                 of the same image: --repair moves them onto that copy instead of deleting \
+                 them",
+                refused.relinked()
+            );
+        }
         println!(
             "They were written before the constraint that now refuses them, or by a \
              writer with the constraints turned off."
@@ -1052,6 +1129,21 @@ fn run_migrate_on(args: &MigrateArgs, disks: &Disks<'_>) -> Result<u64> {
                  until this is resolved",
                 db.display(),
                 refused.total()
+            );
+        }
+        // Refused here, before the snapshot, rather than by the repair after it:
+        // the snapshot's file would otherwise be left behind to block the rerun.
+        if let Some(both) = refused.duplicates().iter().find(|d| d.ambiguous) {
+            anyhow::bail!(
+                "refusing to repair {}: {} is stored twice, as tracks {} and {}, and both \
+                 carry tags or picture links, so --repair cannot choose which to keep. \
+                 Decide which track you want, delete the other yourself (its tags and \
+                 picture links go with it), then run `musefs migrate` again. Nothing has \
+                 been changed",
+                db.display(),
+                both.path.display(),
+                both.kept,
+                both.refused
             );
         }
     }
@@ -1182,11 +1274,43 @@ fn run_migrate_on(args: &MigrateArgs, disks: &Disks<'_>) -> Result<u64> {
 
     // After the snapshot, so the deleted rows are in the copy the user can go
     // back to, and after the confirmation, so --repair alone never deletes.
-    if !refused.is_empty() {
-        let removed = pending.repair()?;
+    // Nothing is deleted yet: the repair runs inside the upgrade's transaction.
+    let repair = if refused.is_empty() {
+        None
+    } else {
+        let plan = pending.repair()?;
         println!(
-            "repaired: deleted {} row(s) the new schema refuses",
-            removed.total()
+            "--repair: {} row(s) the new schema refuses will be deleted as part of the \
+             upgrade{}; if the upgrade fails, they are kept.",
+            plan.total(),
+            moved_links(plan.relinked())
+        );
+        Some(plan)
+    };
+
+    let started = Instant::now();
+    let store = match pending.apply() {
+        Ok(store) => store,
+        Err(e) => {
+            return Err(upgrade_failed(
+                e,
+                db,
+                from,
+                repair.is_some(),
+                snapshot.as_deref(),
+            ));
+        }
+    };
+    println!(
+        "migrated {} from schema version {from} to {to} in {}",
+        db.display(),
+        HumanDuration(started.elapsed())
+    );
+    if let Some(plan) = &repair {
+        println!(
+            "repaired: deleted {} row(s) the new schema refused{}",
+            plan.total(),
+            moved_links(plan.relinked())
         );
         println!(
             "  they are in the snapshot at {}, if you want them back.",
@@ -1196,14 +1320,6 @@ fn run_migrate_on(args: &MigrateArgs, disks: &Disks<'_>) -> Result<u64> {
                 .display()
         );
     }
-
-    let started = Instant::now();
-    let store = pending.apply()?;
-    println!(
-        "migrated {} from schema version {from} to {to} in {}",
-        db.display(),
-        HumanDuration(started.elapsed())
-    );
 
     let grown = store_footprint(db);
     if grown > footprint {

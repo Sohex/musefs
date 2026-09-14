@@ -208,7 +208,10 @@ write is exactly the kind of thing that should not happen without being asked.
 you can go back to — which is why it refuses to run alongside `--no-snapshot`.
 The deletes are part of the upgrade itself, in the same transaction: if the
 upgrade then fails, on a full disk for instance, they are undone with it and the
-store is left exactly as it was. The count is what will actually go: a child
+store is left exactly as it was. So `migrate` first says how many rows the
+upgrade will delete, and reports them as deleted only once it has succeeded. If
+it fails, the error says whether the store was rolled back and where the
+snapshot is. The count is what will actually go: a child
 whose parent does not survive is reported with it, rather than left to the
 cascade to take silently.
 
@@ -237,12 +240,13 @@ row's values; a `revalidate` restores them for pictures the file embeds itself.
 bound it as bytes could add a second row for a file musefs already had: SQLite
 never compares the two spellings equal, so nothing refused it. 2.0.0 stores
 every path as bytes, which makes the two one path, and only one row can keep it.
-`migrate` reports each such pair with both track ids. `--repair` keeps the row
-that carries tags or picture links and deletes the other; when neither carries
-any, nothing is lost either way, and it keeps the older one. When both do, it
-cannot know which you want, so it refuses and deletes nothing: delete the row
-you do not want yourself (deleting a track takes its tags and links with it),
-then run `migrate` again.
+`migrate` reports each such path with both track ids and the one `--repair`
+keeps. `--repair` keeps the row that carries tags or picture links and deletes
+the other; when neither carries any, nothing is lost either way, and it keeps the
+older one. When both do, it cannot know which you want, so `migrate --repair`
+refuses before taking the snapshot and changes nothing: delete the row you do not
+want yourself (deleting a track takes its tags and links with it), then run
+`migrate` again.
 
 The check also catches a row that is fine in itself but points at a parent that
 is not there — the kind an external tool can leave behind with foreign keys

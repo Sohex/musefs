@@ -977,6 +977,7 @@ dependencies = [
  "musefs-cli",
  "musefs-db",
  "musefs-fuse",
+ "rusqlite",
  "rustix",
  "tempfile",
  "tikv-jemalloc-ctl",
