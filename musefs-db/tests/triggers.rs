@@ -1,6 +1,6 @@
 mod common;
 use common::new_track;
-use musefs_db::{Db, Format, NewTrack, StructuralBlock, Tag};
+use musefs_db::{ChecksumWrite, Db, Format, NewTrack, StructuralBlock, Tag};
 
 /// A second well in the past, so a stamp of the current time cannot land on it.
 const AGED: i64 = 1_000_000_000;
@@ -72,6 +72,167 @@ fn every_column_the_upsert_writes_moves_updated_at_when_it_changes() {
             "a changed {column} is a change, so updated_at must move"
         );
     }
+}
+
+/// A restamp that changes `backing_ctime_ns` and nothing else. That is what a
+/// same-size rewrite with its old mtime put back (`touch -r`) looks like, and
+/// also what a `chmod` looks like: ctime is the one stamp field userspace cannot
+/// set back, so it separates neither case from the other. Only the checksums
+/// written with it can.
+fn ctime_restamp(t: &NewTrack) -> NewTrack {
+    let mut restamped = t.clone();
+    restamped.backing_ctime_ns += 1;
+    restamped
+}
+
+/// A ctime-only restamp bumps `content_version` unless a checksum written in the
+/// same statement proves the bytes unchanged: a fingerprint or content hash that
+/// was stored before and is written again with the same value. Without the bump
+/// a rewrite that kept its size and mtime served the same `content_version`, so
+/// the served mtime held still and a kernel cache kept the old pages.
+#[test]
+fn a_ctime_only_restamp_bumps_unless_a_checksum_proves_the_bytes_unchanged() {
+    use ChecksumWrite::{Clear, Keep, Set};
+    let (fp, other, hash) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+    let cases: [(&str, [ChecksumWrite; 2], [ChecksumWrite; 2], bool); 7] = [
+        (
+            "a changed fingerprint",
+            [Set(&fp), Keep],
+            [Set(&other), Clear],
+            true,
+        ),
+        (
+            "a cleared fingerprint",
+            [Set(&fp), Keep],
+            [Clear, Clear],
+            true,
+        ),
+        (
+            "no checksum before or after",
+            [Keep, Keep],
+            [Clear, Clear],
+            true,
+        ),
+        (
+            "a first fingerprint proves nothing about before",
+            [Keep, Keep],
+            [Set(&fp), Clear],
+            true,
+        ),
+        (
+            "the same fingerprint",
+            [Set(&fp), Keep],
+            [Set(&fp), Clear],
+            false,
+        ),
+        (
+            "the same content hash",
+            [Set(&fp), Set(&hash)],
+            [Clear, Set(&hash)],
+            false,
+        ),
+        (
+            "both the same",
+            [Set(&fp), Set(&hash)],
+            [Set(&fp), Set(&hash)],
+            false,
+        ),
+    ];
+    for (what, stored, written, bumps) in cases {
+        let db = Db::open_in_memory().unwrap();
+        let t = new_track("/m/a.mp3");
+        let id = db
+            .upsert_track_with_checksums(&t, stored[0], stored[1])
+            .unwrap();
+        let before = db.track_content_version(id).unwrap();
+
+        db.upsert_track_with_checksums(&ctime_restamp(&t), written[0], written[1])
+            .unwrap();
+
+        let after = db.track_content_version(id).unwrap();
+        let expected = if bumps { before + 1 } else { before };
+        assert_eq!(after, expected, "{what}");
+    }
+}
+
+/// The bulk writer runs the same statement.
+#[test]
+fn a_bulk_writer_restamp_bumps_on_the_same_rule() {
+    let db = Db::open_in_memory().unwrap();
+    let t = new_track("/m/a.mp3");
+    let fp = "a".repeat(64);
+    let id = db
+        .upsert_track_with_checksums(&t, ChecksumWrite::Set(&fp), ChecksumWrite::Keep)
+        .unwrap();
+    let before = db.track_content_version(id).unwrap();
+    let mut bulk = db.bulk_writer().unwrap();
+    bulk.upsert_track_with_checksums(
+        &ctime_restamp(&t),
+        ChecksumWrite::Clear,
+        ChecksumWrite::Clear,
+    )
+    .unwrap();
+    bulk.commit().unwrap();
+    assert_eq!(db.track_content_version(id).unwrap(), before + 1);
+}
+
+/// The first revalidate after the upgrade writes a fingerprint where V4 left
+/// none. That alone does not bump: a stamp that did not change, ctime included,
+/// already vouches for the bytes, and a first fingerprint compares with nothing.
+/// On a filesystem that keeps inodes the same pass records one where the
+/// migration left the sentinel, and that bumps once, as it always has
+/// (`tracks_geometry_au`); ctime does not add a second.
+#[test]
+fn the_first_revalidate_after_the_upgrade_bumps_only_for_the_inode() {
+    let fp = "a".repeat(64);
+    for (what, ino, bumps) in [
+        ("no inode kept (FAT, exFAT)", None, 0),
+        ("an inode recorded", Some(4242), 1),
+    ] {
+        let db = Db::open_in_memory().unwrap();
+        let migrated = new_track("/m/a.mp3");
+        let id = db.upsert_track(&migrated).unwrap();
+        let before = db.track_content_version(id).unwrap();
+
+        let mut probed = migrated.clone();
+        probed.backing_ino = ino;
+        db.upsert_track_with_checksums(&probed, ChecksumWrite::Set(&fp), ChecksumWrite::Clear)
+            .unwrap();
+
+        assert_eq!(
+            db.track_content_version(id).unwrap(),
+            before + bumps,
+            "{what}"
+        );
+    }
+}
+
+/// A rename changes ctime and nothing else a stamp records, and the retarget
+/// writes the fingerprint it was matched on, so the same rule leaves it alone:
+/// the served bytes are the ones the row already described (#674).
+#[test]
+fn a_retarget_whose_fingerprint_matches_does_not_bump_for_ctime() {
+    let db = Db::open_in_memory().unwrap();
+    let t = new_track("/m/old.mp3");
+    let fp = "a".repeat(64);
+    let id = db
+        .upsert_track_with_checksums(&t, ChecksumWrite::Set(&fp), ChecksumWrite::Keep)
+        .unwrap();
+    let before = db.track_content_version(id).unwrap();
+    db.retarget_track(
+        id,
+        std::path::Path::new("/m/new.mp3"),
+        t.backing_size,
+        t.backing_mtime_ns,
+        t.backing_ctime_ns + 1,
+        t.backing_ino,
+        t.audio_offset,
+        t.audio_length,
+        ChecksumWrite::Set(&fp),
+        ChecksumWrite::Clear,
+    )
+    .unwrap();
+    assert_eq!(db.track_content_version(id).unwrap(), before);
 }
 
 #[test]
