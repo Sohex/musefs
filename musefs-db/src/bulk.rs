@@ -52,7 +52,17 @@ pub struct BulkWriter<'c> {
 
 impl BulkWriter<'_> {
     pub fn upsert_track(&mut self, t: &NewTrack) -> Result<i64> {
-        upsert_track_in(&self.tx, t)
+        upsert_track_in(&self.tx, t, ChecksumWrite::Keep, ChecksumWrite::Keep)
+    }
+
+    /// See [`crate::Db::upsert_track_with_checksums`].
+    pub fn upsert_track_with_checksums(
+        &mut self,
+        t: &NewTrack,
+        fingerprint: ChecksumWrite<'_>,
+        content_hash: ChecksumWrite<'_>,
+    ) -> Result<i64> {
+        upsert_track_in(&self.tx, t, fingerprint, content_hash)
     }
 
     pub fn tracks_by_fingerprint(&self, fp: &str) -> Result<Vec<Track>> {

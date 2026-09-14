@@ -846,7 +846,8 @@ END;
 
 -- 6. Recreate the indexes and the thirteen triggers the drops took with them,
 -- plus what the new shapes add. Verbatim except where noted: `tracks_geometry_au`
--- gains `backing_ino`, `tracks_changelog_au` logs the old id too, the two `_au`
+-- gains `backing_ino` and a guarded ctime clause, `tracks_changelog_au` logs the
+-- old id too, the two `_au`
 -- bumps widen to both owners, and two reparent-refusal triggers and a rekey
 -- refusal are new.
 CREATE INDEX tracks_fingerprint_idx ON tracks(fingerprint);
@@ -895,6 +896,19 @@ END;
 -- sentinel-to-real transition a revalidate performs on a migrated row: nothing
 -- about the served bytes changed, but the row's identity now covers a field it
 -- did not, so invalidating once is the conservative call.
+--
+-- A changed `backing_ctime_ns` bumps too, unless a checksum proves the bytes
+-- unchanged: a fingerprint or content hash that was stored before and is stored
+-- again unchanged by the same statement. A same-size rewrite that puts its old
+-- mtime back (`touch -r`) changes ctime and nothing else a stamp records, and
+-- without the bump it kept serving its old `content_version`, so the served
+-- mtime held still and a kernel page cache kept what it had. ctime alone cannot
+-- decide it, because a chmod moves ctime as well, and bumping for every such
+-- re-probe is the served-mtime churn #757 removed. A first fingerprint proves
+-- nothing about the bytes before it. A statement that leaves both checksums
+-- alone is taken at its word that they still hold, which is what
+-- `ChecksumWrite::Keep` means, and why the scanner writes a stamp and its
+-- checksums in one statement: a trigger sees only the statement that fired it.
 CREATE TRIGGER tracks_geometry_au
 AFTER UPDATE ON tracks
 WHEN NEW.format        <> OLD.format
@@ -903,6 +917,9 @@ WHEN NEW.format        <> OLD.format
   OR NEW.backing_size  <> OLD.backing_size
   OR NEW.backing_mtime_ns <> OLD.backing_mtime_ns
   OR NEW.backing_ino   <> OLD.backing_ino
+  OR (NEW.backing_ctime_ns <> OLD.backing_ctime_ns
+      AND NOT (OLD.fingerprint IS NOT NULL AND NEW.fingerprint IS OLD.fingerprint)
+      AND NOT (OLD.content_hash IS NOT NULL AND NEW.content_hash IS OLD.content_hash))
 BEGIN
     UPDATE tracks SET content_version = content_version + 1 WHERE id = NEW.id;
 END;

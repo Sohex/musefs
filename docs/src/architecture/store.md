@@ -42,7 +42,8 @@ plugins under `contrib/` write tags and art here out-of-band.
   bytes: `art_reject_content_update` (art is content-addressed and immutable),
   `art_ad` (a deleted art row bumps referencing tracks so an orphan rebuilds to
   a clean serve-time error), `tracks_geometry_au` (scanner-owned geometry
-  changes), and `structural_blocks_ai`/`_ad`. From v4, `structural_blocks_au`
+  changes and, from v4, a changed ctime no checksum vouches for — see **A changed
+  ctime** below), and `structural_blocks_ai`/`_ad`. From v4, `structural_blocks_au`
   joins those two, `tags_reject_reparent` and
   `track_art_reject_reparent` make row ownership immutable,
   `tracks_reject_rekey` makes a track's id immutable, and
@@ -155,6 +156,21 @@ intent — keep the stored value, set a new one, or clear it — and a pass belo
 the `full` tier clears the column whenever it observes that the recorded bytes
 changed. A pass over a file that has not changed keeps what is stored, so a
 cheap pass never undoes an expensive one.
+
+**A changed ctime.** From v4, `tracks_geometry_au` also bumps `content_version`
+when an update changes `backing_ctime_ns` and neither checksum proves the bytes
+unchanged: a `fingerprint` or `content_hash` that was stored before and is
+stored again, unchanged, by the same statement. A same-size rewrite that puts
+its old mtime back (`touch -r`) changes ctime and nothing else a stamp records,
+and without the bump the served mtime held still while a kernel page cache kept
+the old pages. A `chmod` moves ctime too, which is why ctime alone does not
+bump: a re-probe that computes the fingerprint it already had leaves
+`content_version`, and the served mtime, alone. A first fingerprint, written
+where none was stored, compares with nothing and proves nothing. A statement
+that does not write the checksums is taken to keep them, which is what the
+`Keep` intent claims, so a writer re-probing a file writes its stamp and its
+checksums in one statement (`Db::upsert_track_with_checksums`): a trigger sees
+only the statement that fired it.
 
 Neither column is `UNIQUE` by design — duplicate-content tracks legitimately
 share both values. On a normal `scan`, when a probed file's path is not yet in

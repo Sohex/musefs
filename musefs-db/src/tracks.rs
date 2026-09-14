@@ -100,17 +100,37 @@ fn row_to_track(r: &Row) -> Result<Track> {
 /// one (#757). A synthesized file's served second follows it, so stamping it on
 /// every re-probe made a revalidate over unchanged files look like a change to
 /// every size-plus-mtime consumer.
-pub(crate) fn upsert_track_in(conn: &rusqlite::Connection, t: &NewTrack) -> Result<i64> {
+///
+/// The checksums are written by the same statement, under the same
+/// [`ChecksumWrite`] intents as [`set_track_checksums_in`], and that is not a
+/// convenience. `tracks_geometry_au` bumps `content_version` for a changed
+/// `backing_ctime_ns` unless a checksum proves the bytes unchanged, and a
+/// trigger sees only the statement that fired it: a stamp written by one
+/// statement and its checksums by the next leave neither able to see the other.
+/// `Keep`, which is what a new row takes and what [`Db::upsert_track`] passes,
+/// is the claim that the recorded bytes did not change.
+pub(crate) fn upsert_track_in(
+    conn: &rusqlite::Connection,
+    t: &NewTrack,
+    fingerprint: ChecksumWrite<'_>,
+    content_hash: ChecksumWrite<'_>,
+) -> Result<i64> {
+    let (fp_set, fp_val) = fingerprint.params();
+    let (ch_set, ch_val) = content_hash.params();
     Ok(conn.query_row(
         "INSERT INTO tracks
-            (backing_path, format, audio_offset, audio_length, backing_size, backing_mtime_ns, backing_ctime_ns, backing_ino, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, CAST(strftime('%s','now') AS INTEGER))
+            (backing_path, format, audio_offset, audio_length, backing_size, backing_mtime_ns,
+             backing_ctime_ns, backing_ino, updated_at, fingerprint, content_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, CAST(strftime('%s','now') AS INTEGER),
+                 CASE WHEN ?9 THEN ?10 END, CASE WHEN ?11 THEN ?12 END)
          ON CONFLICT(backing_path) DO UPDATE SET
             format=excluded.format, audio_offset=excluded.audio_offset,
             audio_length=excluded.audio_length, backing_size=excluded.backing_size,
             backing_mtime_ns=excluded.backing_mtime_ns,
             backing_ctime_ns=excluded.backing_ctime_ns,
             backing_ino=excluded.backing_ino,
+            fingerprint  = CASE WHEN ?9  THEN ?10 ELSE fingerprint  END,
+            content_hash = CASE WHEN ?11 THEN ?12 ELSE content_hash END,
             updated_at=CASE
                 WHEN format <> excluded.format
                   OR audio_offset <> excluded.audio_offset
@@ -132,6 +152,10 @@ pub(crate) fn upsert_track_in(conn: &rusqlite::Connection, t: &NewTrack) -> Resu
             t.backing_mtime_ns,
             t.backing_ctime_ns,
             crate::models::ino_to_col(t.backing_ino),
+            fp_set,
+            fp_val,
+            ch_set,
+            ch_val,
         ],
         |r| r.get(0),
     )?)
@@ -458,8 +482,26 @@ impl<M> Db<M> {
 }
 
 impl Db<ReadWrite> {
+    /// Upsert a track by path, leaving its checksums as they are. That is a claim
+    /// that the recorded bytes did not change: a re-probe that computed checksums,
+    /// or cannot vouch for the old ones, writes through
+    /// [`Db::upsert_track_with_checksums`] instead.
     pub fn upsert_track(&self, t: &NewTrack) -> Result<i64> {
-        upsert_track_in(&self.conn, t)
+        upsert_track_in(&self.conn, t, ChecksumWrite::Keep, ChecksumWrite::Keep)
+    }
+
+    /// Upsert a track and write its checksums in one statement, which is what
+    /// lets a restamp that changed only `backing_ctime_ns` bump `content_version`
+    /// exactly when neither checksum proves the bytes unchanged. A scanner
+    /// re-probing a file writes through this rather than `upsert_track` followed
+    /// by [`Db::set_track_checksums`].
+    pub fn upsert_track_with_checksums(
+        &self,
+        t: &NewTrack,
+        fingerprint: ChecksumWrite<'_>,
+        content_hash: ChecksumWrite<'_>,
+    ) -> Result<i64> {
+        upsert_track_in(&self.conn, t, fingerprint, content_hash)
     }
 
     /// Delete a track row. Foreign keys cascade to its `tags` and `track_art`
