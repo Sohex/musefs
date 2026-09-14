@@ -957,8 +957,10 @@ see the [Release notes](release-notes.md).
   override (text, `TXXX`, `COMM` and `USLT` by store key; `POPM` by rating and play
   count together; `APIC` by description; binary frames by their own rules). A tag
   the allocation guard will not parse contributes nothing and discards nothing.
-  Since ID3v2.3 has no update flag, a run of v2.3 tags now resolves to the last of
-  them, where the scan used to read only the first. `SEEK` frames are not
+  ID3v2.3 has no update flag, but its §4.19 makes every later tag an update of
+  the one before, so a later v2.2 or v2.3 tag now overrides only the frames it
+  carries and keeps everything else, where the scan used to read only the first
+  tag. `SEEK` frames are not
   followed, and APEv2 tags remain out of scope.
 
 - **The published crates carry their license.** None of the six `.crate` files
