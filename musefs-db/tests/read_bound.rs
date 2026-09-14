@@ -30,6 +30,22 @@ const READERS: [&str; 5] = [
 
 #[test]
 fn a_hostile_backing_path_is_refused_without_being_loaded() {
+    // The gauge first: a load this test knows it causes has to show, or a mark
+    // that never moved would pass every bound below. `randomblob` makes SQLite
+    // hold every byte it returns.
+    let calibration = rusqlite::Connection::open_in_memory().unwrap();
+    sqlite_memory_highwater_for_test(true);
+    let baseline = sqlite_memory_used();
+    let loaded: Vec<u8> = calibration
+        .query_row("SELECT randomblob(?1)", [MAX_GROWTH], |r| r.get(0))
+        .unwrap();
+    let grew = sqlite_memory_highwater_for_test(false).saturating_sub(baseline);
+    assert!(
+        grew >= u64::try_from(loaded.len()).unwrap(),
+        "the high-water mark missed a {}-byte load: grew {grew}",
+        loaded.len()
+    );
+
     let fingerprint = "a".repeat(64);
     for (what, path_sql) in [
         ("a BLOB over the cap", "zeroblob(?1)"),

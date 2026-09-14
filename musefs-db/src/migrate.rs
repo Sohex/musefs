@@ -904,6 +904,7 @@ mod rejection_tests {
             vec![("track_art", 1), ("art", 1)],
             "the row and the link it would orphan: {found:?}"
         );
+        assert_eq!(found.relinked(), 0, "no correctly filed twin to move onto");
 
         let removed = pending.repair().unwrap();
         assert_eq!(removed.total(), 2);
