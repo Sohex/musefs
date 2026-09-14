@@ -71,6 +71,15 @@ and these packages adhere to [Semantic Versioning](https://semver.org/spec/v2.0.
   noted because a third-party writer doing it will now get an abort rather than
   silently leaving the old track serving stale bytes.
 
+- **Three more store rules a direct writer must follow** (musefs #758, #761,
+  #762). None changes what these helpers do, since they already comply, but a
+  third-party writer that breaks one now gets an abort:
+  - `tracks.backing_path` is at most 64 KiB, as bytes.
+  - A digest is 64 lowercase hex characters. That covers `art.sha256`, which
+    `upsert_art` already writes in that form, and the scanner-owned
+    `fingerprint` and `content_hash`.
+  - A track's `id` cannot be updated once assigned.
+
 - **`backing_path` is bytes.** Schema v4 changes the column from `TEXT` to
   `BLOB`, because a filesystem path is a byte string. SQLite never compares a
   `TEXT` value equal to a `BLOB`, so every query that matches on a path had to

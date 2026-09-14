@@ -192,15 +192,24 @@ served, and is skipped at scan time instead. Two shapes, caught two ways:
   file, rather than a walk over the whole audio region.
 
 A file whose final page does not end at its last byte — a truncated download,
-say — proves nothing either way, and still scans and serves as before.
+say — proves nothing either way, and still scans and serves as before. Neither
+does a tail that exhausts the check's budget of whole-page CRC validations
+(`MAX_TAIL_CRC_CHECKS`, 64): a crafted file can plant a length-to-EOF page
+candidate at every offset, and past the budget the scanner stops looking and
+accepts the file rather than paying for every one.
 
 The serve path carries the same check as a belt: a page whose serial is not the
-resolved file's is refused (`EIO`) rather than renumbered. That matters for rows
-written before this check existed, which keep their too-wide audio bounds. A
-rescan cannot fix one: the scanner refuses the file, so nothing is written and
-the row stays, failing every revalidate after it. `musefs revalidate --prune`
-removes such a row, and nothing else it refuses to probe
-([#747](https://github.com/Sohex/musefs/issues/747)).
+resolved file's is refused (`EIO`) rather than renumbered. That catches a chain
+the tail check could not prove, and it matters for rows written before this
+check existed, which keep their too-wide audio bounds. Neither a rescan nor a
+revalidate can fix such a row: the scanner refuses the file, so nothing is
+written and the row stays, failing every revalidate after it.
+`musefs revalidate --prune` removes it
+([#747](https://github.com/Sohex/musefs/issues/747)). Of the stored files a
+revalidate cannot re-probe, `--prune` removes only one refused for its shape,
+and only while the file still carries the stamp the refusing probe saw. A file
+that merely fails to parse or to read keeps its row, since a download still in
+progress looks the same.
 
 ## Quirks & invariants
 
@@ -221,5 +230,7 @@ removes such a row, and nothing else it refuses to probe
   blocks continue until one sets the last-block flag (and a `STREAMINFO` flagged
   last ends the run at packet 0). A *nonzero* count is taken at its word — the
   mapping requires a count it gives to be accurate, and reserves zero for the
-  unknown case. As with chained Ogg, a row scanned before this fix keeps its
-  wrong `audio_offset` until a rescan.
+  unknown case. A row scanned before this fix keeps its wrong `audio_offset`
+  until a revalidate re-probes the file, which the first revalidate after the
+  2.0.0 upgrade does. Unlike a chained Ogg, the file itself parses, so the
+  re-probe corrects the row rather than refusing it.

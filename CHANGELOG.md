@@ -484,7 +484,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   external edits stopped appearing until the row aged out or the mount
   restarted. The migration recreates the ring with the column's type enforced,
   and a row like that from a store written with constraints off now forces a
-  full rebuild instead.
+  full rebuild instead: `changelog_since` skips it and reports it in the new
+  `ChangelogRead::malformed`.
 
 - **A backing file rewritten mid-read fails that read, not the next one**
   ([#682](https://github.com/Sohex/musefs/issues/682)). The stamp check now runs

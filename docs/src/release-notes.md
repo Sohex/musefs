@@ -84,8 +84,9 @@ the full walkthrough and flag table.
 **2. Disk space, and the way back** ([#705]). Before asking anything, `migrate`
 checks for free space next to the store: the store's on-disk size (the database
 with its `-wal` and `-shm`) for the rewrite, and the same again for the
-snapshot when it goes beside the store. If that is not there it refuses up
-front, rather than failing part-way.
+snapshot when it is written to the same filesystem as the store — beside it by
+default, or at a `--snapshot` path on that filesystem. If that is not there it
+refuses up front, rather than failing part-way.
 
 The snapshot is a single compacted copy at `<db>.v<version>.bak`, where the
 version is the one the store is at when `migrate` runs — `library.db.v2.bak` for
@@ -133,7 +134,12 @@ through the catches.
 **4. Revalidate afterwards.** Accept `migrate`'s offer to revalidate your
 library, or run `musefs revalidate /path/to/music --db library.db` yourself. The
 upgrade leaves several things only a revalidate puts right, and it is the
-**first** revalidate that does it:
+**first** revalidate that does it.
+
+The offer walks your library without following symlinks, like `revalidate`
+without `--follow-symlinks`. If your library reaches its files through symlinks,
+decline it and run `musefs revalidate --follow-symlinks /path/to/music --db
+library.db` yourself, or those files keep everything below until you do:
 
 - **Fingerprints are cleared** ([#691]). Until they are recomputed, a moved file
   is not recognised: `scan` ingests it as a new track and leaves its curated
@@ -257,6 +263,10 @@ what changed underneath:
   `track_id`; delete it and insert it under the new one ([#717]).
 - A track's `id` cannot be changed once assigned. It is the identity the mount's
   refresh keys on, so the store refuses the update ([#762]).
+- A `structural_blocks` row cannot be updated in place ([#759]). The table is
+  scanner-owned and outside this contract, and the scanner replaces a track's
+  blocks by delete-then-insert; the store now refuses the `UPDATE` a writer
+  ignoring the contract could make.
 
 The scan-flag changes above need no plugin update: the packages have called the
 `revalidate` subcommand since their 1.2.0 and pass neither `--fast` nor
@@ -286,6 +296,9 @@ directly.
   `None` only for a virtual directory ([#696], [#725]).
 - `BackingStamp` gains `ino`. Compare a stored stamp with a live one through
   `matches_live`, not `==` ([#674]).
+- `ChangelogRead` gains `malformed`, set when `changelog_since` skipped a
+  changelog row whose track id was not an integer. The refresh treats that
+  window as a gap and rebuilds ([#760]).
 - `musefs_cli::run_scan` no longer takes `revalidate`, and takes a
   `musefs_cli::MatchMode` in place of `fast`/`strict`.
 - The public enums a caller matches on — the error types, `Format`, the scan and
@@ -345,6 +358,8 @@ directly.
 [#750]: https://github.com/Sohex/musefs/issues/750
 [#751]: https://github.com/Sohex/musefs/issues/751
 [#758]: https://github.com/Sohex/musefs/issues/758
+[#759]: https://github.com/Sohex/musefs/issues/759
+[#760]: https://github.com/Sohex/musefs/issues/760
 [#761]: https://github.com/Sohex/musefs/issues/761
 [#762]: https://github.com/Sohex/musefs/issues/762
 

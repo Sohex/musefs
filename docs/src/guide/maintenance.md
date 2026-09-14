@@ -250,6 +250,10 @@ upgraded ([#750](https://github.com/Sohex/musefs/issues/750)). The
 [release notes](../release-notes.md#upgrading-from-v130) list what else the
 first revalidate changes, including every synthesized file's modification time.
 
+The offer walks the library without following symlinks. If yours reaches its
+files through symlinks, decline it and run `musefs revalidate --follow-symlinks`
+over the library yourself.
+
 ### Flags, for scripts
 
 There is no terminal in a pipeline, so `migrate` never blocks waiting on one.
