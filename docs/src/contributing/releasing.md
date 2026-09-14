@@ -96,14 +96,14 @@ human side.
    ```bash
    docker run --rm \
      --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
-     -v "$PWD":/w -w /w alpine:3.23 \
+     -v "$PWD":/w -w /w alpine:3.24 \
      sh -c 'apk add --no-cache fuse3 ffmpeg >/dev/null && sh scripts/smoke-binary.sh ./bin/musefs'
    ```
 
    Another architecture needs user-mode QEMU (`qemu-user`, or
    `qemu-user-static` with binfmt registered) and adds `--platform
    linux/riscv64` to that `docker run`, installing `fuse3 ffmpeg` with the
-   image's package manager (`debian:trixie-slim` for gnu, `alpine:3.23` for
+   image's package manager (`debian:trixie-slim` for gnu, `alpine:3.24` for
    musl). The riscv64 smoke legs are emulated in CI and do not block the
    release.
 

@@ -499,8 +499,9 @@ const RETIRED_SCAN_ENV: &[(&str, &str)] = &[
     ("MUSEFS_STRICT", "set `MUSEFS_MATCH=strict` instead"),
 ];
 
-/// Refuse to run while any of `retired` is set. An empty value counts as unset,
-/// which is how clap treats a declared variable too.
+/// Refuse to run while any of `retired` is set. An empty value counts as unset
+/// here. clap does not treat a variable it declares that way: it hands the empty
+/// string to the flag's value parser, so e.g. `MUSEFS_QUIET=` is rejected.
 fn refuse_retired_env(retired: &[(&str, &str)]) -> Result<()> {
     for (var, instead) in retired {
         if std::env::var_os(var).is_some_and(|v| !v.is_empty()) {
