@@ -195,6 +195,22 @@ covering the full matrix including the FreeBSD VM e2e).
   cleanup of the published crates is needed.
 - GitHub asset upload is idempotent (`gh release upload --clobber`), so re-runs
   re-upload safely.
+- A CI job that fails on the tag for a reason outside the tree (a runner or
+  mirror outage, the FreeBSD VM image download returning a 5xx) is recovered
+  without re-tagging:
+  1. Re-run the tag's CI run: `gh run rerun <ci-run-id> --failed`. That re-runs
+     the failed jobs and everything that needs them, `ci-ok` included. Do the
+     same for `coverage.yml` if `coverage-ok` failed.
+  2. Wait for the re-run's `ci-ok` (and `coverage-ok`) to finish green. Order
+     matters here: while a re-run is still going, the newest *completed*
+     `ci-ok` is the failed one, and the gate fails as soon as it sees it.
+  3. Re-run the release: `gh run rerun <release-run-id> --failed`. The `gate`
+     job ignores check-runs that started before the release run was
+     *created*, which a re-run does not change, so the fresh `ci-ok` counts.
+     Its 45-minute wait starts over with each attempt.
+
+  Don't delete and re-push the tag to force a clean run: it starts the whole
+  matrix again, FreeBSD leg included, and gains nothing a re-run doesn't.
 
 **Post-release verification.**
 
