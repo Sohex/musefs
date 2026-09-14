@@ -199,6 +199,65 @@ fn a_rewrite_during_a_stateless_read_fails_that_read() {
     );
 }
 
+/// Run `read` with every backing `pread` coming back empty, as one past a
+/// truncation would, so the read fails on its own.
+fn with_empty_preads<T>(read: impl FnOnce() -> T) -> T {
+    crate::readahead::PREAD_CAP.with(|cap| cap.set(0));
+    let out = read();
+    crate::readahead::PREAD_CAP.with(|cap| cap.set(usize::MAX));
+    out
+}
+
+/// #682: a handle read that fails on its own while a rewrite lands reports the
+/// rewrite. A rewrite can surface as a short read before anything else, and
+/// `BackingChanged` is what retires the cached attrs (#668), so the detected
+/// drift outranks the read's own error. Checking the read's result first
+/// returned the I/O error instead.
+#[test]
+fn a_rewrite_outranks_a_failing_handle_read() {
+    let (_dir, fs, file_inode, backing) = mount_over_one_mp3();
+    let fh = fs.open_handle(file_inode).unwrap();
+
+    let alone = with_empty_preads(|| fs.read(file_inode, Some(fh), 0, 1 << 20));
+    assert!(
+        matches!(alone, Err(CoreError::Io(_))),
+        "without a rewrite the read reports its own failure: {:?}",
+        alone.map(|b| b.len())
+    );
+
+    set_after_backing_read_hook(rewrite_in_place(backing));
+    let read = with_empty_preads(|| fs.read(file_inode, Some(fh), 0, 1 << 20));
+    clear_after_backing_read_hook();
+    assert!(
+        matches!(read, Err(CoreError::BackingChanged(_))),
+        "{:?}",
+        read.map(|b| b.len())
+    );
+    fs.release_handle(fh);
+}
+
+/// #682, the stateless path: the same ordering, in `read_at_into`.
+#[test]
+fn a_rewrite_outranks_a_failing_stateless_read() {
+    let (_dir, fs, file_inode, backing) = mount_over_one_mp3();
+
+    let alone = with_empty_preads(|| fs.read(file_inode, None, 0, 1 << 20));
+    assert!(
+        matches!(alone, Err(CoreError::Io(_))),
+        "without a rewrite the read reports its own failure: {:?}",
+        alone.map(|b| b.len())
+    );
+
+    set_after_backing_read_hook(rewrite_in_place(backing));
+    let read = with_empty_preads(|| fs.read(file_inode, None, 0, 1 << 20));
+    clear_after_backing_read_hook();
+    assert!(
+        matches!(read, Err(CoreError::BackingChanged(_))),
+        "{:?}",
+        read.map(|b| b.len())
+    );
+}
+
 #[test]
 fn prefetch_workers_created_only_with_budget_and_flag() {
     use std::collections::BTreeMap;

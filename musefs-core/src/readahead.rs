@@ -674,10 +674,12 @@ pub(crate) fn pread_append(
 }
 
 // Caps each `pread` below, so a test can make a regular file return the short
-// reads a network filesystem can; nothing else reaches the resume path.
+// reads a network filesystem can; nothing else reaches the resume path. A cap
+// of zero makes every read come back empty, as one past a truncation does.
 #[cfg(test)]
 thread_local! {
-    static PREAD_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+    pub(crate) static PREAD_CAP: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(usize::MAX) };
 }
 
 fn pread_append_unwound(
