@@ -995,8 +995,9 @@ enum Resolution {
 enum PlusEmit {
     /// With the file's own attrs.
     Attrs(PlusEntry),
-    /// Listed, with attrs the kernel will refuse to link: see
-    /// [`unlinkable_plus_entry`].
+    /// Listed without attrs of its own: sent with the attrs musefs last sent the
+    /// kernel for the inode, or failing those, attrs the kernel refuses to link.
+    /// See [`plus_entry_for`].
     Unlinkable,
 }
 
@@ -1053,6 +1054,9 @@ struct PlusFill {
     reply: Mutex<Option<ReplyDirectoryPlus>>,
     core: Arc<Musefs>,
     pool: Workers,
+    /// What the kernel may hold for each file inode: the fallback source for an
+    /// entry without attrs, and updated with every entry added.
+    sent: Arc<SentAttrs>,
     style: AttrStyle,
     expose_metrics: bool,
     /// The generation tag every cookie of this fill carries (#695).
@@ -1148,10 +1152,15 @@ const UNLINKABLE_SIZE: u64 = u64::MAX;
 /// `readdirplus` dirent before it links the entry, and `fuse_direntplus_link`
 /// runs `fuse_invalid_attr` before it touches the dcache or any inode. An
 /// out-of-range size fails that check, so the name is listed, nothing is
-/// linked, and the kernel sends a `FORGET` for the entry that musefs ignores.
-/// The check is in Linux from 5.5. The zero TTL is a second line of defence:
-/// were the entry ever linked, the kernel would still revalidate it on the next
-/// access.
+/// linked, and the kernel sends a `FORGET` for an inode it never held.
+///
+/// The check arrived with "fuse: verify attributes" (eb59bd17, Linux 5.5) and
+/// was backported to 5.4.3, 4.19.89, 4.14.159, 4.9.207, 4.4.207 and 3.16.85. A
+/// kernel without it writes the size into an inode it already holds, as a
+/// negative `i_size`, and truncates that inode's page cache. So this entry is
+/// the last resort: [`fallback_plus_entry`] sends it only for an inode musefs
+/// has sent the kernel no attrs for, and the zero TTL is a second line of
+/// defence, sending the next access back to `lookup`.
 fn unlinkable_plus_entry(child: u64, kind: FileType, style: &AttrStyle) -> PlusEntry {
     let node = if kind == FileType::Directory {
         (FileType::Directory, style.dir_mode, 2)
@@ -1171,10 +1180,97 @@ fn unlinkable_plus_entry(child: u64, kind: FileType, style: &AttrStyle) -> PlusE
     }
 }
 
+/// The attrs musefs last sent the kernel for each file inode the kernel may still
+/// hold, so that an unresolvable `readdirplus` entry can repeat them rather than
+/// send a size an old kernel would apply (see [`fallback_plus_entry`]).
+///
+/// Recorded wherever a reply carries a file's attrs — `lookup`, `getattr`, and
+/// each `readdirplus` entry added to a page — before that reply goes out, so the
+/// kernel's `FORGET` for it always lands after the record. Dropped where the
+/// kernel stops holding them: at `FORGET`, which the kernel sends only when it
+/// evicts the inode, and when a refresh invalidates the inode, whose attrs the
+/// kernel then discards. Directories are not recorded: their attrs are static,
+/// and a directory entry never needs the fallback.
+///
+/// Two replies for one inode can reach the kernel in the other order from the
+/// one they were recorded in, so the record may be the earlier or the later of
+/// two real attr sets for the file. Either is the file's own, which is all the
+/// fallback needs: never the out-of-range size.
+#[derive(Default)]
+struct SentAttrs(Mutex<std::collections::HashMap<u64, FileAttr>>);
+
+impl SentAttrs {
+    /// Note `attr` as what the kernel is about to hold, if it is a file's.
+    fn record(&self, attr: &FileAttr) {
+        if attr.kind == FileType::RegularFile {
+            self.map().insert(attr.ino.0, *attr);
+        }
+    }
+
+    /// The kernel no longer holds attrs for `ino`.
+    fn forget(&self, ino: u64) {
+        self.map().remove(&ino);
+    }
+
+    /// The attrs last sent for `ino`, if the kernel may still hold them.
+    fn last(&self, ino: u64) -> Option<FileAttr> {
+        self.map().get(&ino).copied()
+    }
+
+    fn map(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<u64, FileAttr>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// The entry for a page's first entry whose attrs could not be resolved: the
+/// attrs musefs last sent the kernel for that inode, with a zero TTL, or
+/// [`unlinkable_plus_entry`] when there are none.
+///
+/// If the kernel holds attrs for the inode at all, it holds `last_sent`, so
+/// linking them changes nothing on any kernel, and the zero TTL sends the next
+/// access back to `getattr` and its real error. Without them the kernel holds no
+/// attrs musefs sent, and the out-of-range size has nothing to overwrite.
+fn fallback_plus_entry(
+    last_sent: Option<FileAttr>,
+    child: u64,
+    kind: FileType,
+    style: &AttrStyle,
+) -> PlusEntry {
+    match last_sent {
+        Some(attr) if attr.ino == INodeNo(child) => PlusEntry {
+            attr,
+            ttl: Duration::ZERO,
+        },
+        _ => unlinkable_plus_entry(child, kind, style),
+    }
+}
+
+/// The attrs one planned entry goes out with: its own when it has them, the
+/// fallback when it has none.
+fn plus_entry_for(
+    emit: PlusEmit,
+    child: u64,
+    kind: FileType,
+    sent: &SentAttrs,
+    style: &AttrStyle,
+) -> PlusEntry {
+    match emit {
+        PlusEmit::Attrs(entry) => entry,
+        PlusEmit::Unlinkable => fallback_plus_entry(sent.last(child), child, kind, style),
+    }
+}
+
 /// Start filling `reply` with `listing` from `page` (#667).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is one independent input of the fill; a struct would only rename them"
+)]
 fn start_plus_fill(
     core: &Arc<Musefs>,
     pool: &Workers,
+    sent: &Arc<SentAttrs>,
     style: AttrStyle,
     expose_metrics: bool,
     listing: Arc<DirListing>,
@@ -1187,6 +1283,7 @@ fn start_plus_fill(
         reply: Mutex::new(Some(reply)),
         core: Arc::clone(core),
         pool: pool.clone(),
+        sent: Arc::clone(sent),
         style,
         expose_metrics,
         cookie_tag: page.tag,
@@ -1286,10 +1383,7 @@ fn finish_plus_round(round: &PlusRound) {
     let plan = plan_round(&slots, round.start == fill.page_start);
     for (i, emit) in (round.start..).zip(&plan.emits) {
         let (child, kind, name) = &fill.listing[i];
-        let entry = match emit {
-            PlusEmit::Attrs(entry) => *entry,
-            PlusEmit::Unlinkable => unlinkable_plus_entry(*child, *kind, &fill.style),
-        };
+        let entry = plus_entry_for(*emit, *child, *kind, &fill.sent, &fill.style);
         // The stored cookie resumes at the *next* entry, as in
         // `reply_dir_entries`: the kernel hands it back to resume from here.
         if reply.add(
@@ -1303,6 +1397,10 @@ fn finish_plus_round(round: &PlusRound) {
             // Buffer full: what fits is the page, and the kernel asks again
             // from the last accepted offset.
             return reply.ok();
+        }
+        if let PlusEmit::Attrs(resolved) = emit {
+            // In the page now, so about to be what the kernel holds.
+            fill.sent.record(&resolved.attr);
         }
     }
     if plan.ends_page || next >= fill.listing.len() {
@@ -1505,6 +1603,9 @@ pub struct MusefsFs {
     /// choose per listing, so whether a mount is getting the folded-in lookups
     /// at all is otherwise unobservable from the daemon (#667).
     readdirplus_calls: Arc<AtomicU64>,
+    /// The attrs last sent the kernel for each file inode it may still hold: the
+    /// fallback for a `readdirplus` entry that cannot be resolved.
+    sent_attrs: Arc<SentAttrs>,
     /// In-flight foreground-read counter. `read` reserves a slot before enqueuing;
     /// over `MAX_INFLIGHT_READS` the read is rejected with `EAGAIN`, capping the
     /// otherwise-unbounded pool queue (#308).
@@ -1567,6 +1668,7 @@ impl MusefsFs {
             dir_handle_rejections: Arc::new(AtomicU64::new(0)),
             dir_handle_cap,
             readdirplus_calls: Arc::new(AtomicU64::new(0)),
+            sent_attrs: Arc::new(SentAttrs::default()),
             inflight_reads: Arc::new(AtomicUsize::new(0)),
             read_errors: Arc::new(AtomicU64::new(0)),
             metrics_handles: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -1602,9 +1704,13 @@ impl MusefsFs {
         let core = Arc::clone(&self.core);
         if self.config.keep_cache {
             let notifier = Arc::clone(&self.notifier);
+            let sent = Arc::clone(&self.sent_attrs);
             execute_guarded(&self.refresh, "poll_refresh_notify", move || {
                 let _guard = guard;
                 if let Err(e) = core.poll_refresh_notify(|ino| {
+                    // The kernel is about to discard what it holds for the
+                    // inode, so those attrs are no longer anything to preserve.
+                    sent.forget(ino);
                     if let Some(n) = notifier.get()
                         && let Err(inval_err) = n.inval_inode(INodeNo(ino), 0, 0)
                     {
@@ -1734,6 +1840,7 @@ impl Filesystem for MusefsFs {
             return reply.error(fuser::Errno::ENOENT);
         };
         let core = Arc::clone(&self.core);
+        let sent = Arc::clone(&self.sent_attrs);
         let (uid, gid, fm, dm, mt, ttl) = (
             self.uid,
             self.gid,
@@ -1751,11 +1858,11 @@ impl Filesystem for MusefsFs {
                 child,
                 std::panic::AssertUnwindSafe(|| core.getattr(child)),
             ) {
-                Ok(attr) => reply.entry(
-                    &ttl,
-                    &to_file_attr(&attr, uid, gid, fm, dm, mt),
-                    Generation(0),
-                ),
+                Ok(attr) => {
+                    let attr = to_file_attr(&attr, uid, gid, fm, dm, mt);
+                    sent.record(&attr);
+                    reply.entry(&ttl, &attr, Generation(0));
+                }
                 Err(e) => reply.error(e),
             }
         });
@@ -1781,6 +1888,7 @@ impl Filesystem for MusefsFs {
             return reply.attr(&self.config.ttl, &attr);
         }
         let core = Arc::clone(&self.core);
+        let sent = Arc::clone(&self.sent_attrs);
         let (uid, gid, fm, dm, mt, ttl) = (
             self.uid,
             self.gid,
@@ -1798,7 +1906,11 @@ impl Filesystem for MusefsFs {
                 ino.0,
                 std::panic::AssertUnwindSafe(|| core.getattr(ino.0)),
             ) {
-                Ok(attr) => reply.attr(&ttl, &to_file_attr(&attr, uid, gid, fm, dm, mt)),
+                Ok(attr) => {
+                    let attr = to_file_attr(&attr, uid, gid, fm, dm, mt);
+                    sent.record(&attr);
+                    reply.attr(&ttl, &attr);
+                }
                 Err(e) => reply.error(e),
             }
         });
@@ -1977,6 +2089,13 @@ impl Filesystem for MusefsFs {
             fh.0,
         );
         reply.ok();
+    }
+
+    /// The kernel evicted `ino`: it sends `FORGET` only then, with the inode's
+    /// whole lookup count, so it holds no attrs for the inode any more and the
+    /// last ones sent are no fallback. fuser's `batch_forget` calls this per node.
+    fn forget(&self, _req: &Request, ino: INodeNo, _nlookup: u64) {
+        self.sent_attrs.forget(ino.0);
     }
 
     fn flush(
@@ -2229,6 +2348,7 @@ impl Filesystem for MusefsFs {
             return start_plus_fill(
                 &self.core,
                 &self.pool,
+                &self.sent_attrs,
                 style,
                 true,
                 Arc::new(metrics_dir::dir_listing()),
@@ -2254,6 +2374,7 @@ impl Filesystem for MusefsFs {
             let handles = Arc::clone(&self.dir_handles);
             let stateless = Arc::clone(&self.stateless_listings);
             let pool = self.pool.clone();
+            let sent = Arc::clone(&self.sent_attrs);
             return self.pool.submit("readdirplus", move || {
                 let loaded = core.tree_snapshot();
                 let latest = || core.tree_snapshot();
@@ -2277,7 +2398,16 @@ impl Filesystem for MusefsFs {
                 });
                 match page {
                     Ok(StatelessPage::Page(listing, start)) => {
-                        start_plus_fill(&core, &pool, style, expose_metrics, listing, start, reply);
+                        start_plus_fill(
+                            &core,
+                            &pool,
+                            &sent,
+                            style,
+                            expose_metrics,
+                            listing,
+                            start,
+                            reply,
+                        );
                     }
                     Ok(StatelessPage::Stale) => {
                         reply.error(stale_enumeration("readdirplus", ino.0));
@@ -2289,6 +2419,7 @@ impl Filesystem for MusefsFs {
         start_plus_fill(
             &self.core,
             &self.pool,
+            &self.sent_attrs,
             style,
             expose_metrics,
             listing,
@@ -3520,6 +3651,129 @@ mod tests {
         );
         assert!(dir.attr.size > u64::try_from(i64::MAX).unwrap());
         assert_eq!(dir.ttl, Duration::ZERO);
+    }
+
+    /// A regular file's attrs for inode `ino` with `size`, as a reply carries them.
+    fn file_attr(ino: u64, size: u64) -> FileAttr {
+        let style = test_style();
+        make_attr(
+            ino,
+            size,
+            (FileType::RegularFile, style.file_mode, 1),
+            style.uid,
+            style.gid,
+            style.mount_time,
+        )
+    }
+
+    /// The record holds the last attrs sent for a file inode until the kernel
+    /// forgets the inode or a refresh invalidates it, and never a directory's.
+    #[test]
+    fn sent_attrs_hold_the_last_file_attrs_until_forgotten() {
+        let style = test_style();
+        let sent = SentAttrs::default();
+        assert!(sent.last(9).is_none(), "nothing sent yet");
+
+        sent.record(&file_attr(9, 100));
+        sent.record(&file_attr(9, 200));
+        assert_eq!(
+            sent.last(9).map(|attr| attr.size),
+            Some(200),
+            "the last reply is the one the kernel may hold"
+        );
+
+        sent.record(&make_attr(
+            7,
+            0,
+            (FileType::Directory, style.dir_mode, 2),
+            style.uid,
+            style.gid,
+            style.mount_time,
+        ));
+        assert!(sent.last(7).is_none(), "a directory is never recorded");
+
+        sent.forget(9);
+        assert!(sent.last(9).is_none(), "a forgotten inode has no fallback");
+        sent.forget(9);
+        assert!(sent.last(9).is_none(), "forgetting twice is harmless");
+    }
+
+    /// A page's first entry that cannot be resolved goes out with the attrs musefs
+    /// last sent for that inode and a zero TTL: if the kernel holds attrs for it at
+    /// all it holds those, so an old kernel without `fuse_invalid_attr` has nothing
+    /// to overwrite. Only an inode with no record gets the size the kernel refuses.
+    #[test]
+    fn an_unresolvable_first_entry_falls_back_to_the_attrs_last_sent() {
+        let style = test_style();
+        let entry = fallback_plus_entry(Some(file_attr(9, 4242)), 9, FileType::RegularFile, &style);
+        assert_eq!(entry.attr.size, 4242, "the size last sent");
+        assert_eq!(entry.attr.ino, INodeNo(9));
+        assert_eq!(entry.attr.kind, FileType::RegularFile);
+        assert_eq!(
+            entry.ttl,
+            Duration::ZERO,
+            "the next access goes back to getattr"
+        );
+
+        let unlinkable = unlinkable_plus_entry(9, FileType::RegularFile, &style);
+        let never_sent = fallback_plus_entry(None, 9, FileType::RegularFile, &style);
+        assert_eq!(
+            (never_sent.attr.size, never_sent.ttl),
+            (unlinkable.attr.size, Duration::ZERO),
+            "with no record, the size the kernel refuses"
+        );
+        let another_inode =
+            fallback_plus_entry(Some(file_attr(8, 4242)), 9, FileType::RegularFile, &style);
+        assert_eq!(
+            another_inode.attr.size, unlinkable.attr.size,
+            "another inode's attrs are never sent for this one"
+        );
+    }
+
+    /// An entry with attrs of its own goes out with them; only an entry without
+    /// attrs takes the record, and not once the record is forgotten, as it is when
+    /// a refresh invalidates the inode (#778): the kernel dropped those attrs.
+    #[test]
+    fn plus_entry_for_uses_the_record_only_for_an_entry_without_attrs() {
+        let style = test_style();
+        let sent = SentAttrs::default();
+        sent.record(&file_attr(9, 4242));
+
+        let resolved = PlusEntry {
+            attr: file_attr(9, 5000),
+            ttl: style.ttl,
+        };
+        let passed = plus_entry_for(
+            PlusEmit::Attrs(resolved),
+            9,
+            FileType::RegularFile,
+            &sent,
+            &style,
+        );
+        assert_eq!(
+            (passed.attr.size, passed.ttl),
+            (5000, style.ttl),
+            "resolved attrs go out as resolved"
+        );
+
+        let fell_back = plus_entry_for(
+            PlusEmit::Unlinkable,
+            9,
+            FileType::RegularFile,
+            &sent,
+            &style,
+        );
+        assert_eq!((fell_back.attr.size, fell_back.ttl), (4242, Duration::ZERO));
+
+        sent.forget(9);
+        let invalidated = plus_entry_for(
+            PlusEmit::Unlinkable,
+            9,
+            FileType::RegularFile,
+            &sent,
+            &style,
+        );
+        assert_eq!(invalidated.attr.size, UNLINKABLE_SIZE);
     }
 
     /// A resolved entry for `plan_round`, told apart by its inode.

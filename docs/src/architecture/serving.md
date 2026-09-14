@@ -172,14 +172,30 @@ Every page still makes progress. A page's first entry is resolved even when
 the pool is over its admission cap (below), and an entry whose resolution
 failed partway down a page is tried again as the first entry of the next one,
 which is what a transient failure, a blip on an NFS backing, needs. An entry
-that still cannot be resolved as a page's first is listed with a size no file
-can have and a zero TTL: the kernel emits the name, refuses to link attributes
-that fail its own validation, and caches nothing. The client's own `lookup`
-then reports the real error, so the file neither vanishes from `ls` nor stalls
-the listing. That refusal relies on the kernel validating attributes before it
-links them, which Linux does from 5.5; an older kernel would apply the
-out-of-range size, so there a file that persistently fails to resolve can still
-reach an inode the kernel holds. The over-cap path does not depend on it.
+that still cannot be resolved as a page's first is listed with the attributes
+musefs last sent the kernel for that inode, and a zero TTL. The mount keeps
+those attributes for every file inode from each `lookup`, `getattr` and
+`readdirplus` reply, and drops them when the kernel forgets the inode, which it
+does only on eviction, or when a refresh invalidates it. If the kernel holds
+attributes for the inode at all, it holds those, so linking them changes
+nothing, and the zero TTL sends the client's next access back to `getattr` and
+its real error. The file neither vanishes from `ls` nor stalls the listing.
+None of this changes what `getattr` serves or when its size cache lets go of a
+stale entry.
+
+Only an inode with no such record is listed with a size no file can have. The
+kernel emits the name and refuses the entry before it links anything, in
+`fuse_invalid_attr`. That check arrived with "fuse: verify attributes"
+(eb59bd17, Linux 5.5) and was backported to 5.4.3, 4.19.89, 4.14.159, 4.9.207,
+4.4.207 and 3.16.85. musefs documents no minimum kernel. On a kernel without
+the check — 3.10, a series that reached end of life before December 2019, or a
+vendor kernel that did not take the patch — the size would be written into an
+inode the kernel holds as a negative `i_size`, and that inode's page cache
+truncated. That is why the out-of-range size goes only where the kernel holds no
+attributes musefs sent: an inode it has never been told about, or one whose
+attributes it has discarded, such as an inode a refresh handed to another track
+([#778](https://github.com/Sohex/musefs/issues/778)). The over-cap path depends
+on none of this.
 
 ### Admission to the worker pool
 
