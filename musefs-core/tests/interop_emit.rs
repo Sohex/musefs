@@ -481,6 +481,37 @@ fn emit_interop_fixtures() {
         });
     }
 
+    // WAV, big-endian (RIFX, #770). mutagen reads only RIFF, so the Python side
+    // reads this one through libsndfile instead.
+    {
+        let bytes = fixtures::wav_in(
+            &[0x0102i16, -2, 300, -32768, 32767, 5, 6, 7],
+            musefs_format::wav::ByteOrder::Big,
+        );
+        let b = musefs_format::wav::locate_audio(&bytes).unwrap();
+        let (ao, al) = emit(
+            &dir.join("src_rifx.wav"),
+            &dir.join("out_rifx.wav"),
+            &bytes,
+            Format::Wav,
+            b.audio_offset,
+            b.audio_length,
+            &[],
+        );
+        manifest.push(ManifestRow {
+            file: "out_rifx.wav",
+            source_file: "src_rifx.wav",
+            title: "Interop Title",
+            artist: "Interop Artist",
+            source_audio_offset: b.audio_offset,
+            source_audio_length: b.audio_length,
+            synth_audio_offset: ao,
+            synth_audio_length: al,
+            ogg_payload_only: false,
+            covr_count: 0,
+        });
+    }
+
     // ── Binary-frame fixtures (spec §Testing: POPM/UFID/PRIV/GEOB + MP4 ----) ──
     // Known ASCII payloads so the Python side compares without hex.
     let priv_owner = "musefs";

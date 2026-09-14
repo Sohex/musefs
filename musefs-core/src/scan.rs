@@ -1272,14 +1272,27 @@ fn probe_body(
     // full-buffer parse (the payload isn't present to bound), yet its `fmt `/`data`
     // headers sit at the front: trust the declared bounds and serve the audio,
     // accepting the loss of any tag chunks trailing the payload.
-    if has_ext(path, "wav")
-        && file_len > MAX_PROBE_BYTES
-        && let Ok(bounds) = wav::locate_audio_at_ceiling(&prefix, file_len)
-    {
-        return Ok(ProbeBody::Parsed(wav_probed(&prefix, &bounds)));
+    // A `LIST('wavl')` waveform is refused here by name too, as the bounded path
+    // refuses it for a file under the ceiling (#769).
+    if has_ext(path, "wav") && file_len > MAX_PROBE_BYTES {
+        match wav::locate_audio_at_ceiling(&prefix, file_len) {
+            Ok(bounds) => return Ok(ProbeBody::Parsed(wav_probed(&prefix, &bounds))),
+            Err(musefs_format::FormatError::WavWaveList) => {
+                return Ok(ProbeBody::Failed(Failure::new(
+                    SkipReason::Unsupported,
+                    format!("skipping {}: {WAVL_REFUSAL}", path.display()),
+                )));
+            }
+            Err(_) => {}
+        }
     }
     Ok(ProbeBody::Failed(unparseable(path, file_len)))
 }
+
+/// Why a WAV whose waveform is a `LIST('wavl')` is refused (#769). No mainstream
+/// decoder plays one, so it is `unsupported` — a property of the file that
+/// `revalidate --prune` may act on — rather than unparseable.
+const WAVL_REFUSAL: &str = "WAVE waveform stored as LIST('wavl')";
 
 /// The "nothing parsed" verdict for one file, naming the probe ceiling when the
 /// file is large enough that the ceiling is the likely reason.
@@ -1391,6 +1404,7 @@ fn probe_prefix(
         match wav::locate_audio_bounded(prefix, file_len) {
             Ok(Extent::Complete(b)) => Probe::Done(wav_probed(prefix, &b)),
             Ok(Extent::NeedMore { up_to }) => Probe::NeedMore(up_to),
+            Err(musefs_format::FormatError::WavWaveList) => Probe::Unsupported(WAVL_REFUSAL),
             Err(_) => Probe::Skip(UNPARSEABLE),
         }
     } else {

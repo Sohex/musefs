@@ -70,7 +70,10 @@ streaming and distinct Opus/Vorbis/OggFLAC fixtures.
 ### Independent-reader interop (mutagen)
 
 Asserts that an independent ecosystem reader sees the tags musefs
-synthesizes, across all five formats:
+synthesizes, across all five formats. mutagen refuses big-endian RIFX
+outright, so the RIFX WAV fixture is read through libsndfile (the
+`soundfile` package) instead, which also decodes its samples against the
+source's:
 
 ```bash
 pip install -r tests/interop/requirements.txt pytest

@@ -6,6 +6,7 @@ import mutagen
 import mutagen.flac
 import mutagen.id3
 import mutagen.mp4
+import soundfile
 
 # Mirrored byte-for-byte from musefs-core/tests/interop_emit.rs (COVR_JPEG/COVR_PNG).
 COVR_JPEG = b"\xff\xd8\xff\xe0interop-jpeg-cover"
@@ -19,7 +20,23 @@ PICTURES = [
 ]
 
 # Every fixture emit_interop_fixtures writes a manifest row for.
-MANIFEST_FILES = {"out.flac", "out.mp3", "out_multi.mp3", "out.m4a", "out.ogg", "out.wav"}
+MANIFEST_FILES = {
+    "out.flac",
+    "out.mp3",
+    "out_multi.mp3",
+    "out.m4a",
+    "out.ogg",
+    "out.wav",
+    "out_rifx.wav",
+}
+
+# The samples interop_emit.rs's RIFX fixture holds, big-endian on disk.
+RIFX_SAMPLES = [0x0102, -2, 300, -32768, 32767, 5, 6, 7]
+
+
+def _is_rifx(path):
+    with open(path, "rb") as fh:
+        return fh.read(4) == b"RIFX"
 
 
 def _synchsafe(b):
@@ -52,6 +69,12 @@ def _appended_id3v2_tags(data):
 
 def _read_tag(path, key):
     """Read a single tag value from an audio file using mutagen."""
+    # RIFX (big-endian WAVE): mutagen's RIFF reader refuses it outright, so read
+    # the LIST/INFO chunk through libsndfile, which reads RIFX natively.
+    if _is_rifx(path):
+        with soundfile.SoundFile(path) as f:
+            return getattr(f, key) or None
+
     # M4A: read via real mutagen.mp4.MP4 (the interop fixture includes mdhd +
     # stsd so mutagen's stream-info parser can open the file).
     if path.endswith(".m4a"):
@@ -178,6 +201,20 @@ def test_mp3_backing_tags_at_either_end_are_not_served():
     assert out[served.size :] == audio
     for stale in (b"Front Title", b"Back Title", b"3DI"):
         assert stale not in out, f"{stale!r} survived into the served file"
+
+
+def test_rifx_is_served_as_rifx_and_decodes_like_its_source():
+    """A big-endian RIFX source is served as RIFX (#770), and libsndfile decodes
+    the served file to exactly the source's samples. Decoding them as the
+    fixture's values also proves the preserved `fmt ` is read big-endian."""
+    base = os.environ["MUSEFS_INTEROP_DIR"]
+    src = os.path.join(base, "src_rifx.wav")
+    out = os.path.join(base, "out_rifx.wav")
+    assert _is_rifx(src) and _is_rifx(out)
+    src_samples, src_rate = soundfile.read(src, dtype="int16")
+    out_samples, out_rate = soundfile.read(out, dtype="int16")
+    assert src_samples.tolist() == RIFX_SAMPLES
+    assert (out_samples.tolist(), out_rate) == (RIFX_SAMPLES, src_rate)
 
 
 def test_binary_frames_survive():

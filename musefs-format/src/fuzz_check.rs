@@ -231,34 +231,58 @@ pub mod fixtures {
     /// little-endian sample bytes. Avoids hound (a dev-dep) so the fixture is
     /// usable from the fuzz crate as well as tests.
     pub fn wav(samples: &[i16]) -> Vec<u8> {
+        wav_in(samples, crate::wav::ByteOrder::Little)
+    }
+
+    /// [`wav`] in either byte order. `Big` builds the `RIFX` twin (#770): the
+    /// form size, both chunk sizes, every `fmt ` field and every sample are
+    /// big-endian.
+    pub fn wav_in(samples: &[i16], order: crate::wav::ByteOrder) -> Vec<u8> {
+        use crate::wav::ByteOrder;
+        let big = order == ByteOrder::Big;
+        let u16_bytes = |v: u16| {
+            if big {
+                v.to_be_bytes()
+            } else {
+                v.to_le_bytes()
+            }
+        };
+        let u32_bytes = |v: u32| {
+            if big {
+                v.to_be_bytes()
+            } else {
+                v.to_le_bytes()
+            }
+        };
+
         // fmt  chunk payload: PCM format (16 bytes)
         let mut fmt = Vec::with_capacity(16);
-        fmt.extend_from_slice(&1u16.to_le_bytes()); // wFormatTag = PCM
-        fmt.extend_from_slice(&1u16.to_le_bytes()); // nChannels = 1
-        fmt.extend_from_slice(&44_100u32.to_le_bytes()); // nSamplesPerSec
-        fmt.extend_from_slice(&88_200u32.to_le_bytes()); // nAvgBytesPerSec = 44100*2
-        fmt.extend_from_slice(&2u16.to_le_bytes()); // nBlockAlign = 2
-        fmt.extend_from_slice(&16u16.to_le_bytes()); // wBitsPerSample
+        fmt.extend_from_slice(&u16_bytes(1)); // wFormatTag = PCM
+        fmt.extend_from_slice(&u16_bytes(1)); // nChannels = 1
+        fmt.extend_from_slice(&u32_bytes(44_100)); // nSamplesPerSec
+        fmt.extend_from_slice(&u32_bytes(88_200)); // nAvgBytesPerSec = 44100*2
+        fmt.extend_from_slice(&u16_bytes(2)); // nBlockAlign = 2
+        fmt.extend_from_slice(&u16_bytes(16)); // wBitsPerSample
 
         let mut data_payload: Vec<u8> = Vec::with_capacity(samples.len() * 2);
         for &s in samples {
-            data_payload.extend_from_slice(&s.to_le_bytes());
+            data_payload.extend_from_slice(&u16_bytes(s.cast_unsigned()));
         }
 
-        // Chunk helpers: 4-byte id + LE 32-bit size + payload.
+        // Chunk helpers: 4-byte id + 32-bit size + payload.
         let mut fmt_chunk = b"fmt ".to_vec();
-        fmt_chunk.extend_from_slice(&u32::try_from(fmt.len()).unwrap().to_le_bytes());
+        fmt_chunk.extend_from_slice(&u32_bytes(u32::try_from(fmt.len()).unwrap()));
         fmt_chunk.extend_from_slice(&fmt);
 
         let mut data_chunk = b"data".to_vec();
-        data_chunk.extend_from_slice(&u32::try_from(data_payload.len()).unwrap().to_le_bytes());
+        data_chunk.extend_from_slice(&u32_bytes(u32::try_from(data_payload.len()).unwrap()));
         data_chunk.extend_from_slice(&data_payload);
 
         // RIFF size = 4 ("WAVE") + fmt_chunk.len() + data_chunk.len()
         let riff_size = u32::try_from(4 + fmt_chunk.len() + data_chunk.len()).unwrap();
         let mut out = Vec::with_capacity(12 + fmt_chunk.len() + data_chunk.len());
-        out.extend_from_slice(b"RIFF");
-        out.extend_from_slice(&riff_size.to_le_bytes());
+        out.extend_from_slice(if big { b"RIFX" } else { b"RIFF" });
+        out.extend_from_slice(&u32_bytes(riff_size));
         out.extend_from_slice(b"WAVE");
         out.extend_from_slice(&fmt_chunk);
         out.extend_from_slice(&data_chunk);

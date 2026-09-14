@@ -20,6 +20,11 @@ pub enum FormatError {
     Mp4Tracks(String),
     #[error("not a supported WAV/RIFF file")]
     NotWav,
+    /// The WAVE waveform is a `LIST('wavl')` of `data`/`slnt` chunks instead of
+    /// one top-level `data` chunk. Legal RIFF, but no mainstream decoder plays
+    /// it, so it is refused by name rather than as "not a WAV" (#769).
+    #[error("unsupported WAV layout: waveform stored as LIST('wavl')")]
+    WavWaveList,
     #[error("synthesized region layout violates producer invariants: {0}")]
     InvalidLayout(#[from] crate::layout::LayoutError),
     #[error("producer invariant violated: {0}")]
