@@ -38,6 +38,13 @@ a file that fails to parse, or cannot be read, keeps its row. Without
 a track's curated metadata along with its row, so a transient mount blip or an
 unplugged drive can't silently drop your edits.
 
+The scope is the track's stored path, which is always fully resolved. With
+`--follow-symlinks`, a track reached through a symlink is stored under the path
+it resolves to, so `revalidate --prune /music --follow-symlinks` never prunes a
+track whose file resolved to `/nas/...`, even once that file is gone. Prune such
+tracks by running `revalidate --prune` over the directory their files resolve
+into.
+
 It shares `scan`'s probe flags — `--jobs N`, `--follow-symlinks`, `--quiet` /
 `-q`, and `--checksum` (a row missing a checksum that tier computes is
 re-probed to fill it, whether or not its file changed) — and shows the same
@@ -258,9 +265,12 @@ upgraded ([#750](https://github.com/Sohex/musefs/issues/750)). The
 [release notes](../release-notes.md#upgrading-from-v130) list what else the
 first revalidate changes, including every synthesized file's modification time.
 
-The offer walks the library without following symlinks. If yours reaches its
-files through symlinks, decline it and run `musefs revalidate --follow-symlinks`
-over the library yourself.
+The offer covers the deepest directory every stored track shares. Stored paths
+are already resolved, symlinks included, so walking that directory reaches every
+track without following any symlink. The one library it cannot cover is one
+whose tracks resolve into unrelated trees, such as symlinks into two separate
+disks: they share no directory below `/`, so `migrate` prints the command
+instead of offering it, and you run `musefs revalidate` over each tree.
 
 The report is printed once, but the gap it describes lasts. So until every
 track has been re-probed, `mount`, `scan` and `revalidate` each print a warning

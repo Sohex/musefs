@@ -136,10 +136,12 @@ library, or run `musefs revalidate /path/to/music --db library.db` yourself. The
 upgrade leaves several things only a revalidate puts right, and it is the
 **first** revalidate that does it.
 
-The offer walks your library without following symlinks, like `revalidate`
-without `--follow-symlinks`. If your library reaches its files through symlinks,
-decline it and run `musefs revalidate --follow-symlinks /path/to/music --db
-library.db` yourself, or those files keep everything below until you do. Until
+The offer revalidates the deepest directory every stored track shares. Stored
+paths are already resolved, symlinks included, so that walk reaches every track
+without following symlinks. If your tracks resolve into unrelated trees — a
+library of symlinks pointing into two different disks, say — they share no
+directory below `/`, so `migrate` makes no offer and prints the command instead:
+run `musefs revalidate` over each tree yourself. Until
 every track has been re-probed, `mount`, `scan` and `revalidate` each warn with
 the number still waiting ([#705]). That number counts tracks with neither a
 fingerprint nor an inode, so on Linux a track on FAT or exFAT that was scanned at
