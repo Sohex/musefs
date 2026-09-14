@@ -906,6 +906,58 @@ fn revalidate_settles_an_unrecorded_inode_only_where_the_filesystem_keeps_none()
     assert!(db.list_tracks().unwrap()[0].backing_ino.is_some());
 }
 
+/// #757: re-probing a file that has not changed leaves its served mtime exactly
+/// as it was, the whole second (`updated_at`) and the nanoseconds
+/// (`content_version`) alike. Raising the checksum tier is the revalidate that
+/// re-probes every unchanged file, so it is the pass that used to churn them.
+#[test]
+fn reprobing_an_unchanged_flac_leaves_its_served_mtime_alone() {
+    let music = tempfile::tempdir().unwrap();
+    let flac = music.path().join("a.flac");
+    write_flac(&flac, &["ARTIST=A", "TITLE=T"], None);
+    // The backing second and the stored update time both sit well in the past,
+    // so a stamp of the current time cannot hide behind either.
+    std::fs::File::options()
+        .write(true)
+        .open(&flac)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_hours(271_752))
+        .unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let db_path = store.path().join("musefs.db");
+    let db = musefs_db::Db::open(&db_path).unwrap();
+    crate::scan_directory(&db, music.path()).unwrap();
+    let id = db.list_tracks().unwrap()[0].id;
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "UPDATE tracks SET updated_at = 1000000000 WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+    let served = || {
+        crate::HeaderCache::new(crate::Mode::Synthesis)
+            .resolve(&db, id)
+            .unwrap()
+            .mtime
+    };
+    let before = served();
+    assert_eq!(before.secs, 1_000_000_000);
+
+    let stats = crate::revalidate_with(
+        &db,
+        music.path(),
+        &ScanOptions {
+            checksum: ChecksumTier::Full,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(stats.updated, 1, "raising the tier re-probes the file");
+
+    assert_eq!(served(), before);
+}
+
 #[test]
 fn scan_ingests_binary_tags_and_promotes() {
     use id3::frame::{Content, Popularimeter, Unknown};

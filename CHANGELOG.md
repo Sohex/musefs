@@ -137,7 +137,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     filesystems that store no sub-second timestamps and where a same-size
     replacement could otherwise pass the freshness guard. Zero means *not yet
     known*, so an upgraded store is not taken dark; each scan arms the guard for
-    the rows it touches.
+    the rows it touches. FAT32 and exFAT get no inode, since they renumber files
+    on every mount ([#757](https://github.com/Sohex/musefs/issues/757)), and are
+    not recommended as backing storage.
   - A backing file dated before 1970 is no longer refused
     ([#696](https://github.com/Sohex/musefs/issues/696)). The lower bounds on
     `backing_mtime_ns` and `backing_ctime_ns` are gone, so an archival rip
@@ -388,6 +390,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Re-probing an unchanged file no longer moves its served mtime**
+  ([#757](https://github.com/Sohex/musefs/issues/757)). Every re-probe stamped
+  the row's `updated_at`, which a synthesized file's whole second follows, and
+  every FLAC re-probe rewrote its structural blocks, bumping the
+  `content_version` its nanoseconds follow. A revalidate over unchanged files
+  made every file look modified to rsync, Syncthing and backup tools. Both are
+  now written only when something actually differs.
+
 - **A revalidate no longer keeps a `content_hash` its row cannot vouch for.**
   Deciding whether an uncomputed checksum may be kept compared the stored stamp
   with the live file the way serving does, where an unrecorded inode matches
@@ -536,7 +546,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   filesystem has no sub-second timestamps
   ([#674](https://github.com/Sohex/musefs/issues/674)). `tracks.backing_ino`
   gained a column in the 2.0.0 migration; the scanner now writes it and every
-  serve compares it. On FAT32, ext3, HFS+ and some SMB and NFS mounts a
+  serve compares it. On ext3, HFS+ and some SMB and NFS mounts a
   same-size *replacement* inside the timestamp granularity left size, mtime and
   ctime all identical to what was scanned, and the reader was served new bytes
   against a header synthesized for the old ones. A true in-place rewrite is
@@ -553,7 +563,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is compared on the other three fields alone rather than failing closed on a
   field the store has nothing to say about, so an upgrade does not take a
   library dark. `musefs revalidate` re-probes exactly those rows and fills the
-  inode in.
+  inode in, except on FAT32 and exFAT, which keep no inode numbers to record
+  ([#757](https://github.com/Sohex/musefs/issues/757)).
 
 - Two files holding byte-identical cover art no longer serve each other's
   picture metadata ([#716](https://github.com/Sohex/musefs/issues/716)). `art`

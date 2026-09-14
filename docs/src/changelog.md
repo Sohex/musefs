@@ -624,14 +624,18 @@ see the [Release notes](release-notes.md).
 
 ### Fixed
 
-- **Re-probing an unchanged FLAC no longer moves its served mtime**
-  ([#757](https://github.com/Sohex/musefs/issues/757)). Every re-probe deleted
-  and re-inserted a track's `STREAMINFO`/`SEEKTABLE` rows, and each write bumped
-  `content_version`, which since #725 is what moves a synthesized file's
-  modification time. A revalidate over unchanged files — to raise the checksum
-  tier, say — made every FLAC look modified to rsync, Syncthing and backup
-  tools. A block set byte-identical to the stored one is now left alone; any
-  difference, down to one byte or a swapped ordinal, still rewrites it.
+- **Re-probing an unchanged file no longer moves its served mtime**
+  ([#757](https://github.com/Sohex/musefs/issues/757)). A synthesized file's
+  modification time follows two values a re-probe wrote whether or not anything
+  had changed. Its whole second follows the row's `updated_at`, which every
+  re-probe stamped with the current time. Its nanoseconds follow
+  `content_version` (#725), which every FLAC re-probe bumped by deleting and
+  re-inserting the track's `STREAMINFO`/`SEEKTABLE` rows. A revalidate over
+  unchanged files, to raise the checksum tier say, made every file look modified
+  to rsync, Syncthing and backup tools. A re-probe now stamps `updated_at` only
+  when a column it writes differs from what is stored, and leaves a
+  byte-identical block set alone. Any real difference, down to one byte or a
+  swapped ordinal, still records a change.
 
 - **A revalidate no longer keeps a `content_hash` its row cannot vouch for.**
   Deciding whether an uncomputed checksum may be kept compared the stored stamp

@@ -224,8 +224,8 @@ fn case_insensitive_refresh_merges_and_matches_full_rebuild() {
 
 #[test]
 fn non_render_column_edit_is_noop_refresh() {
-    // Re-running scan_directory over an unchanged corpus bumps data_version but
-    // changes no rendered path, so the tree must be identical before and after.
+    // Re-running scan_directory over an unchanged corpus changes no rendered
+    // path, so the tree must be identical before and after.
     let target = small_corpus(4);
     let db_path = target.db_path.clone();
     let corpus = target.corpus_dir.clone();
@@ -233,7 +233,7 @@ fn non_render_column_edit_is_noop_refresh() {
     scan_directory(&db, &corpus).unwrap();
     let fs = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
 
-    // Re-scan: touches updated_at (data_version bump) but no rendered path changes.
+    // Re-scan: no rendered path changes.
     let db2 = Db::open(&db_path).unwrap();
     scan_directory(&db2, &corpus).unwrap();
 

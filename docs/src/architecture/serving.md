@@ -190,7 +190,11 @@ negotiated at mount.
 A served file's bytes come from two places — the backing file, and the tags and
 art in the store — so its mtime has to move when *either* does. The mount
 reports the later of the backing file's second and the row's `updated_at`, which
-covers a backing rewrite and a metadata edit alike.
+covers a backing rewrite and a metadata edit alike. `updated_at` moves only when
+the store records a change: a re-probe that finds the file exactly as recorded
+leaves it, and `content_version`, alone
+([#757](https://github.com/Sohex/musefs/issues/757)), so a revalidate over
+unchanged files does not make them look modified.
 
 Whole seconds are not enough on their own. Every trigger stamps `updated_at`
 with `strftime('%s','now')`, so two metadata edits inside one wall-clock second

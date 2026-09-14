@@ -71,6 +71,11 @@ fn row_to_track(r: &Row) -> rusqlite::Result<Track> {
 /// Upsert a track by `backing_path`, returning its id (via `RETURNING`, so the
 /// insert and id-read are one statement). Runs on `conn` so `Db<ReadWrite>` and
 /// `BulkWriter` share one body.
+///
+/// `updated_at` moves only when a column this writes differs from the stored
+/// one (#757). A synthesized file's served second follows it, so stamping it on
+/// every re-probe made a revalidate over unchanged files look like a change to
+/// every size-plus-mtime consumer.
 pub(crate) fn upsert_track_in(conn: &rusqlite::Connection, t: &NewTrack) -> Result<i64> {
     Ok(conn.query_row(
         "INSERT INTO tracks
@@ -82,7 +87,17 @@ pub(crate) fn upsert_track_in(conn: &rusqlite::Connection, t: &NewTrack) -> Resu
             backing_mtime_ns=excluded.backing_mtime_ns,
             backing_ctime_ns=excluded.backing_ctime_ns,
             backing_ino=excluded.backing_ino,
-            updated_at=CAST(strftime('%s','now') AS INTEGER)
+            updated_at=CASE
+                WHEN format <> excluded.format
+                  OR audio_offset <> excluded.audio_offset
+                  OR audio_length <> excluded.audio_length
+                  OR backing_size <> excluded.backing_size
+                  OR backing_mtime_ns <> excluded.backing_mtime_ns
+                  OR backing_ctime_ns <> excluded.backing_ctime_ns
+                  OR backing_ino <> excluded.backing_ino
+                THEN CAST(strftime('%s','now') AS INTEGER)
+                ELSE updated_at
+            END
          RETURNING id",
         params![
             crate::models::path_to_col(&t.backing_path),
