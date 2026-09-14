@@ -25,8 +25,10 @@ round-trip and lossy-edge rules apply to it wholesale.
   preserved from the original front.
 
 At scan time, tags are merged per field from both surfaces with **id3 taking
-precedence** and INFO filling gaps; only chunk headers are walked — the
-`data` payload is never read.
+precedence** and INFO filling gaps. Because tag chunks may trail the `data`
+payload, the probe reads the whole file up to the 64 MiB probe ceiling; only a
+larger file falls back to bounds taken from the `data` chunk header (see the
+lossy edge below).
 
 ## Lossy edges
 
@@ -34,9 +36,10 @@ precedence** and INFO filling gaps; only chunk headers are walked — the
   `fmt `, `fact`, the new `LIST`/`INFO`, and the new `id3 ` chunk: cue
   points (`cue `), broadcast-wave metadata (`bext`), sampler loops (`smpl`),
   and any other chunk from the original front are not reproduced.
-- The INFO chunk carries only the seven-field vocabulary above; readers that
-  understand *only* INFO see just those fields. Everything still rides in
-  the `id3 ` chunk.
+- The INFO chunk carries only the seven-field vocabulary above, and only the
+  first value of each key; readers that understand *only* INFO see just those.
+  When no tag maps to an INFO field, the `LIST` chunk is omitted entirely.
+  Everything still rides in the `id3 ` chunk.
 - All of MP3's ID3 lossy edges apply to the `id3 ` chunk: ID3v2.4-only
   output, placeholder-language `COMM`/`USLT` reset to `XXX`, `POPM` owner
   dropped, ID3v1 ignored, the OOM-guard skips (the authoritative list lives in
@@ -70,12 +73,14 @@ RIFF front, then serves the untouched payload:
 1. `Inline` — `RIFF`/`WAVE` framing, the preserved `fmt ` (and `fact`)
    chunks, the rebuilt `LIST`/`INFO` chunk, and the embedded `id3 ` chunk's
    text frames. Every chunk length is known up front, so the `RIFF` size and
-   each chunk size field are byte-exact — no placeholder sizes.
-2. Inside the `id3 ` chunk: `APIC` framing inline with `ArtImage` segments
-   streaming image bytes, and `BinaryTag` segments streaming opaque ID3
-   frame bodies, exactly as in MP3 synthesis.
-3. `BackingAudio` — the original `data` chunk payload, served verbatim by
-   positioned reads.
+   each chunk size field are byte-exact — no placeholder sizes. A pad byte
+   follows any odd-length chunk, keeping chunks word-aligned.
+2. Inside the `id3 ` chunk: `BinaryTag` segments streaming opaque ID3 frame
+   bodies, and `APIC` framing inline with `ArtImage` segments streaming image
+   bytes, exactly as in MP3 synthesis.
+3. The `data` chunk header, inline, then `BackingAudio` — the original `data`
+   chunk payload, served verbatim by positioned reads — and an inline pad byte
+   when the payload length is odd.
 
 ## RIFF form-size enforcement
 
@@ -90,11 +95,11 @@ this at parse time:
   payload extends past `form_end`.
 - Streaming or concatenated WAVs that write `riff_size = 0` or
   `0xFFFFFFFF` are rejected, but only incidentally: there is no explicit
-  sentinel check. `riff_size = 0` yields `form_end = 8`, which is smaller
-  than any file carrying a `data` payload, and `0xFFFFFFFF` yields a
-  `form_end` larger than any real file — both fall foul of the bounds
-  checks above. Detecting and honouring those sentinels explicitly is a
-  deferred follow-up.
+  sentinel check. `riff_size = 0` yields `form_end = 8`, before the first
+  chunk header at byte 12, so the form-bounded chunk walk finds no `fmt ` or
+  `data` chunk and the file fails as not-WAV. `0xFFFFFFFF` yields a
+  `form_end` larger than any real file, which fails the bounds check above.
+  Detecting and honouring those sentinels explicitly is a deferred follow-up.
 
 ## Quirks & invariants
 

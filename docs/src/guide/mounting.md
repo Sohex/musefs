@@ -20,6 +20,12 @@ Ctrl-C).
 > hard-fails (and crash-loops under `Restart=`). Seed the store with an initial
 > `scan`, or order the mount after it — see
 > [`contrib/systemd`](../integrations/systemd.md).
+>
+> The same happens to a mount started over a store an older musefs left: 2.0.0
+> refuses it until `musefs migrate --db <store>` upgrades it (see
+> [Maintenance](maintenance.md#upgrading-the-store-musefs-migrate)). Until the
+> revalidate that follows has run, `mount` also prints a warning with the number
+> of tracks still waiting.
 
 > **Mounting at an arbitrary path may be denied by AppArmor.** On distros that
 > ship an AppArmor profile for `fusermount3` (Ubuntu 24.04+ / libfuse ≥ 3.17),

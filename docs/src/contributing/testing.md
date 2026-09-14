@@ -24,10 +24,13 @@ test hook goes behind that feature when an integration test needs it, and is
 ### Coverage-guided fuzzing
 
 The `fuzz/` crate is **excluded from the workspace**: workspace-wide build,
-test, and clippy do not compile it, so a format-layer signature change can
-break fuzz targets without anything failing locally — CI's fuzz `smoke` job
-(`cargo +nightly fuzz build`) is what catches it. Check locally before
-pushing a format-layer API change:
+test, and clippy do not compile it, so a signature change can break fuzz
+targets without anything failing locally. It depends on `musefs-format`, and
+the `serve` target also on `musefs-core` and `musefs-db`. CI's fuzz `smoke` job
+(`cargo +nightly fuzz build`) catches a break, but on PRs it triggers only on
+`musefs-format/**` and `fuzz/**`, so a `musefs-core` or `musefs-db` API change
+can break the fuzz build with nothing in the PR noticing. Check locally before
+pushing an API change to any of the three:
 
 ```bash
 cargo install cargo-fuzz                          # one-time; needs nightly
@@ -56,8 +59,9 @@ Coverage notes: the per-format targets also drive the bounded/ceiling probers
 (`*_bounded`, `locate_audio_at_ceiling`, `read_structure_from`) and assert a
 differential oracle against the full-buffer parse. The `serve` target fuzzes the
 read-time serve path (`read_at_with_file` over adversarial layouts, including
-`serve_ogg_window`/`OggArtSlice`) and is scheduled-only (built per-PR, not
-smoke-run) because it builds a DB + temp backing file per input. The `serve`
+`serve_ogg_window`/`OggArtSlice`); it builds a DB + temp backing file per
+input, so it is slower per execution than the format targets, but it is
+smoke-run per PR alongside them and runs in the scheduled campaign. The `serve`
 target also exercises hostile DB rows (negative/oversized geometry,
 invalid formats, orphaned/oversized art, stale binary-tag handles, content-version
 mismatch) via the `musefs-db` `fuzzing`-gated `with_raw_conn`, plus binary-tag
@@ -69,7 +73,7 @@ Asserts that an independent ecosystem reader sees the tags musefs
 synthesizes, across all five formats:
 
 ```bash
-pip install -r tests/interop/requirements.txt
+pip install -r tests/interop/requirements.txt pytest
 MUSEFS_INTEROP_DIR=/tmp/i cargo test -p musefs-core --test interop_emit -- --ignored emit_interop_fixtures
 MUSEFS_INTEROP_DIR=/tmp/i python -m pytest tests/interop
 ```
@@ -123,10 +127,14 @@ concerns and are out of scope for the read-time suite.
 ### Mutation testing
 
 `scripts/mutants.sh` wraps `cargo-mutants` for the logic-bearing crates;
-`.cargo/mutants.toml` permanently excludes the thin glue crates
-(`musefs-fuse`, `musefs-cli`, `musefs`) and feature-gated instrumentation.
-`musefs-latencyfs` carries real logic and has its own leg (it needs
-`/dev/fuse` to kill its mutants).
+the scheduled campaign has a leg each for `musefs-db`, `musefs-core`,
+`musefs-format`, `musefs-fuse` and `musefs-latencyfs`. `.cargo/mutants.toml`'s
+`exclude_globs` permanently exclude `musefs-cli/**`, `musefs/**`, the
+feature-gated `musefs-core/src/metrics.rs`, and, in `musefs-fuse`,
+`src/lib.rs` and `src/platform/**`. The rest of `musefs-fuse` —
+`src/convert.rs`'s pure helpers — is mutated. `musefs-latencyfs` carries real
+logic and needs `/dev/fuse` to kill its mutants, so its leg installs libfuse and
+runs the mounted `#[ignore]`d tests.
 
 The CI parity check for a branch is the **in-diff gate** — mutate only the
 lines your branch changed:
@@ -156,9 +164,10 @@ Sharp edges:
       cargo mutants --in-diff mutants.diff -j2 --exclude 'musefs-latencyfs/**' --output /tmp/mutants-out/in-diff
   ```
 
-  `scripts/mutants.sh` also supports sharding (`MUTANTS_SHARD=i/n`, used by
-  CI to split the long `musefs-format` leg), though a sharded local
-  workflow hasn't been built out.
+  `scripts/mutants.sh` also supports sharding (`MUTANTS_SHARD=i/n`). CI shards
+  every crate's scheduled campaign into ~50-mutant shards, and the per-PR
+  in-diff gate the same way (`cargo mutants --shard i/n`), though a sharded
+  local workflow hasn't been built out.
 - Known-unkillable mutant classes get a *documented* `exclude_re` in
   `.cargo/mutants.toml`, not test contortions. Note that cargo-mutants
   mutates `const` initializer expressions too — a constant is not a hiding
@@ -169,7 +178,7 @@ Sharp edges:
   code, and a stale anchor can re-point onto a *killable* mutant — a silent
   false pass. `scripts/check_mutant_anchors.py` prevents that: it lists the
   full unfiltered mutant set (`cargo mutants --no-config --list --json`) and
-  re-validates every `exclude_re` entry. It runs in the per-PR `in-diff` job
+  re-validates every `exclude_re` entry. It runs in the per-PR `in-diff-plan` job
   (`.github/workflows/mutants.yml`) and its unit tests run in CI's
   `python-musefs` job. Run it locally with:
 
@@ -222,13 +231,13 @@ read/ingest/refresh work must update the golden numbers in the same PR. They run
 on every non-doc PR via CI's `check` job. Constant-factor (wall-clock) changes
 are surfaced separately by the warn-only `perf-ab` job (below).
 
-The A/B benchmark runs only when `musefs-core/src/**` or `musefs-format/src/**`
-change. The `perf-bench` matrix job benches the base and PR commits in parallel
-on separate runners (one ref each), then the `perf-ab` job downloads both
-exported baselines and posts a `critcmp` delta as a sticky PR comment. It is
-**warn-only** and not a required check — GH runner noise (now including
-cross-runner variance) makes wall-clock unfit for hard gating. Reproduce locally
-on one machine with `scripts/perf-ab.sh <base-sha> out.md`.
+The A/B benchmark runs only on PRs that change `musefs-core/src/**` or
+`musefs-format/src/**`. The `perf-ab` job runs `scripts/perf-ab.sh`, which
+benches the base and PR commits back-to-back on one runner and posts a
+`critcmp` delta as a sticky PR comment (for a fork PR, which cannot be commented
+on, the delta lands in the job summary only). It is **warn-only** and not a
+required check — GH runner noise makes wall-clock unfit for hard gating.
+Reproduce locally with the same `scripts/perf-ab.sh <base-sha> out.md`.
 
 ### Concurrency + sanitizers
 
@@ -289,8 +298,11 @@ cargo install cargo-audit
 # Same 0.19 pin both CI jobs use — the config schema shifts across minor releases.
 cargo install cargo-deny --locked --version '^0.19'
 cargo audit                                                    # root Cargo.lock, RUSTSEC advisories
-cargo deny check                                               # advisories + licenses + bans + sources
-cargo deny --manifest-path fuzz/Cargo.toml check --config deny.toml advisories
+# advisories + licenses + bans + sources, as ci.yml's deny job runs it
+cargo deny check --deny advisory-not-detected --deny license-not-encountered
+# the fuzz lockfile, as audit.yml runs it
+cargo deny --manifest-path fuzz/Cargo.toml check --config deny.toml \
+  --allow advisory-not-detected advisories
 ```
 
 `audit.yml` runs `rustsec/audit-check` (root lockfile only) plus the third
@@ -302,10 +314,14 @@ Advisories with no upgrade path are allow-listed **with a written rationale at
 the ignore site** — `.cargo/audit.toml` for `cargo-audit`/the action,
 `deny.toml` for `cargo-deny` (both lists must agree). An `unmaintained`
 advisory on a compile-time-only or unreachable dependency is a candidate; a
-`vulnerability` is not — those get fixed. Note that `cargo-deny` warns
+`vulnerability` is not — those get fixed. `cargo-deny` reports
 `advisory-not-detected` for an ignore whose crate is absent from the lockfile
-being scanned, which is expected for entries that only apply to one of the two
-workspaces.
+being scanned, and `license-not-encountered` for an allowed license nothing
+uses. The `ci.yml` `deny` job promotes both to errors, so a stale entry in
+`deny.toml` fails the gate: remove it in the same change that drops the crate
+or license. `deny.toml` is authored against the root graph, so the fuzz scan
+in `audit.yml` allows `advisory-not-detected` instead; an entry that applies
+only to the fuzz lockfile belongs in a separate config, not the root list.
 
 ### Coverage
 
@@ -320,5 +336,9 @@ tests need a real mount; their behavior is covered by the separate `e2e` CI
 job rather than `llvm-cov`. The CI `e2e` job also runs the binary-level
 `cargo test -p musefs -- --ignored` and
 `cargo test -p musefs-latencyfs -- --ignored` suites so they cannot silently
-rot (they require `/dev/fuse` + `fusermount3`). CI (`coverage.yml`) runs this on every push/PR and
-uploads to Codecov (`CODECOV_TOKEN` repo secret).
+rot (they require `/dev/fuse` + `fusermount3`). CI (`coverage.yml`) runs this on
+every PR, on pushes to `main`, and on `v*` tags (which regenerate `coverage-ok`
+for the release gate), and uploads to Codecov (`CODECOV_TOKEN` repo secret).
+There is no trigger-level path filter: a `changes` job skips the coverage run
+when every changed path is under `docs/` or ends in `.md`, and the
+`coverage-ok` aggregator still reports.

@@ -10,14 +10,17 @@ which rebuilds every core table — a never-reused `AUTOINCREMENT` id, the
 path as bytes, an inode stamp, storage-class constraints throughout, independent
 ordinal spaces for text and binary tags, the picture's MIME type and dimensions
 moved off the shared blob and onto the art link (which also gains depth and
-colour count), immutable row ownership, and the retirement of
-every fingerprint written
-before the value included sampled audio); `user_version` records the schema
+colour count), immutable row ownership, and the clearing of every stored
+fingerprint and content hash — the fingerprint because its value now includes
+sampled audio, the hash because no stored one can be trusted to describe the
+file beside it; `musefs revalidate` recomputes the fingerprints, and
+`revalidate --checksum=full` the hashes); `user_version` records the schema
 version (4).
 The store is the **interface external tools write to** — the beets and Picard
 plugins under `contrib/` write tags and art here out-of-band.
 
-- The **baseline schema** (`MIGRATION_V1`): the core tables — `tracks` (one row
+- The **core schema** (created by `MIGRATION_V1`, rebuilt by `MIGRATION_V4`):
+  the core tables — `tracks` (one row
   per backing file: path, format, audio byte range, the
   size/nanosecond-mtime/ctime freshness stamp — joined by the inode in v4 —
   and `content_version`), `tags` (multi-value key/value rows ordered by
@@ -28,8 +31,9 @@ plugins under `contrib/` write tags and art here out-of-band.
   editable contract). Deleting a track cascades to its `tags` and `track_art`
   rows. Triggers bump the owning track's `content_version`/`updated_at` on any
   `tags`/`track_art` edit; `CHECK` constraints enforce the contract invariants
-  below at commit time. A bounded, self-pruning `track_changes` ring (capacity
-  8192, `CHANGELOG_CAP`; its `track_id` pinned to an integer from v4, and a row
+  below at write time (the offending statement aborts). A bounded,
+  self-pruning `track_changes` ring (capacity 8192, `CHANGELOG_CAP`; its
+  `track_id` pinned to an integer from v4, and a row
   without one read by the refresh as a gap rather than an error) fed by
   triggers on `tracks` gives O(changed) refresh —
   every metadata edit funnels through an `UPDATE` on the tracks row, relying on
@@ -38,7 +42,8 @@ plugins under `contrib/` write tags and art here out-of-band.
   bytes: `art_reject_content_update` (art is content-addressed and immutable),
   `art_ad` (a deleted art row bumps referencing tracks so an orphan rebuilds to
   a clean serve-time error), `tracks_geometry_au` (scanner-owned geometry
-  changes), and `structural_blocks_ai`/`_au`/`_ad`. `tags_reject_reparent` and
+  changes), and `structural_blocks_ai`/`_ad`. From v4, `structural_blocks_au`
+  joins those two, `tags_reject_reparent` and
   `track_art_reject_reparent` make row ownership immutable,
   `tracks_reject_rekey` makes a track's id immutable, and
   `structural_blocks_reject_update` makes a structural block immutable, for the
@@ -103,8 +108,10 @@ bijection, and the column is only ever compared for equality (the invalidation
 trigger, and the Rust freshness stamp), never ordered or summed. Zero is the
 sentinel for "not recorded", which every row in a store upgraded to v4 carries
 until `musefs revalidate` (or a `scan --force` of the file) fills it in; a plain
-`scan` leaves tracked rows alone. A reader decoding this column must cast the bit
-pattern back rather than treat a negative value as invalid.
+`scan` leaves tracked rows alone. On Linux, a row for a file on FAT or exFAT
+carries zero permanently, because those filesystems keep no stable inode
+numbers and none is recorded for them. A reader decoding this column must cast
+the bit pattern back rather than treat a negative value as invalid.
 
 **`backing_path` is bytes, not text.** From schema v4 it is a `BLOB` and the
 Rust model is a `PathBuf`, because a filesystem path is a byte string and the
@@ -159,7 +166,8 @@ reorganization: run `musefs scan` after moving files, and existing store rows
 follow their backing files to the new locations.
 
 **What the store enforces.** SQLite `CHECK` constraints reject the
-malformed *shapes* at commit, so an external writer cannot persist them:
+malformed *shapes* at write time — the offending statement aborts — so an
+external writer cannot persist them:
 
 - an unknown `format` string, or a negative length/offset/size/version;
 - an `audio_offset + audio_length` running past the stored `backing_size`;
@@ -173,7 +181,8 @@ malformed *shapes* at commit, so an external writer cannot persist them:
 - a `tags.key` over 256 chars or `tags.value` over 16 MiB − 1 bytes (FLAC's
   24-bit metadata-block ceiling — the largest tag synthesis could serve, so the
   store never refuses a tag the format could carry);
-- `tags.key` must be non-empty and contain no ASCII control characters or NUL
+- `tags.key` must be non-empty and contain neither NUL nor an ASCII control
+  character in `0x01`–`0x1F`; DEL (`0x7F`) is accepted
   (a DB `CHECK` enforces this, rejecting violating writes; the NUL test is an
   explicit `instr(key, char(0)) = 0` from schema v4, because an embedded NUL
   terminates SQLite's `length()`/`GLOB` and a key like `a\0b` slipped the older
@@ -191,6 +200,21 @@ malformed *shapes* at commit, so an external writer cannot persist them:
   any platform's `PATH_MAX`, so it refuses no path that could be opened. Every
   reader of the column also re-checks the cap from `length(backing_path)` before
   loading the path, for a store written with its constraints off;
+- from schema v4, a value of the wrong storage class. Every integer column of
+  `tracks`, `tags`, `track_art`, `art` and `structural_blocks` must hold an
+  integer; `tags.key` and `value`, `track_art.mime` and `description`,
+  `art.sha256` and the two checksum columns must hold text; and `backing_path`,
+  `tags.value_blob`, `art.data` and `structural_blocks.body` must hold a blob
+  (the nullable columns only when set). Column affinity converts what it can
+  first — numeric text such as `'3'` and an integral real such as `3.0` are
+  stored as the integer 3 and pass — so what is refused is what it cannot
+  convert: non-numeric text, a fractional real or a blob where an integer
+  belongs, a blob where text belongs, and anything but a blob where a blob
+  belongs. The enumerated `tracks.format` and `structural_blocks.kind` carry no
+  storage-class check; their `IN` lists already admit only those text values;
+- a `track_art.width` or `height` (both nullable), `depth` or `colors` outside
+  `0..=4294967295`, the range of the Rust model's `u32`, or a negative
+  `tags.ordinal` or `track_art.ordinal`;
 - a `structural_blocks` row with an unknown `kind`, negative `ordinal`, or `body`
   over the FLAC 24-bit block limit.
 
@@ -232,7 +256,7 @@ guarded the same way where it now lives, by the `track_art` readers.
 **Tag keys: byte-exact to the index, case-insensitive to a clear.** The unique
 index on `tags` compares `key` byte-exactly under the default `BINARY`
 collation, and text and binary rows are numbered in independent ordinal spaces
-(see [below](#text-and-binary-tag-rows-have-independent-ordinal-spaces)), so a
+(see **Text and binary tag rows have independent ordinal spaces** below), so a
 writer rewriting one class never has to reason about the other's ordinals.
 `merge_tags` clears by `lower(key) = lower(?)`, so a lowercase `cuesheet`
 removes the scan-seeded `CUESHEET` *text* row
@@ -246,7 +270,10 @@ byte-exact one when the index is checked.
 **Schema identity.** On open, musefs also validates schema identity: a
 `sqlite_master` comparison against a freshly-migrated reference plus `PRAGMA
 foreign_key_check`, rejecting anything that is not the canonical latest schema
-with a message telling the user to run `musefs scan`. A store whose
+with a message saying the store was altered by something other than musefs:
+restore it from a `musefs migrate` snapshot, or move it aside and let
+`musefs scan` build a new store, whose curated tags and art do not carry over
+from the old one. A store whose
 `user_version` is *newer* than this binary's latest migration (a future or
 third-party tool bumped the schema) is refused up front with a distinct
 "store is newer than this binary" error rather than silently treated as

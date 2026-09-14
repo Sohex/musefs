@@ -6,6 +6,11 @@ toolchain needed), [building from source](#building-from-source), or a
 Whichever you pick, mounting needs a 64-bit FUSE-capable OS (Linux, FreeBSD, macOS) — see
 [Platform support](#platform-support).
 
+> **Upgrading from 1.x:** 2.0.0 changes the store's schema, and every command
+> other than `musefs migrate` refuses a 1.x store until it has been upgraded.
+> Stop any running mount, then run `musefs migrate --db <store>`; the
+> [release notes](../release-notes.md#upgrading-from-v130) walk through it.
+
 > **Important:** Linux and FreeBSD are E2E tested. I don't have anything running macOS to test on, if you run this on one let me know if it works, or especially if it doesn't!
 >
 > At present AMD64, AARCH64, and RISC-V 64 are supported. If you'd like 32-bit support please open an issue.
@@ -53,9 +58,12 @@ is weaker there. That check normally
 compares a file's size, modification time, change time and inode number. FAT
 stores the modification time in two-second steps and exFAT in 10 ms steps, both
 report the change time as the modification time, and neither keeps inode
-numbers stable, so musefs records none. What is left is size plus a coarse
-modification time: a same-size replacement or rewrite inside that window goes
-undetected, and the file is served with metadata laid out for its old content.
+numbers stable. On Linux musefs detects both filesystems and records no inode
+for their files. What is left is size plus a coarse modification time: a
+same-size replacement or rewrite inside that window goes undetected, and the
+file is served with metadata laid out for its old content. Other platforms
+record whatever inode number the filesystem reports, so there the check is only
+as reliable as that number is across remounts.
 Filesystems with real timestamps and stable inode numbers, such as ext4, btrfs
 and XFS, get the full check; see
 [freshness](../architecture/tree-scanning.md) for how it works.
@@ -64,12 +72,12 @@ and XFS, get the full check; see
 > profile only permits unprivileged mounts under whitelisted prefixes
 > (`$HOME/**`, `/mnt`, `/media`, `/tmp`, …). Mounting elsewhere fails with
 > `fusermount3: mount failed: Permission denied` — see
-> [Mounting](mounting.md#mounting) for the whitelist and the fix.
+> [Mounting](mounting.md#mount) for the whitelist and the fix.
 
 ## Building from source
 
-`cargo install musefs` compiles the latest release; building needs a stable
-Rust toolchain (2024 edition) plus the FUSE headers (`libfuse3-dev`) and
+`cargo install musefs` compiles the latest release; building needs Rust 1.95
+or newer (2024 edition) plus the FUSE headers (`libfuse3-dev`) and
 `pkg-config`. To install the latest development version instead:
 
 ```bash

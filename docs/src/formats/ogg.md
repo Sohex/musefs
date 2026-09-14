@@ -32,12 +32,16 @@ Verified by `musefs-format/tests/proptest_ogg.rs` (crate feature `fuzzing`),
   User-defined keys outside the Vorbis field-name grammar (empty, containing `=`,
   control characters, or non-ASCII — outside ASCII `0x20`–`0x7D` minus `=`) are
   dropped on synthesis and logged.
-- **Embedded pictures**, with MIME type, picture type, description, and
-  dimensions — in both art encodings (see below).
+- **Embedded pictures**, with MIME type, picture type, description,
+  dimensions, colour depth, and indexed-colour count — in both art encodings
+  (see below). Both are built by FLAC's `PICTURE` parser and
+  `picture_body_framing`, so they carry the same fields as native FLAC.
 - **Codec headers.** The identification packet (`OpusHead`, Vorbis
-  identification, the OggFLAC `STREAMINFO` carrier) and any trailing header
-  packets (e.g. the Vorbis setup packet) are preserved; only the comment
-  metadata is regenerated.
+  identification, the OggFLAC `STREAMINFO` carrier) and the Vorbis setup
+  packet are preserved; only the comment metadata and pictures are
+  regenerated. FLAC-in-Ogg keeps its `APPLICATION`, `SEEKTABLE` and
+  `CUESHEET` block packets verbatim from the file front (see the lossy edge
+  below for the rest).
 
 ## Lossy edges
 
@@ -45,8 +49,14 @@ Verified by `musefs-format/tests/proptest_ogg.rs` (crate feature `fuzzing`),
 - Vorbis field names are case-insensitive by spec; canonical keys come back
   under their conventional uppercase names and unknown field names are
   upper-cased on synthesis.
-- Ogg carries no binary-tag slot: only text comments and pictures exist, so
-  there is nothing else to preserve.
+- Opus and Vorbis carry no binary-tag slot: only text comments and pictures
+  exist, so there is nothing else to preserve.
+- FLAC-in-Ogg keeps only the `APPLICATION`, `SEEKTABLE` and `CUESHEET`
+  metadata blocks, re-read verbatim from the file front at synthesis time.
+  `PADDING` and blocks of unknown types are dropped, `VORBIS_COMMENT` and
+  `PICTURE` blocks are rebuilt from the store, packet 0's following-packet
+  count is recomputed, and the `STREAMINFO` last-block flag is cleared, since
+  the regenerated comment block always follows it.
 - Embedded pictures are parsed through FLAC's `PICTURE` block reader, so a
   picture type outside the standard `0`–`20` range is clamped to `0` (`Other`)
   at scan time, matching the store's `track_art.picture_type` `CHECK`.
@@ -64,7 +74,7 @@ Verified by `musefs-format/tests/proptest_ogg.rs` (crate feature `fuzzing`),
   `musefs-format/src/ogg/mod.rs`), which is what makes
   `base64(prefix ++ image) == base64(prefix) ++ base64(image)` and lets the
   image's base64 be served as an independent, incrementally-streamable
-  substring (the [art split](#how-synthesis-works) above). Padding the
+  substring (the [art split](#how-synthesis-works) below). Padding the
   description is the safe place to do it — the MIME type must stay a valid
   type. So a synthesized picture's description can differ from the original by
   up to two trailing spaces; this applies to Opus/Vorbis and OggFLAC alike,
@@ -103,9 +113,9 @@ Verified by `musefs-format/tests/proptest_ogg.rs` (crate feature `fuzzing`),
    instead carries one native FLAC `PICTURE` block packet per image (raw
    `OggArtSlice` runs, no base64); the last metadata packet's last-block
    flag and packet 0's 16-bit following-packet count are recomputed to
-   match. Art exceeding `MAX_ART_BYTES` (16 MiB − 64 KiB) is rejected by the
-   store's `CHECK`, with a resolve-time cap backstopping a writer that
-   disables check enforcement.
+   match, and `STREAMINFO`'s last-block flag is cleared. Art exceeding
+   `MAX_ART_BYTES` (16 MiB − 64 KiB) is rejected by the store's `CHECK`, with
+   a resolve-time cap backstopping a writer that disables check enforcement.
 3. `OggAudio` — one compact segment covering all original audio pages, with
    the page-count delta to apply to every sequence number.
 
@@ -233,4 +243,7 @@ progress looks the same.
   unknown case. A row scanned before this fix keeps its wrong `audio_offset`
   until a revalidate re-probes the file, which the first revalidate after the
   2.0.0 upgrade does. Unlike a chained Ogg, the file itself parses, so the
-  re-probe corrects the row rather than refusing it.
+  re-probe corrects the row rather than refusing it. The revalidate fixes only
+  the bounds: tags and art that 1.3.0 never read from such a file arrive only
+  through `musefs scan --force <file>`, which replaces that file's curated
+  tags and art with what it embeds.

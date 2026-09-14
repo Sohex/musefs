@@ -53,16 +53,20 @@ described here is shared with WAV's embedded `id3 ` chunk — see
 - **ID3v1 is not read.** A file whose only tag is ID3v1 scans with no tags
   (populate the DB via beets/Picard instead). A trailing ID3v1 tag is also
   excluded from the audio region, so the synthesized file does not carry it.
-- The audio locator validates the ID3v2 major version (2–4) and rejects
-  synchsafe size bytes with the high bit set, producing a controlled
-  `Malformed` error rather than mask-decoding an invalid offset. Tags using
-  unsynchronisation or an extended header still scan — their declared size
-  already covers the audio boundary.
+- The audio locator steps over a leading ID3v2 tag of any version by its
+  declared size (plus the footer when a v2.4 header declares one), since the
+  header has the same shape in every version. It refuses only a header that
+  fails the spec's detection pattern — a `$FF` version byte, or a synchsafe
+  size byte with the high bit set — with a controlled `Malformed` error rather
+  than mask-decoding an invalid offset. Tags using unsynchronisation or an
+  extended header still scan — their declared size already covers the audio
+  boundary.
 - Scan-time tag extraction is skipped entirely — by a deliberate
-  denial-of-service guard, see below — for tags using unsynchronisation, an
-  extended header, non-zero frame flags (compression/encryption), malformed
-  synchsafe size fields, or containing `CHAP`/`CTOC` chapter frames. Such
-  files still mount and serve; they just contribute no scanned tags.
+  denial-of-service guard, see below — for tags with a major version other
+  than 2–4, unsynchronisation, an extended header, non-zero frame flags
+  (compression/encryption), malformed synchsafe size fields, or containing
+  `CHAP`/`CTOC` chapter frames. Such files still mount and serve; they just
+  contribute no scanned tags.
 - ID3v2.2 binary frames are not extracted (3-char ids; text and art still
   parse). `APIC` width/height are not recorded at scan time.
 - An `APIC` picture type outside the standard `0`–`20` range (the `id3`
@@ -92,11 +96,11 @@ tag followed by the untouched audio:
 1. `Inline` — the 10-byte tag header, all text/`TXXX`/`COMM`/`USLT` frames,
    and the rebuilt `POPM`/`UFID` frames. Frame sizes are synchsafe-bounded;
    oversized frames fail synthesis rather than emit a corrupt tag.
-2. Per picture: inline `APIC` framing + an `ArtImage` segment streaming the
-   image bytes.
-3. Per opaque binary frame: an inline frame header + a `BinaryTag` segment
+2. Per opaque binary frame: an inline frame header + a `BinaryTag` segment
    streaming the body from the DB (empty payloads are skipped — they would
    fail layout validation).
+3. Per picture: inline `APIC` framing + an `ArtImage` segment streaming the
+   image bytes.
 4. `BackingAudio` — the audio region located at scan time: everything after
    the leading ID3v2 tag and before a trailing ID3v1 tag, anchored by an
    MPEG frame-sync check. The Xing/LAME info frame is an MPEG frame, so it

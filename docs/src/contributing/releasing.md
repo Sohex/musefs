@@ -23,9 +23,11 @@ Also create a GitHub environment named `pypi` in the repo settings (it gates the
 
 1. Choose the new version `X.Y.Z` and run `python scripts/bump_python_version.py X.Y.Z`.
    This rewrites every `contrib/*/pyproject.toml` version, the `__version__`
-   strings, the `python-musefs>=` dependency floors, and re-vendors python-musefs
-   into the Picard plugin.
-2. Review `git diff` — it should touch only the version/floor lines and the
+   strings, Picard's `PLUGIN_VERSION`, the pinned `__version__ == "..."`
+   assertions in `contrib/lidarr/tests/test_smoke.py` and
+   `contrib/python-musefs/tests/test_public_api.py`, the `python-musefs>=`
+   dependency floors, and re-vendors python-musefs into the Picard plugin.
+2. Review `git diff` — it should touch only those version/floor lines and the
    Picard vendored `_common/` copy.
 3. Promote the `## [Unreleased]` section of `contrib/CHANGELOG.md` to
    `## [X.Y.Z] - <date>`.
@@ -35,16 +37,19 @@ Also create a GitHub environment named `pypi` in the repo settings (it gates the
    git tag py-vX.Y.Z
    git push origin HEAD --tags
    ```
-5. `release-python.yml` runs the version gate, the four Python test suites, then
-   publishes `python-musefs`, `beets-musefs`, and `lidarr-musefs` to PyPI (in
-   that order).
+5. `release-python.yml` runs the version gate, then the four Python test suites
+   and the real-Lidarr e2e (`lidarr-e2e.yml`); the `publish` job needs all five.
+   It then publishes `python-musefs`, `beets-musefs`, and `lidarr-musefs` to
+   PyPI (in that order).
 
 ## Releasing the Rust crates and binaries
 
 The Rust workspace publishes to crates.io and ships prebuilt cross-compiled
-binaries on a `v*` tag, decoupled from the Python `py-v*` flow. `release.yml`
-runs one ordered graph — `gate → build → smoke → publish → release-assets` —
-and is the source of truth; this checklist is the human side.
+binaries and container images on a `v*` tag, decoupled from the Python `py-v*`
+flow. `release.yml` runs one ordered graph — `gate → build → smoke → publish →
+release-assets`, with `images` branching off `smoke` and a record-only
+`benchmarks` job beside it — and is the source of truth; this checklist is the
+human side.
 
 **Pre-flight.**
 
@@ -68,16 +73,38 @@ and is the source of truth; this checklist is the human side.
    ```
 
    `scripts/smoke-binary.sh <binary>` is the smoke `release.yml` runs on each
-   build (scan, mount, read back, byte-identical audio, clean unmount). A
-   native binary runs it directly; a musl one inside `alpine` with `/dev/fuse`;
-   another architecture needs user-mode QEMU (`qemu-user`, or
-   `qemu-user-static` with binfmt registered for a `--platform` container).
-   The riscv64 smoke legs are emulated in CI and do not block the release.
+   build (scan, mount, read back, byte-identical audio, clean unmount). It needs
+   `ffmpeg` and `fusermount3` (the `fuse3` package) on `PATH` and `/dev/fuse`.
+   A native binary runs it directly, as the `smoke` job's host legs do:
 
-   If a target cannot build `jemalloc-sys`, add `--no-default-features` to that
-   matrix entry's `cargo zigbuild` in `release.yml`, rather than blocking the
-   release. The Docker images `COPY` the binary this step produces (they don't
-   run cargo), so the matching container inherits the opt-out automatically.
+   ```bash
+   ./scripts/apt-install.sh fuse3 ffmpeg
+   ./scripts/smoke-binary.sh ./bin/musefs
+   ```
+
+   A musl one runs inside `alpine`, with the same container flags the job uses:
+
+   ```bash
+   docker run --rm \
+     --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
+     -v "$PWD":/w -w /w alpine:3.23 \
+     sh -c 'apk add --no-cache fuse3 ffmpeg >/dev/null && sh scripts/smoke-binary.sh ./bin/musefs'
+   ```
+
+   Another architecture needs user-mode QEMU (`qemu-user`, or
+   `qemu-user-static` with binfmt registered) and adds `--platform
+   linux/riscv64` to that `docker run`, installing `fuse3 ffmpeg` with the
+   image's package manager (`debian:trixie-slim` for gnu, `alpine:3.23` for
+   musl). The riscv64 smoke legs are emulated in CI and do not block the
+   release.
+
+   If a target cannot build `jemalloc-sys`, don't block the release: add a key
+   to that target's `build` matrix entry in `release.yml` (e.g.
+   `cargo_flags: --no-default-features`) and append it in the shared `Build`
+   step (`cargo zigbuild --release -p musefs --target ${{ matrix.zig_target }}
+   ${{ matrix.cargo_flags }}`), so only that entry gets the flag. The Docker
+   images `COPY` the binary this step produces (they don't run cargo), so the
+   matching container inherits the opt-out automatically.
 
 **Version bump (do this in one commit before tagging).**
 
@@ -86,9 +113,16 @@ and is the source of truth; this checklist is the human side.
 3. Bump every internal `musefs-*` path-dependency constraint that pins the old
    version (e.g. `musefs-db = { version = "X.Y.Z", path = "..." }`) — a stale
    internal floor fails the publish.
-4. Promote the `## [Unreleased]` section of `CHANGELOG.md` to
-   `## [X.Y.Z] - <date>`.
-5. Dry-run package every published crate in **one** invocation, which packages
+4. Refresh the lockfiles. `cargo update --workspace` moves the workspace
+   crates' versions in `Cargo.lock` without touching any other dependency; the
+   dry run below and every `release.yml` publish use `--locked`, so a stale
+   lockfile fails them. `fuzz/` is outside the workspace and keeps its own
+   `fuzz/Cargo.lock`, which still pins the old musefs versions until
+   `cargo +nightly fuzz build` rebuilds it; commit that too.
+5. Promote the `## [Unreleased]` section of `CHANGELOG.md` to
+   `## [X.Y.Z] - <date>`, and confirm `docs/src/release-notes.md` has a
+   `## vX.Y.Z` section, with upgrade steps where the release needs any.
+6. Dry-run package every published crate in **one** invocation, which packages
    and verifies them in dependency order:
 
    ```bash
@@ -101,7 +135,7 @@ and is the source of truth; this checklist is the human side.
    siblings from the registry, not the workspace. The dry run catches packaging
    errors but **not** the cross-crate index-propagation problem at publish
    time; that is handled in-workflow (next section).
-6. Commit, e.g. `git commit -am "release: vX.Y.Z"`.
+7. Commit, e.g. `git commit -am "release: vX.Y.Z"`.
 
 **Tag and push.**
 
@@ -130,6 +164,17 @@ covering the full matrix including the FreeBSD VM e2e).
    a partial failure safe.
 5. `release-assets` — creates/updates the GitHub Release and uploads the binary
    tarballs + checksums (only after crates publishing succeeds).
+6. `images` — needs `smoke` only, so it runs alongside `publish` rather than
+   after it. For each of the glibc and musl variants it builds the amd64 image
+   and runs the binary smoke inside it, then pushes a multi-arch
+   (amd64/arm64/riscv64) manifest to GHCR under the tags
+   `scripts/container_tags.py` computes: `:X.Y.Z` and `:latest` for glibc,
+   `:X.Y.Z-musl` and `:musl` for musl (a prerelease version gets only the
+   version-pinned tag).
+7. `benchmarks` — runs `scripts/perf-release-bench.sh` independently of the
+   graph above and uploads a `benchmark-snapshot-vX.Y.Z` artifact. It is
+   record-only (`continue-on-error`) and never blocks the release; see
+   [Benchmarks](../benchmarks.md#ci-regression-gating).
 
 **Retry / rollback.**
 
@@ -149,34 +194,47 @@ covering the full matrix including the FreeBSD VM e2e).
    `sha256sum -c musefs-X.Y.Z-<triple>.tar.gz.sha256`.
 3. Confirm all six target tarballs + `.sha256` files are attached to the
    GitHub Release.
+4. Confirm the container tags exist on GHCR, e.g.
+   `docker manifest inspect ghcr.io/sohex/musefs:X.Y.Z` and
+   `ghcr.io/sohex/musefs:X.Y.Z-musl` (plus `:latest` and `:musl` for a stable
+   release).
 
-**Lidarr gate at a v1.0.0 milestone.** The Lidarr real-instance e2e
-(`lidarr-e2e.yml`) gates the Python `py-v*` release, not this Rust flow. When a
-v1.0.0 milestone bundles both, ensure the Python release (and therefore its
-Lidarr e2e gate) is also run.
+**The Lidarr gate.** The Lidarr real-instance e2e (`lidarr-e2e.yml`) gates the
+Python `py-v*` release, not this Rust flow. A release that bumps both the Rust
+workspace and the `contrib/` packages cuts both tags, `vX.Y.Z` and
+`py-vX.Y.Z`, so the Lidarr e2e runs as part of it.
 
 ## PRs & commits
 
 - Conventional-style subjects (`fix(format): …`, `docs: …`, `ci: …`), scoped
   and imperative.
 - `main` is protected by required status checks: the `ci-ok` and
-  `coverage-ok` aggregator jobs must pass. CI also runs the fuzz smoke
-  build, the in-diff mutation gate, and a security audit on PRs. Docs-only
-  changes skip the expensive jobs at the *job* level — the aggregators still
-  report.
+  `coverage-ok` aggregator jobs must pass. Docs-only changes skip the
+  expensive jobs at the *job* level — the aggregators still report.
+- Three more workflows run on PRs, filtered by path and not required checks:
+  the fuzz smoke (`fuzz.yml`: `musefs-format/**`, `fuzz/**`, the workflow),
+  the in-diff mutation gate (`mutants.yml`: `musefs-db/**`, `musefs-core/**`,
+  `musefs-format/**`, `scripts/mutants.sh`, `.cargo/mutants.toml`,
+  `scripts/check_mutant_anchors.py`, the workflow), and the security audit
+  (`audit.yml`: `**/Cargo.toml`, `Cargo.lock`, `fuzz/Cargo.lock`, the
+  workflow).
 - Benchmark results, when a change warrants them, are recorded in
   [Benchmarks](../benchmarks.md).
 
 ### Before you push
 
 The pre-commit hook already gates fmt, clippy, the workspace tests, and the
-Python/shell/YAML lints on every commit. What it does **not** run — check the
-ones your change triggers:
+Python/shell/YAML lints on every commit, plus the mutant-anchor drift guard
+when the mutants config, its check script, or a `musefs-core`/`musefs-format`
+source file is staged. What it does **not** run — check the ones your change
+triggers:
 
 - **Logic changes** → the [in-diff mutation gate](testing.md#mutation-testing). It is CI
   parity, not optional polish.
-- **Format-layer API changes** → `cargo +nightly fuzz build`; the `fuzz/`
-  crate is outside the workspace, so nothing else compiles it
+- **`musefs-format`, `musefs-core` or `musefs-db` API changes** →
+  `cargo +nightly fuzz build`; the `fuzz/` crate is outside the workspace, so
+  nothing else compiles it locally, and CI's fuzz smoke only triggers on
+  `musefs-format/**` and `fuzz/**`
   ([coverage-guided fuzzing](testing.md#coverage-guided-fuzzing)).
 - **`musefs-db` schema changes** → regenerate and re-vendor the Python schema
   mirror ([Python plugins](plugins.md#python-plugins-contrib)).

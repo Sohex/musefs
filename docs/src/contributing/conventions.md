@@ -64,8 +64,15 @@
    at a missing arm in another crate. `a_new_format_must_be_wired_into_the_dispatch`
    (in `reader.rs`) fails instead; it only sees its own list of variants, so
    add the new one there once the arm exists.
-3. Extend the test surface: a `fuzz_check::fixtures::<fmt>()` minimal file,
+3. Extend the store's `CHECK (format IN (...))` on `tracks`. It lives in the
+   latest migration's table definition, so it takes a new migration in
+   `musefs-db/src/schema.rs` (see *Schema migrations* above), then a
+   regenerated and re-vendored Python schema mirror
+   ([Python plugins](plugins.md#python-plugins-contrib)).
+4. Extend the test surface: a `fuzz_check::fixtures::<fmt>()` minimal file,
    a `fuzz/fuzz_targets/<fmt>.rs` target with a seed in `generate_seeds`, a
    `musefs-format/tests/proptest_<fmt>.rs`, and a manifest row in
    `musefs-core/tests/interop_emit.rs`.
-4. Write `docs/<FMT>.md` (follow the shape of the existing five).
+5. Write `docs/src/formats/<fmt>.md` (follow the shape of the existing five),
+   and add it to `docs/src/SUMMARY.md` and the table in
+   `docs/src/formats/overview.md`.

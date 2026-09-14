@@ -40,7 +40,9 @@ Two kinds of output ignore the log level entirely: `scan`/`revalidate` progress
 and per-target summaries (suppressed with `--quiet` / `-q`, see
 [Scanning](scanning.md#scan)), and a handful of CLI diagnostics printed
 directly to stderr — `warning: mountpoint … is not empty`, the `--file-mode` /
-`--dir-mode` write-bit warnings, and the final `musefs: <error>` on a hard
+`--dir-mode` write-bit warnings, the `warning: N track(s) have not been
+re-probed since the store was upgraded …` that `mount`, `scan` and `revalidate`
+print while a revalidate is owed, and the final `musefs: <error>` on a hard
 failure.
 
 They share stderr with the log, but they do not collide with it: the progress
@@ -216,7 +218,7 @@ is not a log line at all: it is a hard error, `musefs: mounting at /mnt/musefs:
 | Code | Meaning |
 | ---- | ------- |
 | `0` | Success. For `mount`, a clean unmount. |
-| `2` | `scan` / `revalidate` completed, but at least one file failed to ingest (`failed Y` with `Y > 0`). The parseable files *are* in the store. |
+| `2` | `scan` / `revalidate` completed, but at least one file failed to ingest (`failed Y` with `Y > 0`). The parseable files *are* in the store. Also `migrate`, when it upgraded the store but the revalidate it ran counted failed files. |
 | `1` | Hard error — a missing target, an unreadable or absent store, a mount that could not be established. The message is printed as `musefs: <error>`. |
 
 Exit `2` is what makes a partial ingest machine-detectable, so

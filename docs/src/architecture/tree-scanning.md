@@ -8,7 +8,8 @@ Two distinct counters drive correctness; they answer different questions.
 bytes change?"*. The DB triggers increment it on any input the database can see that changes
 synthesized bytes: tag and `track_art` edits, `art`-row deletes that orphan a
 reference, scanner-owned geometry changes (`format`, audio bounds, backing
-size/nanosecond-mtime), and FLAC structural-block changes. It is
+size/nanosecond-mtime and, from v4, the inode — including the one-time fill of
+an inode not yet recorded), and FLAC structural-block changes. It is
 therefore a superset key — the one input it cannot cover is an on-disk backing
 change with no DB write, which `resolve` (and, since #279, a size-cache
 `getattr` hit) catches by re-statting the backing file and degrading to
@@ -24,18 +25,19 @@ in-place rewrite, which is a POSIX timestamp limit rather than something musefs
 can fix; it catches the shape almost every tagger actually produces, writing a
 temporary file and renaming over the original.
 
-The inode is recorded only where the filesystem keeps one
-([#757](https://github.com/Sohex/musefs/issues/757)). FAT and exFAT store no
+On Linux, the inode is recorded only where the filesystem keeps one
+([#757](https://github.com/Sohex/musefs/issues/757)); on other platforms the
+question is not asked and the inode is always recorded. FAT and exFAT store no
 inode numbers: Linux assigns one each time a file enters the inode cache, so an
 untouched file reports a different number after a remount, or after eviction.
 The scanner asks the probed descriptor's filesystem (`fstatfs`) and records no
 inode there, and `revalidate` asks the same question live before re-probing a
 row that has none, so such a library converges rather than being rewritten on
 every pass. The answer belongs to the filesystem, so it is asked, not stored. On
-FAT and exFAT the stamp is therefore size plus a coarse mtime — two-second steps
-on FAT, 10 ms on exFAT, with ctime reported as mtime on both — which is why the
-[installation guide](../guide/installation.md) recommends against them as
-backing storage.
+Linux a FAT or exFAT stamp is therefore size plus a coarse mtime — two-second
+steps on FAT, 10 ms on exFAT, with ctime reported as mtime on both — which is
+why the [installation guide](../guide/installation.md) recommends against them
+as backing storage.
 
 The stamp does not include the device number either. An inode is unique only
 within one filesystem, so a different filesystem appearing at the backing path —
@@ -52,11 +54,11 @@ copy onto new storage never matches: every file reads as changed until
 
 A stored inode of zero means "not recorded" — every row a store migrated into
 v4 carries, until `musefs revalidate` (or a `scan --force` of the file) fills it
-in, since a plain `scan` leaves tracked rows alone, and every row on a
-filesystem that keeps none — and such a
+in, since a plain `scan` leaves tracked rows alone, and, on Linux, every row on
+a filesystem that keeps none — and such a
 row is compared on the other three fields alone rather than failing closed on a
 field the store has nothing to say about. `revalidate` re-probes those rows,
-except where the filesystem keeps no inodes, which is what makes it the
+except, on Linux, where the filesystem keeps no inodes, which is what makes it the
 repopulation path for an upgraded store. The
 wildcard is one-directional: it belongs to the *stored* side only, and a live
 stat that cannot produce an inode fails closed against a row that has one,
@@ -119,7 +121,10 @@ the inodes whose `content_version` rose are reported to the FUSE layer. Any
 poll whose changelog names a track advances the refresh generation — not only
 one that changed a render key — because an open handle caches its resolved
 layout, backing path and stamp included, until that generation moves. If
-the mount slept past the ring's capacity (or the ring was truncated), it
+the mount slept past the ring's capacity, the ring was truncated, or a
+changelog row past the watermark carries a non-integer `track_id` (possible only
+in a store written with its constraints off,
+[#760](https://github.com/Sohex/musefs/issues/760)), it
 falls back to a full tree rebuild — correct by construction, and a bulk
 change wants one anyway. The new version stamp is committed **only after** a
 successful rebuild; failures arm a retry backoff.

@@ -49,6 +49,11 @@ from the database, spliced in front of your original, untouched audio.
 
 See [Installation](https://sohex.github.io/musefs/guide/installation.html) for prebuilt binaries, container images, and platform notes.
 
+**Upgrading from 1.x?** 2.0.0 changes the store's schema: run
+`musefs migrate --db library.db` before anything else. The
+[release notes](https://sohex.github.io/musefs/release-notes.html#upgrading-from-v130)
+have the steps.
+
 ## Documentation
 
 Full documentation lives at **<https://sohex.github.io/musefs/>**:
@@ -57,6 +62,7 @@ Full documentation lives at **<https://sohex.github.io/musefs/>**:
   [Scanning](https://sohex.github.io/musefs/guide/scanning.html) ·
   [Mounting & path templates](https://sohex.github.io/musefs/guide/mounting.html) ·
   [Tuning](https://sohex.github.io/musefs/guide/tuning.html) ·
+  [Maintenance](https://sohex.github.io/musefs/guide/maintenance.html) ·
   [FAQ](https://sohex.github.io/musefs/guide/faq.html)
 - [Supported formats](https://sohex.github.io/musefs/formats/overview.html)
 - [Integrations](https://sohex.github.io/musefs/integrations/overview.html):
@@ -68,6 +74,7 @@ Full documentation lives at **<https://sohex.github.io/musefs/>**:
 - [Architecture](https://sohex.github.io/musefs/architecture/overview.html) ·
   [Contributing](https://sohex.github.io/musefs/contributing/setup.html) ·
   [Benchmarks](https://sohex.github.io/musefs/benchmarks.html) ·
+  [Release notes](https://sohex.github.io/musefs/release-notes.html) ·
   [Changelog](https://sohex.github.io/musefs/changelog.html)
 
 ## License

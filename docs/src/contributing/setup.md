@@ -14,7 +14,7 @@ Map of this document:
   testing, sanitizers, coverage.
 - [Code conventions](conventions.md#code-conventions) — errors, integer casts, lints,
   `unsafe`, layering.
-- [Adding a format](conventions.md#adding-a-format) — the four-step recipe.
+- [Adding a format](conventions.md#adding-a-format) — the five-step recipe.
 - [Python plugins (contrib)](plugins.md#python-plugins-contrib) — per-suite commands and
   the gotchas.
 - [Releasing](releasing.md#releasing-the-python-packages) — the Python (`py-v*`) and
@@ -31,7 +31,10 @@ Prerequisites:
   `/dev/fuse` and libfuse (`libfuse3-dev` / `libfuse3` plus `pkg-config`), or
   FreeBSD with `/dev/fuse` and the `fusefs` kernel module (no libfuse — see
   [FreeBSD e2e](#freebsd-e2e) for the in-tree VM harness).
-- **Python 3** with `ruff` and `pytest` — only for the Python plugin suites.
+- **Python 3** with `ruff` — needed for every commit: the pre-commit hook's
+  ruff leg runs unconditionally (docs-only commits included) and fails rather
+  than skipping when `ruff` is absent. `pytest` is needed only for the Python
+  suites.
 - **`shellcheck` and `yamllint`** — optional; the pre-commit hook's shell and
   YAML lint legs each skip with a notice if not installed.
 
@@ -116,9 +119,11 @@ truth — CI and local runs invoke the same scripts, so they can't drift:
 - `run-local.sh` — host-side orchestrator: creates and boots a FreeBSD VM under
   qemu/KVM and runs the suite in it. All artifacts go under the gitignored
   `.scratch/freebsd/`.
-- `provision.sh` — in-guest: installs `git`, `ffmpeg`, and the current stable
-  Rust toolchain via `rustup` (FreeBSD's packaged `rust` lags and is too old for
-  some deps), and loads the `fusefs` kernel module. Run by `run-local.sh` and CI.
+- `provision.sh` — in-guest: installs `git`, `ffmpeg`, `gmake` (the default
+  `jemalloc` feature's `tikv-jemalloc-sys` build invokes `gmake`, not base
+  `make`), and the current stable Rust toolchain via `rustup` (FreeBSD's
+  packaged `rust` lags and is too old for some deps), and loads the `fusefs`
+  kernel module. Run by `run-local.sh` and CI.
 - `run-e2e.sh` — in-guest: `cargo test --workspace` then the `--ignored` FUSE
   e2e suite (guards that `ffmpeg` is present so the decode/encode tests don't
   silently skip).
