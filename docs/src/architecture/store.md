@@ -275,7 +275,8 @@ so a store that passed `musefs migrate` holds no such row; the readers keep the
 guard for a store written with its constraints turned off.
 
 `get_art` is the one reader that materializes a whole `art` row, image blob
-included, rather than streaming it. It therefore guards both of its unbounded
+included, rather than streaming it. It is test scaffolding, compiled only under
+`test-support`; the serve path streams the blob. It therefore guards both of its unbounded
 columns from lengths first — `sha256` as above, and `length(data)` against the
 `art.byte_len` cap, which a crafted store can have been written without since
 both that cap and `byte_len = length(data)` are `CHECK`s. `art.sha256` is the

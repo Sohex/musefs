@@ -1483,7 +1483,7 @@ pub fn parse() -> Cli {
 }
 
 /// [`Cli`]'s command line as [`parse`] reads it.
-pub fn command() -> clap::Command {
+fn command() -> clap::Command {
     unset_empty_boolean_env(Cli::command(), &|name| {
         std::env::var_os(name).is_some_and(|value| value.is_empty())
     })

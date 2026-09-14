@@ -217,7 +217,8 @@ impl PendingMigration {
     }
 
     /// The store file this was opened from.
-    pub fn path(&self) -> &Path {
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 

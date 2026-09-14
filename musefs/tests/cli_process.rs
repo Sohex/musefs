@@ -1009,7 +1009,7 @@ fn an_empty_boolean_variable_leaves_the_flag_at_its_default() {
     // added without this test naming it.
     let mut declared: Vec<(String, String)> = Vec::new();
     let boolean = clap::builder::ValueParser::bool().type_id();
-    for sub in musefs_cli::command().get_subcommands() {
+    for sub in <musefs_cli::Cli as clap::CommandFactory>::command().get_subcommands() {
         for arg in sub.get_arguments() {
             if let Some(env) = arg.get_env()
                 && arg.get_value_parser().type_id() == boolean

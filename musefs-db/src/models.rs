@@ -401,6 +401,8 @@ impl Tag {
     }
 }
 
+/// A whole `art` row, as `Db::get_art` reads it: test scaffolding with it (#710).
+#[cfg(any(test, feature = "test-support"))]
 #[cfg_attr(feature = "mutants", derive(Default))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]

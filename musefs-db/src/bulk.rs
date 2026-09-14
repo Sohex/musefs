@@ -55,7 +55,8 @@ impl BulkWriter<'_> {
         upsert_track_in(&self.tx, t, ChecksumWrite::Keep, ChecksumWrite::Keep)
     }
 
-    /// See [`crate::Db::upsert_track_with_checksums`].
+    /// See `Db::upsert_track_with_checksums`. Test scaffolding (#710).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn upsert_track_with_checksums(
         &mut self,
         t: &NewTrack,

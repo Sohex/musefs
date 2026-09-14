@@ -314,6 +314,9 @@ impl VirtualTree {
         (files, dir_nodes.saturating_sub(1))
     }
 
+    /// The track a file inode serves. Test scaffolding, behind `test-support`
+    /// (#710).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn track_id(&self, inode: u64) -> Option<i64> {
         match self.nodes.get(&inode).map(|n| &n.kind) {
             Some(NodeKind::File { track_id }) => Some(*track_id),
@@ -583,6 +586,7 @@ impl VirtualTree {
     }
 
     /// Inodes of `dir`'s direct children whose pre-disambiguation name is `rendered`.
+    #[cfg(test)]
     fn children_by_rendered_with_examined(&self, dir: u64, rendered: &str) -> (Vec<u64>, usize) {
         match self
             .rendered_children
@@ -599,7 +603,8 @@ impl VirtualTree {
     }
 
     /// Inodes of `dir`'s direct children whose pre-disambiguation name is `rendered`.
-    pub fn children_by_rendered(&self, dir: u64, rendered: &str) -> Vec<u64> {
+    #[cfg(test)]
+    pub(crate) fn children_by_rendered(&self, dir: u64, rendered: &str) -> Vec<u64> {
         self.children_by_rendered_with_examined(dir, rendered).0
     }
 

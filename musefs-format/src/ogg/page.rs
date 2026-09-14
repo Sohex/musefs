@@ -224,6 +224,10 @@ pub fn read_packets(data: &[u8], want: usize) -> Result<Vec<ReadPacket>> {
 /// `header_len`) with the sequence number set to `new_seq` and the CRC recomputed
 /// over the patched page. The payload is read (to recompute the CRC) but not
 /// returned — callers splice it verbatim from the backing file.
+///
+/// The oracle the tests hold [`patch_page_header_algebraic`], which the serve
+/// path uses, to: test scaffolding, behind `fuzzing` (#710).
+#[cfg(any(test, feature = "fuzzing"))]
 pub fn patch_page_header(page: &[u8], new_seq: u32) -> Result<Vec<u8>> {
     let h = parse_page(page, 0)?;
     if page.len() < h.total_len() {

@@ -421,7 +421,7 @@ fn ilst_region(buf: &[u8]) -> Option<(usize, usize)> {
 /// Parse a `----` freeform atom payload into `(key, value)` pairs. Folds
 /// (mean, name) to a canonical key via the vocabulary, else keys on the verbatim
 /// `name`. One pair per UTF-8 (`type 1`) `data` sub-box — the iTunes multi-value
-/// convention; binary-typed `data` boxes are left to [`read_binary_tags`]. Empty
+/// convention; binary-typed `data` boxes are left to [`read_binary_tags_reporting`]. Empty
 /// if malformed.
 fn read_freeform(inner: &[u8]) -> Vec<(String, String)> {
     let Some(name_box) = find_box_lenient(inner, b"name") else {
@@ -621,7 +621,8 @@ pub fn read_pictures(buf: &[u8], max_art_bytes: usize) -> Vec<EmbeddedPicture> {
     read_pictures_reporting(buf, max_art_bytes).0
 }
 
-/// Like [`read_binary_tags`], but also returns the oversized `----` values
+/// Every binary-typed `----` atom's value, as `read_binary_tags` describes, and
+/// also the oversized `----` values
 /// skipped over `max_binary_tag_bytes`, so the caller can log each lossy drop.
 /// The size check still happens before any copy — an oversized value is
 /// described, never materialized. See [`OversizeDrop`].
@@ -703,6 +704,10 @@ pub fn read_binary_tags_reporting(
 /// (after the 8-byte `[type][locale]` header) exceed it is skipped before any
 /// copy, so an oversized `----` in a large `moov` is never materialized. Use
 /// [`read_binary_tags_reporting`] to also recover the oversized drops for logging.
+///
+/// Test scaffolding, behind `fuzzing` (#710): the scanner reads through
+/// [`read_binary_tags_reporting`].
+#[cfg(any(test, feature = "fuzzing"))]
 pub fn read_binary_tags(buf: &[u8], max_binary_tag_bytes: usize) -> Vec<EmbeddedBinaryTag> {
     read_binary_tags_reporting(buf, max_binary_tag_bytes).0
 }

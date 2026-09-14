@@ -2395,7 +2395,9 @@ fn uncommitted_total(failed: u64, raced: u64) -> u64 {
     failed + raced
 }
 
-/// Back-compat shim used by the CLI and existing tests.
+/// [`scan_directory_with`] at the default options. Test scaffolding, behind
+/// `test-support` (#710): the CLI builds its options.
+#[cfg(any(test, feature = "test-support"))]
 pub fn scan_directory(db: &Db, root: &Path) -> Result<ScanStats> {
     scan_directory_with(db, root, &ScanOptions::default())
 }
@@ -3000,7 +3002,9 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
     })
 }
 
-/// Back-compat shim used by the CLI and existing tests.
+/// [`revalidate_with`] at the default options. Test scaffolding, behind
+/// `test-support` (#710): the CLI builds its options.
+#[cfg(any(test, feature = "test-support"))]
 pub fn revalidate(db: &Db, root: &Path) -> Result<RevalidateStats> {
     revalidate_with(db, root, &ScanOptions::default())
 }

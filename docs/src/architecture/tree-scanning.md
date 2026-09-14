@@ -191,7 +191,7 @@ prune gets a fresh inode.)
 
 ## Scanning
 
-`scan_directory` (`musefs-core/src/scan.rs`) ingests a backing directory:
+`scan_directory_with` (`musefs-core/src/scan.rs`) ingests a backing directory:
 collect supported audio files, probe each (format detection → audio
 offset/length, tags, pictures, structural blocks) on a parallel probe
 pipeline feeding a single DB writer, committing in batches. Probing reads

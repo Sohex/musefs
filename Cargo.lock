@@ -1081,6 +1081,7 @@ dependencies = [
  "musefs-core",
  "musefs-db",
  "musefs-format",
+ "musefs-fuse",
  "ogg",
  "rustix",
  "sha2",

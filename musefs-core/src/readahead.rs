@@ -594,7 +594,9 @@ impl PrefetchWorkers {
     /// without missing reads still in flight, and tearing down a backing
     /// filesystem that lives in this process (the latency-injecting mount the
     /// read benches use), which otherwise can vanish under a worker mid-read and
-    /// park that thread in uninterruptible sleep.
+    /// park that thread in uninterruptible sleep. Compiled with
+    /// `Musefs::drain_prefetch`, its one caller, for tests only (#710).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn drain(&self, timeout: std::time::Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -807,7 +809,8 @@ impl<'a> BackingReader<'a> {
         (self.planned_next_expected.get(), self.planned_window.get())
     }
 
-    pub fn fills(&self) -> u64 {
+    #[cfg(test)]
+    pub(crate) fn fills(&self) -> u64 {
         self.fills.get()
     }
 

@@ -17,8 +17,10 @@ mod tracks;
 
 pub use bulk::BulkWriter;
 pub use error::{DbError, Result};
+#[cfg(any(test, feature = "test-support"))]
+pub use models::Art;
 pub use models::{
-    Art, ArtMeta, BinaryTag, BinaryTagRow, ChecksumWrite, EmbeddedArt, Format, NewArt, NewTrack,
+    ArtMeta, BinaryTag, BinaryTagRow, ChecksumWrite, EmbeddedArt, Format, NewArt, NewTrack,
     StructuralBlock, Tag, Track, TrackArt, TrackBounds, TrackIdentity,
 };
 pub use tracks::ChangelogRead;
@@ -242,6 +244,9 @@ impl Db<ReadOnly> {
 }
 
 impl<M> Db<M> {
+    /// The store's `user_version`. Test scaffolding (#710): every production
+    /// reader of the version goes through the migration code.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn user_version(&self) -> Result<i64> {
         Ok(self
             .conn

@@ -84,6 +84,8 @@ mod imp {
                 }
             }
 
+            /// Zero every counter. Test scaffolding, behind `test-support` (#710).
+            #[cfg(any(test, feature = "test-support"))]
             pub fn reset() {
                 $($stat.store(0, Ordering::Relaxed);)*
             }
@@ -362,6 +364,7 @@ mod imp {
     pub fn snapshot() -> super::Snapshot {
         super::Snapshot::default()
     }
+    #[cfg(any(test, feature = "test-support"))]
     #[inline(always)]
     pub fn reset() {}
 }
