@@ -1,6 +1,6 @@
 #![cfg(feature = "fuzzing")]
 use musefs_format::fuzz_check::{assert_backing_covers_audio, fixtures};
-use musefs_format::{ArtInput, BinaryTagInput, Segment, TagInput, mp3};
+use musefs_format::{ArtInput, BinaryTagInput, Extent, Segment, TagInput, mp3};
 use proptest::prelude::*;
 
 proptest! {
@@ -188,5 +188,150 @@ proptest! {
         let ufid_count = inline_bytes.windows(4).filter(|w| w == b"UFID").count();
         let expected_ufid_count = if has_mb_ufid { 2 } else { 1 };
         prop_assert_eq!(ufid_count, expected_ufid_count, "UFID frame count mismatch (MB promoted + non-MB opaque)");
+    }
+}
+
+/// Where a layout puts its ID3v1 trailer, relative to its appended tags.
+#[derive(Debug, Clone, Copy)]
+enum Id3v1At {
+    Absent,
+    AfterAppended,
+    BeforeAppended,
+}
+
+/// Synchsafe size encoding, independent of the production encoder.
+fn syncsafe(n: u32) -> [u8; 4] {
+    [
+        ((n >> 21) & 0x7F) as u8,
+        ((n >> 14) & 0x7F) as u8,
+        ((n >> 7) & 0x7F) as u8,
+        (n & 0x7F) as u8,
+    ]
+}
+
+/// A v2.4 text tag with `title` and maybe `artist`, marked as an update (an
+/// extended header with flag b, structure §3.2) when `update`, and given a
+/// `3DI` footer (§3.4) when `footer`.
+fn test_tag(title: &str, artist: Option<&str>, update: bool, footer: bool) -> Vec<u8> {
+    let mut pairs = vec![("title", title)];
+    if let Some(a) = artist {
+        pairs.push(("artist", a));
+    }
+    let mut tag = fixtures::id3v24_text_tag(&pairs);
+    if update {
+        let frames = tag[10..].to_vec();
+        tag = vec![b'I', b'D', b'3', 4, 0, 0x40];
+        tag.extend_from_slice(&syncsafe(u32::try_from(frames.len() + 6).unwrap()));
+        tag.extend_from_slice(&[0, 0, 0, 6, 0x01, 0x40]);
+        tag.extend_from_slice(&frames);
+    }
+    if footer {
+        tag[5] |= 0x10;
+        let copy = tag[3..10].to_vec();
+        tag.extend_from_slice(b"3DI");
+        tag.extend_from_slice(&copy);
+    }
+    tag
+}
+
+/// Probe `file` the way the scan does: a 138-byte tail and a `window`-byte
+/// prefix, each widened on `NeedMore`. Returns the bounds and the final prefix
+/// and tail lengths.
+fn locate_windowed(file: &[u8], window: usize) -> (mp3::Mp3Bounds, usize, usize) {
+    let len = file.len() as u64;
+    let mut tail_len = file.len().min(138);
+    let trailer = loop {
+        match mp3::locate_trailer(&file[file.len() - tail_len..], len).unwrap() {
+            Extent::Complete(t) => break t,
+            Extent::NeedMore { up_to } => {
+                assert!(up_to > tail_len as u64 && up_to <= len);
+                tail_len = usize::try_from(up_to).unwrap();
+            }
+        }
+    };
+    let mut want = file.len().min(window);
+    loop {
+        match mp3::locate_audio_bounded(&file[..want], len, &trailer).unwrap() {
+            Extent::Complete(b) => return (b, want, tail_len),
+            Extent::NeedMore { up_to } => {
+                assert!(up_to > want as u64 && up_to <= len);
+                want = usize::try_from(up_to).unwrap();
+            }
+        }
+    }
+}
+
+type TagSpec = (String, Option<String>, bool);
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// #767/#768: any run of prepended tags, any appended tags, and an ID3v1
+    /// trailer on either side of them. The audio region is exactly the audio;
+    /// a windowed probe agrees with the whole-buffer one; and the merged tags
+    /// follow §5 — each tag in file order replaces what came before, unless it
+    /// is an update, which overrides only the keys it carries.
+    #[test]
+    fn tags_at_both_ends_are_located_and_merged_in_file_order(
+        leading in proptest::collection::vec(
+            (("[a-z]{1,8}", proptest::option::of("[a-z]{1,8}"), any::<bool>()), any::<bool>()),
+            0..4,
+        ),
+        appended in proptest::collection::vec(
+            ("[a-z]{1,8}", proptest::option::of("[a-z]{1,8}"), any::<bool>()),
+            0..4,
+        ),
+        // Below 0x40, so no filler byte can spell `TAG` or `3DI`.
+        audio_fill in proptest::collection::vec(0u8..0x40, 0..64),
+        id3v1 in prop_oneof![
+            Just(Id3v1At::Absent),
+            Just(Id3v1At::AfterAppended),
+            Just(Id3v1At::BeforeAppended),
+        ],
+        window in 1usize..200,
+    ) {
+        let mut file = Vec::new();
+        for ((title, artist, update), footer) in &leading {
+            file.extend(test_tag(title, artist.as_deref(), *update, *footer));
+        }
+        let audio_offset = file.len() as u64;
+        let mut audio = vec![0xFF, 0xFB];
+        audio.extend_from_slice(&audio_fill);
+        file.extend_from_slice(&audio);
+        if matches!(id3v1, Id3v1At::BeforeAppended) {
+            file.extend(fixtures::id3v1_trailer());
+        }
+        for (title, artist, update) in &appended {
+            file.extend(test_tag(title, artist.as_deref(), *update, true));
+        }
+        if matches!(id3v1, Id3v1At::AfterAppended) {
+            file.extend(fixtures::id3v1_trailer());
+        }
+
+        let bounds = mp3::locate_audio(&file).unwrap();
+        prop_assert_eq!((bounds.audio_offset, bounds.audio_length), (audio_offset, audio.len() as u64));
+
+        let (windowed, prefix_len, tail_len) = locate_windowed(&file, window);
+        prop_assert_eq!(&windowed, &bounds);
+        let len = file.len() as u64;
+        let whole = mp3::read_metadata(&file, &file, len, &bounds);
+        let partial = mp3::read_metadata(&file[..prefix_len], &file[file.len() - tail_len..], len, &windowed);
+        prop_assert_eq!(&partial, &whole);
+
+        let in_order: Vec<&TagSpec> = leading.iter().map(|(spec, _)| spec).chain(appended.iter()).collect();
+        let mut model = std::collections::BTreeMap::new();
+        for (title, artist, update) in in_order {
+            if !update {
+                model.clear();
+            }
+            model.insert("title".to_string(), title.clone());
+            if let Some(a) = artist {
+                model.insert("artist".to_string(), a.clone());
+            }
+        }
+        let mut merged = whole.tags.clone();
+        merged.sort();
+        let expected: Vec<(String, String)> = model.into_iter().collect();
+        prop_assert_eq!(merged, expected);
     }
 }

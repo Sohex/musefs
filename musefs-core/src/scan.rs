@@ -800,6 +800,23 @@ fn wav_probed(prefix: &[u8], bounds: &wav::WavBounds) -> Probed {
     }
 }
 
+/// Assemble an MP3 [`Probed`] from located audio bounds, merging every ID3v2 tag
+/// the locator found at either end of the file (#767, #768). `front` holds the
+/// file from offset 0 and `tail` its last bytes, of a file `file_len` long.
+/// Shared by the bounded and full-buffer probe paths.
+fn mp3_probed(front: &[u8], tail: &[u8], file_len: u64, bounds: &mp3::Mp3Bounds) -> Probed {
+    let metadata = mp3::read_metadata(front, tail, file_len, bounds);
+    Probed {
+        format: Format::Mp3,
+        audio_offset: bounds.audio_offset,
+        audio_length: bounds.audio_length,
+        tags: metadata.tags,
+        pictures: metadata.pictures,
+        binary_tags: metadata.binary_tags,
+        structural_blocks: Vec::new(),
+    }
+}
+
 /// Assemble the FLAC `Probed` for an already-located audio region, reading tags
 /// and pictures out of `prefix`.
 ///
@@ -859,18 +876,7 @@ pub(crate) fn probe_full(path: &Path, bytes: &[u8]) -> Option<Probed> {
         Some(flac_probed(bytes, &flac::locate_audio(bytes).ok()?))
     } else if has_ext(path, "mp3") {
         let bounds = mp3::locate_audio(bytes).ok()?;
-        let (binary_tags, promoted) = mp3::read_binary_tags(bytes);
-        let mut tags = mp3::read_tags(bytes);
-        tags.extend(promoted);
-        Some(Probed {
-            format: Format::Mp3,
-            audio_offset: bounds.audio_offset,
-            audio_length: bounds.audio_length,
-            tags,
-            pictures: mp3::read_pictures(bytes),
-            binary_tags,
-            structural_blocks: Vec::new(),
-        })
+        Some(mp3_probed(bytes, bytes, bytes.len() as u64, &bounds))
     } else if has_ext(path, "m4a") || has_ext(path, "m4b") {
         let bounds = mp4::locate_audio(bytes).ok()?;
         let (pictures, art_drops) = mp4::read_pictures_reporting(bytes, MAX_ART_BYTES);
@@ -963,6 +969,49 @@ fn read_tail_128(file: &std::fs::File, file_len: u64) -> std::io::Result<Option<
     file.read_exact_at(&mut buf, file_len - 128)?;
     crate::metrics::on_scan_read(128);
     Ok(Some(buf))
+}
+
+/// The first window an MP3's tail read takes: an ID3v1 trailer, and the ID3v2.4
+/// footer of a tag appended in front of it.
+const MP3_TAIL_WINDOW: u64 = 138;
+
+/// Most reads [`read_mp3_tail`] makes: the first window, one per appended tag the
+/// format layer walks (it stops at 64), and one spare.
+const MAX_MP3_TAIL_READS: usize = 66;
+
+/// An MP3's trailing tags, and the window on the end of the file that holds them.
+struct Mp3Tail {
+    bytes: Vec<u8>,
+    trailer: mp3::Mp3Trailer,
+}
+
+/// Read the end of an MP3 until every tag trailing its audio lies inside the
+/// window (#768): [`MP3_TAIL_WINDOW`] bytes first, then back to wherever the
+/// footers say the appended tags begin, plus one first window more for a further
+/// footer or an ID3v1 trailer in front of them. The MPEG payload is never read.
+///
+/// Held to the probe ceiling, like the front of the file: `Ok(None)` when the
+/// trailing tags reach further back than it, or do not walk, which the MP3 arm
+/// of [`probe_prefix`] reports as unparseable.
+fn read_mp3_tail(file: &std::fs::File, file_len: u64) -> std::io::Result<Option<Mp3Tail>> {
+    use std::os::unix::fs::FileExt;
+    let cap = file_len.min(MAX_PROBE_BYTES);
+    let mut want = MP3_TAIL_WINDOW.min(cap);
+    // `locate_trailer` only asks for more than it was given, so each pass under
+    // the ceiling reads further back than the last.
+    for _ in 0..MAX_MP3_TAIL_READS {
+        let mut bytes = vec![0u8; usize_from(want)];
+        file.read_exact_at(&mut bytes, file_len - want)?;
+        crate::metrics::on_scan_read(want);
+        match mp3::locate_trailer(&bytes, file_len) {
+            Ok(Extent::Complete(trailer)) => return Ok(Some(Mp3Tail { bytes, trailer })),
+            Ok(Extent::NeedMore { up_to }) if up_to <= cap => {
+                want = (up_to + MP3_TAIL_WINDOW).min(cap);
+            }
+            Ok(Extent::NeedMore { .. }) | Err(_) => return Ok(None),
+        }
+    }
+    Ok(None)
 }
 
 /// Bounded probe of one backing file: open once, fstat before and after the
@@ -1138,14 +1187,19 @@ fn probe_body(
     let probe_cap = file_len.min(MAX_PROBE_BYTES);
     let mut want = usize_from((window as u64).min(probe_cap));
     let mut prefix = read_window(file, want)?;
-    // Only the MP3 arm of probe_prefix consumes the ID3v1 tail, plus the FLAC arm
-    // for the rare file that puts an ID3v2 tag in front of the `fLaC` marker
-    // (#602) — a stock .flac still pays no tail read (#67), and .ogg/.wav never
-    // do. The `ID3` magic sits in the first 3 bytes, so this verdict does not
-    // change as the window widens below.
-    let tail = if has_ext(path, "mp3") || (has_ext(path, "flac") && flac::has_leading_id3(&prefix))
-    {
+    // Only the FLAC arm of probe_prefix consumes the 128-byte ID3v1 tail, for the
+    // rare file that puts an ID3v2 tag in front of the `fLaC` marker (#602) — a
+    // stock .flac still pays no tail read (#67), and .ogg/.wav never do. The
+    // `ID3` magic sits in the first 3 bytes, so this verdict does not change as
+    // the window widens below.
+    let tail = if has_ext(path, "flac") && flac::has_leading_id3(&prefix) {
         read_tail_128(file, file_len)?
+    } else {
+        None
+    };
+    // An MP3 reads its trailing tags whole, as far back as their footers say.
+    let mp3_tail = if has_ext(path, "mp3") {
+        read_mp3_tail(file, file_len)?
     } else {
         None
     };
@@ -1157,7 +1211,14 @@ fn probe_body(
         None
     };
     for _ in 0..MAX_WIDEN_RETRIES {
-        match probe_prefix(path, &prefix, file_len, tail.as_ref(), ogg_tail.as_ref()) {
+        match probe_prefix(
+            path,
+            &prefix,
+            file_len,
+            tail.as_ref(),
+            mp3_tail.as_ref(),
+            ogg_tail.as_ref(),
+        ) {
             Probe::Done(p) => return Ok(ProbeBody::Parsed(p)),
             Probe::Skip(why) => {
                 return Ok(ProbeBody::Failed(Failure::new(
@@ -1258,6 +1319,7 @@ fn probe_prefix(
     prefix: &[u8],
     file_len: u64,
     tail: Option<&[u8; 128]>,
+    mp3_tail: Option<&Mp3Tail>,
     ogg_tail: Option<&OggTail>,
 ) -> Probe {
     if has_ext(path, "flac") {
@@ -1267,20 +1329,13 @@ fn probe_prefix(
             Err(_) => Probe::Skip(UNPARSEABLE),
         }
     } else if has_ext(path, "mp3") {
-        match mp3::locate_audio_bounded(prefix, file_len, tail) {
+        // No tail: its trailing tags reach past the probe ceiling, or do not walk.
+        let Some(mp3_tail) = mp3_tail else {
+            return Probe::Skip(UNPARSEABLE);
+        };
+        match mp3::locate_audio_bounded(prefix, file_len, &mp3_tail.trailer) {
             Ok(Extent::Complete(b)) => {
-                let (binary_tags, promoted) = mp3::read_binary_tags(prefix);
-                let mut tags = mp3::read_tags(prefix);
-                tags.extend(promoted);
-                Probe::Done(Probed {
-                    format: Format::Mp3,
-                    audio_offset: b.audio_offset,
-                    audio_length: b.audio_length,
-                    tags,
-                    pictures: mp3::read_pictures(prefix),
-                    binary_tags,
-                    structural_blocks: Vec::new(),
-                })
+                Probe::Done(mp3_probed(prefix, &mp3_tail.bytes, file_len, &b))
             }
             Ok(Extent::NeedMore { up_to }) => Probe::NeedMore(up_to),
             Err(_) => Probe::Skip(UNPARSEABLE),

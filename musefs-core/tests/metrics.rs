@@ -526,10 +526,15 @@ fn scan_still_reads_id3v1_tail_for_mp3() {
     scan_directory_with(&db, &target.corpus_dir, &no_checksum_opts()).unwrap();
     let s = metrics::snapshot();
     // Corpus tracks are far below the default 64 KiB scan window (this test must
-    // keep the default ScanOptions::window): one prefix read + the tail. read_tail_128
-    // always reads 128 bytes when file_len >= 128, trailer present or not, so
-    // the +128 assertion is robust. `--checksum=none` keeps the fingerprint
-    // tier's audio sampling out of the count.
-    assert_eq!(s.scan_preads, 2, "mp3: prefix read + ID3v1 tail read");
-    assert_eq!(s.scan_bytes_read, len + 128, "mp3 keeps the 128-byte tail");
+    // keep the default ScanOptions::window): one prefix read + the tail. The MP3
+    // tail read is 138 bytes, an ID3v1 trailer and the ID3v2.4 footer in front of
+    // it, whether or not either is there; it widens only when a footer declares
+    // an appended tag, which no corpus file carries (#768). `--checksum=none`
+    // keeps the fingerprint tier's audio sampling out of the count.
+    assert!(
+        len >= 138,
+        "the corpus mp3 is at least one tail window long"
+    );
+    assert_eq!(s.scan_preads, 2, "mp3: prefix read + trailer tail read");
+    assert_eq!(s.scan_bytes_read, len + 138, "mp3 reads a 138-byte tail");
 }
