@@ -1,27 +1,19 @@
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::thread;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use musefs_core::{Mode, MountConfig, Musefs, VirtualTree, scan_directory};
+use musefs_core::{MountConfig, Musefs, VirtualTree, scan_directory};
 
 #[path = "../tests/common/mod.rs"]
 mod common;
 use common::corpus::{CorpusParams, Format, bench_formats, format_token, generate};
 
 fn config() -> MountConfig {
-    MountConfig {
-        template: "$artist/$album/$title".to_string(),
-        fallbacks: BTreeMap::new(),
-        default_fallback: "Unknown".to_string(),
-        mode: Mode::Synthesis,
-        poll_interval: std::time::Duration::ZERO,
-        case_insensitive: false,
-        read_ahead_budget: 64 * 1024 * 1024,
-        read_ahead_prefetch: false,
-        skip_on_missing: false,
-        trust_backing_mtime: false,
-    }
+    let mut config = MountConfig::default();
+    config.template = "$artist/$album/$title".to_string();
+    config.poll_interval = std::time::Duration::ZERO;
+    config.case_insensitive = false;
+    config
 }
 
 /// Recursively collect every non-directory inode reachable from `dir`. Used

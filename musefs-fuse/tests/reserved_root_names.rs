@@ -16,10 +16,9 @@ mod common;
 use common::{config, make_flac};
 
 fn fuse_config() -> FuseConfig {
-    FuseConfig {
-        expose_metrics: true,
-        ..FuseConfig::default()
-    }
+    let mut fuse_config = FuseConfig::default();
+    fuse_config.expose_metrics = true;
+    fuse_config
 }
 
 /// #681: a track whose rendered root component is the synthetic name. The

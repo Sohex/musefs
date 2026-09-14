@@ -7,7 +7,8 @@ pub use art_source::{ArtSource, MapArtSource};
 
 pub use b64::{B64Window, b64_len, b64_len_checked, b64_window, encode_b64_slice};
 pub use page::{
-    PageHeader, parse_page, patch_page_header, patch_page_header_algebraic, verify_page_crc,
+    MAX_PAGE_BYTES, PageHeader, parse_page, patch_page_header, patch_page_header_algebraic,
+    verify_page_crc,
 };
 
 use crate::error::{FormatError, Result};
@@ -38,7 +39,8 @@ fn detect_codec(first_packet: &[u8]) -> Result<Codec> {
 
 /// For OggFLAC, packet 0 is `0x7F "FLAC" major minor count(2, BE) "fLaC" STREAMINFO`.
 /// The 16-bit big-endian count is the number of metadata-block packets that follow
-/// packet 0.
+/// packet 0 — or, when it is zero, that the number is *unknown*. See
+/// [`oggflac_header_packets`].
 fn oggflac_following_packets(first_packet: &[u8]) -> Result<usize> {
     if first_packet.len() < 9 {
         return Err(FormatError::Malformed);
@@ -46,9 +48,84 @@ fn oggflac_following_packets(first_packet: &[u8]) -> Result<usize> {
     Ok(u16::from_be_bytes([first_packet[7], first_packet[8]]) as usize)
 }
 
+/// Byte offset of the STREAMINFO block header within the OggFLAC mapping packet:
+/// `0x7F "FLAC"` (5) + major + minor (2) + count (2) + `"fLaC"` (4).
+const OGGFLAC_STREAMINFO_POS: usize = 13;
+
+/// The last-metadata-block flag, the high bit of a FLAC block header's first byte.
+const FLAC_LAST_BLOCK: u8 = 0x80;
+
+/// The reserved-invalid FLAC block type. A native FLAC audio packet opens with the
+/// `0xFF` frame sync, whose low seven bits are exactly this value — which is what
+/// makes the low bits the discriminator the Ogg mapping names for telling a
+/// metadata packet from the first audio packet.
+const FLAC_BLOCK_TYPE_INVALID: u8 = 127;
+
+fn is_flac_metadata_block(packet: &[u8]) -> bool {
+    packet
+        .first()
+        .is_some_and(|b| b & 0x7F != FLAC_BLOCK_TYPE_INVALID)
+}
+
+fn is_last_flac_metadata_block(packet: &[u8]) -> bool {
+    packet.first().is_some_and(|b| b & FLAC_LAST_BLOCK != 0)
+}
+
+/// Reassemble exactly `want` packets, treating a short run as malformed.
+fn read_exactly(data: &[u8], want: usize) -> Result<Vec<page::ReadPacket>> {
+    let pkts = page::read_packets(data, want)?;
+    if pkts.len() != want {
+        return Err(FormatError::Malformed);
+    }
+    Ok(pkts)
+}
+
+/// Reassemble an OggFLAC header run: the mapping packet plus the metadata-block
+/// packets that follow it.
+///
+/// A nonzero count is taken at its word: the mapping requires a count it gives to
+/// be the true number of following packets, and zero is its escape hatch for
+/// *unknown* — not a statement that there are none. Metadata packets still follow. Reading it as "none" put a file's real VORBIS_COMMENT (and any
+/// PICTURE, SEEKTABLE or CUESHEET) past `audio_offset`, so it was never ingested
+/// and was then replayed verbatim inside the synthesized stream, where a decoder
+/// meets metadata blocks in place of audio frames (#723).
+///
+/// So an unknown count discovers the run by the rule the format defines: metadata
+/// blocks run until one carries the last-block flag. STREAMINFO is itself a
+/// metadata block, so a mapping packet that flags it as the last one ends the run
+/// at packet 0.
+fn oggflac_header_packets(data: &[u8], mapping: &[u8]) -> Result<Vec<page::ReadPacket>> {
+    let declared = oggflac_following_packets(mapping)?;
+    if declared > 0 {
+        return read_exactly(data, 1 + declared);
+    }
+    if mapping
+        .get(OGGFLAC_STREAMINFO_POS)
+        .is_some_and(|b| b & FLAC_LAST_BLOCK != 0)
+    {
+        return read_exactly(data, 1);
+    }
+    page::read_packets_while(data, |out| {
+        let last = out.last().expect("a packet was just completed");
+        if out.len() == 1 {
+            return Ok(true); // the mapping packet; its followers are what we seek
+        }
+        // A run that reaches the audio packet without ever flagging its last block
+        // has no discoverable end: malformed, rather than something to guess at.
+        // That is also what bounds the walk — along with the data itself, since
+        // every page advances the cursor by at least its 27 header bytes and
+        // running off the end is an error.
+        if !is_flac_metadata_block(&last.data) {
+            return Err(FormatError::Malformed);
+        }
+        Ok(!is_last_flac_metadata_block(&last.data))
+    })
+}
+
 /// The parsed Ogg header region: codec, serial, the reassembled header packets,
 /// the number of header pages, and where audio begins.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct OggHeader {
     pub codec: Codec,
     pub serial: u32,
@@ -88,17 +165,12 @@ pub fn read_header(data: &[u8]) -> Result<OggHeader> {
     let first_pkt = first.first().ok_or(FormatError::Malformed)?;
     let codec = detect_codec(&first_pkt.data)?;
 
-    let want = match codec {
-        Codec::Opus => 2,
-        Codec::Vorbis => 3,
-        Codec::OggFlac => 1 + oggflac_following_packets(&first_pkt.data)?,
+    let pkts = match codec {
+        Codec::Opus => read_exactly(data, 2)?,
+        Codec::Vorbis => read_exactly(data, 3)?,
+        Codec::OggFlac => oggflac_header_packets(data, &first_pkt.data)?,
     };
-
-    let pkts = page::read_packets(data, want)?;
-    if pkts.len() != want {
-        return Err(FormatError::Malformed);
-    }
-    let last = pkts.last().unwrap();
+    let last = pkts.last().ok_or(FormatError::Malformed)?;
     let audio_offset = last.end_offset as u64;
     validate_single_bitstream(data, audio_offset, serial)?;
     Ok(OggHeader {
@@ -171,6 +243,7 @@ pub fn read_pictures(data: &[u8]) -> Result<Vec<EmbeddedPicture>> {
 /// the caller can log the lossy drop (the format layer has no logging facade).
 /// Carries only a reason and the skipped value's encoded size — never the bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PictureDrop {
     /// Why the picture was skipped.
     pub reason: &'static str,
@@ -268,15 +341,98 @@ fn decode_picture_base64(value: &str) -> Option<Vec<u8>> {
 
 /// Audio bounds + codec from a complete file, for the scanner.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct OggScan {
     pub codec: Codec,
     pub audio_offset: u64,
     pub audio_length: u64,
 }
 
+/// What a file's final page says about how many logical bitstreams it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chaining {
+    /// The final page belongs to the header's bitstream: one stream, start to end.
+    Single,
+    /// The final page belongs to a different bitstream: the file is chained.
+    Chained,
+    /// No page ended at the file's last byte within the window given — a truncated
+    /// file, or trailing bytes that are not a page. Nothing is proven either way.
+    Unknown,
+}
+
+/// Classify a file by the serial of its final page, where `tail` is its last
+/// `tail.len()` bytes starting at absolute offset `tail_start`.
+///
+/// `validate_single_bitstream` can only prove things about the *header* region,
+/// which is where multiplexing shows up. A chain is complete logical bitstreams
+/// concatenated end to end (RFC 3533), so the second stream's pages necessarily
+/// begin after the first stream's audio does — inside what the scanner otherwise
+/// declares to be one audio region, where the serve path would renumber them as
+/// though they belonged to the first stream (#722).
+///
+/// The final page is the cheap discriminator: a chain's last page belongs to its
+/// last stream, so a serial other than the header's proves chaining for the whole
+/// well-formed-chain class at the cost of one page-sized read. A *missing* page
+/// end at EOF proves nothing — that is what a truncated file looks like, and those
+/// still serve — so it reports [`Chaining::Unknown`] rather than a rejection.
+///
+/// A `tail` at least [`MAX_PAGE_BYTES`] long (or covering the whole file) always
+/// contains the final page whole, so the CRC below is always checkable.
+pub fn classify_tail(tail: &[u8], tail_start: u64, serial: u32) -> Chaining {
+    let file_end = tail_start + tail.len() as u64;
+    // Backwards, like the serve path's page location: the final page is the one
+    // whose declared length lands exactly on the last byte, and its CRC is what
+    // separates it from a coincidental `OggS` in audio payload.
+    let mut i = tail.len().saturating_sub(4);
+    let mut crc_checks = 0usize;
+    loop {
+        if tail[i..].starts_with(page::CAPTURE)
+            && let Ok(h) = page::parse_page(tail, i)
+            && tail_start + (i + h.total_len()) as u64 == file_end
+        {
+            // Spend from the budget before the CRC, which walks the whole page: a
+            // crafted tail can plant a length-to-EOF candidate at every offset,
+            // and without a bound one file would cost ~65,000 whole-page CRCs
+            // (the amplification #619 bounded on the serve path's own scan). A
+            // real file resolves on its first candidate. Past the budget nothing
+            // is proven, which is what `Unknown` already means.
+            if crc_checks == MAX_TAIL_CRC_CHECKS {
+                return Chaining::Unknown;
+            }
+            crc_checks += 1;
+            if page::verify_page_crc(&tail[i..]).unwrap_or(false) {
+                return if h.serial == serial {
+                    Chaining::Single
+                } else {
+                    Chaining::Chained
+                };
+            }
+        }
+        if i == 0 {
+            return Chaining::Unknown;
+        }
+        i -= 1;
+    }
+}
+
+/// Whole-page CRC validations one [`classify_tail`] scan may pay. Mirrors the
+/// serve path's `MAX_CRC_CHECKS`: orders of magnitude more headroom than a real
+/// file needs, and a fixed small multiple of the legitimate cost.
+const MAX_TAIL_CRC_CHECKS: usize = 64;
+
+/// [`classify_tail`] over a whole-file buffer, taking its own tail window.
+fn classify_whole(data: &[u8], serial: u32) -> Chaining {
+    let want = crate::convert::usize_from((data.len() as u64).min(MAX_PAGE_BYTES));
+    let start = data.len() - want;
+    classify_tail(&data[start..], start as u64, serial)
+}
+
 pub fn locate_audio(data: &[u8]) -> Result<OggScan> {
     let header = read_header(data)?;
     if header.audio_offset > data.len() as u64 {
+        return Err(FormatError::Malformed);
+    }
+    if classify_whole(data, header.serial) == Chaining::Chained {
         return Err(FormatError::Malformed);
     }
     Ok(OggScan {
@@ -341,6 +497,7 @@ pub fn synthesize_layout(
         offset: audio_offset,
         len: audio_length,
         seq_delta,
+        serial: header.serial,
     });
     Ok(RegionLayout::validated(segments)?)
 }
@@ -550,13 +707,23 @@ fn oggflac_packets_with_art(
         return Err(FormatError::Malformed);
     }
     mapping[7..9].copy_from_slice(&count.to_be_bytes());
+    // Metadata blocks always follow this packet — the regenerated comment block at
+    // minimum — so STREAMINFO is never the last one. A source whose count was
+    // unknown may have flagged it as last; leaving that flag set would terminate
+    // the metadata run before the comment block a decoder is about to meet.
+    if let Some(b) = mapping.get_mut(OGGFLAC_STREAMINFO_POS) {
+        *b &= !FLAC_LAST_BLOCK;
+    }
 
     let mut out = vec![vec![PayloadChunk::Bytes(mapping)]];
     out.extend(block_packets);
     Ok(out)
 }
 
-#[doc(hidden)]
+/// Page and comment-body builders for fixtures, used by `fuzz_check` and by
+/// musefs-core's tests. Behind `fuzzing` with the rest of the test surface, so
+/// none of it is published API.
+#[cfg(any(test, feature = "fuzzing"))]
 pub mod page_test_support {
     pub use crate::ogg::page::{build_header as build_header_pub, lace_packet as lace_packet_pub};
 
@@ -1141,6 +1308,151 @@ mod tests {
         assert!(locate_audio(&data).is_err());
     }
 
+    /// Stream A (the `opus_headers` bitstream, serial 0x1234) complete, then a
+    /// whole second logical bitstream appended under its own serial — a chain, in
+    /// the shape RFC 3533 defines. Returns the file and stream A's length.
+    fn chained_opus() -> (Vec<u8>, usize) {
+        let mut data = opus_headers();
+        let (audio, _) = lace_packet(0x1234, 2, false, 960, &[0u8; 120]);
+        data.extend_from_slice(&audio);
+        let stream_a_len = data.len();
+
+        let head = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".to_vec();
+        let tags = b"OpusTags\x06\x00\x00\x00musefs\x00\x00\x00\x00".to_vec();
+        let (b_header, b_pages) = build_header(0x5678, &[&head, &tags]);
+        data.extend_from_slice(&b_header);
+        let (b_audio, _) = lace_packet(0x5678, b_pages, false, 960, &[1u8; 120]);
+        data.extend_from_slice(&b_audio);
+        (data, stream_a_len)
+    }
+
+    #[test]
+    fn rejects_chained_second_bitstream() {
+        let (data, stream_a_len) = chained_opus();
+        // The header region alone still looks like one clean bitstream — which is
+        // exactly the gap the final-page check closes: a chain's second stream
+        // begins after the first one's audio does (#722).
+        assert!(read_header(&data).is_ok());
+        assert_eq!(classify_whole(&data, 0x1234), Chaining::Chained);
+        assert!(locate_audio(&data).is_err());
+        // Stream A on its own is unaffected.
+        assert!(locate_audio(&data[..stream_a_len]).is_ok());
+    }
+
+    #[test]
+    fn classify_tail_works_from_a_window_anchored_mid_file() {
+        // The scanner passes only the file's last page-sized window, not the file.
+        let (data, _) = chained_opus();
+        let start = data.len() - 200;
+        assert_eq!(
+            classify_tail(&data[start..], start as u64, 0x1234),
+            Chaining::Chained
+        );
+        // A window that does not reach the final page's start proves nothing —
+        // which is why the scanner reads a whole page's worth.
+        let short = data.len() - 64;
+        assert_eq!(
+            classify_tail(&data[short..], short as u64, 0x1234),
+            Chaining::Unknown
+        );
+    }
+
+    #[test]
+    fn classify_tail_rejects_ogg_captures_that_are_not_the_final_page() {
+        // A tail densely packed with `OggS` must not be read as a page end. Every
+        // candidate here parses as a zero-segment page, so only the "declared
+        // length lands exactly on the last byte" filter and the CRC separate them
+        // from the real thing — and neither passes.
+        let mut tail = vec![0u8; 4096];
+        for i in 0..tail.len() - 27 {
+            tail[i..i + 4].copy_from_slice(page::CAPTURE);
+        }
+        assert_eq!(classify_tail(&tail, 0, 0x1234), Chaining::Unknown);
+    }
+
+    #[test]
+    fn classify_whole_covers_a_file_that_is_a_single_page() {
+        // The window is the file's LAST `MAX_PAGE_BYTES` bytes, so for a file
+        // shorter than that it has to start at zero. A window anchored one byte
+        // in would miss a page that begins at the very start of the file.
+        let (page, _) = lace_packet(0x1234, 0, true, 0, &[7u8; 40]);
+        assert_eq!(classify_whole(&page, 0x1234), Chaining::Single);
+        assert_eq!(classify_whole(&page, 0x5678), Chaining::Chained);
+    }
+
+    /// One valid page of serial 0x5678 whose payload hides `decoys` fake page
+    /// headers, each declaring a length that lands exactly on EOF so only the CRC
+    /// can reject it. The backward scan meets every decoy before the real page.
+    fn tail_with_decoys(decoys: usize) -> Vec<u8> {
+        let stride = 300usize; // > one decoy's 282-byte maximum header extent
+        let payload = vec![0u8; stride * (decoys + 1)];
+        let (mut page, _) = lace_packet(0x5678, 9, false, 0, &payload);
+        let h = parse_page(&page, 0).unwrap();
+        let len = page.len();
+
+        for k in 1..=decoys {
+            let i = len - k * stride;
+            assert!(
+                i >= h.header_len,
+                "decoys must not overwrite the real header"
+            );
+            page[i..i + 4].copy_from_slice(page::CAPTURE);
+            page[i + 4] = 0; // version
+            page[i + 5] = 0; // header_type
+            // total_len = 27 + seg_count + sum(lacing) must land on EOF.
+            page[i + 26] = 255;
+            let mut left = len - i - 27 - 255;
+            for seg in 0..255usize {
+                let v = left.min(255);
+                page[i + 27 + seg] = u8::try_from(v).expect("v <= 255");
+                left -= v;
+            }
+            assert_eq!(left, 0, "decoy payload must fit one page's lacing table");
+            assert_eq!(page::parse_page(&page, i).unwrap().total_len(), len - i);
+        }
+        // The real page's CRC covers the decoys, so recompute it over them.
+        let patched = patch_page_header(&page, h.seq).unwrap();
+        page[..h.header_len].copy_from_slice(&patched);
+        assert!(page::verify_page_crc(&page).unwrap());
+        page
+    }
+
+    #[test]
+    fn classify_tail_stops_after_a_bounded_number_of_crc_checks() {
+        // Decoys are what a crafted tail costs: without a bound, one file would
+        // pay a whole-page CRC per candidate — the amplification #619 bounded on
+        // the serve path's own backward scan. Just inside the budget the real
+        // page is still found; one decoy more and detection is given up rather
+        // than amplified. The serve path's serial check is what still fails such
+        // a file closed, which is why giving up here is `Unknown`, not an error.
+        let within = tail_with_decoys(MAX_TAIL_CRC_CHECKS - 1);
+        assert_eq!(classify_tail(&within, 0, 0x1234), Chaining::Chained);
+        assert_eq!(classify_tail(&within, 0, 0x5678), Chaining::Single);
+
+        let past = tail_with_decoys(MAX_TAIL_CRC_CHECKS);
+        assert_eq!(classify_tail(&past, 0, 0x1234), Chaining::Unknown);
+    }
+
+    #[test]
+    fn truncated_stream_is_not_mistaken_for_a_chain() {
+        // A torn final page proves nothing about chaining, and a truncated file
+        // still serves — so it must stay accepted.
+        let mut data = opus_headers();
+        let (audio, _) = lace_packet(0x1234, 2, false, 960, &[0u8; 120]);
+        data.extend_from_slice(&audio);
+        data.truncate(data.len() - 7);
+        assert_eq!(classify_whole(&data, 0x1234), Chaining::Unknown);
+        assert!(locate_audio(&data).is_ok());
+    }
+
+    #[test]
+    fn a_whole_single_stream_classifies_as_single() {
+        let mut data = opus_headers();
+        let (audio, _) = lace_packet(0x1234, 2, false, 960, &[0u8; 120]);
+        data.extend_from_slice(&audio);
+        assert_eq!(classify_whole(&data, 0x1234), Chaining::Single);
+    }
+
     #[test]
     fn synthesize_oggflac_keeps_seektable_replaces_comment_and_count() {
         let mut data = oggflac_headers();
@@ -1190,6 +1502,157 @@ mod tests {
         );
     }
 
+    /// Build an OggFLAC file: a mapping packet declaring `declared` following
+    /// packets with STREAMINFO flagged `streaminfo_last`, then `blocks` as one
+    /// metadata packet each, then one audio page. Returns the file and the byte
+    /// length of its header region.
+    fn oggflac_file(declared: u16, streaminfo_last: bool, blocks: &[Vec<u8>]) -> (Vec<u8>, usize) {
+        let mut streaminfo = Vec::new();
+        crate::flac::push_block_header(&mut streaminfo, 0, 34, streaminfo_last).unwrap();
+        streaminfo.extend(std::iter::repeat_n(0u8, 34));
+
+        let mut mapping = vec![0x7F];
+        mapping.extend_from_slice(b"FLAC");
+        mapping.push(1);
+        mapping.push(0);
+        mapping.extend_from_slice(&declared.to_be_bytes());
+        mapping.extend_from_slice(b"fLaC");
+        mapping.extend_from_slice(&streaminfo);
+
+        let mut packets: Vec<&[u8]> = vec![&mapping];
+        packets.extend(blocks.iter().map(Vec::as_slice));
+        let (header, pages) = crate::ogg::page::build_header(77, &packets);
+        let header_len = header.len();
+
+        let mut data = header;
+        // A native FLAC audio frame opens with the 0xFF sync, which is what tells
+        // the discovery walk it has left the metadata run.
+        let (audio, _) =
+            crate::ogg::page::lace_packet(77, pages, false, 4096, &[0xFFu8, 0xF8, 0x69, 0x18]);
+        data.extend_from_slice(&audio);
+        (data, header_len)
+    }
+
+    fn vorbis_comment_block(last: bool, title: &str) -> Vec<u8> {
+        let body =
+            crate::vorbiscomment::build(&[crate::input::TagInput::new("title", title)]).unwrap();
+        let mut blk = Vec::new();
+        crate::flac::push_block_header(&mut blk, 4, body.len(), last).unwrap();
+        blk.extend_from_slice(&body);
+        blk
+    }
+
+    #[test]
+    fn oggflac_unknown_count_discovers_the_header_run() {
+        // A count of 0 means "unknown", not "none": the VORBIS_COMMENT still
+        // follows, and reading the count literally left it inside the audio
+        // region, un-ingested and replayed by synthesis (#723).
+        let blocks = vec![vorbis_comment_block(true, "RealTitle")];
+        let (unknown, header_len) = oggflac_file(0, false, &blocks);
+        let (declared, _) = oggflac_file(1, false, &blocks);
+
+        let h = read_header(&unknown).unwrap();
+        assert_eq!(h.codec, Codec::OggFlac);
+        assert_eq!(h.packets.len(), 2, "mapping packet + VORBIS_COMMENT");
+        assert_eq!(h.audio_offset, header_len as u64);
+        assert_eq!(
+            read_tags(&unknown).unwrap(),
+            vec![("title".to_string(), "RealTitle".to_string())]
+        );
+        // An honest count and an unknown one describe the same file — the mapping
+        // packet's count byte is the only difference between the two.
+        let d = read_header(&declared).unwrap();
+        assert_eq!(h.packets[1..], d.packets[1..]);
+        assert_eq!(
+            (h.header_pages, h.audio_offset),
+            (d.header_pages, d.audio_offset)
+        );
+        assert_eq!(
+            locate_audio(&unknown).unwrap(),
+            locate_audio(&declared).unwrap()
+        );
+    }
+
+    #[test]
+    fn oggflac_unknown_count_walks_past_blocks_that_are_not_last() {
+        // Discovery must continue through every block whose last-block flag is
+        // clear and stop at the one that sets it — a run of exactly one block
+        // would not tell the two conditions apart.
+        let seektable = {
+            let mut b = Vec::new();
+            crate::flac::push_block_header(&mut b, 3, 18, false).unwrap();
+            b.extend(std::iter::repeat_n(0xEEu8, 18));
+            b
+        };
+        let blocks = vec![seektable, vorbis_comment_block(true, "RealTitle")];
+        let (data, header_len) = oggflac_file(0, false, &blocks);
+
+        let h = read_header(&data).unwrap();
+        assert_eq!(h.packets.len(), 3, "mapping + SEEKTABLE + VORBIS_COMMENT");
+        assert_eq!(h.audio_offset, header_len as u64);
+        assert_eq!(
+            read_tags(&data).unwrap(),
+            vec![("title".to_string(), "RealTitle".to_string())]
+        );
+    }
+
+    #[test]
+    fn oggflac_unknown_count_ends_at_a_streaminfo_flagged_last() {
+        // STREAMINFO is itself a metadata block: flagged last, the run is packet 0.
+        let (data, header_len) = oggflac_file(0, true, &[]);
+        let h = read_header(&data).unwrap();
+        assert_eq!(h.packets.len(), 1);
+        assert_eq!(h.audio_offset, header_len as u64);
+        assert_eq!(read_tags(&data).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn oggflac_run_that_never_flags_its_last_block_is_malformed() {
+        // No last-block flag anywhere: the walk reaches the audio packet, which is
+        // not a metadata block, and there is nothing left to guess from.
+        let (data, _) = oggflac_file(0, false, &[vorbis_comment_block(false, "T")]);
+        assert!(read_header(&data).is_err());
+        assert!(locate_audio(&data).is_err());
+    }
+
+    #[test]
+    fn synthesize_oggflac_from_unknown_count_clears_the_streaminfo_last_flag() {
+        // Source: STREAMINFO flagged last, no following blocks. Synthesis appends a
+        // comment block, so STREAMINFO must stop claiming to be the last one.
+        let (data, _) = oggflac_file(0, true, &[]);
+        let scan = locate_audio(&data).unwrap();
+        let header = read_metadata(&data[..crate::convert::usize_from(scan.audio_offset)]).unwrap();
+        let layout = synthesize_layout(
+            &header,
+            scan.audio_offset,
+            scan.audio_length,
+            &[TagInput::new("title", "Kaini Industries")],
+            &[],
+            &MapArtSource::default(),
+        )
+        .unwrap();
+
+        let mut header_bytes: Vec<u8> = Vec::new();
+        for seg in layout.segments() {
+            match seg {
+                Segment::Inline(b) => header_bytes.extend_from_slice(b),
+                Segment::OggAudio { .. } => break,
+                other => panic!("unexpected segment {other:?}"),
+            }
+        }
+        let h = read_header(&header_bytes).unwrap();
+        assert_eq!(
+            h.packets[0][OGGFLAC_STREAMINFO_POS] & FLAC_LAST_BLOCK,
+            0,
+            "STREAMINFO is no longer the last metadata block"
+        );
+        assert_eq!(u16::from_be_bytes([h.packets[0][7], h.packets[0][8]]), 1);
+        assert_eq!(
+            read_tags(&header_bytes).unwrap(),
+            vec![("title".to_string(), "Kaini Industries".to_string())]
+        );
+    }
+
     #[test]
     fn synthesize_opus_embeds_art_that_round_trips() {
         let mut data = opus_headers();
@@ -1206,6 +1669,8 @@ mod tests {
             picture_type: crate::input::PictureType::new(3).unwrap(),
             width: 64,
             height: 64,
+            depth: 0,
+            colors: 0,
             data_len: crate::input::BlobLen::new(image.len() as u64).unwrap(),
         };
         let src = MapArtSource::new([(meta.art_id, image.clone())]);
@@ -1299,6 +1764,8 @@ mod tests {
             picture_type: crate::input::PictureType::new(3).unwrap(),
             width: 10,
             height: 10,
+            depth: 0,
+            colors: 0,
             data_len: crate::input::BlobLen::new(len as u64).unwrap(),
         }
     }
@@ -1450,6 +1917,8 @@ mod tests {
             art_id: 0,
             mime: "image/jpeg".to_string(),
             description: String::new(),
+            depth: 0,
+            colors: 0,
             data_len: crate::input::BlobLen::new(u64::from(u32::MAX)).unwrap(),
             picture_type: crate::input::PictureType::new(3).unwrap(),
             width: 0,
@@ -1475,6 +1944,8 @@ mod tests {
             art_id: 0,
             mime: "image/png".to_string(),
             description: "x".repeat(256),
+            depth: 0,
+            colors: 0,
             data_len: crate::input::BlobLen::new(3_221_225_470).unwrap(),
             picture_type: crate::input::PictureType::new(3).unwrap(),
             width: 0,
@@ -1507,6 +1978,8 @@ mod tests {
             art_id: 0,
             mime: "image/png".to_string(),
             description: String::new(),
+            depth: 0,
+            colors: 0,
             data_len: crate::input::BlobLen::new(3_221_225_412).unwrap(),
             picture_type: crate::input::PictureType::new(3).unwrap(),
             width: 0,
@@ -1536,6 +2009,8 @@ mod tests {
             art_id: 0,
             mime: "image/jpeg".to_string(),
             description: String::new(),
+            depth: 0,
+            colors: 0,
             data_len: crate::input::BlobLen::new(u64::MAX).unwrap(),
             picture_type: crate::input::PictureType::new(3).unwrap(),
             width: 0,
@@ -1565,6 +2040,8 @@ mod tests {
             art_id: 0,
             mime: "image/jpeg".to_string(),
             description: String::new(),
+            depth: 0,
+            colors: 0,
             data_len: crate::input::BlobLen::new(u64::MAX).unwrap(),
             picture_type: crate::input::PictureType::new(3).unwrap(),
             width: 0,
@@ -1592,6 +2069,8 @@ mod tests {
             picture_type: crate::input::PictureType::new(3).unwrap(),
             width: 1,
             height: 1,
+            depth: 0,
+            colors: 0,
             data_len: crate::input::BlobLen::new(12345).unwrap(),
         };
         let p = picture_prefix(&art).unwrap();
@@ -1695,6 +2174,8 @@ mod tests {
             picture_type: crate::input::PictureType::new(3).unwrap(),
             width: 0,
             height: 0,
+            depth: 0,
+            colors: 0,
             data_len: crate::input::BlobLen::new(data_len).unwrap(),
         };
         let framing_len = picture_prefix(&mk(1)).unwrap().len() as u64;
@@ -1763,6 +2244,8 @@ mod tests {
             picture_type: crate::input::PictureType::new(3).unwrap(),
             width: 1,
             height: 1,
+            depth: 0,
+            colors: 0,
             data_len: crate::input::BlobLen::new(100).unwrap(),
         };
         let prefix = picture_prefix(&art).unwrap();
@@ -1808,6 +2291,8 @@ mod tests {
             picture_type: crate::input::PictureType::new(3).unwrap(),
             width: 0,
             height: 0,
+            depth: 0,
+            colors: 0,
             data_len: crate::input::BlobLen::new(image.len() as u64).unwrap(),
         };
         let max = Cell::new(0usize);

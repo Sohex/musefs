@@ -10,7 +10,7 @@ use musefs_db::Db;
 /// art)`, with tags as `(key, value, ordinal)` and art as
 /// `(sha256, picture_type, description, ordinal)`.
 type NormalizedTrack = (
-    String,
+    std::path::PathBuf,
     u64,
     u64,
     Vec<(String, String, u64)>,
@@ -65,15 +65,9 @@ fn bounded_probe_equivalent_to_full_for_every_format() {
 
         // Bounded scan with a 64-byte window → widen path fires on every file.
         let bounded_db = Db::open_in_memory().unwrap();
-        musefs_core::scan_directory_with(
-            &bounded_db,
-            dir.path(),
-            &musefs_core::ScanOptions {
-                window: 64,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let mut options = musefs_core::ScanOptions::default();
+        options.window = 64;
+        musefs_core::scan_directory_with(&bounded_db, dir.path(), &options).unwrap();
         let bounded = normalized(&bounded_db);
 
         assert_eq!(

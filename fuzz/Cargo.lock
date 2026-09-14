@@ -422,7 +422,7 @@ dependencies = [
 
 [[package]]
 name = "musefs-core"
-version = "1.3.0"
+version = "2.0.0"
 dependencies = [
  "arc-swap",
  "base16ct",
@@ -435,6 +435,7 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "quick_cache",
+ "rustix",
  "sha2",
  "sharded-slab",
  "thiserror",
@@ -442,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "musefs-db"
-version = "1.3.0"
+version = "2.0.0"
 dependencies = [
  "base16ct",
  "log",
@@ -454,7 +455,7 @@ dependencies = [
 
 [[package]]
 name = "musefs-format"
-version = "1.3.0"
+version = "2.0.0"
 dependencies = [
  "base64",
  "id3",

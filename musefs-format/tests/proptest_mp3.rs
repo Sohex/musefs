@@ -98,14 +98,15 @@ proptest! {
         // Step 2: DB round-trip.
         let db = musefs_db::Db::open_in_memory().unwrap();
         let tid = db.upsert_track(&musefs_db::NewTrack {
-            backing_path: "/a.mp3".into(),
+            backing_path: std::path::PathBuf::from("/a.mp3"),
             format: musefs_db::Format::Mp3,
             audio_offset: 0,
             audio_length: 0,
             backing_size: 0,
             backing_mtime_ns: 0,
             backing_ctime_ns: 0,
-        }).unwrap();
+            backing_ino: None,
+}).unwrap();
         let db_tags: Vec<musefs_db::BinaryTag> = opaque.iter().enumerate().map(|(i, e)| {
             musefs_db::BinaryTag { key: e.key.clone(), payload: e.payload.clone(), ordinal: u64::try_from(i).unwrap() }
         }).collect();

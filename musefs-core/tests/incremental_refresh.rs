@@ -3,7 +3,7 @@ mod common;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use musefs_core::{Mode, MountConfig, Musefs, scan_directory};
+use musefs_core::{MountConfig, Musefs, scan_directory};
 use musefs_db::{Db, Tag};
 
 use common::corpus::{CorpusParams, Format, Target, prepare};
@@ -16,37 +16,28 @@ fn small_corpus(n: usize) -> Target {
 }
 
 fn config() -> MountConfig {
-    MountConfig {
-        template: "$artist/$album/$title".into(),
-        fallbacks: BTreeMap::new(),
-        default_fallback: "Unknown".into(),
-        mode: Mode::Synthesis,
-        poll_interval: Duration::ZERO,
-        case_insensitive: false,
-        read_ahead_budget: 64 * 1024 * 1024,
-        read_ahead_prefetch: false,
-        skip_on_missing: false,
-        trust_backing_mtime: false,
-    }
+    let mut config = MountConfig::default();
+    config.template = "$artist/$album/$title".into();
+    config.poll_interval = Duration::ZERO;
+    config.case_insensitive = false;
+    config
 }
 
 fn config_ci() -> MountConfig {
-    MountConfig {
-        case_insensitive: true,
-        read_ahead_budget: 64 * 1024 * 1024,
-        read_ahead_prefetch: false,
-        skip_on_missing: false,
-        trust_backing_mtime: false,
-        ..config()
-    }
+    let mut new_config = config();
+    new_config.case_insensitive = true;
+    new_config.read_ahead_budget = 64 * 1024 * 1024;
+    new_config.read_ahead_prefetch = false;
+    new_config.skip_on_missing = false;
+    new_config.trust_backing_mtime = false;
+    new_config
 }
 
 fn config_skip() -> MountConfig {
-    MountConfig {
-        skip_on_missing: true,
-        trust_backing_mtime: false,
-        ..config()
-    }
+    let mut new_config = config();
+    new_config.skip_on_missing = true;
+    new_config.trust_backing_mtime = false;
+    new_config
 }
 
 /// (rendered tree path -> inode) for every FILE, walking from root. Tests compare
@@ -443,12 +434,7 @@ fn empty_ring_with_zero_watermark_polls_incremental() {
     // ring stays empty.
     let writer = Db::open(&db_path).unwrap();
     writer
-        .upsert_art(&musefs_db::NewArt {
-            mime: "image/png".into(),
-            width: None,
-            height: None,
-            data: vec![0u8; 8],
-        })
+        .upsert_art(&musefs_db::NewArt { data: vec![0u8; 8] })
         .unwrap();
 
     assert!(fs.poll_refresh().unwrap());
@@ -501,10 +487,13 @@ proptest! {
                     // DB-only track: tree-building never reads the backing file, and
                     // both fs and reference read the same DB, so equivalence holds.
                     let new = musefs_db::NewTrack {
-                        backing_path: format!("/virt/added-{add_seq}.flac"),
+                        backing_path: std::path::PathBuf::from(format!(
+                            "/virt/added-{add_seq}.flac"
+                        )),
                         format: musefs_db::Format::Flac,
                         audio_offset: 0, audio_length: 1, backing_size: 1, backing_mtime_ns: 0, backing_ctime_ns: 0,
-                    };
+                        backing_ino: None,
+};
                     // Surface DB errors instead of vacuously skipping the op.
                     let id = writer.upsert_track(&new).unwrap();
                     writer
@@ -555,6 +544,62 @@ fn revalidate_reprobes_on_ctime_only_change() {
     assert_eq!(stats.updated, 1, "ctime-only change must be re-probed");
 }
 
+/// #674's repopulation path. A store migrated into V4 has no recorded inode on
+/// any row, and `matches_live` has to ignore the field for those — so the stamp
+/// passes on three columns where it should pass on four. Revalidate is what
+/// closes that gap, alongside the structural and checksum backfills it already
+/// covered, so it must re-probe a row whose inode is missing even though every
+/// other field says the file is unchanged.
+#[test]
+fn revalidate_reprobes_a_row_with_no_recorded_inode() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("a.flac");
+    common::write_flac(&src, &["TITLE=T"], &[0xAB; 4096]);
+    let db_path = dir.path().join("m.db");
+    {
+        let db = Db::open(&db_path).unwrap();
+        scan_directory(&db, dir.path()).unwrap();
+    }
+
+    let db = Db::open(&db_path).unwrap();
+    let id = db.list_tracks().unwrap()[0].id;
+    assert!(
+        db.get_track(id).unwrap().unwrap().backing_ino.is_some(),
+        "a fresh scan records the inode"
+    );
+
+    // Rewind the column to the sentinel by upserting the row as a build older
+    // than #674 would have written it — which is the shape V4 leaves every
+    // existing row in, reached through the public writer rather than by
+    // standing up a migrated store.
+    let before = db.get_track(id).unwrap().unwrap();
+    db.upsert_track(&musefs_db::NewTrack {
+        backing_path: before.backing_path.clone(),
+        format: before.format,
+        audio_offset: before.bounds.audio_offset(),
+        audio_length: before.bounds.audio_length(),
+        backing_size: before.backing_size,
+        backing_mtime_ns: before.backing_mtime_ns,
+        backing_ctime_ns: before.backing_ctime_ns,
+        backing_ino: None,
+    })
+    .unwrap();
+    assert_eq!(db.get_track(id).unwrap().unwrap().backing_ino, None);
+
+    // Nothing about the file changed, so only the missing inode can make this
+    // re-probe.
+    let stats = musefs_core::revalidate(&db, dir.path()).unwrap();
+    assert_eq!(stats.updated, 1, "a row with no inode must be re-probed");
+    assert!(
+        db.get_track(id).unwrap().unwrap().backing_ino.is_some(),
+        "and the re-probe must fill it in"
+    );
+
+    // Idempotent: with the inode recorded, the same file is skipped again.
+    let stats = musefs_core::revalidate(&db, dir.path()).unwrap();
+    assert_eq!(stats.updated, 0, "a complete row is unchanged");
+}
+
 #[test]
 fn revalidate_changed_file_refreshes_layer_a_preserves_layer_b() {
     let dir = tempfile::tempdir().unwrap();
@@ -602,10 +647,8 @@ fn revalidate_prunes_only_with_flag() {
     assert_eq!(stats.pruned, 0);
     assert_eq!(db.list_tracks().unwrap().len(), 1);
 
-    let opts = musefs_core::ScanOptions {
-        prune: true,
-        ..Default::default()
-    };
+    let mut opts = musefs_core::ScanOptions::default();
+    opts.prune = true;
     let stats = musefs_core::revalidate_with(&db, dir.path(), &opts).unwrap();
     assert_eq!(stats.pruned, 1);
     assert_eq!(db.list_tracks().unwrap().len(), 0);

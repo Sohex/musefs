@@ -13,13 +13,14 @@ fn setup() -> (tempfile::TempDir, Db, i64) {
     let db = Db::open_in_memory().unwrap();
     let id = db
         .upsert_track(&NewTrack {
-            backing_path: flac.to_string_lossy().into_owned(),
+            backing_path: flac.clone(),
             format: Format::Flac,
             audio_offset,
             audio_length,
             backing_size: meta.len(),
             backing_mtime_ns: common::real_mtime_ns(&flac),
             backing_ctime_ns: common::real_ctime_ns(&flac),
+            backing_ino: None,
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("title", "Real Title", 0)])
@@ -69,13 +70,14 @@ fn bounds_check_rejects_audio_region_overrunning_the_file() {
 
     let db = Db::open_in_memory().unwrap();
     let overrun = db.upsert_track(&NewTrack {
-        backing_path: flac.to_string_lossy().into_owned(),
+        backing_path: flac.clone(),
         format: Format::Flac,
         audio_offset: 0,
         audio_length: meta.len() + 1,
         backing_size: meta.len(),
         backing_mtime_ns: mtime_ns,
         backing_ctime_ns: ctime_ns,
+        backing_ino: None,
     });
     assert!(
         overrun.is_err(),
@@ -91,9 +93,6 @@ fn resolve_includes_art_image_segments() {
     let (_dir, db, id) = setup();
     let art_id = db
         .upsert_art(&NewArt {
-            mime: "image/png".to_string(),
-            width: None,
-            height: None,
             data: vec![0x9u8; 80],
         })
         .unwrap();
@@ -103,6 +102,11 @@ fn resolve_includes_art_image_segments() {
             art_id,
             picture_type: 3,
             description: String::new(),
+            mime: "image/png".into(),
+            width: None,
+            height: None,
+            depth: 0,
+            colors: 0,
             ordinal: 0,
         }],
     )
@@ -139,4 +143,52 @@ fn structure_only_resolves_to_whole_backing_file() {
     // Reading the whole file yields the original bytes unchanged (not synthesized).
     let whole = read_at(&resolved, &db, 0, resolved.total_len).unwrap();
     assert_eq!(whole, original);
+}
+
+/// #725 puts the store's `content_version` in the reported timestamp's
+/// nanoseconds so a metadata edit moves the mtime. That is right only where the
+/// served bytes are synthesized from the store.
+///
+/// In `StructureOnly` the served bytes *are* the backing file, so a tag edit
+/// changes nothing about them — and signalling a change would send every
+/// size-plus-mtime consumer to re-copy a byte-identical file. The inverse of the
+/// bug #725 fixes, and just as wrong.
+#[test]
+fn a_tag_edit_does_not_move_the_passthrough_mtime() {
+    let (dir, db, id) = setup();
+    let _ = dir;
+
+    let before = HeaderCache::new(Mode::StructureOnly)
+        .resolve(&db, id)
+        .unwrap()
+        .mtime;
+
+    // A real edit: it bumps content_version, which is what Synthesis reports.
+    db.replace_tags(id, &[musefs_db::Tag::new("title", "Edited", 0)])
+        .unwrap();
+    let bumped = db.get_track(id).unwrap().unwrap().content_version;
+    assert!(bumped > 0, "the edit must have bumped content_version");
+
+    let after = HeaderCache::new(Mode::StructureOnly)
+        .resolve(&db, id)
+        .unwrap()
+        .mtime;
+    assert_eq!(
+        after, before,
+        "passthrough bytes did not change, so the timestamp must not either"
+    );
+    assert_eq!(
+        after.content_version, 0,
+        "no sub-second signal in passthrough"
+    );
+
+    // And the same edit *does* move it under synthesis, where the bytes really
+    // are rebuilt from the store — so this is a mode distinction, not a dead
+    // mechanism.
+    let synth = HeaderCache::new(Mode::Synthesis)
+        .resolve(&db, id)
+        .unwrap()
+        .mtime;
+    assert_eq!(synth.content_version, bumped);
+    assert_ne!(synth.nanos(), after.nanos());
 }

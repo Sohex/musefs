@@ -211,19 +211,11 @@ fn scan_with_checksum_full_exits_zero() {
     );
 }
 
+/// #707: the alias deprecated in 1.1.0 is gone, and asking for it is a usage
+/// error like any other unknown flag — not a scan that quietly ran instead.
 #[test]
-fn scan_with_revalidate_flag_runs_the_revalidate_pass() {
+fn scan_revalidate_flag_is_a_usage_error() {
     let (_dir, target, db) = library_with_one_flac();
-    // Seed the store first so revalidate has something to re-check.
-    let seed = musefs()
-        .arg("scan")
-        .arg(&target)
-        .arg("--db")
-        .arg(&db)
-        .output()
-        .unwrap();
-    assert!(seed.status.success());
-
     let out = musefs()
         .arg("scan")
         .arg(&target)
@@ -232,20 +224,53 @@ fn scan_with_revalidate_flag_runs_the_revalidate_pass() {
         .arg("--revalidate")
         .output()
         .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("--revalidate"), "stderr: {stderr}");
+    assert!(
+        !db.exists(),
+        "a refused scan must not have created the store"
+    );
+}
+
+/// #707: clap never reads a variable no flag declares, so the retired one is
+/// refused explicitly. Ignoring it would turn a unit file's revalidate into a
+/// full scan without a word.
+#[test]
+fn retired_revalidate_env_is_refused() {
+    let (_dir, target, db) = library_with_one_flac();
+    let out = musefs()
+        .arg("scan")
+        .arg(&target)
+        .arg("--db")
+        .arg(&db)
+        .env("MUSEFS_REVALIDATE", "true")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("MUSEFS_REVALIDATE") && stderr.contains("`revalidate` subcommand"),
+        "the refusal should name the variable and its replacement, stderr: {stderr}"
+    );
+    assert!(
+        !db.exists(),
+        "a refused scan must not have created the store"
+    );
+
+    // Empty is unset, as it is for every variable clap reads.
+    let out = musefs()
+        .arg("scan")
+        .arg(&target)
+        .arg("--db")
+        .arg(&db)
+        .env("MUSEFS_REVALIDATE", "")
+        .output()
+        .unwrap();
     assert!(
         out.status.success(),
-        "revalidate should exit 0, stderr: {}",
+        "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("scan --revalidate") && stderr.contains("deprecated"),
-        "expected a deprecation warning on stderr, stderr: {stderr}"
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("revalidated"),
-        "the --revalidate flag should select the revalidate summary, stdout: {stdout}"
     );
 }
 
@@ -273,32 +298,6 @@ fn scan_prune_and_revalidate_force_are_usage_errors() {
             out.status.code(),
             Some(2),
             "usage error should exit 2, stderr: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-}
-
-#[test]
-fn scan_revalidate_with_strictness_flags_errors() {
-    // `--fast`/`--strict` are scan-only (move-retarget confirmation); combining
-    // them with the deprecated `scan --revalidate` alias must error rather than
-    // silently ignore them.
-    let (_dir, target, db) = library_with_one_flac();
-    for flag in ["--fast", "--strict"] {
-        let out = musefs()
-            .args([
-                "scan",
-                target.to_str().unwrap(),
-                "--db",
-                db.to_str().unwrap(),
-                "--revalidate",
-                flag,
-            ])
-            .output()
-            .unwrap();
-        assert!(
-            !out.status.success(),
-            "scan --revalidate {flag} must error, stderr: {}",
             String::from_utf8_lossy(&out.stderr)
         );
     }
@@ -539,8 +538,10 @@ fn scan_help_lists_env_vars() {
     assert!(stdout.contains("MUSEFS_DB"), "stdout: {stdout}");
     assert!(stdout.contains("MUSEFS_JOBS"), "stdout: {stdout}");
     assert!(stdout.contains("MUSEFS_CHECKSUM"), "stdout: {stdout}");
-    assert!(stdout.contains("MUSEFS_FAST"), "stdout: {stdout}");
-    assert!(stdout.contains("MUSEFS_STRICT"), "stdout: {stdout}");
+    assert!(stdout.contains("MUSEFS_MATCH"), "stdout: {stdout}");
+    // #709: the two booleans the value replaced must not still be advertised.
+    assert!(!stdout.contains("MUSEFS_FAST"), "stdout: {stdout}");
+    assert!(!stdout.contains("MUSEFS_STRICT"), "stdout: {stdout}");
 }
 
 // #370: the SetTrue bools parse the full boolish set from env (case-insensitive
@@ -571,42 +572,6 @@ fn boolish_boolean_env_values_are_accepted() {
             "MUSEFS_KEEP_CACHE={val} should reach the missing-db guard, stderr: {stderr}"
         );
     }
-}
-
-// #370: a boolish MUSEFS_REVALIDATE actually flips scan into its revalidate
-// pass (observable on stdout), proving the parsed bool reaches run_scan — not
-// merely that parsing succeeds.
-#[test]
-fn boolish_revalidate_env_selects_the_revalidate_pass() {
-    let dir = tempfile::tempdir().unwrap();
-    let target = dir.path().join("library");
-    std::fs::create_dir(&target).unwrap();
-    let db = dir.path().join("reval.db");
-
-    let out = musefs()
-        .arg("scan")
-        .arg(&target)
-        .env("MUSEFS_DB", &db)
-        .env("MUSEFS_REVALIDATE", "on")
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("revalidated"), "stdout: {stdout}");
-
-    // Default (no env) takes the full-ingest path.
-    let out = musefs()
-        .arg("scan")
-        .arg(&target)
-        .env("MUSEFS_DB", &db)
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("scanned"), "stdout: {stdout}");
 }
 
 // #370: a boolish MUSEFS_QUIET (1/0) is honoured — `1` suppresses the summary,
@@ -656,26 +621,77 @@ fn boolish_quiet_env_toggles_the_summary() {
     );
 }
 
+/// #709: `--match` is the one way to ask, and it reaches the scan.
 #[test]
-fn scan_fast_and_strict_are_mutually_exclusive() {
-    let dir = tempfile::tempdir().unwrap();
-    let target = dir.path().join("library");
-    std::fs::create_dir(&target).unwrap();
-    let db = dir.path().join("mutual.db");
+fn scan_match_takes_a_value_and_rejects_anything_else() {
+    let (_dir, target, db) = library_with_one_flac();
     let out = musefs()
-        .args(["scan", "--fast", "--strict"])
+        .arg("scan")
         .arg(&target)
         .arg("--db")
         .arg(&db)
+        .args(["--match", "strict"])
         .output()
         .unwrap();
     assert!(
-        !out.status.success(),
-        "--fast --strict should fail, but exited successfully"
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
+
+    let out = musefs()
+        .arg("scan")
+        .arg(&target)
+        .arg("--db")
+        .arg(&db)
+        .args(["--match", "paranoid"])
+        .output()
+        .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
     assert!(
-        stderr.contains("mutually exclusive"),
-        "stderr should mention 'mutually exclusive', got: {stderr}"
+        stderr.contains("auto") && stderr.contains("fast") && stderr.contains("strict"),
+        "the usage error should list the accepted values, stderr: {stderr}"
+    );
+}
+
+/// #709: the flags `--match` replaced are gone, so they are usage errors, and
+/// their variables are refused with the value to use. Ignoring
+/// `MUSEFS_STRICT=true` would quietly weaken how a moved file is confirmed.
+#[test]
+fn retired_fast_and_strict_are_refused() {
+    let (_dir, target, db) = library_with_one_flac();
+    for flag in ["--fast", "--strict"] {
+        let out = musefs()
+            .arg("scan")
+            .arg(&target)
+            .arg("--db")
+            .arg(&db)
+            .arg(flag)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{flag}, stderr: {stderr}");
+        assert!(stderr.contains(flag), "{flag}, stderr: {stderr}");
+    }
+    for (var, value) in [("MUSEFS_FAST", "fast"), ("MUSEFS_STRICT", "strict")] {
+        let out = musefs()
+            .arg("scan")
+            .arg(&target)
+            .arg("--db")
+            .arg(&db)
+            .env(var, "true")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{var}, stderr: {stderr}");
+        assert!(
+            stderr.contains(var) && stderr.contains(&format!("MUSEFS_MATCH={value}")),
+            "the refusal should name {var} and its replacement, stderr: {stderr}"
+        );
+    }
+    assert!(
+        !db.exists(),
+        "a refused scan must not have created the store"
     );
 }

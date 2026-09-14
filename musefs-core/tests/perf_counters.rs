@@ -2,8 +2,7 @@
 
 mod common;
 use common::corpus::{ALL_FORMATS, CorpusParams, Format, format_token, prepare_format};
-use musefs_core::{Mode, MountConfig, Musefs, VirtualTree, metrics, scan_directory};
-use std::collections::BTreeMap;
+use musefs_core::{MountConfig, Musefs, VirtualTree, metrics, scan_directory};
 use std::sync::Mutex;
 
 /// The `metrics` counters are global statics; serialize every measured region.
@@ -15,21 +14,15 @@ const AUDIO_BYTES_USIZE: usize = 4 * 1024 * 1024;
 const CHUNK: u64 = 128 * 1024;
 
 fn config() -> MountConfig {
-    MountConfig {
-        template: "$artist/$album/$title".to_string(),
-        fallbacks: BTreeMap::new(),
-        default_fallback: "Unknown".to_string(),
-        mode: Mode::Synthesis,
-        poll_interval: std::time::Duration::ZERO,
-        case_insensitive: false,
-        // Read-ahead off: these goldens are exact per-format pread counts that
-        // detect synthesis-path regressions; read amplification would collapse
-        // and mask them. Read-ahead's own effects are covered in readahead.rs.
-        read_ahead_budget: 0,
-        read_ahead_prefetch: false,
-        skip_on_missing: false,
-        trust_backing_mtime: false,
-    }
+    let mut config = MountConfig::default();
+    config.template = "$artist/$album/$title".to_string();
+    config.poll_interval = std::time::Duration::ZERO;
+    config.case_insensitive = false;
+    // Read-ahead off: these goldens are exact per-format pread counts that
+    // detect synthesis-path regressions; read amplification would collapse
+    // and mask them. Read-ahead's own effects are covered in readahead.rs.
+    config.read_ahead_budget = 0;
+    config
 }
 
 /// Recursively collect every file inode (non-FLAC corpus tracks render under
@@ -183,7 +176,10 @@ fn read_preads_and_seek_match_goldens() {
 
 /// Ingest of files LARGER than the ~64 KiB bounded metadata window: the scanner
 /// reads only a bounded prefix, never the whole file. A reintroduced slurp shows
-/// up as `scan_bytes_read` jumping toward `tracks * 2 MiB`. Counts frozen below.
+/// up as `scan_bytes_read` jumping toward `tracks * 2 MiB`. Counts frozen below,
+/// at the default `fingerprint` tier: per file, one 64 KiB prefix read plus the
+/// fingerprint's three 8 KiB audio windows (#691) — four reads of 88 KiB, which
+/// is still a bounded constant rather than a pass over the 2 MiB file.
 #[test]
 fn ingest_reads_bounded_prefix_not_whole_file() {
     let _g = METRICS_LOCK
@@ -191,7 +187,8 @@ fn ingest_reads_bounded_prefix_not_whole_file() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     const TRACKS: usize = 3;
     const BYTES_PER_TRACK: usize = 2 * 1024 * 1024; // > 64 KiB scan window
-    let (exp_opens, exp_preads, exp_bytes): (u64, u64, u64) = (3, 3, 196_608); // 3 × 64 KiB
+    // 3 × (64 KiB prefix + 3 × 8 KiB audio sample)
+    let (exp_opens, exp_preads, exp_bytes): (u64, u64, u64) = (3, 12, 270_336);
 
     let base = tempfile::tempdir().unwrap();
     let params = CorpusParams {

@@ -15,15 +15,23 @@ anyhow = "1"
 # `std` for `set_boxed_logger`: the CLI installs the process-wide log sink
 # (wrapped so scan progress and log records do not clobber each other).
 log = { version = "0.4", features = ["std"] }
-musefs-db = { path = "../musefs-db", version = "1.3.0" }
-musefs-core = { path = "../musefs-core", version = "1.3.0" }
-musefs-fuse = { path = "../musefs-fuse", version = "1.3.0" }
+musefs-db = { path = "../musefs-db", version = "2.0.0" }
+musefs-core = { path = "../musefs-core", version = "2.0.0" }
+musefs-fuse = { path = "../musefs-fuse", version = "2.0.0" }
 signal-hook = "0.4"
 uzers = "0.12"
 indicatif = { version = "0.18", default-features = false }
+dialoguer = { version = "0.12", default-features = false }
+fs4 = { version = "1", default-features = false }
 
 [dev-dependencies]
+# Used to rewind a store's user_version, so the migrate command can be exercised
+# against a store an older musefs build would have left behind.
+rusqlite = { version = "0.40", features = ["bundled"] }
 tempfile = "3"
+# `musefs-db`'s test scaffolding (`seed_store_at_version`), for building a store
+# an older musefs left behind; compiled for tests only (#751).
+musefs-db = { path = "../musefs-db", features = ["test-support"] }
 
 [features]
 metrics = ["musefs-fuse/metrics"]

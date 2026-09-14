@@ -25,13 +25,14 @@ fn scanner_owned_bounds_mutation_is_rejected_by_the_contract() {
     let db = Db::open(&db_path).unwrap();
     let id = db
         .upsert_track(&NewTrack {
-            backing_path: audio_path.to_string_lossy().into_owned(),
+            backing_path: audio_path.clone(),
             format: Format::Mp3,
             audio_offset: bounds.audio_offset,
             audio_length: bounds.audio_length,
             backing_size: bytes.len() as u64,
             backing_mtime_ns: real_mtime_ns(&audio_path),
             backing_ctime_ns: real_ctime_ns(&audio_path),
+            backing_ino: None,
         })
         .unwrap();
 

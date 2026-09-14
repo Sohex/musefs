@@ -13,6 +13,7 @@ use crate::size;
 /// ID3v2 tag is regenerated from the DB, and the Xing/LAME info frame lives
 /// inside the first audio frame, carried by the backing-audio segment.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Mp3Bounds {
     pub audio_offset: u64,
     pub audio_length: u64,
@@ -609,8 +610,13 @@ pub fn read_pictures(data: &[u8]) -> Vec<EmbeddedPicture> {
             picture_type: PictureType::new(u8::from(p.picture_type).into())
                 .unwrap_or(PictureType::ZERO),
             description: p.description.clone(),
+            // `APIC` carries no geometry at all -- not the dimensions and not
+            // the depth or colour count -- so every one of these is the
+            // format's own "not stated".
             width: 0,
             height: 0,
+            depth: 0,
+            colors: 0,
             data: p.data.clone(),
         })
         .collect()
@@ -1258,6 +1264,8 @@ mod tests {
             picture_type: PictureType::new(3).unwrap(),
             width: 0,
             height: 0,
+            depth: 0,
+            colors: 0,
             data_len: BlobLen::new(data_len).unwrap(),
         };
         assert_eq!(
@@ -1306,6 +1314,8 @@ mod tests {
             picture_type: PictureType::new(3).unwrap(),
             width: 0,
             height: 0,
+            depth: 0,
+            colors: 0,
             data_len: BlobLen::new(16).unwrap(),
         };
         assert_eq!(
@@ -1341,6 +1351,8 @@ mod tests {
             picture_type: PictureType::new(3).unwrap(),
             width: 0,
             height: 0,
+            depth: 0,
+            colors: 0,
             data_len: BlobLen::new(data_len).unwrap(),
         };
         let (segments, _len) = build_id3v2_segments(&[], &[], &[mk(2, 16)]).unwrap();
@@ -2375,6 +2387,8 @@ mod tests {
             picture_type: PictureType::new(3).unwrap(),
             width: 0,
             height: 0,
+            depth: 0,
+            colors: 0,
             data_len: BlobLen::new(data_len).unwrap(),
         };
         assert_eq!(

@@ -109,10 +109,13 @@ impl Renderer {
     }
 }
 
-fn basename(path: &str) -> String {
-    Path::new(path)
-        .file_name()
-        .map_or_else(|| path.to_string(), |n| n.to_string_lossy().into_owned())
+/// The progress bar's label, and one of the few places a path is genuinely
+/// rendered for a human — so the lossy conversion belongs here (#680).
+fn basename(path: &Path) -> String {
+    path.file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+        .into_owned()
 }
 
 pub(crate) struct ScanReporter {

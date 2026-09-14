@@ -1,5 +1,5 @@
 mod common;
-use common::{make_flac, streaminfo_body, vorbis_comment_body, write_flac};
+use common::{make_flac, set_mtime, streaminfo_body, vorbis_comment_body, write_flac};
 use musefs_core::{ScanOptions, revalidate, scan_directory, scan_directory_with};
 use musefs_db::{Db, Tag};
 
@@ -129,10 +129,8 @@ fn force_rescan_reseeds_tags_from_file() {
     db.replace_tags(id, &[Tag::new("title", "Curated", 0)])
         .unwrap();
 
-    let opts = ScanOptions {
-        force: true,
-        ..Default::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.force = true;
     scan_directory_with(&db, dir.path(), &opts).unwrap();
 
     let tags = db.get_tags(id).unwrap();
@@ -311,15 +309,9 @@ fn revalidate_skips_unchanged_prunes_missing_and_gcs_art() {
         .unwrap();
     assert!(tags.iter().any(|t| t.key == "title" && t.value == "Edited"));
 
-    let stats = musefs_core::revalidate_with(
-        &db,
-        dir.path(),
-        &ScanOptions {
-            prune: true,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut options = ScanOptions::default();
+    options.prune = true;
+    let stats = musefs_core::revalidate_with(&db, dir.path(), &options).unwrap();
     assert_eq!(stats.pruned, 1); // gone.flac's track is removed
     assert_eq!(db.list_tracks().unwrap().len(), 1);
 }
@@ -466,6 +458,62 @@ fn scan_stores_a_tag_value_the_old_cap_rejected() {
     assert_eq!(lyrics.value, lyrics_body);
 }
 
+/// #696, the corpus entry: a backing file whose mtime predates the Unix epoch.
+/// Archival rips, restored backups and anything whose mtime was set from the
+/// original media's metadata can carry one, and `tar`/`rsync` preserve it, so
+/// this is legitimate input rather than a crafted one.
+///
+/// It used to probe cleanly, produce a valid unit, and then die at the store's
+/// `CHECK (backing_mtime_ns >= 0)` — counted under `failed` and absent from the
+/// mount. The `tracks` rebuild drops that lower bound (#696), so the file now
+/// reaches the store with its negative stamp intact, which is what this asserts.
+#[test]
+fn a_pre_epoch_backing_mtime_reaches_the_store_intact() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = dir.path().join("archival.flac");
+    write_flac(&old, &["TITLE=Archival"], &[0xAA; 30]);
+    // 1969-12-31 23:59:58.5 UTC: negative whole seconds with a non-negative
+    // `tv_nsec` fraction, which is the shape the kernel actually stores.
+    set_mtime(&old, -2, 500_000_000);
+
+    // A sibling with an ordinary mtime proves the failure is contained to the
+    // one file rather than aborting the run.
+    let modern = dir.path().join("modern.flac");
+    write_flac(&modern, &["TITLE=Modern"], &[0xBB; 30]);
+
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(&old).unwrap();
+    assert_eq!(
+        meta.mtime(),
+        -2,
+        "the filesystem must preserve a pre-epoch mtime for this test to mean anything"
+    );
+
+    // The Rust half of #696, against a real filesystem stamp: the stamp keeps
+    // the negative nanosecond value, and the `getattr` display second is the
+    // file's own `st_mtime` rather than the truncation toward zero.
+    let stamp = musefs_core::freshness::BackingStamp::from_metadata(&meta);
+    assert_eq!(stamp.mtime_ns, -1_500_000_000);
+    assert_eq!(stamp.display_secs(), meta.mtime());
+
+    let db = Db::open_in_memory().unwrap();
+    let stats = scan_directory(&db, dir.path()).unwrap();
+
+    assert_eq!(stats.scanned, 2, "both files reach the store");
+    assert_eq!(stats.failed, 0);
+
+    let archival = db
+        .list_tracks()
+        .unwrap()
+        .into_iter()
+        .find(|t| t.backing_path.ends_with("archival.flac"))
+        .expect("the pre-epoch file is stored, not rejected");
+    assert_eq!(
+        archival.backing_mtime_ns, -1_500_000_000,
+        "stored verbatim: the stamp is the file's, not a clamped stand-in"
+    );
+}
+
 fn flac_with_pictures(comments: &[&str], pics: &[(u32, &[u8])]) -> Vec<u8> {
     use common::{flac_block, streaminfo_body, vorbis_comment_body};
     fn picture_body(pic_type: u32, mime: &str, data: &[u8]) -> Vec<u8> {
@@ -550,10 +598,285 @@ fn scan_fails_only_the_file_with_oversized_art() {
     assert!(
         tracks[0].backing_path.ends_with("b.flac"),
         "only the clean file is stored, got {}",
-        tracks[0].backing_path
+        tracks[0].backing_path.display()
     );
     // No partial row for the failed file, and no orphan art from it either.
     let ta = db.get_track_art(tracks[0].id).unwrap();
     assert_eq!(ta.len(), 1);
     assert_eq!(db.get_art_meta(ta[0].art_id).unwrap().unwrap().byte_len, 50);
+}
+
+/// Two files holding byte-identical art that describe it differently.
+///
+/// This is #716's reproduction. `art` is deduplicated on `sha256(data)`, and it
+/// used to own the mime, the dimensions and (in the format, but nowhere in the
+/// store) the depth and colour count. `upsert_art` is `ON CONFLICT DO NOTHING`,
+/// so whichever occurrence was scanned first chose all of them for every track
+/// referencing that blob — including the *declared MIME type*, so a file whose
+/// own block said JPEG could be served one saying PNG. Scan order decided it.
+///
+/// The blob is still shared; the description of it is not.
+#[test]
+fn two_files_sharing_one_blob_keep_their_own_picture_metadata() {
+    /// A FLAC `PICTURE` block declaring its own mime, geometry, depth and colours.
+    fn picture_block(mime: &str, w: u32, h: u32, depth: u32, colors: u32, data: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&3u32.to_be_bytes()); // front cover
+        b.extend_from_slice(&u32::try_from(mime.len()).unwrap().to_be_bytes());
+        b.extend_from_slice(mime.as_bytes());
+        b.extend_from_slice(&0u32.to_be_bytes()); // description
+        b.extend_from_slice(&w.to_be_bytes());
+        b.extend_from_slice(&h.to_be_bytes());
+        b.extend_from_slice(&depth.to_be_bytes());
+        b.extend_from_slice(&colors.to_be_bytes());
+        b.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
+        b.extend_from_slice(data);
+        b
+    }
+
+    // One image, two descriptions of it.
+    let image = [0xABu8; 64];
+    let dir = tempfile::tempdir().unwrap();
+    for (name, title, block) in [
+        (
+            "a.flac",
+            "TITLE=A",
+            picture_block("image/jpeg", 1200, 1200, 24, 0, &image),
+        ),
+        (
+            "b.flac",
+            "TITLE=B",
+            picture_block("image/png", 64, 64, 8, 256, &image),
+        ),
+    ] {
+        let bytes = make_flac(
+            &[
+                (0, streaminfo_body()),
+                (4, vorbis_comment_body("v", &[title])),
+                (6, block),
+            ],
+            &[0xCC; 30],
+        );
+        std::fs::write(dir.path().join(name), bytes).unwrap();
+    }
+
+    let db = Db::open_in_memory().unwrap();
+    let stats = scan_directory(&db, dir.path()).unwrap();
+    assert_eq!(stats.scanned, 2);
+
+    let link_of = |file: &str| {
+        let track = db
+            .list_tracks()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.backing_path.ends_with(file))
+            .expect("both tracks stored");
+        db.get_track_art(track.id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("each track links its own picture")
+    };
+    let a = link_of("a.flac");
+    let b = link_of("b.flac");
+
+    // One blob: the deduplication that made this a problem still happens.
+    assert_eq!(a.art_id, b.art_id, "byte-identical art is still one row");
+
+    // Two descriptions of it, each its own.
+    assert_eq!(
+        (a.mime.as_str(), a.width, a.height),
+        ("image/jpeg", Some(1200), Some(1200))
+    );
+    assert_eq!(
+        (b.mime.as_str(), b.width, b.height),
+        ("image/png", Some(64), Some(64))
+    );
+    // Depth and colours too: the FLAC parser used to read and discard both.
+    assert_eq!((a.depth, a.colors), (24, 0));
+    assert_eq!((b.depth, b.colors), (8, 256));
+}
+
+/// #746: the V4 migration could only copy each blob's shared metadata onto
+/// every link, with FLAC's depth and colours at 0, and promised the real values
+/// back from `migrate`'s offer — a revalidate, whose structural pass never
+/// touched art. A link the file supplied is not curated metadata, so what the
+/// file declares about the picture comes back; a link an external writer made,
+/// and the tags, stay as they are.
+#[test]
+fn revalidate_restores_a_files_own_picture_metadata_and_leaves_curated_art() {
+    fn picture_block(mime: &str, side: u32, depth: u32, colors: u32, data: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&3u32.to_be_bytes()); // front cover
+        b.extend_from_slice(&u32::try_from(mime.len()).unwrap().to_be_bytes());
+        b.extend_from_slice(mime.as_bytes());
+        b.extend_from_slice(&0u32.to_be_bytes()); // description
+        b.extend_from_slice(&side.to_be_bytes());
+        b.extend_from_slice(&side.to_be_bytes());
+        b.extend_from_slice(&depth.to_be_bytes());
+        b.extend_from_slice(&colors.to_be_bytes());
+        b.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
+        b.extend_from_slice(data);
+        b
+    }
+
+    // One image embedded twice and described two ways, so restoring it has to
+    // pair the file's pictures with their links by order.
+    let image = [0xABu8; 64];
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = make_flac(
+        &[
+            (0, streaminfo_body()),
+            (4, vorbis_comment_body("v", &["TITLE=A"])),
+            (6, picture_block("image/jpeg", 1200, 24, 0, &image)),
+            (6, picture_block("image/png", 64, 8, 256, &image)),
+        ],
+        &[0xCC; 30],
+    );
+    std::fs::write(dir.path().join("a.flac"), bytes).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    scan_directory(&db, dir.path()).unwrap();
+    let track = db.list_tracks().unwrap().remove(0);
+    let as_scanned = db.get_track_art(track.id).unwrap();
+    assert_eq!(as_scanned.len(), 2);
+
+    // What V4 leaves: one occurrence's values on both links, depth and colours
+    // zeroed. Plus a cover an external writer linked, and a curated title.
+    let mut links: Vec<musefs_db::TrackArt> = as_scanned
+        .iter()
+        .map(|link| musefs_db::TrackArt {
+            mime: "image/jpeg".to_string(),
+            width: Some(1200),
+            height: Some(1200),
+            depth: 0,
+            colors: 0,
+            ..link.clone()
+        })
+        .collect();
+    let written = db
+        .upsert_art(&musefs_db::NewArt {
+            data: vec![0xEE; 16],
+        })
+        .unwrap();
+    links.push(musefs_db::TrackArt {
+        art_id: written,
+        picture_type: 3,
+        description: String::new(),
+        mime: "image/webp".to_string(),
+        width: None,
+        height: None,
+        depth: 0,
+        colors: 0,
+        ordinal: 2,
+    });
+    db.set_track_art(track.id, &links).unwrap();
+    db.replace_tags(track.id, &[Tag::new("title", "Curated", 0)])
+        .unwrap();
+    // And no recorded inode, as V4 leaves every row, which is what makes
+    // revalidate re-probe a file that has not changed.
+    db.upsert_track(&musefs_db::NewTrack {
+        backing_path: track.backing_path.clone(),
+        format: track.format,
+        audio_offset: track.bounds.audio_offset(),
+        audio_length: track.bounds.audio_length(),
+        backing_size: track.backing_size,
+        backing_mtime_ns: track.backing_mtime_ns,
+        backing_ctime_ns: track.backing_ctime_ns,
+        backing_ino: None,
+    })
+    .unwrap();
+
+    let stats = revalidate(&db, dir.path()).unwrap();
+    assert_eq!(stats.updated, 1);
+
+    let restored = db.get_track_art(track.id).unwrap();
+    assert_eq!(
+        restored[..2],
+        as_scanned[..],
+        "the file's own links read as a fresh scan wrote them"
+    );
+    assert_eq!(
+        restored[2], links[2],
+        "the external writer's link is untouched"
+    );
+    assert_eq!(db.get_tags(track.id).unwrap()[0].value, "Curated");
+}
+
+/// #680: a filename is an arbitrary byte string on Unix, and the scanner used
+/// to store `to_string_lossy()` as the row's identity.
+///
+/// Two failures came out of that, and the second is the serious one. The stored
+/// path did not exist on disk, so the track could never be served. And two
+/// distinct byte paths converged on one `U+FFFD`-bearing string, where
+/// `ON CONFLICT(backing_path) DO UPDATE` silently merged them into a single row
+/// — one file's identity carrying the other's metadata, with nothing in the
+/// skipped or failed counts to say so.
+#[test]
+fn two_paths_differing_only_in_invalid_utf8_stay_two_tracks() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    // `bad\x80name.flac` and `bad\x81name.flac`: distinct byte strings, and
+    // both render as the same `bad<U+FFFD>name.flac` once converted lossily.
+    let a = dir.path().join(OsStr::from_bytes(b"bad\x80name.flac"));
+    let b = dir.path().join(OsStr::from_bytes(b"bad\x81name.flac"));
+    assert_ne!(a, b);
+
+    // Not every filesystem will host such a name. APFS and HFS+ enforce valid
+    // UTF-8 and refuse the create with `EILSEQ`, so macOS cannot run this;
+    // Linux and FreeBSD take arbitrary bytes and do. Detected by trying rather
+    // than by an OS allowlist, because it is a property of the filesystem under
+    // the temp directory, not of the platform — the same Linux build hits it on
+    // a FAT32 or a network mount.
+    if let Err(e) = std::fs::write(&a, b"") {
+        eprintln!(
+            "skipping two_paths_differing_only_in_invalid_utf8_stay_two_tracks: \
+             this filesystem will not accept a non-UTF-8 filename ({e})"
+        );
+        return;
+    }
+    assert_eq!(
+        a.to_string_lossy(),
+        b.to_string_lossy(),
+        "the fixture only tests anything if these collide lossily"
+    );
+    common::write_flac(&a, &["TITLE=A"], &[0xAA; 512]);
+    common::write_flac(&b, &["TITLE=B"], &[0xBB; 512]);
+
+    let db = Db::open_in_memory().unwrap();
+    let stats = scan_directory(&db, dir.path()).unwrap();
+    assert_eq!(stats.scanned, 2, "both files must be stored: {stats:?}");
+    assert_eq!(stats.failed, 0, "{stats:?}");
+
+    let tracks = db.list_tracks().unwrap();
+    assert_eq!(tracks.len(), 2, "one row each, not one row total");
+
+    // Each row's path is the bytes that were on disk, so it still names a real
+    // file — the half that made a mangled row unservable.
+    for t in &tracks {
+        assert!(
+            t.backing_path.exists(),
+            "stored path must exist on disk: {:?}",
+            t.backing_path
+        );
+    }
+    let mut stored: Vec<_> = tracks.iter().map(|t| t.backing_path.clone()).collect();
+    stored.sort();
+    let mut expected = vec![a.clone(), b.clone()];
+    expected.sort();
+    assert_eq!(stored, expected);
+
+    // And the two rows kept their own tags rather than one overwriting the other.
+    let title = |p: &std::path::Path| {
+        let t = db.get_track_by_path(p).unwrap().expect("row by byte path");
+        db.get_tags(t.id)
+            .unwrap()
+            .into_iter()
+            .find(|tag| tag.key == "title")
+            .map(|tag| tag.value)
+    };
+    assert_eq!(title(&a).as_deref(), Some("A"));
+    assert_eq!(title(&b).as_deref(), Some("B"));
 }

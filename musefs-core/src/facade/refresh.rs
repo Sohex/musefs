@@ -156,6 +156,7 @@ impl Musefs {
     /// publish a stale tree or race the `content_version` snapshot the change-diff
     /// relies on. Unlike `poll_refresh`, it blocks until it owns the gate rather than
     /// bailing out, so the forced rebuild always happens.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn refresh_for_test(&self) -> Result<()> {
         while self
             .refreshing
@@ -180,7 +181,7 @@ impl Musefs {
     /// no-concurrent-rebuild contract.
     fn rebuild_full(&self) -> Result<HashMap<i64, TrackRenderState>> {
         if self.force_rebuild_error.load(Ordering::Acquire) {
-            return Err(CoreError::BackingChanged(
+            return Err(CoreError::DerivedStateStale(
                 "forced refresh failure".to_string(),
             ));
         }
@@ -253,7 +254,7 @@ impl Musefs {
     /// scan path. The tree is published here on success.
     fn rebuild_incremental(&self) -> Result<Option<IncrementalOutcome>> {
         if self.force_rebuild_error.load(Ordering::Acquire) {
-            return Err(CoreError::BackingChanged(
+            return Err(CoreError::DerivedStateStale(
                 "forced refresh failure".to_string(),
             ));
         }
@@ -499,7 +500,7 @@ impl Musefs {
         // connection re-dispatches a fast-failing poll on every metadata op, never
         // arming the backoff the rebuild-error paths below rely on (#369).
         let version_read = if self.force_poll_read_error.load(Ordering::Acquire) {
-            Err(CoreError::BackingChanged(
+            Err(CoreError::DerivedStateStale(
                 "forced poll-read failure".to_string(),
             ))
         } else {
@@ -692,17 +693,17 @@ impl Musefs {
         *crate::lock::lock_recover(&self.last_failed_refresh, "last_failed_refresh") = None;
     }
 
-    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn force_rebuild_errors_for_test(&self, fail: bool) {
         self.force_rebuild_error.store(fail, Ordering::Release);
     }
 
-    #[doc(hidden)]
-    pub fn force_poll_read_errors_for_test(&self, fail: bool) {
+    #[cfg(test)]
+    pub(crate) fn force_poll_read_errors_for_test(&self, fail: bool) {
         self.force_poll_read_error.store(fail, Ordering::Release);
     }
 
-    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn force_apply_failure_for_test(&self, on: bool) {
         self.force_apply_fail.store(on, Ordering::Release);
     }
@@ -718,31 +719,31 @@ impl Musefs {
     /// How many polls took the changelog-gap full-rebuild path. Test-only
     /// observability: the gap and incremental paths produce identical trees, so
     /// only this counter distinguishes them.
-    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn gap_fallbacks_for_test(&self) -> u64 {
         self.gap_fallbacks.load(Ordering::Acquire)
     }
 
-    #[doc(hidden)]
-    pub fn mark_needs_rebuild_for_test(&self) {
+    #[cfg(test)]
+    pub(crate) fn mark_needs_rebuild_for_test(&self) {
         self.needs_rebuild
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    #[doc(hidden)]
-    pub fn needs_rebuild_is_set_for_test(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn needs_rebuild_is_set_for_test(&self) -> bool {
         self.needs_rebuild
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn lookup_track_inode_for_test(&self, track_id: i64) -> Option<u64> {
         self.tree.load().inode_of_track(track_id)
     }
 
     /// Backdates `last_poll` so the next `poll_refresh` is past the debounce
     /// window, letting tests cross the window deterministically without sleeping.
-    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn expire_poll_debounce_for_test(&self) {
         let past = std::time::Instant::now()
             .checked_sub(self.poll_interval)
@@ -752,16 +753,16 @@ impl Musefs {
 
     /// Stamps a failed-refresh time of "now" so the backoff gate is active, for
     /// tests exercising `poll_due`'s backoff branch without a real failure.
-    #[doc(hidden)]
-    pub fn fail_refresh_now_for_test(&self) {
+    #[cfg(test)]
+    pub(crate) fn fail_refresh_now_for_test(&self) {
         *crate::lock::lock_recover(&self.last_failed_refresh, "last_failed_refresh") =
             Some(std::time::Instant::now());
     }
 
     /// Backdates the failed-refresh stamp past the retry-backoff window so the
     /// backoff gate no longer blocks (companion to `expire_poll_debounce_for_test`).
-    #[doc(hidden)]
-    pub fn expire_refresh_backoff_for_test(&self) {
+    #[cfg(test)]
+    pub(crate) fn expire_refresh_backoff_for_test(&self) {
         let past = std::time::Instant::now()
             .checked_sub(self.refresh_retry_backoff)
             .expect("refresh_retry_backoff exceeds monotonic clock base");

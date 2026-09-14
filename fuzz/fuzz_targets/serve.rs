@@ -25,13 +25,14 @@ fn setup(
     let db = Db::open_in_memory().ok()?;
     let id = db
         .upsert_track(&NewTrack {
-            backing_path: path.to_string_lossy().into_owned(),
+            backing_path: path.clone(),
             format,
             audio_offset,
             audio_length,
             backing_size: meta.len(),
             backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
             backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+            backing_ino: Some(meta.ino()),
         })
         .ok()?;
     db.replace_tags(id, &[Tag::new("title", "T", 0)]).ok()?;
@@ -220,9 +221,6 @@ fuzz_target!(|data: &[u8]| {
         let blob = vec![0xABu8; usize::try_from(a.data_len.get().min(4096)).unwrap_or(0)];
         if !blob.is_empty()
             && let Ok(art_id) = db.upsert_art(&NewArt {
-                mime: a.mime.clone(),
-                width: Some(8),
-                height: Some(8),
                 data: blob,
             })
         {
@@ -232,6 +230,11 @@ fuzz_target!(|data: &[u8]| {
                     art_id,
                     picture_type: 3,
                     description: String::new(),
+                    mime: "image/png".into(),
+                    width: None,
+                    height: None,
+                    depth: 0,
+                    colors: 0,
                     ordinal: 0,
                 }],
             );

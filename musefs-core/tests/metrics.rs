@@ -5,8 +5,10 @@ use common::{
     make_flac, picture_block_body, streaminfo_body, vorbis_comment_body, write_ogg,
     write_oggflac_with_art, write_opus_with_art,
 };
-use musefs_core::{MountConfig, Musefs, VirtualTree, metrics, scan_directory};
-use std::collections::BTreeMap;
+use musefs_core::{
+    ChecksumTier, MountConfig, Musefs, ScanOptions, VirtualTree, metrics, scan_directory,
+    scan_directory_with,
+};
 use std::sync::Mutex;
 
 /// Serialise every test that calls `metrics::reset()` / `metrics::snapshot()`.
@@ -14,19 +16,20 @@ use std::sync::Mutex;
 /// measurements without this lock.
 static METRICS_LOCK: Mutex<()> = Mutex::new(());
 
+/// Scan options that compute no checksums, so a read-count assertion measures
+/// only the probe itself.
+fn no_checksum_opts() -> ScanOptions {
+    let mut options = ScanOptions::default();
+    options.checksum = ChecksumTier::None;
+    options
+}
+
 fn config() -> MountConfig {
-    MountConfig {
-        template: "$artist/$title".to_string(),
-        fallbacks: BTreeMap::new(),
-        default_fallback: "Unknown".to_string(),
-        mode: musefs_core::Mode::Synthesis,
-        poll_interval: std::time::Duration::ZERO,
-        case_insensitive: false,
-        read_ahead_budget: 64 * 1024 * 1024,
-        read_ahead_prefetch: false,
-        skip_on_missing: false,
-        trust_backing_mtime: false,
-    }
+    let mut config = MountConfig::default();
+    config.template = "$artist/$title".to_string();
+    config.poll_interval = std::time::Duration::ZERO;
+    config.case_insensitive = false;
+    config
 }
 
 /// Scan `dir`, mount, read the single track end-to-end in 16 KiB chunks under
@@ -226,13 +229,14 @@ fn layout_cache_survives_unrelated_refresh() {
         let db2 = musefs_db::Db::open(&db_path).unwrap();
         let id = db2
             .upsert_track(&NewTrack {
-                backing_path: "/x/ghost.mp3".to_string(),
+                backing_path: std::path::PathBuf::from("/x/ghost.mp3"),
                 format: Format::Mp3,
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         db2.replace_tags(
@@ -423,6 +427,10 @@ fn oggflac_raw_art_serve_increments_art_chunks() {
 /// #67: only .mp3 consumes the ID3v1 tail; non-MP3 formats must not pay the
 /// 128-byte tail read. A 300-byte FLAC (< the 64 KiB window) probes in exactly
 /// one positioned read of exactly the file's length.
+///
+/// Scanned at `--checksum=none` so the count is the tail question alone: the
+/// fingerprint tier adds its own bounded audio-sample reads (#691), covered by
+/// `fingerprint_tier_samples_bounded_audio` below.
 #[test]
 fn scan_reads_no_id3v1_tail_for_flac() {
     let _guard = METRICS_LOCK
@@ -441,13 +449,49 @@ fn scan_reads_no_id3v1_tail_for_flac() {
 
     let db = musefs_db::Db::open_in_memory().unwrap();
     metrics::reset();
-    scan_directory(&db, dir.path()).unwrap();
+    scan_directory_with(&db, dir.path(), &no_checksum_opts()).unwrap();
     let s = metrics::snapshot();
     assert_eq!(
         s.scan_preads, 1,
         "flac: one bounded prefix read, no tail read"
     );
     assert_eq!(s.scan_bytes_read, len, "no +128 ID3v1 tail for non-mp3");
+}
+
+/// The fingerprint tier's extra I/O is a bounded constant, not a second pass
+/// over the file: three positioned windows over the audio region, on top of the
+/// probe's own reads (#691). A file whose audio region is shorter than three
+/// windows pays one read of that region instead.
+#[test]
+fn fingerprint_tier_samples_bounded_audio() {
+    let _guard = METRICS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let mut b = b"fLaC".to_vec();
+    b.push(0x80);
+    b.extend_from_slice(&[0, 0, 34]);
+    b.extend(std::iter::repeat_n(0u8, 34));
+    let audio_offset = b.len() as u64;
+    // Audio long enough for three disjoint 8 KiB windows with gaps between them.
+    b.extend(std::iter::repeat_n(0x55u8, 512 * 1024));
+    let path = dir.path().join("t.flac");
+    std::fs::write(&path, &b).unwrap();
+
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    metrics::reset();
+    scan_directory(&db, dir.path()).unwrap(); // default tier: fingerprint
+    let s = metrics::snapshot();
+    assert_eq!(s.scan_preads, 4, "one prefix read plus three audio windows");
+    assert_eq!(
+        s.scan_bytes_read,
+        64 * 1024 + 3 * 8 * 1024,
+        "the 64 KiB prefix plus three 8 KiB windows, nothing whole-file"
+    );
+    // Sanity: the fixture's audio region really is longer than what was read.
+    let t = &db.list_tracks().unwrap()[0];
+    assert_eq!(t.bounds.audio_offset(), audio_offset);
+    assert!(t.bounds.audio_length() > s.scan_bytes_read);
 }
 
 /// #67 inverse: MP3 keeps its tail read (prefix + 128-byte ID3v1 trailer).
@@ -479,12 +523,13 @@ fn scan_still_reads_id3v1_tail_for_mp3() {
 
     let db = musefs_db::Db::open_in_memory().unwrap();
     metrics::reset();
-    scan_directory(&db, &target.corpus_dir).unwrap();
+    scan_directory_with(&db, &target.corpus_dir, &no_checksum_opts()).unwrap();
     let s = metrics::snapshot();
     // Corpus tracks are far below the default 64 KiB scan window (this test must
     // keep the default ScanOptions::window): one prefix read + the tail. read_tail_128
     // always reads 128 bytes when file_len >= 128, trailer present or not, so
-    // the +128 assertion is robust.
+    // the +128 assertion is robust. `--checksum=none` keeps the fingerprint
+    // tier's audio sampling out of the count.
     assert_eq!(s.scan_preads, 2, "mp3: prefix read + ID3v1 tail read");
     assert_eq!(s.scan_bytes_read, len + 128, "mp3 keeps the 128-byte tail");
 }

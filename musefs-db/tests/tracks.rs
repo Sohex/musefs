@@ -1,3 +1,4 @@
+use std::path::Path;
 mod common;
 use common::{jpeg, new_track};
 use musefs_db::{Db, Format, NewArt, NewTrack, Tag, TrackArt};
@@ -9,13 +10,13 @@ fn insert_then_get_by_id_and_path() {
 
     let by_id = db.get_track(id).unwrap().expect("track by id");
     assert_eq!(by_id.id, id);
-    assert_eq!(by_id.backing_path, "/music/a.flac");
+    assert_eq!(by_id.backing_path, Path::new("/music/a.flac"));
     assert_eq!(by_id.format, Format::Flac);
     assert_eq!(by_id.bounds.audio_offset(), 100);
     assert_eq!(by_id.content_version, 0);
 
     let by_path = db
-        .get_track_by_path("/music/a.flac")
+        .get_track_by_path(Path::new("/music/a.flac"))
         .unwrap()
         .expect("track by path");
     assert_eq!(by_path.id, id);
@@ -34,6 +35,11 @@ fn track_identity_returns_content_version_and_backing_identity() {
             art_id,
             picture_type: 3,
             description: String::new(),
+            mime: "image/png".into(),
+            width: None,
+            height: None,
+            depth: 0,
+            colors: 0,
             ordinal: 0,
         }],
     )
@@ -45,16 +51,16 @@ fn track_identity_returns_content_version_and_backing_identity() {
         "linking art must bump content_version above the default"
     );
     let track = db.get_track(id).unwrap().expect("track by id");
+    let identity = db.track_identity(id).unwrap().expect("identity by id");
+    assert_eq!(identity.content_version, cv);
     assert_eq!(
-        db.track_identity(id).unwrap(),
-        Some(musefs_db::TrackIdentity {
-            content_version: cv,
-            backing_path: "/music/a.flac".to_string(),
-            backing_size: track.backing_size,
-            backing_mtime_ns: track.backing_mtime_ns,
-            backing_ctime_ns: track.backing_ctime_ns,
-        }),
+        identity.backing_path,
+        std::path::PathBuf::from("/music/a.flac")
     );
+    assert_eq!(identity.backing_size, track.backing_size);
+    assert_eq!(identity.backing_mtime_ns, track.backing_mtime_ns);
+    assert_eq!(identity.backing_ctime_ns, track.backing_ctime_ns);
+    assert_eq!(identity.backing_ino, track.backing_ino);
     assert!(db.track_identity(999_999).unwrap().is_none());
 }
 
@@ -117,21 +123,19 @@ fn delete_track_cascades_tags_and_track_art() {
     let db = Db::open_in_memory().unwrap();
     let id = db
         .upsert_track(&NewTrack {
-            backing_path: "/x/a.flac".to_string(),
+            backing_path: std::path::PathBuf::from("/x/a.flac"),
             format: Format::Flac,
             audio_offset: 0,
             audio_length: 0,
             backing_size: 0,
             backing_mtime_ns: 0,
             backing_ctime_ns: 0,
+            backing_ino: None,
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("artist", "A", 0)]).unwrap();
     let art_id = db
         .upsert_art(&NewArt {
-            mime: "image/png".to_string(),
-            width: None,
-            height: None,
             data: vec![1, 2, 3],
         })
         .unwrap();
@@ -141,6 +145,11 @@ fn delete_track_cascades_tags_and_track_art() {
             art_id,
             picture_type: 3,
             description: String::new(),
+            mime: "image/png".into(),
+            width: None,
+            height: None,
+            depth: 0,
+            colors: 0,
             ordinal: 0,
         }],
     )
@@ -162,13 +171,14 @@ fn upsert_conflict_updates_all_mutable_columns() {
 
     // Same backing_path => ON CONFLICT update path; change every mutable column.
     let changed = NewTrack {
-        backing_path: "/m/a.flac".to_string(),
+        backing_path: std::path::PathBuf::from("/m/a.flac"),
         format: Format::Mp3,
         audio_offset: 222,
         audio_length: 333,
         backing_size: 555,
         backing_mtime_ns: 555,
         backing_ctime_ns: 666,
+        backing_ino: None,
     };
     let id2 = db.upsert_track(&changed).unwrap();
     assert_eq!(id, id2, "conflict update must keep the same id");

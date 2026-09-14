@@ -32,7 +32,10 @@ fn validate_opened_backing_rejects_mismatched_descriptor_metadata() {
         content_version: 1,
         backing_path: expected_path,
         stamp: crate::freshness::BackingStamp::from_metadata(&expected_meta),
-        mtime_secs: crate::freshness::BackingStamp::from_metadata(&expected_meta).display_secs(),
+        mtime: crate::VirtualMtime {
+            secs: crate::freshness::BackingStamp::from_metadata(&expected_meta).display_secs(),
+            content_version: 0,
+        },
         last_page: std::sync::Mutex::new(None),
         cache_bytes: 0,
         streams_db_rowid: false,
@@ -108,6 +111,92 @@ fn open_handle_reresolves_after_content_version_bump() {
         "handle did not re-resolve: {len_before} -> {len_after}"
     );
     fs.release_handle(fh);
+}
+
+/// A mount over one scanned MP3, returning its file inode and backing path.
+fn mount_over_one_mp3() -> (tempfile::TempDir, Musefs, u64, std::path::PathBuf) {
+    use crate::scan::scan_directory;
+    use id3::TagLike;
+    use std::collections::BTreeMap;
+
+    let dir = tempfile::tempdir().unwrap();
+    let backing = dir.path().join("a.mp3");
+    let mut tag = id3::Tag::new();
+    tag.set_artist("Pix");
+    tag.set_title("Song");
+    let mut bytes = Vec::new();
+    tag.write_to(&mut bytes, id3::Version::Id3v24).unwrap();
+    bytes.extend_from_slice(&[0xFF, 0xFB, 1, 2, 3, 4]);
+    std::fs::write(&backing, &bytes).unwrap();
+
+    let db_path = dir.path().join("m.db");
+    scan_directory(&musefs_db::Db::open(&db_path).unwrap(), dir.path()).unwrap();
+    let cfg = MountConfig {
+        template: "$artist/$title".to_string(),
+        fallbacks: BTreeMap::new(),
+        default_fallback: "Unknown".to_string(),
+        mode: Mode::Synthesis,
+        poll_interval: std::time::Duration::ZERO,
+        case_insensitive: false,
+        read_ahead_budget: 64 * 1024 * 1024,
+        read_ahead_prefetch: false,
+        skip_on_missing: false,
+        trust_backing_mtime: false,
+    };
+    let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
+    let artist = fs.lookup(VirtualTree::ROOT, "Pix").expect("artist dir");
+    let (_, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
+    (dir, fs, file_inode, std::fs::canonicalize(backing).unwrap())
+}
+
+/// Rewrite `path` in place: same inode, same size, new bytes and timestamps.
+fn rewrite_in_place(path: std::path::PathBuf) -> impl FnMut() {
+    move || {
+        use std::os::unix::fs::FileExt;
+        let len = std::fs::metadata(&path).unwrap().len();
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.write_all_at(&vec![0x5A; usize::try_from(len).unwrap()], 0)
+            .unwrap();
+        f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_hours(1))
+            .unwrap();
+    }
+}
+
+/// #682: a backing rewrite landing between a handle read acquiring its bytes
+/// and returning them fails that read. With the stat taken before the read, as
+/// the handle path used to, this read succeeded with the new file's bytes
+/// spliced into the old layout, and only the next read noticed.
+#[test]
+fn a_rewrite_during_a_handle_read_fails_that_read() {
+    let (_dir, fs, file_inode, backing) = mount_over_one_mp3();
+    let fh = fs.open_handle(file_inode).unwrap();
+    fs.read(file_inode, Some(fh), 0, 1 << 20)
+        .expect("an untouched file reads");
+
+    set_after_backing_read_hook(rewrite_in_place(backing));
+    let read = fs.read(file_inode, Some(fh), 0, 1 << 20);
+    clear_after_backing_read_hook();
+    assert!(
+        matches!(read, Err(CoreError::BackingChanged(_))),
+        "{:?}",
+        read.map(|b| b.len())
+    );
+    fs.release_handle(fh);
+}
+
+/// #682, the stateless path: it opened the file and checked it before reading,
+/// so the same rewrite slipped past it the same way.
+#[test]
+fn a_rewrite_during_a_stateless_read_fails_that_read() {
+    let (_dir, fs, file_inode, backing) = mount_over_one_mp3();
+    set_after_backing_read_hook(rewrite_in_place(backing));
+    let read = fs.read(file_inode, None, 0, 1 << 20);
+    clear_after_backing_read_hook();
+    assert!(
+        matches!(read, Err(CoreError::BackingChanged(_))),
+        "{:?}",
+        read.map(|b| b.len())
+    );
 }
 
 #[test]
@@ -979,24 +1068,26 @@ fn full_rebuild_gives_bare_colliding_name_to_lower_id() {
     // Insertion order fixes ascending ids: id_a < id_b.
     let id_a = db
         .upsert_track(&NewTrack {
-            backing_path: "/a.flac".into(),
+            backing_path: std::path::PathBuf::from("/a.flac"),
             format: Format::Flac,
             audio_offset: 0,
             audio_length: 1,
             backing_size: 1,
             backing_mtime_ns: 0,
             backing_ctime_ns: 0,
+            backing_ino: None,
         })
         .unwrap();
     let id_b = db
         .upsert_track(&NewTrack {
-            backing_path: "/b.flac".into(),
+            backing_path: std::path::PathBuf::from("/b.flac"),
             format: Format::Flac,
             audio_offset: 0,
             audio_length: 1,
             backing_size: 1,
             backing_mtime_ns: 0,
             backing_ctime_ns: 0,
+            backing_ino: None,
         })
         .unwrap();
     assert!(id_a < id_b, "insertion assigns ascending ids");
@@ -1052,6 +1143,7 @@ fn entry_counts_reports_files_and_dirs() {
                 backing_size: 1,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         db.replace_tags(
@@ -1577,4 +1669,45 @@ fn drain_prefetch_reports_the_pool_state() {
         on.drain_prefetch(Duration::from_secs(30)),
         "the pool drains once the job finishes"
     );
+}
+
+/// `VirtualMtime::nanos` is the whole of #725's mechanism: the sub-second part
+/// a `stat` reports, derived from the store's change counter.
+///
+/// Tested here rather than only through the FUSE conversion that consumes it.
+/// A public method whose only coverage lives in a downstream crate is a method
+/// this crate's own mutation gate cannot see — and it did not: both mutants on
+/// this function survived a `musefs-core`-scoped run until these landed.
+#[test]
+fn nanos_is_the_content_version_folded_into_the_sub_second_range() {
+    let at = |content_version| {
+        VirtualMtime {
+            secs: 0,
+            content_version,
+        }
+        .nanos()
+    };
+
+    // It is the counter itself while the counter fits.
+    assert_eq!(at(0), 0);
+    assert_eq!(at(1), 1);
+    assert_eq!(at(999_999_999), 999_999_999);
+
+    // Past a billion it wraps, which is the documented collision.
+    assert_eq!(at(1_000_000_000), 0);
+    assert_eq!(at(1_000_000_007), 7);
+
+    // The property that actually matters: consecutive versions differ, so a
+    // bump always moves the reported timestamp.
+    for v in [0, 1, 42, 999_999_998, 1_000_000_000, i64::MAX - 1] {
+        assert_ne!(at(v), at(v + 1), "version {v} and {} collide", v + 1);
+    }
+
+    // And the result is always a legal `tv_nsec`, including for a negative
+    // version the column's CHECK is supposed to forbid — `rem_euclid`, not `%`,
+    // so a reader that trusted the CHECK and was wrong still produces something
+    // the kernel accepts.
+    for v in [i64::MIN, -1, 0, i64::MAX] {
+        assert!(at(v) < 1_000_000_000, "version {v} -> {}", at(v));
+    }
 }

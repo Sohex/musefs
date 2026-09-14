@@ -44,6 +44,7 @@ thread_local! {
 /// every entry. Distinct from `musefs_core::MountConfig`, which governs how the
 /// virtual tree is rendered.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FuseConfig {
     /// Entry/attr cache lifetime the kernel may trust before re-validating.
     /// Longer cuts `lookup`/`getattr` traffic but bounds how fast external DB
@@ -180,6 +181,12 @@ fn statfs_params() -> (u64, u64, u64, u64, u64, u32, u32, u32) {
 
 /// Map a core error onto a POSIX errno for the FUSE reply. `Io` errors carry the
 /// underlying errno when present; everything structural collapses to `EIO`.
+#[expect(
+    clippy::match_same_arms,
+    reason = "the named EIO arm records which errors are deliberately EIO; the wildcard is \
+              `#[non_exhaustive]`'s fallback for variants not yet placed, and folding the \
+              two would erase the record"
+)]
 pub fn errno(err: &CoreError) -> fuser::Errno {
     match err {
         CoreError::NoEntry(_) | CoreError::TrackNotFound(_) => fuser::Errno::ENOENT,
@@ -191,6 +198,7 @@ pub fn errno(err: &CoreError) -> fuser::Errno {
             fuser::Errno::from_i32(source.raw_os_error().unwrap_or(libc::EIO))
         }
         CoreError::BackingChanged(_)
+        | CoreError::DerivedStateStale(_)
         | CoreError::Db(_)
         | CoreError::DbOpen { .. }
         | CoreError::Mp4MetadataTooLarge { .. }
@@ -205,6 +213,10 @@ pub fn errno(err: &CoreError) -> fuser::Errno {
         | CoreError::TrackMetadataTooLarge { .. }
         | CoreError::Format(_)
         | CoreError::InvalidTemplate(_) => fuser::Errno::EIO,
+        // `CoreError` is `#[non_exhaustive]` (#708). A variant added after this
+        // list collapses to `EIO` with the structural errors above until it is
+        // given a place in it.
+        _ => fuser::Errno::EIO,
     }
 }
 
@@ -246,30 +258,145 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
 /// `musefs_pool_workers` keeps reading healthy (#669). Catching here keeps the
 /// worker, and therefore its connection, alive.
 ///
-/// This is a backstop, not the reply guarantee: fuser's reply objects send
-/// nothing when dropped, so a task that panics before replying still hangs the
-/// syscall. Reply-bearing tasks guard their synthesis with [`synth_outcome`] and
-/// reply *outside* that boundary, which is what answers the caller (#359, #533).
+/// This is a backstop, not the reply guarantee. fuser answers a reply dropped
+/// unsent with a bare `EIO` and a warning that names only the request id, so a
+/// task that panics before replying fails its syscall with the wrong errno and
+/// no record of what failed. Reply-bearing tasks guard their synthesis with
+/// [`synth_outcome`] and reply *outside* that boundary, which is what gives the
+/// caller the real errno and the log its cause (#359, #533).
 /// What reaches this boundary is the rest of the task body — the reply call
 /// itself, handle bookkeeping — and the poll-refresh tasks, which carry no reply
 /// at all. `op` labels the syscall in the log line.
 fn execute_guarded(pool: &ThreadPool, op: &'static str, work: impl FnOnce() + Send + 'static) {
-    pool.execute(move || {
-        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
-            log::error!(
-                "{op} worker task panicked outside the synthesis boundary: {}; worker retained",
-                panic_message(&*payload)
-            );
+    pool.execute(move || run_guarded(op, work));
+}
+
+/// Run `work` behind [`execute_guarded`]'s panic boundary on the calling thread,
+/// for a job [`Workers::submit`] runs in place because the queue is full.
+fn run_guarded(op: &'static str, work: impl FnOnce()) {
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+        log::error!(
+            "{op} worker task panicked outside the synthesis boundary: {}; worker retained",
+            panic_message(&*payload)
+        );
+    }
+}
+
+/// Cap on metadata jobs queued or running on the worker pool at once (#694).
+///
+/// `ThreadPool`'s queue is unbounded. Reads reserve against their own cap before
+/// queueing ([`MAX_INFLIGHT_READS`], #308); every other job used to queue with
+/// no bound at all. 4096 is many times what a pool of any sensible size drains
+/// between two kernel round trips, so an ordinary workload never meets it; what
+/// meets it is a backlog already too deep to be worth growing.
+const MAX_QUEUED_JOBS: usize = 4096;
+
+/// The worker pool behind one admission gate for everything but reads (#694).
+/// Cloning shares the pool, the count and the counter.
+#[derive(Clone)]
+struct Workers {
+    pool: ThreadPool,
+    /// Metadata jobs queued or running.
+    admitted: Arc<AtomicUsize>,
+    /// Jobs that found `admitted` at the cap: run in place, or for a
+    /// `readdirplus` entry's attrs, not run at all (`musefs_pool_over_cap_total`).
+    over_cap: Arc<AtomicU64>,
+    cap: usize,
+}
+
+/// Gives one [`Workers::admitted`] slot back when dropped: when its job ends,
+/// when it panics, or when a dead pool drops it without running it.
+struct AdmittedSlot(Arc<AtomicUsize>);
+
+impl Drop for AdmittedSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl Workers {
+    fn new(pool: ThreadPool, cap: usize) -> Workers {
+        Workers {
+            pool,
+            admitted: Arc::new(AtomicUsize::new(0)),
+            over_cap: Arc::new(AtomicU64::new(0)),
+            cap,
         }
-    });
+    }
+
+    /// Take a slot if the queue has room, counting the refusal if not.
+    fn admit(&self) -> Option<AdmittedSlot> {
+        let count = self.admitted.fetch_add(1, Ordering::Relaxed) + 1;
+        let slot = AdmittedSlot(Arc::clone(&self.admitted));
+        if count > self.cap {
+            self.over_cap.fetch_add(1, Ordering::Relaxed);
+            None // `slot` drops here, giving the increment back
+        } else {
+            Some(slot)
+        }
+    }
+
+    /// Queue a metadata job, or — with the queue at its cap — run it on this
+    /// thread instead (#694).
+    ///
+    /// Running it here is the backpressure. From the dispatch thread it stops
+    /// fuser reading the next request until the job is done, so a backlog waits
+    /// in the kernel, which bounds it, rather than in an unbounded queue here.
+    /// Nothing is refused: a failed `lookup` or `getattr` fails the caller's
+    /// syscall outright, and refusing directory work is what #616 walked back.
+    fn submit(&self, op: &'static str, work: impl FnOnce() + Send + 'static) {
+        match self.admit() {
+            Some(slot) => execute_guarded(&self.pool, op, move || {
+                let _slot = slot;
+                work();
+            }),
+            None => run_guarded(op, work),
+        }
+    }
+
+    /// Queue a job only if the queue has room, dropping it unrun otherwise, and
+    /// report which (#694). For work with a cheaper answer than running in place.
+    fn try_submit(&self, op: &'static str, work: impl FnOnce() + Send + 'static) -> bool {
+        let Some(slot) = self.admit() else {
+            return false;
+        };
+        execute_guarded(&self.pool, op, move || {
+            let _slot = slot;
+            work();
+        });
+        true
+    }
+
+    /// Queue a read. Reads are admitted against their own cap before they get
+    /// here (#308), so they bypass this gate.
+    fn submit_read(&self, work: impl FnOnce() + Send + 'static) {
+        execute_guarded(&self.pool, "read", work);
+    }
+
+    fn max_count(&self) -> usize {
+        self.pool.max_count()
+    }
+
+    fn active_count(&self) -> usize {
+        self.pool.active_count()
+    }
+
+    fn queued_count(&self) -> usize {
+        self.pool.queued_count()
+    }
+
+    #[cfg(test)]
+    fn join(&self) {
+        self.pool.join();
+    }
 }
 
 /// Run metadata/handle/read synthesis under a panic boundary so a residual
 /// parser panic — one the format-layer alloc guards (`id3v2_alloc_safe` and
 /// friends) don't catch — becomes an errno reply instead of unwinding the pool
-/// worker. fuser's reply objects send nothing when dropped, so an unwound worker
-/// leaves the kernel waiting forever and the syscall hangs at 0% CPU with no
-/// error logged (#359). The same metadata synthesis runs behind `read`,
+/// worker. An unwound worker drops its reply unsent, which fuser answers with a
+/// bare `EIO` and a warning naming only the request id, so the caller gets no
+/// real errno and the log no cause (#359). The same metadata synthesis runs behind `read`,
 /// `lookup`, `getattr`, and `open` (all resolve a layout via `cache.resolve`),
 /// so every one of them must guard it, not just `read` (#533). The caller makes
 /// the reply *outside* this boundary on the returned outcome. A `CoreError` maps
@@ -361,16 +488,169 @@ struct DirHandles {
 /// The cap bounds memory, not correctness: an ordinary parallel walker (`bfs`,
 /// the default `find` on some distributions) blows past 1024 concurrent dir
 /// handles on a large mount, so over-cap opens must still *work* (#616). They
-/// are served statelessly via [`DIR_FH_STATELESS`] and counted, never refused.
+/// are served statelessly via [`DIR_FH_STATELESS`] and counted, never refused,
+/// and a stateless enumeration still pages a single generation's listing
+/// through [`StatelessListings`] (#695).
 const MAX_DIR_HANDLES: usize = 1024;
 
-/// The `opendir` fh that stores no snapshot: `readdir` treats an unknown fh as a
-/// cache miss and rebuilds the listing, and `releasedir` on it removes nothing.
-/// Handed out for the synthetic `.musefs-metrics` directory and for any open
-/// over `MAX_DIR_HANDLES` (#616), so a saturated table costs a client a rebuild
-/// per `readdir` rather than the directory itself. `dir_fh` starts at 1, so no
-/// real handle can collide with it.
+/// The `opendir` fh that stores no snapshot: `readdir` pages it through
+/// [`StatelessListings`], which pins the listing each enumeration started on
+/// (#695), and `releasedir` on it removes nothing. Handed out for the synthetic
+/// `.musefs-metrics` directory and for any open over `MAX_DIR_HANDLES` (#616),
+/// so a saturated table costs a client at most a rebuild per enumeration rather
+/// than the directory itself. `dir_fh` starts at 1, so no real handle can
+/// collide with it.
 const DIR_FH_STATELESS: u64 = 0;
+
+/// Bits of a directory cookie that hold the index of the next entry (#695). The
+/// bits above them hold the generation tag of the listing a stateless
+/// enumeration is paging. An admitted handle, whose listing cannot change under
+/// it, uses tag 0, so its cookies are exactly the indexes they always were. A
+/// cookie is opaque to the kernel and to readers; ext4 hands out 63-bit hash
+/// cookies, so a large one is ordinary.
+const COOKIE_INDEX_BITS: u32 = 32;
+
+/// The cookie that resumes a listing tagged `tag` at entry `next`.
+fn dir_cookie(tag: u32, next: usize) -> u64 {
+    let index = u32::try_from(next).expect("a directory listing has fewer than 2^32 entries");
+    (u64::from(tag) << COOKIE_INDEX_BITS) | u64::from(index)
+}
+
+/// Split a cookie into its generation tag and the index it resumes at.
+fn split_dir_cookie(offset: u64) -> (u32, usize) {
+    let tag = u32::try_from(offset >> COOKIE_INDEX_BITS).expect("the high half of a u64 fits u32");
+    (tag, usize_from(offset & u64::from(u32::MAX)))
+}
+
+/// Where a directory page starts: the listing index, and the generation tag its
+/// cookies carry (0 for a listing that cannot change under the cursor).
+#[derive(Clone, Copy)]
+struct PageStart {
+    index: usize,
+    tag: u32,
+}
+
+impl PageStart {
+    /// A page of a listing held for the whole enumeration, where the offset the
+    /// kernel hands back is the index itself.
+    fn untagged(offset: u64) -> PageStart {
+        PageStart {
+            index: usize_from(offset),
+            tag: 0,
+        }
+    }
+}
+
+/// How many listings stateless enumerations keep pinned (#695). Eviction is not
+/// an error: an enumeration whose listing was evicted continues on the current
+/// generation, which is what every stateless page did before.
+const MAX_STATELESS_LISTINGS: usize = 64;
+
+/// Listings pinned for enumerations served without a directory handle (#695).
+///
+/// A stateless fh cannot tell one enumeration from another, so nothing
+/// per-handle can hold the listing it is paging. Rebuilding each page from
+/// whatever generation was current let a refresh between two pages shift the
+/// entries under an index cookie: one enumeration could return an entry twice,
+/// or skip one. Instead the first page of an enumeration tags the current
+/// generation and pins its listing here, and every cookie it hands out carries
+/// the tag, so each later page reads the same listing.
+#[derive(Default)]
+struct StatelessListings {
+    /// The generation new enumerations are tagged with. Held because a
+    /// snapshot's id is a heap address, unique only while the snapshot lives:
+    /// without the pin, a later tree at the same address would inherit the tag.
+    current: Option<(TreeSnapshot, u32)>,
+    /// The last tag minted. Tags start at 1; 0 means untagged.
+    last_tag: u32,
+    /// `((directory inode, tag), listing)`, least recently used first.
+    pinned: std::collections::VecDeque<((u64, u32), Arc<DirListing>)>,
+}
+
+impl StatelessListings {
+    /// The tag for `snapshot`'s generation, minting a new one unless it is the
+    /// generation the current tag stands for.
+    fn tag_for(&mut self, snapshot: &TreeSnapshot) -> u32 {
+        if let Some((held, tag)) = &self.current
+            && held.id() == snapshot.id()
+        {
+            return *tag;
+        }
+        self.last_tag = self.last_tag.checked_add(1).unwrap_or(1);
+        self.current = Some((snapshot.clone(), self.last_tag));
+        self.last_tag
+    }
+
+    /// The listing pinned for `(ino, tag)`, marked most recently used.
+    fn get(&mut self, ino: u64, tag: u32) -> Option<Arc<DirListing>> {
+        let at = self.pinned.iter().position(|(key, _)| *key == (ino, tag))?;
+        let entry = self.pinned.remove(at)?;
+        let listing = Arc::clone(&entry.1);
+        self.pinned.push_back(entry);
+        Some(listing)
+    }
+
+    /// Pin `listing` for `(ino, tag)`, evicting the least recently used past the cap.
+    fn insert(&mut self, ino: u64, tag: u32, listing: Arc<DirListing>) {
+        self.pinned.retain(|(key, _)| *key != (ino, tag));
+        self.pinned.push_back(((ino, tag), listing));
+        while self.pinned.len() > MAX_STATELESS_LISTINGS {
+            self.pinned.pop_front();
+        }
+    }
+}
+
+/// Resolve a stateless `readdir`/`readdirplus` page (#695): the listing to page
+/// and where its page starts.
+///
+/// A tagged cookie resumes the listing its tag pinned, whatever has been
+/// published since. An untagged offset — the first page of an enumeration — or a
+/// tag whose listing has been evicted is served from `snapshot`'s generation,
+/// which is tagged and pinned so the rest of the enumeration stays on it.
+/// `build` supplies that listing when it is not pinned already, and runs without
+/// the cache lock held.
+fn stateless_page<E>(
+    listings: &Mutex<StatelessListings>,
+    ino: u64,
+    offset: u64,
+    snapshot: &TreeSnapshot,
+    build: impl FnOnce() -> Result<Arc<DirListing>, E>,
+) -> Result<(Arc<DirListing>, PageStart), E> {
+    let (tag, index) = split_dir_cookie(offset);
+    let current = {
+        let mut guard = listings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if tag != 0
+            && let Some(listing) = guard.get(ino, tag)
+        {
+            return Ok((listing, PageStart { index, tag }));
+        }
+        let current = guard.tag_for(snapshot);
+        if let Some(listing) = guard.get(ino, current) {
+            return Ok((
+                listing,
+                PageStart {
+                    index,
+                    tag: current,
+                },
+            ));
+        }
+        current
+    };
+    let listing = build()?;
+    listings
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(ino, current, Arc::clone(&listing));
+    Ok((
+        listing,
+        PageStart {
+            index,
+            tag: current,
+        },
+    ))
+}
 
 /// The fh an `opendir` reply carries, given the [`try_admit_dir_handle`]
 /// outcome: the admitted snapshot id, or the stateless sentinel when the table
@@ -415,14 +695,24 @@ fn build_dir_listing(
     Ok(listing)
 }
 
-/// Answer a `readdir` with the page of `listing` starting at `offset`. Slicing
-/// from `offset` directly keeps a paginated enumeration O(n) rather than O(n^2):
-/// the skipped prefix is never re-walked (#442). The offset stored with each
-/// entry is the index of the *next* entry to return.
-fn reply_dir_page(mut reply: ReplyDirectory, listing: &[(u64, FileType, String)], offset: u64) {
-    let start = usize_from(offset).min(listing.len());
+/// Answer a `readdir` with the page of a listing held for the whole enumeration,
+/// starting at `offset`.
+fn reply_dir_page(reply: ReplyDirectory, listing: &[(u64, FileType, String)], offset: u64) {
+    reply_dir_entries(reply, listing, PageStart::untagged(offset));
+}
+
+/// Answer a `readdir` with the page of `listing` starting at `page`. Slicing from
+/// the start index directly keeps a paginated enumeration O(n) rather than
+/// O(n^2): the skipped prefix is never re-walked (#442). The cookie stored with
+/// each entry resumes at the *next* entry, under the page's tag.
+fn reply_dir_entries(
+    mut reply: ReplyDirectory,
+    listing: &[(u64, FileType, String)],
+    page: PageStart,
+) {
+    let start = page.index.min(listing.len());
     for (i, (child, kind, name)) in (start..).zip(&listing[start..]) {
-        if reply.add(INodeNo(*child), (i + 1) as u64, *kind, name) {
+        if reply.add(INodeNo(*child), dir_cookie(page.tag, i + 1), *kind, name) {
             break;
         }
     }
@@ -484,9 +774,11 @@ struct PlusFill {
     /// afterwards, so a stray second finish cannot double-reply.
     reply: Mutex<Option<ReplyDirectoryPlus>>,
     core: Arc<Musefs>,
-    pool: ThreadPool,
+    pool: Workers,
     style: AttrStyle,
     expose_metrics: bool,
+    /// The generation tag every cookie of this fill carries (#695).
+    cookie_tag: u32,
 }
 
 /// One round's resolutions: a slice of the listing, a slot per entry, and the
@@ -507,8 +799,8 @@ struct PlusRound {
 /// completion, a panic caught by [`execute_guarded`], and a task a dead pool
 /// dropped without running (the shape [`PollPendingGuard`] guards against,
 /// #369). The last one out assembles the round, so a lost task costs that
-/// entry's attrs and never the reply — which, dropped unsent, would hang the
-/// syscall (#359).
+/// entry's attrs and never the reply — which, dropped unsent, fuser would
+/// answer with a bare `EIO` for the whole listing (#359).
 struct PlusSlot(Arc<PlusRound>);
 
 impl Drop for PlusSlot {
@@ -578,17 +870,17 @@ fn unresolved_plus_entry(child: u64, kind: FileType, style: &AttrStyle) -> PlusE
     }
 }
 
-/// Start filling `reply` with `listing` from `offset` (#667).
+/// Start filling `reply` with `listing` from `page` (#667).
 fn start_plus_fill(
     core: &Arc<Musefs>,
-    pool: &ThreadPool,
+    pool: &Workers,
     style: AttrStyle,
     expose_metrics: bool,
     listing: Arc<DirListing>,
-    offset: u64,
+    page: PageStart,
     reply: ReplyDirectoryPlus,
 ) {
-    let start = usize_from(offset).min(listing.len());
+    let start = page.index.min(listing.len());
     let fill = Arc::new(PlusFill {
         listing,
         reply: Mutex::new(Some(reply)),
@@ -596,6 +888,7 @@ fn start_plus_fill(
         pool: pool.clone(),
         style,
         expose_metrics,
+        cookie_tag: page.tag,
     });
     spawn_plus_round(&fill, start);
 }
@@ -632,7 +925,12 @@ fn spawn_plus_round(fill: &Arc<PlusFill>, start: usize) {
         round.outstanding.fetch_add(1, Ordering::Relaxed);
         let slot = PlusSlot(Arc::clone(&round));
         let style = fill.style;
-        execute_guarded(&fill.pool, "readdirplus", move || {
+        // Over the pool's admission cap the job is dropped unrun rather than run
+        // here (#694): its slot counts it out, and the entry gets the zero-TTL
+        // placeholder a lost task gets, so the client's own `lookup` fetches the
+        // attrs. Running it in place instead would let a very wide directory
+        // recurse through round after round on this one thread.
+        fill.pool.try_submit("readdirplus", move || {
             let round = &slot.0;
             let entry = match synth_outcome(
                 "readdirplus",
@@ -681,11 +979,11 @@ fn finish_plus_round(round: &PlusRound) {
             .get()
             .copied()
             .unwrap_or_else(|| unresolved_plus_entry(*child, *kind, &fill.style));
-        // The stored offset is the index of the *next* entry, as in
-        // `reply_dir_page`: the kernel hands it back to resume from here.
+        // The stored cookie resumes at the *next* entry, as in
+        // `reply_dir_entries`: the kernel hands it back to resume from here.
         if reply.add(
             INodeNo(*child),
-            (i + 1) as u64,
+            dir_cookie(fill.cookie_tag, i + 1),
             name,
             &entry.ttl,
             &entry.attr,
@@ -833,7 +1131,13 @@ fn reserve_read_slot(inflight: &Arc<AtomicUsize>, cap: usize) -> Option<ReadSlot
 /// backing read never stalls the dispatch thread or unrelated metadata ops.
 pub struct MusefsFs {
     core: Arc<Musefs>,
-    pool: ThreadPool,
+    /// Offloaded ops, behind the metadata admission gate (#694).
+    pool: Workers,
+    /// Store-refresh tasks, on a lane of their own (#694). A metadata backlog on
+    /// `pool` cannot delay them, and they never run in place on the dispatch
+    /// thread, where `poll_refresh_notify`'s `inval_inode` notifications would be
+    /// written to the very channel fuser is reading.
+    refresh: ThreadPool,
     uid: u32,
     gid: u32,
     mount_time: SystemTime,
@@ -861,6 +1165,8 @@ pub struct MusefsFs {
     /// leave a partially-observable map across a single lock acquisition. So even a
     /// poisoning panic can't tear a later `readdir`'s view; recovery is deliberate.
     dir_handles: Arc<Mutex<DirHandles>>,
+    /// Listings pinned for enumerations served on the stateless fh (#695).
+    stateless_listings: Arc<Mutex<StatelessListings>>,
     /// Monotonic dir-handle id (starts at 1; 0 stays [`DIR_FH_STATELESS`]).
     ///
     /// Unlike the file slab's generation-encoded keys (`facade.rs`, ABA-safe by
@@ -913,13 +1219,18 @@ impl MusefsFs {
         let structure_only = core.mode() == musefs_core::Mode::StructureOnly;
         MusefsFs {
             core: Arc::new(core),
-            // `ThreadPool`'s queue is unbounded, so foreground reads are gated by
-            // `inflight_reads`/`MAX_INFLIGHT_READS` before submission (#308) and
-            // directory handles are capped at `MAX_DIR_HANDLES` (#307); both reject
-            // over-cap work rather than letting it grow process memory.
-            // `max_background` (set in `init`) separately caps the kernel's
-            // background/readahead requests.
-            pool: ThreadPool::new(workers),
+            // `ThreadPool`'s queue is unbounded, so nothing reaches it ungated:
+            // reads reserve against `MAX_INFLIGHT_READS` and get EAGAIN over it
+            // (#308); every other job goes through `Workers`' admission gate and
+            // runs in place over it (#694); directory handles are capped at
+            // `MAX_DIR_HANDLES` and degrade to the stateless fh over it (#307,
+            // #616). `max_background` (set in `init`) separately caps the
+            // kernel's background/readahead requests.
+            pool: Workers::new(ThreadPool::new(workers), MAX_QUEUED_JOBS),
+            refresh: threadpool::Builder::new()
+                .num_threads(1)
+                .thread_name("musefs-refresh".to_string())
+                .build(),
             uid: config.uid,
             gid: config.gid,
             mount_time: SystemTime::now(),
@@ -928,6 +1239,7 @@ impl MusefsFs {
             poll_pending: Arc::new(AtomicBool::new(false)),
             passthrough: platform::passthrough::PassthroughState::new(structure_only),
             dir_handles: Arc::new(Mutex::new(DirHandles::default())),
+            stateless_listings: Arc::new(Mutex::new(StatelessListings::default())),
             dir_fh: Arc::new(AtomicU64::new(1)),
             dir_handle_rejections: Arc::new(AtomicU64::new(0)),
             readdirplus_calls: Arc::new(AtomicU64::new(0)),
@@ -942,7 +1254,7 @@ impl MusefsFs {
         Arc::clone(&self.notifier)
     }
 
-    /// Fire `poll_refresh` on the worker pool (off the dispatch thread), but only
+    /// Fire `poll_refresh` on the refresh lane (off the dispatch thread), but only
     /// when due: a cheap synchronous `poll_due()` check gates submission so a
     /// metadata-op storm doesn't flood the pool, and a `poll_pending` single-flight
     /// gate bounds in-flight poll tasks to one (#89). When keep-cache is enabled,
@@ -966,7 +1278,7 @@ impl MusefsFs {
         let core = Arc::clone(&self.core);
         if self.config.keep_cache {
             let notifier = Arc::clone(&self.notifier);
-            execute_guarded(&self.pool, "poll_refresh_notify", move || {
+            execute_guarded(&self.refresh, "poll_refresh_notify", move || {
                 let _guard = guard;
                 if let Err(e) = core.poll_refresh_notify(|ino| {
                     if let Some(n) = notifier.get()
@@ -979,7 +1291,7 @@ impl MusefsFs {
                 }
             });
         } else {
-            execute_guarded(&self.pool, "poll_refresh", move || {
+            execute_guarded(&self.refresh, "poll_refresh", move || {
                 let _guard = guard;
                 if let Err(e) = core.poll_refresh() {
                     log::warn!("poll_refresh failed: {e}");
@@ -1025,6 +1337,7 @@ impl MusefsFs {
             pool_workers: self.pool.max_count() as u64,
             pool_active: self.pool.active_count() as u64,
             pool_queued: self.pool.queued_count() as u64,
+            pool_over_cap: self.pool.over_cap.load(Ordering::Relaxed),
             passthrough: self
                 .passthrough
                 .telemetry()
@@ -1108,7 +1421,7 @@ impl Filesystem for MusefsFs {
         // `reply` stays outside the panic boundary so a residual synthesis panic
         // is answered (EIO) instead of unwinding the worker and hanging the
         // syscall (#359, #533).
-        execute_guarded(&self.pool, "lookup", move || {
+        self.pool.submit("lookup", move || {
             match synth_outcome(
                 "lookup",
                 child,
@@ -1155,7 +1468,7 @@ impl Filesystem for MusefsFs {
         // `reply` stays outside the panic boundary so a residual synthesis panic
         // is answered (EIO) instead of unwinding the worker and hanging the
         // syscall (#359, #533).
-        execute_guarded(&self.pool, "getattr", move || {
+        self.pool.submit("getattr", move || {
             match synth_outcome(
                 "getattr",
                 ino.0,
@@ -1204,7 +1517,7 @@ impl Filesystem for MusefsFs {
         let core = Arc::clone(&self.core);
         let flags = open_flags(self.config.keep_cache);
         let passthrough = self.passthrough.clone();
-        execute_guarded(&self.pool, "open", move || {
+        self.pool.submit("open", move || {
             // `open_handle` runs the same layout synthesis as `read`; guard it so a
             // residual panic replies EIO instead of unwinding the worker and hanging
             // `open` (#359, #533). `reply_open` below stays outside the boundary.
@@ -1238,7 +1551,7 @@ impl Filesystem for MusefsFs {
         let counter = Arc::clone(&self.dir_fh);
         let rejections = Arc::clone(&self.dir_handle_rejections);
         let expose_metrics = self.config.expose_metrics;
-        execute_guarded(&self.pool, "opendir", move || {
+        self.pool.submit("opendir", move || {
             // Pin the tree generation first: it names what a listing of this
             // directory would contain, so it is both what the build reads and
             // what the result is keyed by (#675).
@@ -1443,7 +1756,7 @@ impl Filesystem for MusefsFs {
             return reply.data(&body[start..end]);
         }
         // Reserve a slot on the dispatch thread before enqueuing; over the cap,
-        // reject with EAGAIN so the unbounded pool queue can't grow (#308).
+        // reject with EAGAIN so reads cannot grow the pool queue (#308).
         let Some(slot) = reserve_read_slot(&self.inflight_reads, MAX_INFLIGHT_READS) else {
             self.read_errors.fetch_add(1, Ordering::Relaxed);
             // Rate-limited: a saturated client retries rejected reads in a tight
@@ -1456,7 +1769,7 @@ impl Filesystem for MusefsFs {
         };
         let core = Arc::clone(&self.core);
         let read_errors = Arc::clone(&self.read_errors);
-        execute_guarded(&self.pool, "read", move || {
+        self.pool.submit_read(move || {
             // `_slot` (named) holds the guard until the read completes or the
             // worker panics, then releases it. Do NOT simplify to bare `_`: that
             // drops the guard immediately, releasing the slot before the work
@@ -1525,31 +1838,35 @@ impl Filesystem for MusefsFs {
             // expensive (#623). `ReplyDirectory` is `Send`, so the worker answers.
             let core = Arc::clone(&self.core);
             let handles = Arc::clone(&self.dir_handles);
+            let stateless = Arc::clone(&self.stateless_listings);
             let expose_metrics = self.config.expose_metrics;
-            return execute_guarded(&self.pool, "readdir", move || {
-                // An over-cap open is exactly the case where some *other* handle
-                // usually holds this directory's listing already, so probe the
-                // index before walking the tree again (#675). A hit is the same
-                // listing the rebuild would produce: same directory, same
-                // generation.
+            return self.pool.submit("readdir", move || {
                 let snapshot = core.tree_snapshot();
-                let cached = shared_listing(
-                    &handles
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner),
-                    (snapshot.id(), ino.0),
-                );
-                if let Some(listing) = cached {
-                    return reply_dir_page(reply, &listing, offset);
-                }
-                match synth_outcome(
-                    "readdir",
-                    ino.0,
-                    std::panic::AssertUnwindSafe(|| {
-                        build_dir_listing(&snapshot, ino.0, expose_metrics)
-                    }),
-                ) {
-                    Ok(listing) => reply_dir_page(reply, &listing, offset),
+                let page = stateless_page(&stateless, ino.0, offset, &snapshot, || {
+                    // An over-cap open is exactly the case where some *other*
+                    // handle usually holds this directory's listing already, so
+                    // probe the index before walking the tree again (#675). A hit
+                    // is the listing the rebuild would produce: same directory,
+                    // same generation.
+                    if let Some(listing) = shared_listing(
+                        &handles
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        (snapshot.id(), ino.0),
+                    ) {
+                        return Ok(listing);
+                    }
+                    synth_outcome(
+                        "readdir",
+                        ino.0,
+                        std::panic::AssertUnwindSafe(|| {
+                            build_dir_listing(&snapshot, ino.0, expose_metrics)
+                        }),
+                    )
+                    .map(Arc::new)
+                });
+                match page {
+                    Ok((listing, start)) => reply_dir_entries(reply, &listing, start),
                     Err(e) => reply.error(e),
                 }
             });
@@ -1586,7 +1903,7 @@ impl Filesystem for MusefsFs {
                 style,
                 true,
                 Arc::new(metrics_dir::dir_listing()),
-                offset,
+                PageStart::untagged(offset),
                 reply,
             );
         }
@@ -1606,29 +1923,34 @@ impl Filesystem for MusefsFs {
             // spares it even that (#675).
             let core = Arc::clone(&self.core);
             let handles = Arc::clone(&self.dir_handles);
+            let stateless = Arc::clone(&self.stateless_listings);
             let pool = self.pool.clone();
-            return execute_guarded(&self.pool, "readdirplus", move || {
+            return self.pool.submit("readdirplus", move || {
                 let snapshot = core.tree_snapshot();
-                let cached = shared_listing(
-                    &handles
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner),
-                    (snapshot.id(), ino.0),
-                );
-                let listing = match cached {
-                    Some(listing) => listing,
-                    None => match synth_outcome(
+                let page = stateless_page(&stateless, ino.0, offset, &snapshot, || {
+                    if let Some(listing) = shared_listing(
+                        &handles
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        (snapshot.id(), ino.0),
+                    ) {
+                        return Ok(listing);
+                    }
+                    synth_outcome(
                         "readdirplus",
                         ino.0,
                         std::panic::AssertUnwindSafe(|| {
                             build_dir_listing(&snapshot, ino.0, expose_metrics)
                         }),
-                    ) {
-                        Ok(listing) => Arc::new(listing),
-                        Err(e) => return reply.error(e),
-                    },
-                };
-                start_plus_fill(&core, &pool, style, expose_metrics, listing, offset, reply);
+                    )
+                    .map(Arc::new)
+                });
+                match page {
+                    Ok((listing, start)) => {
+                        start_plus_fill(&core, &pool, style, expose_metrics, listing, start, reply);
+                    }
+                    Err(e) => reply.error(e),
+                }
             });
         };
         start_plus_fill(
@@ -1637,7 +1959,7 @@ impl Filesystem for MusefsFs {
             style,
             expose_metrics,
             listing,
-            offset,
+            PageStart::untagged(offset),
             reply,
         );
     }
@@ -1935,21 +2257,13 @@ mod tests {
     }
 
     fn test_fs() -> (tempfile::TempDir, MusefsFs) {
-        use musefs_core::{Mode, MountConfig, Musefs};
+        use musefs_core::{MountConfig, Musefs};
         let dir = tempfile::tempdir().unwrap();
-        let cfg = MountConfig {
-            template: "$artist/$title".to_string(),
-            fallbacks: std::collections::BTreeMap::new(),
-            default_fallback: "Unknown".to_string(),
-            mode: Mode::Synthesis,
-            // Zero interval => poll_due() is always true, isolating the gate.
-            poll_interval: std::time::Duration::ZERO,
-            case_insensitive: false,
-            read_ahead_budget: 64 * 1024 * 1024,
-            read_ahead_prefetch: false,
-            skip_on_missing: false,
-            trust_backing_mtime: false,
-        };
+        let mut cfg = MountConfig::default();
+        cfg.template = "$artist/$title".to_string();
+        // Zero interval => poll_due() is always true, isolating the gate.
+        cfg.poll_interval = std::time::Duration::ZERO;
+        cfg.case_insensitive = false;
         let core =
             Musefs::open(musefs_db::Db::open(dir.path().join("m.db")).unwrap(), cfg).unwrap();
         (dir, MusefsFs::new(core, FuseConfig::default()))
@@ -1957,20 +2271,12 @@ mod tests {
 
     #[test]
     fn explicit_workers_sets_pool_size() {
-        use musefs_core::{Mode, MountConfig, Musefs};
+        use musefs_core::{MountConfig, Musefs};
         let dir = tempfile::tempdir().unwrap();
-        let cfg = MountConfig {
-            template: "$artist/$title".to_string(),
-            fallbacks: std::collections::BTreeMap::new(),
-            default_fallback: "Unknown".to_string(),
-            mode: Mode::Synthesis,
-            poll_interval: std::time::Duration::ZERO,
-            case_insensitive: false,
-            read_ahead_budget: 64 * 1024 * 1024,
-            read_ahead_prefetch: false,
-            skip_on_missing: false,
-            trust_backing_mtime: false,
-        };
+        let mut cfg = MountConfig::default();
+        cfg.template = "$artist/$title".to_string();
+        cfg.poll_interval = std::time::Duration::ZERO;
+        cfg.case_insensitive = false;
         let core =
             Musefs::open(musefs_db::Db::open(dir.path().join("w.db")).unwrap(), cfg).unwrap();
         let fs = MusefsFs::new(
@@ -1988,6 +2294,64 @@ mod tests {
         let (_dir, fs) = test_fs(); // default config: workers == 0
         let auto = std::thread::available_parallelism().map_or(4, std::num::NonZero::get) * 2;
         assert_eq!(fs.pool.max_count(), auto);
+    }
+
+    /// #694: under the cap a job runs on a pool thread and holds its slot until
+    /// it ends; at the cap the next job runs on the caller, and `try_submit`
+    /// drops its job unrun — both counted.
+    #[test]
+    fn workers_queue_under_the_cap_and_run_in_place_over_it() {
+        let workers = Workers::new(ThreadPool::new(1), 1);
+        let (ids_tx, ids) = std::sync::mpsc::channel();
+        let (release, parked) = std::sync::mpsc::channel::<()>();
+        let tx = ids_tx.clone();
+        workers.submit("test", move || {
+            tx.send(std::thread::current().id()).unwrap();
+            parked.recv().unwrap();
+        });
+        assert_ne!(ids.recv().unwrap(), std::thread::current().id(), "queued");
+        assert_eq!(workers.admitted.load(Ordering::Relaxed), 1);
+
+        let tx = ids_tx.clone();
+        workers.submit("test", move || {
+            tx.send(std::thread::current().id()).unwrap();
+        });
+        assert_eq!(
+            ids.recv().unwrap(),
+            std::thread::current().id(),
+            "at the cap, run on the caller"
+        );
+        assert_eq!(workers.over_cap.load(Ordering::Relaxed), 1);
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+        assert!(!workers.try_submit("test", move || flag.store(true, Ordering::SeqCst)));
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "try_submit drops the job unrun"
+        );
+        assert_eq!(workers.over_cap.load(Ordering::Relaxed), 2);
+
+        release.send(()).unwrap();
+        workers.join();
+        assert_eq!(
+            workers.admitted.load(Ordering::Relaxed),
+            0,
+            "the slot comes back when its job ends"
+        );
+    }
+
+    #[test]
+    fn an_admitted_slot_comes_back_when_its_job_panics() {
+        let workers = Workers::new(ThreadPool::new(1), 4);
+        workers.submit("test", || panic!("boom"));
+        workers.join();
+        assert_eq!(workers.admitted.load(Ordering::Relaxed), 0);
+        assert!(
+            workers.try_submit("test", || {}),
+            "and the gate admits again"
+        );
+        workers.join();
     }
 
     #[test]
@@ -2022,13 +2386,21 @@ mod tests {
         let (_d, fs) = test_fs();
         // Simulate a poll already in flight; the gate must reject new submissions.
         fs.poll_pending.store(true, Ordering::SeqCst);
-        let queued = fs.pool.queued_count();
-        let active = fs.pool.active_count();
+        let queued = fs.refresh.queued_count();
+        let active = fs.refresh.active_count();
         for _ in 0..50 {
             fs.fire_poll_refresh();
         }
-        assert_eq!(fs.pool.queued_count(), queued, "no task should be queued");
-        assert_eq!(fs.pool.active_count(), active, "no task should be started");
+        assert_eq!(
+            fs.refresh.queued_count(),
+            queued,
+            "no task should be queued"
+        );
+        assert_eq!(
+            fs.refresh.active_count(),
+            active,
+            "no task should be started"
+        );
     }
 
     #[test]
@@ -2036,7 +2408,7 @@ mod tests {
         let (_d, fs) = test_fs();
         assert!(!fs.poll_pending.load(Ordering::SeqCst));
         fs.fire_poll_refresh(); // poll_due() true (zero interval): gate taken, task runs
-        fs.pool.join(); // block until the poll task completes
+        fs.refresh.join(); // block until the poll task completes
         assert!(
             !fs.poll_pending.load(Ordering::SeqCst),
             "guard must clear the gate after the task finishes"
@@ -2061,6 +2433,136 @@ mod tests {
                 .map(|(i, name)| (i as u64 + 2, FileType::RegularFile, (*name).to_string()))
                 .collect(),
         )
+    }
+
+    /// #695: tag 0 is the plain index a held listing always used, and a tag
+    /// rides above the index bits without disturbing it.
+    #[test]
+    fn an_untagged_cookie_is_the_index_it_always_was() {
+        assert_eq!(dir_cookie(0, 7), 7);
+        assert_eq!(split_dir_cookie(7), (0, 7));
+        let tagged = dir_cookie(5, 3);
+        assert_eq!(split_dir_cookie(tagged), (5, 3));
+        assert!(
+            tagged > u64::from(u32::MAX),
+            "the tag lives above the index"
+        );
+    }
+
+    #[test]
+    fn stateless_listings_tag_per_generation_and_evict_the_least_recently_used() {
+        let (_d, fs, snapshot) = test_snapshot();
+        let mut listings = StatelessListings::default();
+        let tag = listings.tag_for(&snapshot);
+        assert_ne!(tag, 0, "0 is reserved for untagged cookies");
+        assert_eq!(
+            listings.tag_for(&fs.core.tree_snapshot()),
+            tag,
+            "the same generation keeps its tag"
+        );
+        let cap = u64::try_from(MAX_STATELESS_LISTINGS).unwrap();
+        for ino in 0..cap {
+            listings.insert(ino, tag, listing(&["a"]));
+        }
+        assert!(
+            listings.get(0, tag).is_some(),
+            "touching 0 makes 1 the oldest"
+        );
+        listings.insert(cap, tag, listing(&["a"]));
+        assert!(
+            listings.get(1, tag).is_none(),
+            "the least recently used goes"
+        );
+        assert!(listings.get(0, tag).is_some());
+        assert!(listings.get(cap, tag).is_some());
+    }
+
+    /// #695: a stateless enumeration that a refresh interrupts keeps paging the
+    /// listing it started on, so an entry inserted ahead of its cursor cannot
+    /// shift what the next page returns — no entry twice, none skipped. Paging
+    /// the new generation at the same index, as before, returned "b" again.
+    #[test]
+    fn a_refresh_between_stateless_pages_cannot_shift_the_enumeration() {
+        let (dir, fs) = test_fs();
+        let db = musefs_db::Db::open(dir.path().join("m.db")).unwrap();
+        let add = |title: &str| {
+            let id = db
+                .upsert_track(&musefs_db::NewTrack {
+                    backing_path: dir.path().join(format!("{title}.flac")),
+                    format: musefs_db::Format::Flac,
+                    audio_offset: 0,
+                    audio_length: 1,
+                    backing_size: 1,
+                    backing_mtime_ns: 0,
+                    backing_ctime_ns: 0,
+                    backing_ino: None,
+                })
+                .unwrap();
+            db.replace_tags(
+                id,
+                &[
+                    musefs_db::Tag::new("artist", "Art", 0),
+                    musefs_db::Tag::new("title", title, 0),
+                ],
+            )
+            .unwrap();
+        };
+        let names = |listing: &DirListing, from: usize| -> Vec<String> {
+            listing[from..]
+                .iter()
+                .map(|(_, _, name)| name.clone())
+                .collect()
+        };
+        add("b");
+        add("c");
+        assert!(fs.core.poll_refresh().unwrap());
+        let artist = fs
+            .core
+            .lookup(musefs_core::VirtualTree::ROOT, "Art")
+            .unwrap();
+        let listings = Mutex::new(StatelessListings::default());
+
+        let first = fs.core.tree_snapshot();
+        let (listing, page) = stateless_page(&listings, artist, 0, &first, || {
+            build_dir_listing(&first, artist, false).map(Arc::new)
+        })
+        .unwrap();
+        assert_eq!(page.index, 0);
+        let all = names(&listing, 0);
+        assert_eq!(all.len(), 4, "{all:?}");
+        let (b, c) = (all[2].clone(), all[3].clone());
+        assert!(b.starts_with('b') && c.starts_with('c'), "{all:?}");
+        // The kernel took ".", "..", b, and hands back the cookie after b.
+        let resume = dir_cookie(page.tag, 3);
+
+        add("a");
+        assert!(fs.core.poll_refresh().unwrap());
+        let second = fs.core.tree_snapshot();
+        let (listing, resumed) = stateless_page(&listings, artist, resume, &second, || {
+            build_dir_listing(&second, artist, false).map(Arc::new)
+        })
+        .unwrap();
+        assert_eq!(
+            resumed.tag, page.tag,
+            "the enumeration stays on its generation"
+        );
+        assert_eq!(
+            names(&listing, resumed.index),
+            [c],
+            "no b twice, no c skipped"
+        );
+
+        let (listing, fresh) = stateless_page(&listings, artist, 0, &second, || {
+            build_dir_listing(&second, artist, false).map(Arc::new)
+        })
+        .unwrap();
+        assert_ne!(
+            fresh.tag, page.tag,
+            "a new enumeration takes the new generation"
+        );
+        let now = names(&listing, 0);
+        assert_eq!(now.len(), 5, "{now:?}");
+        assert!(now[2].starts_with('a'), "{now:?}");
     }
 
     fn empty_dir_handles() -> DirHandles {

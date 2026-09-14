@@ -185,12 +185,21 @@ fn page_crc_ok(backing: &std::fs::File, page_start: u64) -> Result<bool> {
 /// `audio_offset + audio_length`, which indicates corrupt or misaligned data.
 /// This preserves the `consumed == audio_length` check the removed `build_index`
 /// enforced, as a hard error in both debug and release builds.
+///
+/// Second guard: a page whose serial is not `serial` belongs to another logical
+/// bitstream, so `seq_delta` — the shift derived from *this* stream's header page
+/// count — does not apply to it. Patching it anyway renumbered a chained file's
+/// second stream into self-consistent nonsense, CRC and all (#722). Scanning now
+/// rejects chained files, but a row written by an older binary (or an external
+/// writer) still carries the bad bounds until a rescan, so the serve path fails
+/// closed rather than trusting them.
 #[allow(clippy::too_many_arguments)] // serve geometry + memo; bundling adds no clarity
 pub fn serve_ogg_window(
     backing: &crate::readahead::BackingReader,
     audio_offset: u64,
     audio_length: u64,
     seq_delta: i64,
+    serial: u32,
     rstart: u64,
     rend: u64,
     out: &mut Vec<u8>,
@@ -243,6 +252,14 @@ pub fn serve_ogg_window(
             return Err(musefs_format::FormatError::Malformed.into());
         }
         let payload_len: usize = hdr_buf[27..header_len].iter().map(|&b| b as usize).sum();
+        if u32::from_le_bytes(
+            hdr_buf[14..18]
+                .try_into()
+                .expect("18 <= 27 <= hdr_buf.len()"),
+        ) != serial
+        {
+            return Err(musefs_format::FormatError::Malformed.into());
+        }
 
         // Reuse the snapshotted patched header for the one page it was memoized
         // against (the boundary-straddling page sequential reads re-touch); every
@@ -284,9 +301,7 @@ pub fn serve_ogg_window(
         if ps < pe {
             let within = ps - hdr_end;
             let n = usize_from(pe - ps);
-            let start = out.len();
-            out.resize(start + n, 0);
-            backing.read_exact_at(&mut out[start..], pos + header_len_u64 + within)?;
+            backing.read_append(out, n, pos + header_len_u64 + within)?;
         }
 
         let total_len = header_len_u64
@@ -389,10 +404,10 @@ mod tests {
 
     /// Materialize the synthesized header region (Inline segments only; these
     /// fixtures embed no art) up to the OggAudio segment, returning
-    /// (header_bytes, audio_offset, audio_length, seq_delta).
+    /// (header_bytes, audio_offset, audio_length, seq_delta, serial).
     fn materialize_header_and_audio_params(
         layout: &musefs_format::RegionLayout,
-    ) -> (Vec<u8>, u64, u64, i64) {
+    ) -> (Vec<u8>, u64, u64, i64, u32) {
         use musefs_format::Segment;
         let mut header = Vec::new();
         let mut params = None;
@@ -403,14 +418,15 @@ mod tests {
                     offset,
                     len,
                     seq_delta,
+                    serial,
                 } => {
-                    params = Some((*offset, *len, *seq_delta));
+                    params = Some((*offset, *len, *seq_delta, *serial));
                 }
                 other => panic!("unexpected segment in no-art header: {other:?}"),
             }
         }
-        let (offset, len, delta) = params.expect("OggAudio segment present");
-        (header, offset, len, delta)
+        let (offset, len, delta, serial) = params.expect("OggAudio segment present");
+        (header, offset, len, delta, serial)
     }
 
     /// Build a complete synthetic Ogg file: `header_packets` laced as header pages
@@ -441,7 +457,7 @@ mod tests {
             &musefs_format::ogg::MapArtSource::default(),
         )
         .unwrap();
-        let (hdr_bytes, ao, alen, delta) = materialize_header_and_audio_params(&layout);
+        let (hdr_bytes, ao, alen, delta, serial) = materialize_header_and_audio_params(&layout);
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("f.ogg");
@@ -454,7 +470,7 @@ mod tests {
         let test_br = TestBr::new();
         let br = test_br.reader(&backing, u64::MAX);
         let mut audio = Vec::new();
-        serve_ogg_window(&br, ao, alen, delta, 0, alen, &mut audio, None).unwrap();
+        serve_ogg_window(&br, ao, alen, delta, serial, 0, alen, &mut audio, None).unwrap();
 
         let mut full = hdr_bytes;
         full.extend_from_slice(&audio);
@@ -550,7 +566,7 @@ mod tests {
         let test_br = TestBr::new();
         let br = test_br.reader(&backing, u64::MAX);
         let mut out = Vec::new();
-        serve_ogg_window(&br, ao, alen, 2, a, b, &mut out, None).unwrap();
+        serve_ogg_window(&br, ao, alen, 2, 0xABCD, a, b, &mut out, None).unwrap();
         out
     }
 
@@ -807,7 +823,17 @@ mod tests {
         let test_br = TestBr::new();
         let br = test_br.reader(&backing, u64::MAX);
         let mut out = Vec::new();
-        let r = serve_ogg_window(&br, 0, audio_length, 0, 0, audio_length, &mut out, None);
+        let r = serve_ogg_window(
+            &br,
+            0,
+            audio_length,
+            0,
+            0xABCD,
+            0,
+            audio_length,
+            &mut out,
+            None,
+        );
         assert!(r.is_err(), "misaligned audio_length must error");
     }
 
@@ -829,7 +855,7 @@ mod tests {
 
         // audio_offset + audio_length overflows u64.
         let mut out = Vec::new();
-        let r = serve_ogg_window(&br, u64::MAX, 10, 0, 0, 5, &mut out, None);
+        let r = serve_ogg_window(&br, u64::MAX, 10, 0, 0, 0, 5, &mut out, None);
         assert!(
             r.is_err(),
             "overflowing audio_offset + audio_length must error"
@@ -837,7 +863,7 @@ mod tests {
 
         // audio_offset + rstart overflows u64 (audio_end stays in range).
         let mut out2 = Vec::new();
-        let r2 = serve_ogg_window(&br, u64::MAX - 1, 1, 0, 5, 10, &mut out2, None);
+        let r2 = serve_ogg_window(&br, u64::MAX - 1, 1, 0, 0, 5, 10, &mut out2, None);
         assert!(r2.is_err(), "overflowing audio_offset + rstart must error");
     }
 
@@ -858,7 +884,7 @@ mod tests {
         let chunk = 20_000u64;
         while off < alen {
             let end = (off + chunk).min(alen);
-            serve_ogg_window(&br, ao, alen, 2, off, end, &mut out, Some(&memo)).unwrap();
+            serve_ogg_window(&br, ao, alen, 2, 0xABCD, off, end, &mut out, Some(&memo)).unwrap();
             off = end;
         }
         assert_eq!(out, want, "memo-served bytes must match the reference");
@@ -988,7 +1014,7 @@ mod tests {
         let alen = data.len() as u64;
         let mut out = Vec::new();
         // seq_delta 0 → patched headers equal the originals, so output == input.
-        serve_ogg_window(&br, 0, alen, 0, 0, alen, &mut out, None).unwrap();
+        serve_ogg_window(&br, 0, alen, 0, 0xABCD, 0, alen, &mut out, None).unwrap();
         assert_eq!(out, data);
     }
 
@@ -1037,6 +1063,39 @@ mod tests {
     }
 
     #[test]
+    fn serve_ogg_window_refuses_a_page_from_another_bitstream() {
+        // A row written before the scan-time chain check — or by an external
+        // writer — can declare an audio region that runs into a second logical
+        // bitstream. Renumbering those pages by this stream's delta produced
+        // self-consistent corruption that passed a page-level integrity check
+        // (#722), so the serve path fails closed on the serial instead.
+        let (mut data, _) = lace_packet_pub(0xABCD, 5, false, 100, &[9u8; 200]);
+        let first_len = data.len() as u64;
+        let (foreign, _) = lace_packet_pub(0x5678, 0, true, 0, &[7u8; 50]);
+        data.extend_from_slice(&foreign);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chained.ogg");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&data)
+            .unwrap();
+        let backing = std::fs::File::open(&path).unwrap();
+        let test_br = TestBr::new();
+        let br = test_br.reader(&backing, u64::MAX);
+        let alen = data.len() as u64;
+
+        let mut out = Vec::new();
+        let r = serve_ogg_window(&br, 0, alen, 1, 0xABCD, 0, alen, &mut out, None);
+        assert!(r.is_err(), "a foreign serial must not be renumbered");
+
+        // The first stream's own pages still serve.
+        let mut ok = Vec::new();
+        serve_ogg_window(&br, 0, alen, 0, 0xABCD, 0, first_len, &mut ok, None).unwrap();
+        assert_eq!(ok, data[..usize_from(first_len)]);
+    }
+
+    #[test]
     fn serve_ogg_window_wraps_seq_past_u32_max() {
         use musefs_format::ogg::{parse_page, patch_page_header};
         // A single audio page whose sequence number is u32::MAX. With seq_delta = +1
@@ -1058,7 +1117,7 @@ mod tests {
         let test_br = TestBr::new();
         let br = test_br.reader(&backing, u64::MAX);
         let mut out = Vec::new();
-        serve_ogg_window(&br, ao, alen, 1, 0, alen, &mut out, None).unwrap();
+        serve_ogg_window(&br, ao, alen, 1, 0x1234, 0, alen, &mut out, None).unwrap();
 
         // The served region must be the page with its sequence wrapped (u32::MAX + 1 == 0):
         // patched header followed by the original payload bytes.

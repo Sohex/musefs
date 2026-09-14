@@ -4,9 +4,13 @@ pub mod convert;
 mod error;
 pub mod limits;
 mod maintenance;
+mod migrate;
 mod models;
 mod schema;
-pub use schema::LATEST_VERSION;
+pub use migrate::PendingMigration;
+#[cfg(any(test, feature = "test-support"))]
+pub use schema::seed_store_at_version;
+pub use schema::{LATEST_VERSION, PendingStep};
 mod structural;
 mod tags;
 mod tracks;
@@ -14,8 +18,8 @@ mod tracks;
 pub use bulk::BulkWriter;
 pub use error::{DbError, Result};
 pub use models::{
-    Art, ArtMeta, BinaryTag, BinaryTagRow, Format, NewArt, NewTrack, StructuralBlock, Tag, Track,
-    TrackArt, TrackBounds, TrackIdentity,
+    Art, ArtMeta, BinaryTag, BinaryTagRow, ChecksumWrite, EmbeddedArt, Format, NewArt, NewTrack,
+    StructuralBlock, Tag, Track, TrackArt, TrackBounds, TrackIdentity,
 };
 pub use tracks::ChangelogRead;
 
@@ -145,7 +149,8 @@ impl Db<ReadWrite> {
     /// logging (file-backed DBs only) so a reader (the FUSE mount) and a writer
     /// (e.g. a beets-plugin sync) don't block each other; the busy timeout lets
     /// brief lock contention retry instead of failing immediately with
-    /// SQLITE_BUSY.
+    /// SQLITE_BUSY. A gated migration is refused rather than applied here; the
+    /// only door that applies one is [`crate::PendingMigration`].
     fn configure(conn: &mut Connection, wal: bool) -> Result<()> {
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "foreign_keys", true)?;
@@ -371,9 +376,8 @@ mod tests {
             db.conn
                 .execute_batch(
                     "PRAGMA foreign_keys=OFF; \
-                     INSERT INTO art (sha256, mime, byte_len, data) \
-                     VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', \
-                             'image/png', 1, X'00'); \
+                     INSERT INTO art (sha256, byte_len, data) \
+                     VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 1, X'00'); \
                      INSERT INTO track_art (track_id, art_id, picture_type, ordinal) \
                      VALUES (999, 1, 3, 0);",
                 )
@@ -397,13 +401,14 @@ mod fuzzing_accessor_tests {
         let db = Db::open_in_memory().unwrap();
         let id = db
             .upsert_track(&NewTrack {
-                backing_path: "/x".to_string(),
+                backing_path: std::path::PathBuf::from("/x"),
                 format: Format::Flac,
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
 

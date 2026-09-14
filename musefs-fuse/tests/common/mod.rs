@@ -7,7 +7,6 @@
 //! module in full but only uses a subset of the helpers.
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use musefs_core::{Mode, MountConfig};
@@ -31,18 +30,12 @@ pub fn config() -> MountConfig {
 
 /// Mount config with an explicit [`Mode`] (passthrough exercises StructureOnly).
 pub fn config_with_mode(mode: Mode) -> MountConfig {
-    MountConfig {
-        template: "$artist/$title".to_string(),
-        fallbacks: BTreeMap::new(),
-        default_fallback: "Unknown".to_string(),
-        mode,
-        poll_interval: std::time::Duration::ZERO,
-        case_insensitive: false,
-        read_ahead_budget: 64 * 1024 * 1024,
-        read_ahead_prefetch: false,
-        skip_on_missing: false,
-        trust_backing_mtime: false,
-    }
+    let mut config = MountConfig::default();
+    config.template = "$artist/$title".to_string();
+    config.mode = mode;
+    config.poll_interval = std::time::Duration::ZERO;
+    config.case_insensitive = false;
+    config
 }
 
 /// A tiny valid 4×4 front-cover PNG used to embed art into test fixtures.

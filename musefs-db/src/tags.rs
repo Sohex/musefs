@@ -1,41 +1,55 @@
-use crate::error::{check_field_len, check_tag_count};
+use crate::error::{check_field_bytes, check_tag_count, check_text_field};
 use crate::limits::{MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN};
 use crate::models::{BinaryTag, BinaryTagRow, Tag};
 use crate::{Db, ReadWrite, Result};
 use rusqlite::params;
 
-/// Reject an over-cap text-tag row from its `length(key)` /
-/// `length(CAST(value AS BLOB))` columns *before* the strings are
-/// materialized. `value` is measured in bytes (not characters, #505) so the
-/// materialized-memory bound is exact. Routes through the shared
-/// `check_field_len`, so the allocation-free guarantee is the same one its
-/// unit test pins (spec N13).
-fn check_tag_lengths(key_len: i64, value_len: i64) -> Result<()> {
-    check_field_len("tags", "key", key_len, MAX_TAG_KEY_LEN)?;
-    check_field_len("tags", "value", value_len, MAX_TAG_VALUE_LEN)?;
+/// Reject an over-cap text-tag row from its projected length columns *before*
+/// the strings are materialized. `value` is measured in bytes (not characters,
+/// #505) so its materialized-memory bound is exact; `key` keeps its character
+/// cap and gains the byte ceiling that cap implies. Routes through the shared
+/// guard helpers, so the allocation-free guarantee is the same one their unit
+/// tests pin (spec N13).
+fn check_tag_lengths(key_chars: i64, key_bytes: i64, value_len: i64) -> Result<()> {
+    check_text_field("tags", "key", key_chars, key_bytes, MAX_TAG_KEY_LEN)?;
+    check_field_bytes("tags", "value", value_len, MAX_TAG_VALUE_LEN)?;
     Ok(())
 }
 
-/// Columns the grouped tag readers project: `track_id` followed by the five
-/// columns `read_tag_row` consumes. Kept in lockstep with `read_tag_row`'s
-/// offset arithmetic.
-const GROUPED_TAG_COLS: &str =
-    "track_id, length(key), length(CAST(value AS BLOB)), key, value, ordinal";
+/// Columns every text-tag reader projects: `track_id` followed by the six
+/// columns `read_tag_row` consumes at base 1. Kept in lockstep with
+/// `read_tag_row`'s offset arithmetic — which is why the single-track reader
+/// projects `track_id` it already knows rather than keeping a second,
+/// separately-maintained column list one offset out of step.
+///
+/// `key` carries both its character length and its byte length: it is capped in
+/// characters, and an embedded NUL stops SQLite's character count dead, so the
+/// character length alone bounds nothing (#693).
+///
+/// A macro rather than a `const &str` so `concat!` can splice it into a
+/// statement that is still a literal: the single-track reader is on the serve
+/// path and should not format a string per call.
+macro_rules! grouped_tag_cols {
+    () => {
+        "track_id, length(key), length(CAST(key AS BLOB)), \
+         length(CAST(value AS BLOB)), key, value, ordinal"
+    };
+}
 
-/// Read one text-tag row laid out as `length(key), length(value), key, value,
-/// ordinal` starting at column `base`; length-guards the row before its strings
-/// are materialized (spec N13).
+/// Read one text-tag row laid out as `length(key), length(CAST(key AS BLOB)),
+/// length(CAST(value AS BLOB)), key, value, ordinal` starting at column `base`;
+/// length-guards the row before its strings are materialized (spec N13).
 fn read_tag_row(r: &rusqlite::Row, base: usize) -> Result<Tag> {
-    check_tag_lengths(r.get(base)?, r.get(base + 1)?)?;
+    check_tag_lengths(r.get(base)?, r.get(base + 1)?, r.get(base + 2)?)?;
     Ok(Tag {
-        key: r.get(base + 2)?,
-        value: r.get(base + 3)?,
-        ordinal: r.get(base + 4)?,
+        key: r.get(base + 3)?,
+        value: r.get(base + 4)?,
+        ordinal: r.get(base + 5)?,
     })
 }
 
-/// Drain grouped tag rows (`GROUPED_TAG_COLS`: `track_id` then `read_tag_row`'s
-/// five columns at base 1) into `out`, enforcing the per-track count cap.
+/// Drain grouped tag rows (`grouped_tag_cols!`: `track_id` then `read_tag_row`'s
+/// six columns at base 1) into `out`, enforcing the per-track count cap.
 fn collect_grouped_tags(
     rows: &mut rusqlite::Rows,
     out: &mut std::collections::HashMap<i64, Vec<Tag>>,
@@ -51,14 +65,15 @@ fn collect_grouped_tags(
 
 impl<M> Db<M> {
     pub fn get_tags(&self, track_id: i64) -> Result<Vec<Tag>> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT length(key), length(CAST(value AS BLOB)), key, value, ordinal FROM tags \
-             WHERE track_id = ?1 AND value_blob IS NULL ORDER BY key, ordinal",
-        )?;
+        let mut stmt = self.conn.prepare_cached(concat!(
+            "SELECT ",
+            grouped_tag_cols!(),
+            " FROM tags WHERE track_id = ?1 AND value_blob IS NULL ORDER BY key, ordinal"
+        ))?;
         let mut rows = stmt.query(params![track_id])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
-            out.push(read_tag_row(r, 0)?);
+            out.push(read_tag_row(r, 1)?);
             check_tag_count(track_id, out.len())?;
         }
         Ok(out)
@@ -74,9 +89,10 @@ impl<M> Db<M> {
             track_ids,
             |ph| {
                 format!(
-                    "SELECT {GROUPED_TAG_COLS} FROM tags \
+                    "SELECT {cols} FROM tags \
                      WHERE track_id IN ({ph}) AND value_blob IS NULL \
-                     ORDER BY track_id, key, ordinal"
+                     ORDER BY track_id, key, ordinal",
+                    cols = grouped_tag_cols!()
                 )
             },
             |rows| collect_grouped_tags(rows, &mut out),
@@ -85,11 +101,11 @@ impl<M> Db<M> {
     }
 
     pub fn tags_grouped(&self) -> Result<std::collections::HashMap<i64, Vec<Tag>>> {
-        let sql = format!(
-            "SELECT {GROUPED_TAG_COLS} FROM tags \
-             WHERE value_blob IS NULL ORDER BY track_id, key, ordinal"
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
+        let mut stmt = self.conn.prepare(concat!(
+            "SELECT ",
+            grouped_tag_cols!(),
+            " FROM tags WHERE value_blob IS NULL ORDER BY track_id, key, ordinal"
+        ))?;
         let mut rows = stmt.query([])?;
         let mut out = std::collections::HashMap::new();
         collect_grouped_tags(&mut rows, &mut out)?;
@@ -107,9 +123,10 @@ impl<M> Db<M> {
             &lowered,
             |ph| {
                 format!(
-                    "SELECT {GROUPED_TAG_COLS} FROM tags \
+                    "SELECT {cols} FROM tags \
                      WHERE value_blob IS NULL AND lower(key) IN ({ph}) \
-                     ORDER BY track_id, key, ordinal"
+                     ORDER BY track_id, key, ordinal",
+                    cols = grouped_tag_cols!()
                 )
             },
             |rows| collect_grouped_tags(rows, &mut out),
@@ -123,17 +140,17 @@ impl<M> Db<M> {
     /// is length-guarded, plus the per-track row count.
     pub fn get_binary_tags(&self, track_id: i64) -> Result<Vec<BinaryTagRow>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT length(key), rowid, key, length(value_blob) FROM tags \
-             WHERE track_id = ?1 AND value_blob IS NOT NULL ORDER BY key, ordinal",
+            "SELECT length(key), length(CAST(key AS BLOB)), rowid, key, length(value_blob) \
+             FROM tags WHERE track_id = ?1 AND value_blob IS NOT NULL ORDER BY key, ordinal",
         )?;
         let mut rows = stmt.query(params![track_id])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
-            check_field_len("tags", "key", r.get(0)?, MAX_TAG_KEY_LEN)?;
+            check_text_field("tags", "key", r.get(0)?, r.get(1)?, MAX_TAG_KEY_LEN)?;
             out.push(BinaryTagRow {
-                rowid: r.get(1)?,
-                key: r.get(2)?,
-                byte_len: r.get(3)?,
+                rowid: r.get(2)?,
+                key: r.get(3)?,
+                byte_len: r.get(4)?,
             });
             check_tag_count(track_id, out.len())?;
         }
@@ -263,6 +280,7 @@ mod tags_for_tracks_tests {
             backing_size: 1,
             backing_mtime_ns: 0,
             backing_ctime_ns: 0,
+            backing_ino: None,
         }
     }
 
@@ -478,6 +496,205 @@ mod tags_for_tracks_tests {
         let err = db.get_tags(a).unwrap_err();
         assert!(
             matches!(err, crate::DbError::FieldTooLarge { field: "value", .. }),
+            "{err:?}"
+        );
+    }
+
+    /// The `tags.key` byte ceiling: four bytes per character, so a key of
+    /// 256 four-byte characters is honest and must still read.
+    fn key_byte_ceiling() -> usize {
+        usize::try_from(MAX_TAG_KEY_LEN).unwrap() * 4
+    }
+
+    /// A key whose SQLite character length is 1 and whose byte length is `bytes`.
+    /// SQLite stops counting characters at an embedded NUL, which is the whole
+    /// of #693: the character cap sees a one-character key and waves through
+    /// however much follows the NUL.
+    fn nul_truncated_key(bytes: usize) -> String {
+        let mut k = String::from("k\0");
+        k.push_str(&"x".repeat(bytes - k.len()));
+        k
+    }
+
+    /// #693: an external writer can hide an unbounded payload behind an
+    /// embedded NUL, and `Row::get::<String>` would materialize all of it —
+    /// rusqlite takes the column's byte length, and a NUL is valid UTF-8. The
+    /// byte projection is what bounds the allocation.
+    #[test]
+    fn get_tags_rejects_a_nul_truncated_key() {
+        let db = open_mem();
+        let a = db.upsert_track(&new_track("/a.flac")).unwrap();
+        let key = nul_truncated_key(key_byte_ceiling() + 1);
+        // Planted with the constraints off. The schema now bans an embedded
+        // NUL outright (#693), so this row can only arrive the way the threat
+        // model says it does -- written before the ban, or by a writer that
+        // turned the constraints off. Guarding it at read time is the whole
+        // point: no constraint added later can clean a store that already has
+        // one.
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?1, ?2, 'v', 0)",
+                rusqlite::params![a, key],
+            )
+            .unwrap();
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", false)
+            .unwrap();
+
+        // The character cap this row sails past the guard on. The schema now
+        // bans an embedded NUL outright (#693), so the row has to be planted
+        // the way the threat model says it arrives -- a store written before
+        // the ban, or a writer that turned the constraints off.
+        let chars: i64 = db
+            .conn
+            .query_row(
+                "SELECT length(key) FROM tags WHERE track_id = ?1",
+                rusqlite::params![a],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(chars, 1, "SQLite counts characters only up to the NUL");
+
+        let err = db.get_tags(a).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::DbError::FieldTooLarge {
+                    table: "tags",
+                    field: "key",
+                    unit: "bytes",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// The ceiling must not narrow what the field may legitimately hold: 256
+    /// four-byte characters is exactly the character cap and exactly the byte
+    /// ceiling, and it reads back intact.
+    #[test]
+    fn get_tags_accepts_a_key_of_four_byte_characters_at_cap() {
+        let db = open_mem();
+        let a = db.upsert_track(&new_track("/a.flac")).unwrap();
+        let key = "\u{1D11E}".repeat(usize::try_from(MAX_TAG_KEY_LEN).unwrap());
+        assert_eq!(key.len(), key_byte_ceiling(), "exactly at the byte ceiling");
+        db.conn
+            .execute(
+                "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?1, ?2, 'v', 0)",
+                rusqlite::params![a, key],
+            )
+            .unwrap();
+        assert_eq!(db.get_tags(a).unwrap()[0].key, key);
+    }
+
+    /// A NUL-bearing key that stays inside the ceiling is not this guard's
+    /// business — banning NUL outright is the schema half of #693, and the
+    /// read-side ceiling is an allocation bound, not a grammar.
+    #[test]
+    fn get_tags_accepts_a_nul_key_within_the_byte_ceiling() {
+        let db = open_mem();
+        let a = db.upsert_track(&new_track("/a.flac")).unwrap();
+        let key = nul_truncated_key(key_byte_ceiling());
+        // Planted with the constraints off. The schema now bans an embedded
+        // NUL outright (#693), so this row can only arrive the way the threat
+        // model says it does -- written before the ban, or by a writer that
+        // turned the constraints off. Guarding it at read time is the whole
+        // point: no constraint added later can clean a store that already has
+        // one.
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?1, ?2, 'v', 0)",
+                rusqlite::params![a, key],
+            )
+            .unwrap();
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", false)
+            .unwrap();
+        assert_eq!(db.get_tags(a).unwrap()[0].key, key);
+    }
+
+    /// The grouped readers project the same columns at base 1, so they inherit
+    /// the guard — and this catches an offset that drifts out of step with
+    /// `read_tag_row`.
+    #[test]
+    fn tags_for_tracks_rejects_a_nul_truncated_key() {
+        let db = open_mem();
+        let a = db.upsert_track(&new_track("/a.flac")).unwrap();
+        let key = nul_truncated_key(key_byte_ceiling() + 1);
+        // Planted with the constraints off. The schema now bans an embedded
+        // NUL outright (#693), so this row can only arrive the way the threat
+        // model says it does -- written before the ban, or by a writer that
+        // turned the constraints off. Guarding it at read time is the whole
+        // point: no constraint added later can clean a store that already has
+        // one.
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?1, ?2, 'v', 0)",
+                rusqlite::params![a, key],
+            )
+            .unwrap();
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", false)
+            .unwrap();
+        let err = db.tags_for_tracks(&[a]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::DbError::FieldTooLarge {
+                    field: "key",
+                    unit: "bytes",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn get_binary_tags_rejects_a_nul_truncated_key() {
+        let db = open_mem();
+        let a = db.upsert_track(&new_track("/a.flac")).unwrap();
+        let key = nul_truncated_key(key_byte_ceiling() + 1);
+        // Planted with the constraints off. The schema now bans an embedded
+        // NUL outright (#693), so this row can only arrive the way the threat
+        // model says it does -- written before the ban, or by a writer that
+        // turned the constraints off. Guarding it at read time is the whole
+        // point: no constraint added later can clean a store that already has
+        // one.
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO tags (track_id, key, value, value_blob, ordinal) \
+                 VALUES (?1, ?2, '', X'00', 0)",
+                rusqlite::params![a, key],
+            )
+            .unwrap();
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", false)
+            .unwrap();
+        let err = db.get_binary_tags(a).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::DbError::FieldTooLarge {
+                    table: "tags",
+                    field: "key",
+                    unit: "bytes",
+                    ..
+                }
+            ),
             "{err:?}"
         );
     }

@@ -77,6 +77,8 @@ fn payload_weight_sums_all_buffered_payloads() {
         description: String::new(),
         width: 0,
         height: 0,
+        depth: 0,
+        colors: 0,
         data: vec![0u8; n],
     };
     let probed = Probed {
@@ -210,7 +212,10 @@ fn probe_file_fails_file_with_oversized_mp4_covr() {
     let path = dir.path().join("oversized_art.m4a");
     std::fs::write(&path, &bytes).unwrap();
     assert!(
-        matches!(probe_file(&path, 0).unwrap(), ProbeOutcome::Failed(_)),
+        matches!(
+            probe_file(&path, 0, ChecksumTier::Fingerprint).unwrap(),
+            ProbeOutcome::Failed(_)
+        ),
         "an oversized covr must fail the file, not yield a track without its art"
     );
 }
@@ -223,7 +228,10 @@ fn probe_file_fails_file_with_oversized_mp4_binary_freeform() {
     let path = dir.path().join("oversized_bin.m4a");
     std::fs::write(&path, &bytes).unwrap();
     assert!(
-        matches!(probe_file(&path, 0).unwrap(), ProbeOutcome::Failed(_)),
+        matches!(
+            probe_file(&path, 0, ChecksumTier::Fingerprint).unwrap(),
+            ProbeOutcome::Failed(_)
+        ),
         "an oversized `----` value must fail the file"
     );
 }
@@ -237,8 +245,8 @@ fn probe_file_keeps_mp4_covr_at_cap() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("at_cap_art.m4a");
     std::fs::write(&path, &bytes).unwrap();
-    let probed = match probe_file(&path, 0).unwrap() {
-        ProbeOutcome::Probed(p, _) => p,
+    let probed = match probe_file(&path, 0, ChecksumTier::Fingerprint).unwrap() {
+        ProbeOutcome::Probed(p, _, _) => p,
         other => panic!("expected Probed, got {other:?}"),
     };
     assert_eq!(probed.format, Format::M4a);
@@ -388,26 +396,35 @@ fn fingerprint_is_deterministic_and_sensitive_to_content() {
         structural_blocks: vec![("STREAMINFO".into(), vec![1, 2, 3])],
         ..clone_probed(&p1)
     };
+    let audio = b"AUDIO".as_slice();
     assert_eq!(
-        fingerprint_of(&p1),
-        fingerprint_of(&p2),
+        fingerprint_of(&p1, audio),
+        fingerprint_of(&p2, audio),
         "same content => same fp"
     );
 
     let mut p3 = clone_probed(&p1);
     p3.audio_length = 101;
     assert_ne!(
-        fingerprint_of(&p1),
-        fingerprint_of(&p3),
+        fingerprint_of(&p1, audio),
+        fingerprint_of(&p3, audio),
         "length change => fp change"
     );
 
     let mut p4 = clone_probed(&p1);
     p4.tags = vec![("title".into(), "B".into())];
     assert_ne!(
-        fingerprint_of(&p1),
-        fingerprint_of(&p4),
+        fingerprint_of(&p1, audio),
+        fingerprint_of(&p4, audio),
         "tag change => fp change"
+    );
+
+    // The #691 half: two files agreeing on every parsed field still differ if
+    // their sampled audio differs.
+    assert_ne!(
+        fingerprint_of(&p1, audio),
+        fingerprint_of(&p1, b"OTHER"),
+        "sampled audio change => fp change"
     );
 }
 
@@ -418,9 +435,137 @@ fn full_file_hash_matches_known_sha256() {
     std::fs::write(&path, b"abc").unwrap();
     // sha256("abc")
     assert_eq!(
-        full_file_hash(&path).unwrap(),
+        full_file_hash(&std::fs::File::open(&path).unwrap()).unwrap(),
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
     );
+}
+
+/// The fingerprint's audio sampling: three bounded windows over the audio
+/// region, and the whole region when it is shorter than three windows.
+#[test]
+fn audio_sample_reads_three_bounded_windows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.bin");
+    let span = usize_from(AUDIO_SAMPLE_BYTES);
+    // Region long enough for three disjoint windows, with a distinct byte in
+    // each so a dropped or mispositioned window is visible.
+    let len = 10 * span;
+    let mut bytes = vec![0u8; 16 + len];
+    bytes[16] = 1; // first window
+    bytes[16 + (len - span) / 2] = 2; // middle window
+    bytes[16 + len - span] = 3; // last window
+    std::fs::write(&path, &bytes).unwrap();
+    let p = Probed {
+        format: Format::Flac,
+        audio_offset: 16,
+        audio_length: len as u64,
+        tags: Vec::new(),
+        pictures: Vec::new(),
+        binary_tags: Vec::new(),
+        structural_blocks: Vec::new(),
+    };
+    let f = std::fs::File::open(&path).unwrap();
+    let sample = audio_sample(&f, &p).unwrap();
+    assert_eq!(sample.len(), 3 * span, "three windows, nothing more");
+    assert_eq!(sample[0], 1);
+    assert_eq!(sample[span], 2);
+    assert_eq!(sample[2 * span], 3);
+
+    // A region shorter than three windows is read whole, once.
+    let short = Probed {
+        audio_offset: 16,
+        audio_length: 32,
+        ..clone_probed(&p)
+    };
+    assert_eq!(audio_sample(&f, &short).unwrap(), bytes[16..48]);
+
+    // The branch boundary sits at three windows, not one: a region of two
+    // windows is still read whole (2 × span contiguous), not sampled as three
+    // overlapping ones (3 × span).
+    let two = Probed {
+        audio_offset: 16,
+        audio_length: 2 * AUDIO_SAMPLE_BYTES,
+        ..clone_probed(&p)
+    };
+    assert_eq!(audio_sample(&f, &two).unwrap(), bytes[16..16 + 2 * span]);
+
+    // A zero-length audio region reads nothing at all.
+    let empty = Probed {
+        audio_offset: 16,
+        audio_length: 0,
+        ..clone_probed(&p)
+    };
+    assert!(audio_sample(&f, &empty).unwrap().is_empty());
+
+    // Nor does a malformed region running past u64: the sampler declines it
+    // rather than overflowing its window arithmetic on untrusted geometry.
+    let overflowing = Probed {
+        audio_offset: u64::MAX - 4,
+        audio_length: 8,
+        ..clone_probed(&p)
+    };
+    assert!(audio_sample(&f, &overflowing).unwrap().is_empty());
+}
+
+/// `records_same_bytes` is the whole Keep-vs-Clear decision (#689), so each of
+/// the four facts it compares has to be able to say "not the same content" on
+/// its own — an `||` slipped between them would let three agreeing fields vouch
+/// for a fourth that does not.
+#[test]
+fn records_same_bytes_needs_every_field_to_agree() {
+    let unit = unit_with("/m/a.flac", Some("a".repeat(64)));
+    // A real row to vary: `Track` is `#[non_exhaustive]`, so outside musefs-db
+    // one comes from the store rather than a literal.
+    let db = Db::open_in_memory().unwrap();
+    let id = db
+        .upsert_track(&NewTrack {
+            backing_path: unit.abs_path.clone(),
+            format: Format::Flac,
+            audio_offset: 0,
+            audio_length: 0,
+            backing_size: unit.stamp.size,
+            backing_mtime_ns: unit.stamp.mtime_ns,
+            backing_ctime_ns: unit.stamp.ctime_ns,
+            backing_ino: unit.stamp.ino,
+        })
+        .unwrap();
+    let stored = db.get_track(id).unwrap().expect("the row just written");
+    let row = |stamp: BackingStamp, format, offset, length| {
+        let mut track = stored.clone();
+        track.format = format;
+        track.bounds = musefs_db::TrackBounds::new(offset, length, stamp.size).unwrap();
+        track.backing_size = stamp.size;
+        track.backing_mtime_ns = stamp.mtime_ns;
+        track.backing_ctime_ns = stamp.ctime_ns;
+        track.backing_ino = stamp.ino;
+        track
+    };
+    let same = row(unit.stamp, Format::Flac, 0, 0);
+    assert!(
+        records_same_bytes(&unit, Some(&same)),
+        "a row agreeing on stamp, format and geometry is the same content"
+    );
+    assert!(
+        !records_same_bytes(&unit, None),
+        "no stored row means nothing is known to be unchanged"
+    );
+
+    // One disagreement at a time, the rest agreeing.
+    let other_stamp = BackingStamp {
+        ctime_ns: unit.stamp.ctime_ns + 1,
+        ..unit.stamp
+    };
+    for (label, t) in [
+        ("stamp", row(other_stamp, Format::Flac, 0, 0)),
+        ("format", row(unit.stamp, Format::Mp3, 0, 0)),
+        ("audio_offset", row(unit.stamp, Format::Flac, 4, 0)),
+        ("audio_length", row(unit.stamp, Format::Flac, 0, 4)),
+    ] {
+        assert!(
+            !records_same_bytes(&unit, Some(&t)),
+            "a differing {label} must not read as the same content"
+        );
+    }
 }
 
 #[test]
@@ -445,11 +590,12 @@ fn empty_probed() -> Probed {
 
 fn unit_with(abs_path: &str, fingerprint: Option<String>) -> Unit {
     Unit {
-        abs_path: abs_path.to_string(),
+        abs_path: std::path::PathBuf::from(abs_path),
         stamp: BackingStamp {
             size: 10,
             mtime_ns: 1,
             ctime_ns: 2,
+            ino: None,
         },
         probed: empty_probed(),
         weight: 0,
@@ -487,16 +633,18 @@ fn ingest_unit_db_path_retargets_orphan() {
     let orphan = "/gone/missing-orphan.flac";
     let id = db
         .upsert_track(&NewTrack {
-            backing_path: orphan.to_string(),
+            backing_path: std::path::PathBuf::from(orphan),
             format: Format::Flac,
             audio_offset: 0,
             audio_length: 10,
             backing_size: 10,
             backing_mtime_ns: 0,
             backing_ctime_ns: 0,
+            backing_ino: None,
         })
         .unwrap();
-    db.set_track_checksums(id, Some(&fp), None).unwrap();
+    db.set_track_checksums(id, ChecksumWrite::Set(&fp), ChecksumWrite::Keep)
+        .unwrap();
 
     let new_path = "/moved/here.flac";
     let unit = unit_with(new_path, Some(fp.clone()));
@@ -505,7 +653,7 @@ fn ingest_unit_db_path_retargets_orphan() {
     let tracks = db.list_tracks().unwrap();
     assert_eq!(tracks.len(), 1, "orphan retargeted, not duplicated");
     assert_eq!(tracks[0].id, id, "retarget keeps the id");
-    assert_eq!(tracks[0].backing_path, new_path);
+    assert_eq!(tracks[0].backing_path, std::path::PathBuf::from(new_path));
     // Retarget must refresh the stamp + audio bounds too, not just the path — the
     // orphan was inserted with mtime/ctime 0 and audio_length 10, so a path-only
     // regression would leave these stale.
@@ -532,7 +680,6 @@ fn ingest_unit_db_path_skips_unstatable_candidate() {
     let blocker = dir.path().join("not_a_dir");
     std::fs::write(&blocker, b"x").unwrap();
     let bad_path = blocker.join("under_a_file.flac");
-    let bad_path = bad_path.to_string_lossy().into_owned();
     // Sanity: the candidate path is unstatable for a reason other than NotFound.
     let kind = std::fs::metadata(&bad_path).unwrap_err().kind();
     assert_ne!(
@@ -550,9 +697,11 @@ fn ingest_unit_db_path_skips_unstatable_candidate() {
             backing_size: 10,
             backing_mtime_ns: 0,
             backing_ctime_ns: 0,
+            backing_ino: None,
         })
         .unwrap();
-    db.set_track_checksums(id, Some(&fp), None).unwrap();
+    db.set_track_checksums(id, ChecksumWrite::Set(&fp), ChecksumWrite::Keep)
+        .unwrap();
 
     let unit = unit_with("/fresh/new.flac", Some(fp));
     ingest_unit(&db, unit, MatchStrictness::Auto, WritePolicy::Full).unwrap();
@@ -565,6 +714,61 @@ fn ingest_unit_db_path_skips_unstatable_candidate() {
     );
 }
 
+/// #746: a structural refresh restores what the file declares about its own
+/// picture through a plain `Db` sink too, not only the pipeline's bulk writer.
+#[test]
+fn refresh_structural_into_restores_the_files_picture_metadata_through_a_db() {
+    let db = Db::open_in_memory().unwrap();
+    let stamp = BackingStamp {
+        size: 10,
+        mtime_ns: 1,
+        ctime_ns: 1,
+        ino: None,
+    };
+    let probed = |mime: &str, depth: u32| Probed {
+        format: Format::Flac,
+        audio_offset: 4,
+        audio_length: 6,
+        tags: Vec::new(),
+        pictures: vec![EmbeddedPicture {
+            mime: mime.into(),
+            picture_type: PictureType::new(3).unwrap(),
+            description: String::new(),
+            width: 8,
+            height: 8,
+            depth,
+            colors: 0,
+            data: vec![7, 7, 7],
+        }],
+        binary_tags: Vec::new(),
+        structural_blocks: Vec::new(),
+    };
+    let path = Path::new("/m/a.flac");
+    ingest_into(
+        &db,
+        path,
+        stamp,
+        probed("image/png", 0),
+        ChecksumWrite::Keep,
+        ChecksumWrite::Keep,
+    )
+    .unwrap();
+    let id = db.list_tracks().unwrap()[0].id;
+
+    refresh_structural_into(
+        &db,
+        path,
+        stamp,
+        probed("image/jpeg", 24),
+        ChecksumWrite::Keep,
+        ChecksumWrite::Keep,
+    )
+    .unwrap();
+
+    let link = &db.get_track_art(id).unwrap()[0];
+    assert_eq!((link.mime.as_str(), link.depth), ("image/jpeg", 24));
+}
+
 #[test]
 fn refresh_structural_into_preserves_tags_and_art() {
     let db = Db::open_in_memory().unwrap();
@@ -572,6 +776,7 @@ fn refresh_structural_into_preserves_tags_and_art() {
         size: 10,
         mtime_ns: 1,
         ctime_ns: 1,
+        ino: None,
     };
     let seeded = Probed {
         format: Format::Flac,
@@ -584,6 +789,8 @@ fn refresh_structural_into_preserves_tags_and_art() {
             description: "Original art".into(),
             width: 1,
             height: 1,
+            depth: 0,
+            colors: 0,
             data: vec![1, 2, 3],
         }],
         binary_tags: vec![EmbeddedBinaryTag {
@@ -592,7 +799,15 @@ fn refresh_structural_into_preserves_tags_and_art() {
         }],
         structural_blocks: vec![("STREAMINFO".into(), vec![1, 2, 3])],
     };
-    ingest_into(&db, "/m/a.flac", stamp, seeded, None, None).unwrap();
+    ingest_into(
+        &db,
+        Path::new("/m/a.flac"),
+        stamp,
+        seeded,
+        ChecksumWrite::Keep,
+        ChecksumWrite::Keep,
+    )
+    .unwrap();
     let id = db.list_tracks().unwrap()[0].id;
 
     let changed = Probed {
@@ -606,6 +821,8 @@ fn refresh_structural_into_preserves_tags_and_art() {
             description: "Changed art".into(),
             width: 2,
             height: 2,
+            depth: 0,
+            colors: 0,
             data: vec![9, 9, 9],
         }],
         binary_tags: vec![EmbeddedBinaryTag {
@@ -618,8 +835,17 @@ fn refresh_structural_into_preserves_tags_and_art() {
         size: 20,
         mtime_ns: 2,
         ctime_ns: 2,
+        ino: None,
     };
-    refresh_structural_into(&db, "/m/a.flac", stamp2, changed, None, None).unwrap();
+    refresh_structural_into(
+        &db,
+        Path::new("/m/a.flac"),
+        stamp2,
+        changed,
+        ChecksumWrite::Keep,
+        ChecksumWrite::Keep,
+    )
+    .unwrap();
 
     let track = &db.list_tracks().unwrap()[0];
     assert_eq!(track.id, id, "same row upserted, not replaced");
@@ -666,6 +892,8 @@ fn fingerprint_changes_with_picture_description() {
         description: desc.into(),
         width: 10,
         height: 10,
+        depth: 0,
+        colors: 0,
         data: vec![1, 2, 3],
     };
     let base = Probed {
@@ -682,8 +910,150 @@ fn fingerprint_changes_with_picture_description() {
         ..clone_probed(&base)
     };
     assert_ne!(
-        fingerprint_of(&base),
-        fingerprint_of(&other),
+        fingerprint_of(&base, b""),
+        fingerprint_of(&other, b""),
         "picture description change => fp change"
+    );
+}
+
+// --- #690: checksums come from the probe's descriptor, inside its sandwich ---
+
+/// The point of `full_file_hash` taking a `&File`: once the caller has stamped
+/// this inode the hash describes it, not whatever later takes its name.
+/// Reopening the pathname is how a row came to pair one generation's stamp,
+/// geometry and tags with another generation's hash (#690).
+#[test]
+fn full_file_hash_follows_the_descriptor_not_the_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("f.bin");
+    std::fs::write(&path, b"abc").unwrap();
+    let held = std::fs::File::open(&path).unwrap();
+
+    // Replace the name with different content, atomically, the way an external
+    // tool rewriting a file in place does.
+    let other = dir.path().join("g.bin");
+    std::fs::write(&other, b"zzz").unwrap();
+    std::fs::rename(&other, &path).unwrap();
+
+    assert_eq!(
+        full_file_hash(&held).unwrap(),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        "sha256(\"abc\") — the descriptor's bytes, not the path's"
+    );
+}
+
+/// The retarget confirm decides an identity question, so it must refuse to
+/// answer rather than compare a hash of bytes the probe never stamped (#690).
+#[test]
+fn hash_confirm_refuses_a_file_that_no_longer_matches_the_stamp() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("f.bin");
+    std::fs::write(&path, b"abc").unwrap();
+    let stamp = BackingStamp::from_metadata(&std::fs::metadata(&path).unwrap());
+    assert_eq!(
+        hash_confirm(&path, stamp).unwrap().as_deref(),
+        Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+        "the stamped file confirms"
+    );
+
+    // The file moves on; the stamp the probe committed to no longer describes it.
+    std::fs::write(&path, b"abcd").unwrap();
+    assert_eq!(
+        hash_confirm(&path, stamp).unwrap(),
+        None,
+        "a changed file must not be confirmed against a stale stamp"
+    );
+}
+
+/// A checksum the tier asked for and could not produce fails that file under
+/// its own reason, instead of committing a row one tier below what the flag
+/// promised behind a warn nothing counted (#690). Being in `SkipReason::FAILED`
+/// is what puts it in `ScanStats::failed` and so in the exit-2 contract.
+#[test]
+fn a_checksum_that_cannot_be_produced_fails_the_file() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("p");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    #[expect(unsafe_code, reason = "libc::mkfifo FFI; no std equivalent")]
+    let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
+    assert_eq!(rc, 0, "mkfifo");
+    // A FIFO's read end opens without a writer under O_NONBLOCK, and `pread` on
+    // it fails with ESPIPE — the shape of any I/O error the checksum reads can
+    // hit on a descriptor the probe already opened and parsed successfully.
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo)
+        .unwrap();
+    let probed = Probed {
+        format: Format::Flac,
+        audio_offset: 0,
+        audio_length: 4096,
+        tags: Vec::new(),
+        pictures: Vec::new(),
+        binary_tags: Vec::new(),
+        structural_blocks: Vec::new(),
+    };
+
+    let err = checksums_of(&f, &probed, ChecksumTier::Full).expect_err("pread on a FIFO fails");
+    assert_eq!(checksum_failure(&fifo, &err).reason, SkipReason::Checksum);
+    assert!(
+        SkipReason::FAILED.contains(&SkipReason::Checksum),
+        "a checksum failure must count in ScanStats::failed"
+    );
+    // The `none` tier asks for nothing, so it has nothing to fail on.
+    assert_eq!(
+        checksums_of(&f, &probed, ChecksumTier::None).unwrap(),
+        Checksums::default()
+    );
+}
+
+/// The `&Db` sink's known-path arm: a unit whose path already has a row must be
+/// upserted through `ingest_into`, and a pass that computed no full hash over
+/// unchanged bytes must leave the stored one alone (#689).
+///
+/// Also the only coverage of `<&Db>::existing_track` returning a row — the
+/// other `&Db` ingest tests all use paths the store has never seen, so a sink
+/// that always answers "no row here" is invisible to them.
+#[test]
+fn ingest_unit_db_path_keeps_the_hash_of_unchanged_bytes() {
+    let db = Db::open_in_memory().unwrap();
+    let fp = "a".repeat(64);
+    let hash = "d".repeat(64);
+    let unit = unit_with("/exists.flac", Some(fp.clone()));
+    let id = db
+        .upsert_track(&NewTrack {
+            backing_path: unit.abs_path.clone(),
+            format: unit.probed.format,
+            audio_offset: unit.probed.audio_offset,
+            audio_length: unit.probed.audio_length,
+            backing_size: unit.stamp.size,
+            backing_mtime_ns: unit.stamp.mtime_ns,
+            backing_ctime_ns: unit.stamp.ctime_ns,
+            backing_ino: None,
+        })
+        .unwrap();
+    db.set_track_checksums(id, ChecksumWrite::Keep, ChecksumWrite::Set(&hash))
+        .unwrap();
+
+    // The unit carries a fingerprint but no content hash, over bytes the row
+    // already describes.
+    ingest_unit(&db, unit, MatchStrictness::Auto, WritePolicy::Full).unwrap();
+
+    let tracks = db.list_tracks().unwrap();
+    assert_eq!(
+        tracks.len(),
+        1,
+        "the known path is upserted, not duplicated"
+    );
+    assert_eq!(tracks[0].id, id, "same row");
+    assert_eq!(tracks[0].fingerprint.as_deref(), Some(fp.as_str()));
+    assert_eq!(
+        tracks[0].content_hash.as_deref(),
+        Some(hash.as_str()),
+        "an unchanged file's hash is still true of it"
     );
 }

@@ -1,7 +1,7 @@
 //! The `musefs` command-line interface: `scan` (ingest a backing directory into a
 //! SQLite store) and `mount` (serve a read-only FUSE view of that store).
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -9,18 +9,20 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use indicatif::{HumanBytes, HumanDuration};
 use musefs_core::{MountConfig, Musefs};
-use musefs_db::Db;
+use musefs_db::{Db, PendingMigration};
 
 use crate::progress::ScanReporter;
 
 mod logging;
 mod progress;
+mod prompt;
 mod signal;
 
 pub use crate::logging::install_logger;
 
 /// Mount content mode (CLI surface for `musefs_core::Mode`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[non_exhaustive]
 pub enum CliMode {
     /// Synthesize a fresh metadata region in front of the audio (default).
     Synthesis,
@@ -39,6 +41,7 @@ impl From<CliMode> for musefs_core::Mode {
 
 /// CLI surface for `musefs_core::ChecksumTier`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[non_exhaustive]
 pub enum ChecksumMode {
     /// No checksums.
     None,
@@ -58,6 +61,29 @@ impl From<ChecksumMode> for musefs_core::ChecksumTier {
     }
 }
 
+/// CLI surface for `musefs_core::MatchStrictness`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[non_exhaustive]
+pub enum MatchMode {
+    /// Confirm with a full hash when the matched row has one; otherwise trust
+    /// the fingerprint (default).
+    Auto,
+    /// Trust a fingerprint match; never read the whole file.
+    Fast,
+    /// Require a full-hash match: a row with no stored hash is not retargeted.
+    Strict,
+}
+
+impl From<MatchMode> for musefs_core::MatchStrictness {
+    fn from(m: MatchMode) -> musefs_core::MatchStrictness {
+        match m {
+            MatchMode::Auto => musefs_core::MatchStrictness::Auto,
+            MatchMode::Fast => musefs_core::MatchStrictness::Fast,
+            MatchMode::Strict => musefs_core::MatchStrictness::Strict,
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "musefs",
@@ -65,6 +91,7 @@ impl From<ChecksumMode> for musefs_core::ChecksumTier {
     propagate_version = true,
     about = "Read-only re-tagging FUSE view of a music library"
 )]
+#[non_exhaustive]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -78,6 +105,7 @@ pub struct Cli {
 /// instead of ten ordering-fragile positional parameters.
 #[derive(clap::Args, Debug)]
 #[allow(clippy::struct_excessive_bools)] // independent CLI toggles, not a state machine
+#[non_exhaustive]
 pub struct MountArgs {
     /// Empty directory to mount at. Not required with `--dry-run`, which only
     /// previews the template and never touches a target (#555).
@@ -200,6 +228,7 @@ pub struct MountArgs {
 }
 
 #[derive(Subcommand, Debug)]
+#[non_exhaustive]
 pub enum Command {
     /// Walk backing files or directories, ingesting supported audio
     /// (FLAC, MP3, M4A/M4B, Ogg, WAV) into the SQLite store.
@@ -210,10 +239,6 @@ pub enum Command {
         /// Path to the SQLite database (created if absent).
         #[arg(long, env = "MUSEFS_DB")]
         db: PathBuf,
-        /// DEPRECATED: use the `revalidate` subcommand. Forwards to it (now
-        /// non-pruning). Removed next release.
-        #[arg(long, env = "MUSEFS_REVALIDATE", value_parser = clap::builder::BoolishValueParser::new())]
-        revalidate: bool,
         /// Re-ingest files already present in the DB, overwriting curated tags
         /// and art with the file's embedded metadata.
         #[arg(long, env = "MUSEFS_FORCE", value_parser = clap::builder::BoolishValueParser::new())]
@@ -232,12 +257,10 @@ pub enum Command {
         /// Which content checksums to compute and store (none|fingerprint|full).
         #[arg(long, value_enum, env = "MUSEFS_CHECKSUM", default_value_t = ChecksumMode::Fingerprint)]
         checksum: ChecksumMode,
-        /// Confirm a move only by fingerprint, never reading the full file.
-        #[arg(long, env = "MUSEFS_FAST", value_parser = clap::builder::BoolishValueParser::new())]
-        fast: bool,
-        /// Require a full-hash match to retarget a moved file.
-        #[arg(long, env = "MUSEFS_STRICT", value_parser = clap::builder::BoolishValueParser::new())]
-        strict: bool,
+        /// How a moved file's fingerprint match is confirmed before its row is
+        /// retargeted (auto|fast|strict).
+        #[arg(long = "match", value_enum, env = "MUSEFS_MATCH", default_value_t = MatchMode::Auto)]
+        match_mode: MatchMode,
     },
     /// Refresh tracks already in the store: re-probe files whose backing bytes
     /// changed while preserving curated tags and art. Files not yet in the
@@ -249,7 +272,9 @@ pub enum Command {
         /// Path to the SQLite database.
         #[arg(long, env = "MUSEFS_DB")]
         db: PathBuf,
-        /// Delete tracks whose backing file is gone and GC orphaned art.
+        /// Delete tracks whose backing file is gone, or whose file this build
+        /// refuses as unsupported (a chained Ogg an older musefs stored), with
+        /// their tags and art links; then GC orphaned art.
         #[arg(long, env = "MUSEFS_PRUNE", value_parser = clap::builder::BoolishValueParser::new())]
         prune: bool,
         /// Probe worker threads (0 = available parallelism). 1 = sequential.
@@ -270,19 +295,64 @@ pub enum Command {
     /// Mount a read-only FUSE view of the store.
     Mount(MountArgs),
     /// Compact the SQLite store, reclaiming free pages left by deletions
-    /// (prunes, orphan-art GC, the schema migration). Run while unmounted; this
-    /// may also upgrade an older store's schema to the current version.
+    /// (prunes, orphan-art GC, the schema migration). Run while unmounted. A
+    /// store needing a gated schema upgrade is refused: run `musefs migrate`
+    /// first.
     Vacuum {
         /// Path to the SQLite database.
         #[arg(long, env = "MUSEFS_DB")]
         db: PathBuf,
     },
+    /// Upgrade the store's schema to the version this build needs.
+    ///
+    /// Some schema changes are too invasive to apply as a side effect of
+    /// opening the store: they rewrite data, transiently need the store's size
+    /// again in free disk, and end compatibility with older musefs builds.
+    /// Those are refused by `mount`, `scan`, `revalidate` and `vacuum`, and applied here,
+    /// after reporting what they will do. Run it while unmounted. A snapshot is
+    /// taken first unless `--no-snapshot`, so the upgrade stays reversible.
+    Migrate(MigrateArgs),
+}
+
+#[derive(clap::Args, Debug)]
+#[non_exhaustive]
+pub struct MigrateArgs {
+    /// Path to the SQLite database.
+    #[arg(long, env = "MUSEFS_DB")]
+    pub db: PathBuf,
+    /// Upgrade without asking. Required when not running on a terminal.
+    #[arg(long, short = 'y', env = "MUSEFS_YES")]
+    pub yes: bool,
+    /// Where to write the pre-upgrade snapshot. Default: the store's own path
+    /// with `.v<version>.bak` appended, alongside it.
+    #[arg(long, value_name = "PATH", conflicts_with = "no_snapshot")]
+    pub snapshot: Option<PathBuf>,
+    /// Delete rows the upgraded schema refuses, instead of stopping to report
+    /// them. Nothing is deleted without this.
+    ///
+    /// Refuses alongside `--no-snapshot`: the rows are deleted for good, and the
+    /// snapshot is the only copy they survive in.
+    #[arg(long, conflicts_with = "no_snapshot")]
+    pub repair: bool,
+    /// Upgrade without taking a snapshot first. The upgrade is then not
+    /// reversible.
+    #[arg(long)]
+    pub no_snapshot: bool,
+    /// Compact the store afterwards (an upgrade grows it). Omit to be asked.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
+    pub vacuum: Option<bool>,
+    /// Revalidate the library afterwards, recomputing what the upgrade retired.
+    /// Omit to be asked.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
+    pub revalidate: Option<bool>,
+    /// Probe worker threads for that revalidate (0 = available parallelism).
+    #[arg(long, env = "MUSEFS_JOBS", default_value_t = 0)]
+    pub jobs: usize,
 }
 
 /// Open (creating/migrating) the DB at `db_path` once, then scan each target in
-/// `targets` (a file or a directory; directories recurse). With `revalidate`,
-/// run the maintenance pass (skip-unchanged, prune, GC) instead of a full
-/// ingest. With `quiet`, suppress the per-target summary on stdout. Fails fast:
+/// `targets` (a file or a directory; directories recurse). With `quiet`,
+/// suppress the per-target summary on stdout. Fails fast:
 /// the first failing target aborts the batch; targets already scanned stay
 /// committed (ingest is an idempotent upsert).
 ///
@@ -290,57 +360,27 @@ pub enum Command {
 /// failures (an unparseable/uningestible entry) do not abort the batch — only a
 /// hard `Err` does — so the caller inspects the returned count to signal partial
 /// or total ingest failure via the process exit code (#554).
-#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+#[allow(clippy::too_many_arguments)]
 pub fn run_scan(
     db_path: &Path,
     targets: &[PathBuf],
-    revalidate: bool,
     force: bool,
     jobs: usize,
     follow_symlinks: bool,
     quiet: bool,
     checksum: ChecksumMode,
-    fast: bool,
-    strict: bool,
+    match_mode: MatchMode,
 ) -> Result<u64> {
-    if revalidate {
-        if force {
-            anyhow::bail!("--force and --revalidate are mutually exclusive");
-        }
-        if fast || strict {
-            anyhow::bail!("--fast/--strict are scan-only and cannot be combined with --revalidate");
-        }
-        log::warn!(
-            "`scan --revalidate` is deprecated; use `revalidate` (now non-pruning — add `--prune` to delete gone tracks). This alias will be removed next release."
-        );
-        return run_revalidate(
-            db_path,
-            targets,
-            false,
-            jobs,
-            follow_symlinks,
-            quiet,
-            checksum,
-        );
-    }
-    let strictness = match (fast, strict) {
-        (true, true) => anyhow::bail!("--fast and --strict are mutually exclusive"),
-        (true, false) => musefs_core::MatchStrictness::Fast,
-        (false, true) => musefs_core::MatchStrictness::Strict,
-        (false, false) => musefs_core::MatchStrictness::Auto,
-    };
     let db =
         Db::open(db_path).with_context(|| format!("opening database at {}", db_path.display()))?;
     let reporter = ScanReporter::new(quiet);
-    let opts = musefs_core::ScanOptions {
-        jobs,
-        follow_symlinks,
-        progress: reporter.sink(),
-        checksum: checksum.into(),
-        strictness,
-        force,
-        ..Default::default()
-    };
+    let mut opts = musefs_core::ScanOptions::default();
+    opts.jobs = jobs;
+    opts.follow_symlinks = follow_symlinks;
+    opts.progress = reporter.sink();
+    opts.checksum = checksum.into();
+    opts.strictness = match_mode.into();
+    opts.force = force;
     let mut total_failed = 0u64;
     for target in targets {
         reporter.start_target();
@@ -382,14 +422,12 @@ pub fn run_revalidate(
     let db =
         Db::open(db_path).with_context(|| format!("opening database at {}", db_path.display()))?;
     let reporter = ScanReporter::new(quiet);
-    let opts = musefs_core::ScanOptions {
-        jobs,
-        follow_symlinks,
-        progress: reporter.sink(),
-        checksum: checksum.into(),
-        prune,
-        ..Default::default()
-    };
+    let mut opts = musefs_core::ScanOptions::default();
+    opts.jobs = jobs;
+    opts.follow_symlinks = follow_symlinks;
+    opts.progress = reporter.sink();
+    opts.checksum = checksum.into();
+    opts.prune = prune;
     let mut total_failed = 0u64;
     for target in targets {
         reporter.start_target();
@@ -413,6 +451,30 @@ pub fn run_revalidate(
     }
     reporter.finish();
     Ok(total_failed)
+}
+
+/// Environment variables for `scan` flags that 2.0.0 removed, each with what to
+/// use instead. clap rejects a removed flag, but it never reads a variable no
+/// flag declares, so without this a unit file still setting one would carry on
+/// doing something different from what it asks for, and say nothing.
+const RETIRED_SCAN_ENV: &[(&str, &str)] = &[
+    (
+        "MUSEFS_REVALIDATE",
+        "run the `revalidate` subcommand instead",
+    ),
+    ("MUSEFS_FAST", "set `MUSEFS_MATCH=fast` instead"),
+    ("MUSEFS_STRICT", "set `MUSEFS_MATCH=strict` instead"),
+];
+
+/// Refuse to run while any of `retired` is set. An empty value counts as unset,
+/// which is how clap treats a declared variable too.
+fn refuse_retired_env(retired: &[(&str, &str)]) -> Result<()> {
+    for (var, instead) in retired {
+        if std::env::var_os(var).is_some_and(|v| !v.is_empty()) {
+            anyhow::bail!("{var} was removed in musefs 2.0.0; {instead}");
+        }
+    }
+    Ok(())
 }
 
 /// Split a `--fallback FIELD=VALUE` argument. The value may contain '=' (only
@@ -480,41 +542,39 @@ fn effective_allow_other(flag: bool, owner: Option<u32>, group: Option<u32>) -> 
 /// Parse mount CLI flags into `MountConfig` and `FuseConfig`. Pure function —
 /// no DB access, no mounting. Exported for unit testing.
 pub fn parse_mount_config(args: &MountArgs) -> (MountConfig, musefs_fuse::FuseConfig) {
-    let config = MountConfig {
-        template: args.template.clone(),
-        // Field names are case-insensitive everywhere else (the template parser
-        // and `tags_to_fields` ASCII-lowercase them), so a fallback keyed under
-        // any uppercase letter would never match at render time (#504). Normalize
-        // the key the same way; later duplicates win, matching `collect`'s prior
-        // last-write semantics.
-        fallbacks: args
-            .fallbacks
-            .iter()
-            .map(|(field, value)| (field.to_ascii_lowercase(), value.clone()))
-            .collect(),
-        default_fallback: args.default_fallback.clone(),
-        mode: args.mode.into(),
-        poll_interval: std::time::Duration::from_millis(args.poll_interval_ms),
-        case_insensitive: args.case_insensitive,
-        read_ahead_budget: u64::from(args.read_ahead_budget_mib).saturating_mul(1024 * 1024),
-        read_ahead_prefetch: args.read_ahead_prefetch,
-        skip_on_missing: args.skip_on_missing,
-        trust_backing_mtime: args.trust_backing_mtime,
-    };
-    let defaults = musefs_fuse::FuseConfig::default();
-    let fuse_config = musefs_fuse::FuseConfig {
-        ttl: std::time::Duration::from_millis(args.attr_ttl_ms),
-        max_readahead: args.max_readahead_kib.saturating_mul(1024),
-        max_background: args.max_background,
-        keep_cache: args.keep_cache,
-        uid: args.owner.unwrap_or(defaults.uid),
-        gid: args.group.unwrap_or(defaults.gid),
-        file_mode: args.file_mode.unwrap_or(defaults.file_mode),
-        dir_mode: args.dir_mode.unwrap_or(defaults.dir_mode),
-        allow_other: effective_allow_other(args.allow_other, args.owner, args.group),
-        expose_metrics: args.expose_metrics,
-        workers: args.workers,
-    };
+    let mut config = MountConfig::default();
+    config.template.clone_from(&args.template);
+    // Field names are case-insensitive everywhere else (the template parser
+    // and `tags_to_fields` ASCII-lowercase them), so a fallback keyed under
+    // any uppercase letter would never match at render time (#504). Normalize
+    // the key the same way; later duplicates win, matching `collect`'s prior
+    // last-write semantics.
+    config.fallbacks = args
+        .fallbacks
+        .iter()
+        .map(|(field, value)| (field.to_ascii_lowercase(), value.clone()))
+        .collect();
+    config.default_fallback.clone_from(&args.default_fallback);
+    config.mode = args.mode.into();
+    config.poll_interval = std::time::Duration::from_millis(args.poll_interval_ms);
+    config.case_insensitive = args.case_insensitive;
+    config.read_ahead_budget = u64::from(args.read_ahead_budget_mib).saturating_mul(1024 * 1024);
+    config.read_ahead_prefetch = args.read_ahead_prefetch;
+    config.skip_on_missing = args.skip_on_missing;
+    config.trust_backing_mtime = args.trust_backing_mtime;
+    // Starts from the defaults, so an unset owner, group or mode keeps its default.
+    let mut fuse_config = musefs_fuse::FuseConfig::default();
+    fuse_config.ttl = std::time::Duration::from_millis(args.attr_ttl_ms);
+    fuse_config.max_readahead = args.max_readahead_kib.saturating_mul(1024);
+    fuse_config.max_background = args.max_background;
+    fuse_config.keep_cache = args.keep_cache;
+    fuse_config.uid = args.owner.unwrap_or(fuse_config.uid);
+    fuse_config.gid = args.group.unwrap_or(fuse_config.gid);
+    fuse_config.file_mode = args.file_mode.unwrap_or(fuse_config.file_mode);
+    fuse_config.dir_mode = args.dir_mode.unwrap_or(fuse_config.dir_mode);
+    fuse_config.allow_other = effective_allow_other(args.allow_other, args.owner, args.group);
+    fuse_config.expose_metrics = args.expose_metrics;
+    fuse_config.workers = args.workers;
     (config, fuse_config)
 }
 
@@ -664,8 +724,9 @@ fn vacuum_summary(path: &Path, before: u64, after: u64) -> String {
     }
 }
 
-/// Compact the SQLite store at `db`. Best-effort: a store in use (a live mount
-/// or a running scan) surfaces `DbError::StoreInUse`'s actionable message.
+/// Compact the SQLite store at `db`. A store anything else has open — a mount,
+/// even one idle between reads, or a scan — is refused with
+/// `DbError::StoreInUse`'s actionable message before anything is rewritten.
 pub fn run_vacuum(db: &Path) -> Result<()> {
     if !db.exists() {
         anyhow::bail!("database not found: {} (nothing to vacuum)", db.display());
@@ -676,6 +737,320 @@ pub fn run_vacuum(db: &Path) -> Result<()> {
     let after = store_footprint(db);
     println!("{}", vacuum_summary(db, before, after));
     Ok(())
+}
+
+/// The peak free space an upgrade of a `footprint`-byte store needs on one
+/// filesystem, as `copies` whole copies of it.
+///
+/// SQLite stages a rewritten page in the write-ahead log before committing it,
+/// so a migration that touches every row transiently has the store on disk
+/// twice; a snapshot alongside it is another whole copy. Both are estimates
+/// from the store's current size, which is the only number available before the
+/// work is done — deliberately not padded, since the point is to refuse a run
+/// that would fail part-way through rather than to reserve headroom.
+fn space_needed(footprint: u64, copies: u64) -> u64 {
+    footprint.saturating_mul(copies)
+}
+
+/// Free space on the filesystem holding `path`'s directory. `path` itself need
+/// not exist; its parent must.
+fn free_space_for(path: &Path) -> Result<u64> {
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs4::available_space(dir).with_context(|| format!("checking free space on {}", dir.display()))
+}
+
+/// Where a snapshot goes when the user did not say: the store's own path with
+/// the version it is being taken from appended, so two upgrades of one store
+/// never collide and the file says what it is.
+fn default_snapshot_path(db: &Path, from_version: i64) -> PathBuf {
+    let mut p = db.as_os_str().to_os_string();
+    p.push(format!(".v{from_version}.bak"));
+    PathBuf::from(p)
+}
+
+/// The deepest directory containing every stored backing file — the one target
+/// a `revalidate` has to walk to reach the whole library.
+///
+/// `None` when there is no such place worth walking: an empty store, or paths
+/// that share nothing above the filesystem root. Revalidating from `/` is never
+/// what anyone meant, so the caller prints the command instead of offering to
+/// run it.
+fn common_library_root(paths: &[PathBuf]) -> Option<PathBuf> {
+    let mut dirs = paths.iter().filter_map(|p| p.parent());
+    let mut common: Vec<Component<'_>> = dirs.next()?.components().collect();
+    for dir in dirs {
+        let shared = common
+            .iter()
+            .zip(dir.components())
+            .take_while(|(a, b)| **a == *b)
+            .count();
+        common.truncate(shared);
+        if common.is_empty() {
+            return None;
+        }
+    }
+    // A prefix or a bare root separator is not a library.
+    common
+        .iter()
+        .any(|c| matches!(c, Component::Normal(_)))
+        .then(|| common.iter().collect())
+}
+
+/// Upgrade the store at `args.db` to the schema this build needs.
+///
+/// The order is the point: everything that can refuse the run does so before
+/// anything is written, the user is told what is about to happen and agrees to
+/// it, a snapshot makes it reversible, and only then does the store change.
+///
+/// Returns how many files the follow-up revalidate counted as failed, zero when
+/// none ran, so the caller can exit `2` the way `revalidate` itself does
+/// (#750): the store is upgraded either way, but a script chaining on the exit
+/// status must be able to tell a partial revalidate from a clean one.
+pub fn run_migrate(args: &MigrateArgs) -> Result<u64> {
+    let db = args.db.as_path();
+    if !db.exists() {
+        anyhow::bail!(
+            "database not found: {} (nothing to migrate; `musefs scan` creates one)",
+            db.display()
+        );
+    }
+    let pending =
+        PendingMigration::open(db).with_context(|| format!("opening store {}", db.display()))?;
+    let from = pending.current_version();
+    let to = pending.target_version();
+    if pending.is_current() {
+        println!(
+            "{} is already at schema version {to}; nothing to migrate.",
+            db.display()
+        );
+        return Ok(0);
+    }
+
+    // Refuse a store somebody else is using before reporting anything, so the
+    // report is never a description of work that was never on the table.
+    pending.claim_exclusive()?;
+
+    println!(
+        "store {} is at schema version {from}; this build needs {to}.",
+        db.display()
+    );
+    for step in pending.pending() {
+        let mark = if step.gated {
+            "  [needs this command]"
+        } else {
+            ""
+        };
+        println!(
+            "  v{} (musefs {}) — {}{mark}",
+            step.version, step.since, step.summary
+        );
+    }
+    println!(
+        "This rewrites the store in place. Once it is done, musefs builds older \
+         than this one will no longer open it."
+    );
+
+    // The rows the new shapes refuse, before anything is copied or written.
+    // Ordered here deliberately: a user who is going to be stopped should be
+    // stopped before being asked about disk, snapshots or confirmation.
+    let refused = pending.inspect_rejections()?;
+    if !refused.is_empty() {
+        println!(
+            "{} rows in this store are not valid under the new schema:",
+            refused.total()
+        );
+        for t in refused.tables() {
+            println!("  {}: {} row(s)", t.table, t.rejected);
+        }
+        println!(
+            "They were written before the constraint that now refuses them, or by a \
+             writer with the constraints turned off."
+        );
+        if !args.repair {
+            anyhow::bail!(
+                "refusing to upgrade {}: {} row(s) would be rejected. Pass --repair to \
+                 delete them, or fix them yourself first. The upgrade changes nothing \
+                 until this is resolved",
+                db.display(),
+                refused.total()
+            );
+        }
+    }
+
+    let footprint = store_footprint(db);
+    let snapshot = if args.no_snapshot {
+        None
+    } else {
+        Some(
+            args.snapshot
+                .clone()
+                .unwrap_or_else(|| default_snapshot_path(db, from)),
+        )
+    };
+    if let Some(dest) = &snapshot
+        && dest.exists()
+    {
+        anyhow::bail!(
+            "snapshot destination already exists: {} (move it, or pass --snapshot PATH, \
+             or --no-snapshot to skip the snapshot)",
+            dest.display()
+        );
+    }
+
+    // The store's own filesystem carries the rewrite, and the snapshot too when
+    // it is going alongside; a --snapshot elsewhere is checked on its own.
+    let snapshot_is_alongside = snapshot.as_ref().is_some_and(|d| d.parent() == db.parent());
+    let copies = 1 + u64::from(snapshot_is_alongside);
+    let needed = space_needed(footprint, copies);
+    let available = free_space_for(db)?;
+    println!(
+        "store is {}; the upgrade needs about {} free and has {}.",
+        HumanBytes(footprint),
+        HumanBytes(needed),
+        HumanBytes(available)
+    );
+    if available < needed {
+        anyhow::bail!(
+            "not enough free space on {}: need about {}, have {}. Free some space, \
+             or pass --no-snapshot to skip the copy",
+            db.parent().unwrap_or(Path::new(".")).display(),
+            HumanBytes(needed),
+            HumanBytes(available)
+        );
+    }
+    if let Some(dest) = &snapshot
+        && !snapshot_is_alongside
+    {
+        let there = free_space_for(dest)?;
+        if there < footprint {
+            anyhow::bail!(
+                "not enough free space for the snapshot at {}: need about {}, have {}",
+                dest.display(),
+                HumanBytes(footprint),
+                HumanBytes(there)
+            );
+        }
+    }
+    match &snapshot {
+        Some(dest) => println!("a snapshot will be written to {} first.", dest.display()),
+        None => println!("no snapshot will be taken (--no-snapshot): this is not reversible."),
+    }
+
+    if !args.yes {
+        if !prompt::interactive() {
+            anyhow::bail!(
+                "refusing to upgrade {} without confirmation; pass --yes to proceed \
+                 (there is no terminal here to ask on)",
+                db.display()
+            );
+        }
+        if !prompt::confirm(&format!("Upgrade {} now?", db.display()), false)? {
+            println!("aborted; the store is unchanged.");
+            return Ok(0);
+        }
+    }
+
+    if let Some(dest) = &snapshot {
+        pending
+            .snapshot_to(dest)
+            .with_context(|| format!("writing the snapshot to {}", dest.display()))?;
+        println!("snapshot written to {}", dest.display());
+    }
+
+    // After the snapshot, so the deleted rows are in the copy the user can go
+    // back to, and after the confirmation, so --repair alone never deletes.
+    if !refused.is_empty() {
+        let removed = pending.repair()?;
+        println!(
+            "repaired: deleted {} row(s) the new schema refuses",
+            removed.total()
+        );
+        println!(
+            "  they are in the snapshot at {}, if you want them back.",
+            snapshot
+                .as_ref()
+                .expect("--repair refuses --no-snapshot, so there is always one")
+                .display()
+        );
+    }
+
+    let started = Instant::now();
+    let store = pending.apply()?;
+    println!(
+        "migrated {} from schema version {from} to {to} in {}",
+        db.display(),
+        HumanDuration(started.elapsed())
+    );
+
+    let grown = store_footprint(db);
+    if grown > footprint {
+        println!(
+            "the store grew from {} to {}; a vacuum reclaims the difference.",
+            HumanBytes(footprint),
+            HumanBytes(grown)
+        );
+    }
+    if prompt::decide(args.vacuum, "Compact the store now?", grown > footprint)? {
+        store.vacuum()?;
+        println!("{}", vacuum_summary(db, grown, store_footprint(db)));
+    } else if grown > footprint {
+        println!("  run later: musefs vacuum --db {}", db.display());
+    }
+
+    // Every read of the store has to happen before the handle is dropped, and
+    // the handle has to be dropped before a revalidate can open its own: the
+    // exclusive claim taken above is held for as long as it lives.
+    let owed = store.count_tracks_without_fingerprint()?;
+    let root = if owed > 0 {
+        common_library_root(&store.list_backing_paths()?)
+    } else {
+        None
+    };
+    drop(store);
+
+    let mut failed = 0u64;
+    if owed > 0 {
+        println!(
+            "{owed} track(s) now carry no fingerprint; a revalidate recomputes them and \
+             restores each file's own picture metadata, and until it runs those tracks \
+             cannot be recovered by a move."
+        );
+        let offer = root
+            .as_ref()
+            .map(|r| format!("Revalidate {} now?", r.display()));
+        match (root, offer) {
+            (Some(root), Some(question)) if prompt::decide(args.revalidate, &question, false)? => {
+                failed = run_revalidate(
+                    db,
+                    &[root],
+                    false,
+                    args.jobs,
+                    false,
+                    false,
+                    ChecksumMode::Fingerprint,
+                )?;
+                if failed > 0 {
+                    println!(
+                        "the store is upgraded, but the revalidate counted {failed} failed \
+                         file(s); this run exits 2, as `musefs revalidate` would."
+                    );
+                }
+            }
+            (Some(root), _) => println!(
+                "  run later: musefs revalidate {} --db {}",
+                root.display(),
+                db.display()
+            ),
+            (None, _) => println!(
+                "  run later: musefs revalidate <library path> --db {}",
+                db.display()
+            ),
+        }
+    }
+    Ok(failed)
 }
 
 /// Print a sample of the paths a `mount --dry-run` would expose, walking the
@@ -748,26 +1123,23 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         Command::Scan {
             targets,
             db,
-            revalidate,
             force,
             jobs,
             follow_symlinks,
             quiet,
             checksum,
-            fast,
-            strict,
+            match_mode,
         } => {
+            refuse_retired_env(RETIRED_SCAN_ENV)?;
             let failed = run_scan(
                 &db,
                 &targets,
-                revalidate,
                 force,
                 jobs,
                 follow_symlinks,
                 quiet,
                 checksum,
-                fast,
-                strict,
+                match_mode,
             )?;
             // Per-file ingest failures are not a hard error (they don't abort the
             // batch), but a pipeline like `scan && mount` needs a machine-detectable
@@ -799,12 +1171,180 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         }
         Command::Mount(args) => run_mount(&args).map(|()| ExitCode::SUCCESS),
         Command::Vacuum { db } => run_vacuum(&db).map(|()| ExitCode::SUCCESS),
+        Command::Migrate(args) => {
+            // The store upgrade succeeded if this returns at all; a failure
+            // count comes from the revalidate it offered, and marks the run
+            // partial exactly as `revalidate`'s own does (#750).
+            let failed = run_migrate(&args)?;
+            Ok(if failed > 0 {
+                ExitCode::from(2)
+            } else {
+                ExitCode::SUCCESS
+            })
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn space_needed_scales_with_the_copies_and_saturates() {
+        assert_eq!(space_needed(100, 1), 100);
+        assert_eq!(space_needed(100, 2), 200);
+        // A nonsense footprint must not wrap the estimate to a small number and
+        // wave through a run that cannot fit.
+        assert_eq!(space_needed(u64::MAX, 2), u64::MAX);
+    }
+
+    #[test]
+    fn default_snapshot_path_names_the_version_it_came_from() {
+        assert_eq!(
+            default_snapshot_path(Path::new("/srv/library.db"), 3),
+            PathBuf::from("/srv/library.db.v3.bak")
+        );
+        // Two upgrades of one store must not collide on the same backup file.
+        assert_ne!(
+            default_snapshot_path(Path::new("/srv/library.db"), 3),
+            default_snapshot_path(Path::new("/srv/library.db"), 4)
+        );
+    }
+
+    #[test]
+    fn common_library_root_is_the_deepest_shared_directory() {
+        let paths = [
+            PathBuf::from("/srv/music/a/one.flac"),
+            PathBuf::from("/srv/music/b/two.mp3"),
+            PathBuf::from("/srv/music/b/c/three.mp3"),
+        ];
+        assert_eq!(
+            common_library_root(&paths),
+            Some(PathBuf::from("/srv/music"))
+        );
+        // One track's own directory is the whole library.
+        assert_eq!(
+            common_library_root(&[PathBuf::from("/srv/music/a/one.flac")]),
+            Some(PathBuf::from("/srv/music/a"))
+        );
+    }
+
+    /// Revalidating from the filesystem root is never what anyone meant, so a
+    /// library that spans unrelated trees gets the command printed instead of
+    /// an offer to walk everything.
+    #[test]
+    fn common_library_root_declines_to_offer_the_filesystem_root() {
+        let split = [
+            PathBuf::from("/srv/music/one.flac"),
+            PathBuf::from("/home/u/music/two.mp3"),
+        ];
+        assert_eq!(common_library_root(&split), None);
+        assert_eq!(common_library_root(&[PathBuf::from("/one.flac")]), None);
+        assert_eq!(common_library_root(&[]), None);
+    }
+
+    /// An explicit flag is answered without consulting a terminal, which is
+    /// what keeps a script from ever being stuck on a prompt.
+    #[test]
+    fn an_explicit_answer_is_taken_as_given() {
+        assert!(prompt::decide(Some(true), "unused", false).unwrap());
+        assert!(!prompt::decide(Some(false), "unused", true).unwrap());
+        // No flag and no terminal (the shape a test runs in): decline, leaving
+        // the user something they can still run by hand.
+        assert!(!prompt::decide(None, "unused", true).unwrap());
+    }
+
+    #[test]
+    fn migrate_command_parses_its_flags() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "musefs",
+            "migrate",
+            "--db",
+            "/tmp/x.db",
+            "--yes",
+            "--snapshot",
+            "/tmp/backup.db",
+            "--vacuum",
+            "--revalidate=false",
+            "--jobs",
+            "4",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Migrate(args) => {
+                assert_eq!(args.db, PathBuf::from("/tmp/x.db"));
+                assert!(args.yes);
+                assert_eq!(args.snapshot, Some(PathBuf::from("/tmp/backup.db")));
+                assert!(!args.no_snapshot);
+                assert_eq!(args.vacuum, Some(true));
+                assert_eq!(args.revalidate, Some(false));
+                assert_eq!(args.jobs, 4);
+            }
+            _ => panic!("expected Migrate"),
+        }
+    }
+
+    /// Unset is distinct from `false`: it means "ask", and off a terminal it
+    /// means "skip and print the command". Collapsing the two would make a
+    /// scripted run silently do work nobody asked for.
+    #[test]
+    fn migrate_offers_default_to_unset_not_false() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["musefs", "migrate", "--db", "/tmp/x.db"]).unwrap();
+        match cli.command {
+            Command::Migrate(args) => {
+                assert_eq!(args.vacuum, None);
+                assert_eq!(args.revalidate, None);
+                assert!(!args.yes);
+                assert_eq!(args.snapshot, None);
+            }
+            _ => panic!("expected Migrate"),
+        }
+    }
+
+    /// Naming a snapshot and refusing to take one are contradictory, and clap
+    /// says so rather than silently honouring one of them.
+    /// `--repair` deletes rows for good, and the snapshot is the only copy they
+    /// survive in — so asking for one without the other is refused rather than
+    /// quietly honoured.
+    #[test]
+    fn migrate_rejects_repair_alongside_no_snapshot() {
+        use clap::Parser;
+        assert!(
+            Cli::try_parse_from([
+                "musefs",
+                "migrate",
+                "--db",
+                "/tmp/x.db",
+                "--repair",
+                "--no-snapshot",
+            ])
+            .is_err()
+        );
+        // Either alone is fine.
+        for flag in ["--repair", "--no-snapshot"] {
+            Cli::try_parse_from(["musefs", "migrate", "--db", "/tmp/x.db", flag])
+                .unwrap_or_else(|e| panic!("{flag} alone must parse: {e}"));
+        }
+    }
+
+    #[test]
+    fn migrate_rejects_a_named_snapshot_alongside_no_snapshot() {
+        use clap::Parser;
+        assert!(
+            Cli::try_parse_from([
+                "musefs",
+                "migrate",
+                "--db",
+                "/tmp/x.db",
+                "--snapshot",
+                "/tmp/b.db",
+                "--no-snapshot",
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn read_ahead_budget_flag_maps_to_mount_config() {
@@ -952,7 +1492,9 @@ mod tests {
                 assert_eq!(targets, vec![PathBuf::from("/m")]);
             }
             Command::Mount(..) => panic!("expected Scan"),
-            Command::Revalidate { .. } | Command::Vacuum { .. } => unreachable!(),
+            Command::Revalidate { .. } | Command::Vacuum { .. } | Command::Migrate(..) => {
+                unreachable!()
+            }
         }
     }
 
@@ -963,7 +1505,9 @@ mod tests {
         match cli.command {
             Command::Scan { quiet, .. } => assert!(!quiet),
             Command::Mount(..) => panic!("expected Scan"),
-            Command::Revalidate { .. } | Command::Vacuum { .. } => unreachable!(),
+            Command::Revalidate { .. } | Command::Vacuum { .. } | Command::Migrate(..) => {
+                unreachable!()
+            }
         }
         for arg in ["--quiet", "-q"] {
             let cli =
@@ -971,7 +1515,9 @@ mod tests {
             match cli.command {
                 Command::Scan { quiet, .. } => assert!(quiet),
                 Command::Mount(..) => panic!("expected Scan"),
-                Command::Revalidate { .. } | Command::Vacuum { .. } => unreachable!(),
+                Command::Revalidate { .. } | Command::Vacuum { .. } | Command::Migrate(..) => {
+                    unreachable!()
+                }
             }
         }
     }
@@ -993,7 +1539,9 @@ mod tests {
                 follow_symlinks, ..
             } => assert!(follow_symlinks),
             Command::Mount(..) => panic!("expected scan command"),
-            Command::Revalidate { .. } | Command::Vacuum { .. } => unreachable!(),
+            Command::Revalidate { .. } | Command::Vacuum { .. } | Command::Migrate(..) => {
+                unreachable!()
+            }
         }
     }
 
@@ -1006,7 +1554,9 @@ mod tests {
                 follow_symlinks, ..
             } => assert!(!follow_symlinks),
             Command::Mount(..) => panic!("expected scan command"),
-            Command::Revalidate { .. } | Command::Vacuum { .. } => unreachable!(),
+            Command::Revalidate { .. } | Command::Vacuum { .. } | Command::Migrate(..) => {
+                unreachable!()
+            }
         }
     }
 
@@ -1027,7 +1577,9 @@ mod tests {
                 );
             }
             Command::Mount(..) => panic!("expected Scan"),
-            Command::Revalidate { .. } | Command::Vacuum { .. } => unreachable!(),
+            Command::Revalidate { .. } | Command::Vacuum { .. } | Command::Migrate(..) => {
+                unreachable!()
+            }
         }
     }
 
@@ -1364,9 +1916,6 @@ mod tests {
             let db = musefs_db::Db::open(&path).unwrap();
             for i in 0..16u8 {
                 db.upsert_art(&musefs_db::NewArt {
-                    mime: "image/png".into(),
-                    width: None,
-                    height: None,
                     data: vec![i; 256 * 1024],
                 })
                 .unwrap();

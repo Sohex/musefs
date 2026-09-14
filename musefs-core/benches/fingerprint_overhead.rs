@@ -32,11 +32,9 @@ fn bench_tiers(c: &mut Criterion) {
         g.bench_function(format!("{tier:?}"), |b| {
             b.iter(|| {
                 let db = Db::open_in_memory().unwrap();
-                let opts = ScanOptions {
-                    jobs: 1,
-                    checksum: tier,
-                    ..Default::default()
-                };
+                let mut opts = ScanOptions::default();
+                opts.jobs = 1;
+                opts.checksum = tier;
                 scan_directory_with(&db, lib.path(), &opts).unwrap();
             });
         });

@@ -121,10 +121,11 @@ proptest! {
         // DB round-trip (synthetic rowids via the in-memory DB).
         let db = musefs_db::Db::open_in_memory().unwrap();
         let tid = db.upsert_track(&musefs_db::NewTrack {
-            backing_path: "/a.wav".into(),
+            backing_path: std::path::PathBuf::from("/a.wav"),
             format: musefs_db::Format::Wav,
             audio_offset: 0, audio_length: 0, backing_size: 0, backing_mtime_ns: 0, backing_ctime_ns: 0,
-        }).unwrap();
+            backing_ino: None,
+}).unwrap();
         let rows: Vec<musefs_db::BinaryTag> = opaque.iter().enumerate().map(|(i, e)| {
             musefs_db::BinaryTag { key: e.key.clone(), payload: e.payload.clone(), ordinal: u64::try_from(i).unwrap() }
         }).collect();

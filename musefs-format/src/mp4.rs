@@ -46,6 +46,7 @@ impl BoxRef {
 /// A parsed box header (the payload need not be in memory). Public so the core
 /// reader can reason about box bounds while seeking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BoxHeader {
     /// The 4-byte box type, e.g. `*b"moov"`.
     pub kind: [u8; 4],
@@ -184,6 +185,7 @@ fn find_path(buf: &[u8], path: &[&[u8; 4]]) -> Result<Option<(usize, usize)>> {
 
 /// Audio payload bounds within the backing file (the verbatim `mdat` payload).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Mp4Bounds {
     pub audio_offset: u64,
     pub audio_length: u64,
@@ -277,6 +279,7 @@ pub fn locate_audio(buf: &[u8]) -> Result<Mp4Bounds> {
 
 /// Everything `synthesize_layout` needs, read from the backing file once.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct Mp4Scan {
     pub ftyp: Vec<u8>,
     pub moov: Vec<u8>,
@@ -541,6 +544,7 @@ pub fn read_tags(buf: &[u8]) -> Vec<(String, String)> {
 /// lossy drop (the format layer has no logging facade) without materializing the
 /// oversized item out of a potentially large `moov` (#343).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct OversizeDrop {
     /// Cover-art MIME type, or the binary tag's `----:<mean>:<name>` key.
     pub descriptor: String,
@@ -591,8 +595,12 @@ pub fn read_pictures_reporting(
                 mime: mime.to_string(),
                 picture_type: PictureType::new(3).expect("3 is in range"),
                 description: String::new(),
+                // `covr` is the image bytes and a type flag; it declares no
+                // geometry, so these are all "not stated" as with `APIC`.
                 width: 0,
                 height: 0,
+                depth: 0,
+                colors: 0,
                 data: dp[8..].to_vec(),
             });
         }

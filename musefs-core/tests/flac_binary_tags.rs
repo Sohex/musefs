@@ -1,7 +1,6 @@
 mod common;
 use common::{make_flac, streaminfo_body, vorbis_comment_body};
 use musefs_core::{MountConfig, Musefs, VirtualTree, scan_directory};
-use std::collections::BTreeMap;
 
 // Block types: STREAMINFO=0, APPLICATION=2, SEEKTABLE=3, VORBIS_COMMENT=4, CUESHEET=5.
 fn fixture() -> Vec<u8> {
@@ -43,18 +42,11 @@ fn scan_splits_flac_into_structural_store_and_binary_tags() {
 }
 
 fn config() -> MountConfig {
-    MountConfig {
-        template: "$artist/$title".to_string(),
-        fallbacks: BTreeMap::new(),
-        default_fallback: "Unknown".to_string(),
-        mode: musefs_core::Mode::Synthesis,
-        poll_interval: std::time::Duration::ZERO,
-        case_insensitive: false,
-        read_ahead_budget: 64 * 1024 * 1024,
-        read_ahead_prefetch: false,
-        skip_on_missing: false,
-        trust_backing_mtime: false,
-    }
+    let mut config = MountConfig::default();
+    config.template = "$artist/$title".to_string();
+    config.poll_interval = std::time::Duration::ZERO;
+    config.case_insensitive = false;
+    config
 }
 
 fn read_whole(fs: &Musefs, inode: u64) -> Vec<u8> {
@@ -129,13 +121,14 @@ fn legacy_flac_without_structural_rows_serves_via_front_read_fallback() {
     let db = musefs_db::Db::open_in_memory().unwrap();
     let id = db
         .upsert_track(&NewTrack {
-            backing_path: path.to_string_lossy().into_owned(),
+            backing_path: path.clone(),
             format: Format::Flac,
             audio_offset: scan.audio_offset,
             audio_length: scan.audio_length,
             backing_size: meta.len(),
             backing_mtime_ns: common::real_mtime_ns(&path),
             backing_ctime_ns: common::real_ctime_ns(&path),
+            backing_ino: None,
         })
         .unwrap();
     db.replace_tags(
