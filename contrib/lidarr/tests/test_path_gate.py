@@ -7,7 +7,7 @@ import warnings
 from pathlib import Path
 
 import pytest
-from musefs_common import connect, path_value, realpath_key
+from musefs_common import connect, realpath_key, track_id_for_path
 
 pytestmark = pytest.mark.musefs_bin
 
@@ -22,7 +22,15 @@ def _newest_rs_mtime(repo_root):
     return newest
 
 
-def test_symlink_scan_matches_real_backing_path(tmp_path):
+@pytest.mark.parametrize("link", ["symlink", "hardlink"])
+def test_linked_scan_matches_real_backing_path(tmp_path, link):
+    """What the scanner stores for each `MUSEFS_LIDARR_LINK_MODE` is the key the
+    plugin looks the track up by.
+
+    A symlink resolves to its target, so the key is the download's path. A
+    hardlink is a second name for the same inode, so it resolves to itself —
+    and the inode, which is what makes the two names one file, is stored too.
+    """
     repo_root = Path(__file__).resolve().parents[3]
     env_bin = os.environ.get("MUSEFS_BIN")
     if env_bin:
@@ -67,16 +75,27 @@ def test_symlink_scan_matches_real_backing_path(tmp_path):
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    destination.symlink_to(source)
+    if link == "symlink":
+        destination.symlink_to(source)
+        expected = realpath_key(source)
+    else:
+        os.link(source, destination)
+        expected = realpath_key(destination)
 
     subprocess.run([str(musefs_bin), "scan", str(destination), "--db", str(db_path)], check=True)
 
     conn = connect(str(db_path))
     try:
-        # `backing_path` is a BLOB from schema v4 on; decode at the boundary the
-        # way the library's own readers do.
-        paths = [path_value(r[0]) for r in conn.execute("SELECT backing_path FROM tracks")]
+        rows = conn.execute("SELECT id, backing_path, backing_ino FROM tracks").fetchall()
+        assert len(rows) == 1
+        track_id, raw, ino = rows[0]
+        # The raw column, not a decoded rendering of it: `backing_path` is a BLOB
+        # holding the filesystem's bytes from schema v4 on (#680).
+        assert isinstance(raw, bytes)
+        assert raw == os.fsencode(expected)
+        # And the plugin's own lookup direction finds that row.
+        assert track_id_for_path(conn, expected) == track_id
     finally:
         conn.close()
-
-    assert paths == [realpath_key(source)]
+    # Stored as the two's-complement bit pattern of `st_ino` (#674).
+    assert ino % 2**64 == source.stat().st_ino

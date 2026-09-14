@@ -298,28 +298,45 @@ def _embed_cover(path, cover_bytes, mime):
         raise ValueError(f"unsupported audio for art embed: {path}")
 
 
-def _served_cover(path):
-    """Extract the raw front-cover image bytes from a (served) audio file."""
+def _served_covers(path):
+    """Every picture a (served) audio file carries, as ``(data, mime, type,
+    description)``.
+
+    M4A's ``covr`` has no picture type or description, so those are ``None``
+    there, and its mime is only the PNG/JPEG flag the atom holds.
+    """
     p = str(path)
     if p.endswith(".flac"):
-        pics = FLAC(p).pictures
-        assert pics, f"no FLAC picture in {path}"
-        return bytes(pics[0].data)
+        return [(bytes(pic.data), pic.mime, pic.type, pic.desc) for pic in FLAC(p).pictures]
     if p.endswith(".mp3"):
-        apics = ID3(p).getall("APIC")
-        assert apics, f"no MP3 APIC in {path}"
-        return bytes(apics[0].data)
+        return [(bytes(a.data), a.mime, a.type, a.desc) for a in ID3(p).getall("APIC")]
     if p.endswith(".m4a"):
         covrs = MP4(p).tags.get("covr") or []
-        assert covrs, f"no M4A covr in {path}"
-        return bytes(covrs[0])
+        return [
+            (
+                bytes(c),
+                "image/png" if c.imageformat == MP4Cover.FORMAT_PNG else "image/jpeg",
+                None,
+                None,
+            )
+            for c in covrs
+        ]
     raise ValueError(f"unsupported audio for art extract: {path}")
 
 
-def _check_mount_art(cfg, env, mnt, expected_cover_sha):
+def _check_mount_art(cfg, env, mnt, expected_cover_sha, expected_mime):
     """For each served format under the default `Test AA/Orig Album` tree, assert
-    title, byte-faithful audio, and that the served front cover's sha256 equals
-    `expected_cover_sha`."""
+    title, byte-faithful audio, and that the file carries exactly one picture:
+    the front cover whose sha256 is `expected_cover_sha`, declared as
+    `expected_mime`.
+
+    Exactly one, not "the first one matches": where the two art sources meet,
+    the one that loses must not be served alongside the one that wins.
+
+    On M4A the mime is weaker evidence than it looks. Synthesis can only choose
+    between the atom's PNG and JPEG flags, and anything that is not ``image/png``
+    is served as JPEG — so a JPEG there cannot be told from a wrong mime. The
+    FLAC and MP3 checks carry that half."""
     specs = [
         (mnt / "Test AA" / "Orig Album" / "Orig FLAC.flac", "format:FLAC", "Orig FLAC"),
         (mnt / "Test AA" / "Orig Album" / "Orig MP3.mp3", "format:MP3", "Orig MP3"),
@@ -331,8 +348,15 @@ def _check_mount_art(cfg, env, mnt, expected_cover_sha):
         assert tags["title"] == [title]
         backing = _beet(cfg, env, "ls", "-p", fquery).strip()
         assert _audio_md5(str(vpath)) == _audio_md5(backing)
-        served_sha = hashlib.sha256(_served_cover(vpath)).hexdigest()
-        assert served_sha == expected_cover_sha, f"{vpath.name}: cover sha mismatch"
+        covers = _served_covers(vpath)
+        assert len(covers) == 1, f"{vpath.name}: expected one picture, got {len(covers)}"
+        ((data, mime, picture_type, description),) = covers
+        assert hashlib.sha256(data).hexdigest() == expected_cover_sha, (
+            f"{vpath.name}: cover sha mismatch"
+        )
+        assert mime == expected_mime, f"{vpath.name}: served mime {mime!r}"
+        if picture_type is not None:  # M4A carries neither
+            assert (picture_type, description) == (3, ""), vpath.name
 
 
 @contextmanager
@@ -530,10 +554,14 @@ def test_e2e_import_retag_mount_playback(tmp_path):
 
         mt = mutagen.File(str(mp3), easy=True)
         assert mt["title"] == ["New MP3"]
+        assert mt["artist"] == ["New Artist"]
+        assert mt["albumartist"] == ["AA"]
         assert mt["album"] == ["New Album"]
 
         at = mutagen.File(str(m4a), easy=True)
         assert at["title"] == ["New M4A"]
+        assert at["artist"] == ["New Artist"]
+        assert at["albumartist"] == ["AA"]
         assert at["album"] == ["New Album"]
 
         # Audio served byte-faithfully: decoded PCM identical to the backing file.
@@ -598,7 +626,7 @@ def test_e2e_art_embedded_via_scan(tmp_path):
     cfg, env, db, mnt, _ = _imported_library(tmp_path, embed_cover=cover)
     _beet(cfg, env, "musefs")  # autoscan ingests the embedded pictures
     with _mounted(mnt, db, "$albumartist/$album/$title"):
-        _check_mount_art(cfg, env, mnt, hashlib.sha256(cover).hexdigest())
+        _check_mount_art(cfg, env, mnt, hashlib.sha256(cover).hexdigest(), "image/png")
 
 
 def test_e2e_art_external_via_plugin(tmp_path):
@@ -607,7 +635,8 @@ def test_e2e_art_external_via_plugin(tmp_path):
     cfg, env, db, mnt, _ = _imported_library(tmp_path, external_cover=cover)
     _beet(cfg, env, "musefs")  # plugin syncs album.artpath into track_art
     with _mounted(mnt, db, "$albumartist/$album/$title"):
-        _check_mount_art(cfg, env, mnt, hashlib.sha256(cover).hexdigest())
+        # The mime is the plugin's own sniff of the file, stored on the link.
+        _check_mount_art(cfg, env, mnt, hashlib.sha256(cover).hexdigest(), "image/jpeg")
 
 
 def test_e2e_art_precedence_beets_wins(tmp_path):
@@ -624,7 +653,7 @@ def test_e2e_art_precedence_beets_wins(tmp_path):
     _beet(cfg, env, "musefs")  # scan ingests A, then sync replaces with B
     with _mounted(mnt, db, "$albumartist/$album/$title"):
         # beets art (external B) wins; the embedded A must not survive.
-        _check_mount_art(cfg, env, mnt, external_sha)
+        _check_mount_art(cfg, env, mnt, external_sha, "image/jpeg")
 
 
 def test_e2e_full_fields_sticky_delete_and_restore(tmp_path):
@@ -633,10 +662,15 @@ def test_e2e_full_fields_sticky_delete_and_restore(tmp_path):
     cfg, env, db, mnt, library = _imported_library(tmp_path)
     template = "$albumartist/$album/$title"
 
+    # `-w`, explicitly: without it `modify` falls back to `import.write`, which
+    # this config sets to no, so "from file" would only ever reach the store
+    # through the sync and --restore-backing below would have no file value to
+    # bring back.
     _beet(
         cfg,
         env,
         "modify",
+        "-w",
         "-M",
         "-y",
         "format:FLAC",
@@ -647,8 +681,8 @@ def test_e2e_full_fields_sticky_delete_and_restore(tmp_path):
     _beet(cfg, env, "musefs")
     with _mounted(mnt, db, template):
         ft = FLAC(str(next(mnt.rglob("*.flac"))))
-        assert ft["replaygain_track_gain"][0].endswith("dB")
-        assert ft["musicbrainz_albumid"][0].startswith("11111111")
+        assert ft["replaygain_track_gain"] == ["-7.50 dB"]
+        assert ft["musicbrainz_albumid"] == ["11111111-1111-1111-1111-111111111111"]
         assert ft["comment"][0] == "from file"
 
     _beet(cfg, env, "modify", "-W", "-M", "-y", "format:FLAC", "comments!")

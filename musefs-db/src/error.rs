@@ -60,6 +60,14 @@ pub enum DbError {
     },
     #[error("structural block for track {track_id} is invalid: {detail} (crafted or corrupt DB)")]
     InvalidStructuralBlock { track_id: i64, detail: String },
+    /// An `art` row is filed under a `sha256` its own bytes do not hash to, so
+    /// linking it would hand one image's bytes to a file embedding another's
+    /// (#724). No constraint can prevent this: the schema cannot tie the digest
+    /// column to the data column.
+    #[error(
+        "art {art_id} is stored under sha256 {sha256} but holds different bytes (crafted or corrupt DB)"
+    )]
+    ArtDigestMismatch { art_id: i64, sha256: String },
     #[error(
         "track {track_id} has {count} tag rows, exceeds the {max}-row cap (crafted or corrupt DB)"
     )]

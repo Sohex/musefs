@@ -61,9 +61,17 @@ impl Db<ReadWrite> {
     /// needs free disk roughly equal to the store size) followed by
     /// `PRAGMA wal_checkpoint(TRUNCATE)`. The TRUNCATE checkpoint *after* VACUUM
     /// is what actually shrinks the main `.db` file on disk and zeroes the
-    /// `-wal`. A busy/locked store (e.g. a live mount) maps to
-    /// [`DbError::StoreInUse`].
+    /// `-wal`.
+    ///
+    /// The store is claimed first, exactly as `migrate` claims it
+    /// ([`claim_exclusive`]), and refused with [`DbError::StoreInUse`] if anything
+    /// else has it open (#721). Mapping a busy `VACUUM` alone was not that check:
+    /// in WAL mode a mount idle between reads holds no lock, so the rewrite ran
+    /// underneath it. The claim is held until this `Db` is dropped, which is also
+    /// why the checkpoint's result row can be discarded — with no other connection
+    /// attached, nothing can leave it unable to finish.
     pub fn vacuum(&self) -> Result<()> {
+        claim_exclusive(&self.conn, "vacuuming")?;
         self.conn
             .execute_batch("VACUUM")
             .map_err(|e| map_busy(e, "vacuuming"))?;
@@ -147,6 +155,52 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(dir.path().join("t.db")).unwrap();
         db.vacuum().unwrap();
+    }
+
+    /// #721: a store another connection has open is refused — including one
+    /// that did a read and went idle, which is what a mount looks like between
+    /// serving two files, and a read-only one, which is what most of a mount's
+    /// connections are. The vacuum used to run to completion under both.
+    #[test]
+    fn vacuum_refuses_a_store_another_connection_has_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let db = Db::open(&path).unwrap();
+        db.conn
+            .busy_timeout(std::time::Duration::from_millis(50))
+            .unwrap();
+
+        let idle = rusqlite::Connection::open(&path).unwrap();
+        idle.query_row("SELECT count(*) FROM tracks", [], |r| r.get::<_, i64>(0))
+            .unwrap();
+        let err = db.vacuum().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DbError::StoreInUse {
+                    op: "vacuuming",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        drop(idle);
+
+        let reader = Db::open_readonly(&path).unwrap();
+        let err = db.vacuum().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DbError::StoreInUse {
+                    op: "vacuuming",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        drop(reader);
+
+        db.vacuum().expect("nobody else has the store now");
     }
 
     #[test]

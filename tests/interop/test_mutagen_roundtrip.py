@@ -2,12 +2,23 @@ import json
 import os
 
 import mutagen
+import mutagen.flac
 import mutagen.id3
 import mutagen.mp4
 
 # Mirrored byte-for-byte from musefs-core/tests/interop_emit.rs (COVR_JPEG/COVR_PNG).
 COVR_JPEG = b"\xff\xd8\xff\xe0interop-jpeg-cover"
 COVR_PNG = b"\x89PNG\r\n\x1a\ninterop-png-cover"
+
+# Mirrored from interop_emit.rs's PICTURES, in ordinal order: (data, mime,
+# picture_type, description, width, height, depth, colors).
+PICTURES = [
+    (COVR_PNG, "image/png", 4, "Back Cover", 300, 200, 8, 256),
+    (COVR_JPEG, "image/jpeg", 6, "Disc", 640, 480, 24, 0),
+]
+
+# Every fixture emit_interop_fixtures writes a manifest row for.
+MANIFEST_FILES = {"out.flac", "out.mp3", "out.m4a", "out.ogg", "out.wav"}
 
 
 def _read_tag(path, key):
@@ -61,7 +72,8 @@ def test_ecosystem_reads_synthesized_tags():
     base = os.environ["MUSEFS_INTEROP_DIR"]
     with open(os.path.join(base, "manifest.json")) as fh:
         manifest = json.load(fh)
-    assert manifest, "empty manifest"
+    # Sorted lists, not sets: a duplicated manifest row must fail too.
+    assert sorted(row["file"] for row in manifest) == sorted(MANIFEST_FILES)
     for row in manifest:
         path = os.path.join(base, row["file"])
         title = _read_tag(path, "title")
@@ -81,11 +93,13 @@ def test_synthesized_preserves_source_audio_payload():
     base = os.environ["MUSEFS_INTEROP_DIR"]
     with open(os.path.join(base, "manifest.json")) as fh:
         manifest = json.load(fh)
-    assert manifest, "manifest.json is empty — emit_interop_fixtures may have failed"
+    # Sorted lists, not sets: a duplicated manifest row must fail too.
+    assert sorted(row["file"] for row in manifest) == sorted(MANIFEST_FILES)
     for row in manifest:
         synth_length = row["synth_audio_length"]
-        if synth_length == 0:
-            continue
+        # Every fixture has audio, so a zero-length payload is a regression, not
+        # a case to skip.
+        assert synth_length > 0, f"{row['file']}: synthesized audio payload is empty"
 
         synth_path = os.path.join(base, row["file"])
         with open(synth_path, "rb") as f:
@@ -118,16 +132,24 @@ def test_binary_frames_survive():
     mp3 = bm["mp3"]
     id3 = mutagen.id3.ID3(os.path.join(base, mp3["file"]))
 
+    # Presence before the value check, for the clearer failure message.
     priv = [f for f in id3.getall("PRIV") if f.owner == mp3["priv_owner"]]
     assert priv, "PRIV frame missing"
     assert priv[0].data == mp3["priv_data"].encode("ascii"), "PRIV data changed"
 
     geob = id3.getall("GEOB")
-    assert geob, "GEOB frame missing"
-    assert any(g.data == mp3["geob_data"].encode("ascii") for g in geob), "GEOB data changed"
+    assert len(geob) == 1, f"{len(geob)} GEOB frames, one was written"
+    assert (geob[0].mime, geob[0].filename, geob[0].desc, geob[0].data) == (
+        mp3["geob_mime"],
+        mp3["geob_filename"],
+        mp3["geob_desc"],
+        mp3["geob_data"].encode("ascii"),
+    ), "GEOB frame changed"
 
     popm = id3.getall("POPM")
-    assert popm, "POPM frame missing"
+    assert len(popm) == 1, f"{len(popm)} POPM frames, one was rebuilt"
+    # Rebuilt from the rating/playcount text tags, which carry no owner.
+    assert popm[0].email == "", f"POPM owner {popm[0].email!r}"
     assert int(popm[0].rating) == int(mp3["rating"]), f"rating {popm[0].rating} != {mp3['rating']}"
     assert int(popm[0].count) == int(mp3["playcount"]), (
         f"playcount {popm[0].count} != {mp3['playcount']}"
@@ -141,7 +163,7 @@ def test_binary_frames_survive():
     mp4 = bm["mp4"]
     f = mutagen.mp4.MP4(os.path.join(base, mp4["file"]))
     vals = f.tags.get(mp4["freeform_key"]) if f.tags else None
-    assert vals, f"freeform atom {mp4['freeform_key']} missing"
+    assert vals is not None and len(vals) == 1, f"freeform atom {mp4['freeform_key']}: {vals!r}"
     assert bytes(vals[0]) == mp4["freeform_data"].encode("ascii"), "---- payload changed"
 
 
@@ -159,6 +181,29 @@ def test_m4a_multi_cover_art():
         assert covr is not None, f"{row['file']}: no covr tag"
         assert len(covr) == row["covr_count"]
         assert bytes(covr[0]) == COVR_JPEG
+        # Presence-only as a check on the stored mime: `covr` can only say PNG
+        # or not-PNG, and synthesis serves every non-PNG mime (an empty one
+        # included) as JPEG. The PNG line below is the one that tells a right
+        # mime from a wrong one; the full mime string is asserted on FLAC and
+        # ID3 in test_flac_and_id3_pictures_carry_every_link_field.
         assert covr[0].imageformat == mutagen.mp4.MP4Cover.FORMAT_JPEG
         assert bytes(covr[1]) == COVR_PNG
         assert covr[1].imageformat == mutagen.mp4.MP4Cover.FORMAT_PNG
+
+
+def test_flac_and_id3_pictures_carry_every_link_field():
+    """Every `track_art` field a picture block can carry comes back as the link
+    declared it, in ordinal order. FLAC's PICTURE block carries all of them;
+    ID3 `APIC` has no geometry fields, so the MP3 side checks the rest."""
+    base = os.environ["MUSEFS_INTEROP_DIR"]
+
+    flac = mutagen.flac.FLAC(os.path.join(base, "out.flac"))
+    served = [
+        (p.data, p.mime, p.type, p.desc, p.width, p.height, p.depth, p.colors)
+        for p in flac.pictures
+    ]
+    assert served == PICTURES
+
+    apics = mutagen.id3.ID3(os.path.join(base, "out.mp3")).getall("APIC")
+    served = [(a.data, a.mime, a.type, a.desc) for a in apics]
+    assert served == [picture[:4] for picture in PICTURES]

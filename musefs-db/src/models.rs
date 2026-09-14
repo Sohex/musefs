@@ -438,6 +438,26 @@ pub struct TrackArt {
     pub ordinal: u64,
 }
 
+/// One picture as a backing file embeds it: its bytes, and what the file
+/// declares about them. The input to `refresh_embedded_art` (#746), which finds
+/// the link the file itself supplied by the bytes, type and description, and
+/// restores the rest onto it.
+///
+/// A store write input, so exhaustive like [`TrackArt`]: a new field here is a
+/// new thing the refresh has to decide whether to restore.
+#[cfg_attr(feature = "mutants", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddedArt {
+    pub data: Vec<u8>,
+    pub picture_type: u32,
+    pub description: String,
+    pub mime: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub depth: u32,
+    pub colors: u32,
+}
+
 /// A binary tag payload to write (e.g. an opaque ID3 `PRIV` frame body). `key` is
 /// the format-private identifier (ID3 frame id, `APPLICATION`/`CUESHEET`,
 /// `----:<mean>:<name>`); `payload` is the post-header frame/block body.

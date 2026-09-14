@@ -4,7 +4,14 @@ import sqlite3
 import pytest
 from conftest import insert_track
 
-from musefs_common import connect, prune_missing, track_id_for_path
+from musefs_common import (
+    connect,
+    path_param,
+    path_value,
+    prune_missing,
+    track_id_for_path,
+    track_ids_for_paths,
+)
 from musefs_common.errors import SchemaMismatch
 from musefs_common.store import check_schema_version
 
@@ -44,6 +51,50 @@ def test_track_id_for_path_found_and_missing(db_path):
         conn.commit()
         assert track_id_for_path(conn, "/music/a.flac") == tid
         assert track_id_for_path(conn, "/music/nope.flac") is None
+    finally:
+        conn.close()
+
+
+def test_path_param_encodes_to_the_bytes_on_disk():
+    """The key is the filesystem's bytes, not a UTF-8 rendering of them (#680).
+
+    Every other test here inserts and looks up through `path_param`, so a
+    consistently wrong encoding would round-trip and pass them all.
+    """
+    raw = b"/m/\xff.flac"
+    assert path_param(os.fsdecode(raw)) == raw
+    assert path_value(raw) == os.fsdecode(raw)
+
+
+def _insert_raw_track(conn, raw):
+    """A track row whose `backing_path` is the given bytes, written without the
+    helper, the way `musefs scan` writes it."""
+    return conn.execute(
+        "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, "
+        "backing_size, backing_mtime_ns, updated_at) VALUES (?, 'flac', 0, 0, 0, 0, 0)",
+        (raw,),
+    ).lastrowid
+
+
+def test_a_non_utf8_backing_path_resolves_and_prunes(db_path, tmp_path):
+    base = os.fsencode(str(tmp_path))
+    present = base + b"/here\xff.flac"
+    gone = base + b"/gone\xfe.flac"
+    with open(present, "wb") as f:
+        f.write(b"x")
+    conn = connect(db_path)
+    try:
+        keep = _insert_raw_track(conn, present)
+        lost = _insert_raw_track(conn, gone)
+        conn.commit()
+        assert track_id_for_path(conn, os.fsdecode(present)) == keep
+        assert track_ids_for_paths(conn, [os.fsdecode(present), os.fsdecode(gone)]) == {
+            os.fsdecode(present): keep,
+            os.fsdecode(gone): lost,
+        }
+        assert prune_missing(conn) == 1
+        conn.commit()
+        assert conn.execute("SELECT id, backing_path FROM tracks").fetchall() == [(keep, present)]
     finally:
         conn.close()
 

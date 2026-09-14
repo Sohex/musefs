@@ -26,6 +26,9 @@ musefs-db = { path = "../musefs-db", version = "1.3.0" }
 musefs-format = { path = "../musefs-format", version = "1.3.0" }
 once_cell = "1"
 parking_lot = "0.12"
+# Positioned reads into uninitialized spare capacity, so a backing read that
+# is about to overwrite a buffer does not zero-fill it first (#670).
+rustix = "1"
 quick_cache = { version = "0.7.0", features = ["stats"] }
 base16ct = "1.0"
 sha2 = "0.11"

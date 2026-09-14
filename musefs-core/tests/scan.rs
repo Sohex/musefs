@@ -697,6 +697,112 @@ fn two_files_sharing_one_blob_keep_their_own_picture_metadata() {
     assert_eq!((b.depth, b.colors), (8, 256));
 }
 
+/// #746: the V4 migration could only copy each blob's shared metadata onto
+/// every link, with FLAC's depth and colours at 0, and promised the real values
+/// back from `migrate`'s offer — a revalidate, whose structural pass never
+/// touched art. A link the file supplied is not curated metadata, so what the
+/// file declares about the picture comes back; a link an external writer made,
+/// and the tags, stay as they are.
+#[test]
+fn revalidate_restores_a_files_own_picture_metadata_and_leaves_curated_art() {
+    fn picture_block(mime: &str, side: u32, depth: u32, colors: u32, data: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&3u32.to_be_bytes()); // front cover
+        b.extend_from_slice(&u32::try_from(mime.len()).unwrap().to_be_bytes());
+        b.extend_from_slice(mime.as_bytes());
+        b.extend_from_slice(&0u32.to_be_bytes()); // description
+        b.extend_from_slice(&side.to_be_bytes());
+        b.extend_from_slice(&side.to_be_bytes());
+        b.extend_from_slice(&depth.to_be_bytes());
+        b.extend_from_slice(&colors.to_be_bytes());
+        b.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
+        b.extend_from_slice(data);
+        b
+    }
+
+    // One image embedded twice and described two ways, so restoring it has to
+    // pair the file's pictures with their links by order.
+    let image = [0xABu8; 64];
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = make_flac(
+        &[
+            (0, streaminfo_body()),
+            (4, vorbis_comment_body("v", &["TITLE=A"])),
+            (6, picture_block("image/jpeg", 1200, 24, 0, &image)),
+            (6, picture_block("image/png", 64, 8, 256, &image)),
+        ],
+        &[0xCC; 30],
+    );
+    std::fs::write(dir.path().join("a.flac"), bytes).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    scan_directory(&db, dir.path()).unwrap();
+    let track = db.list_tracks().unwrap().remove(0);
+    let as_scanned = db.get_track_art(track.id).unwrap();
+    assert_eq!(as_scanned.len(), 2);
+
+    // What V4 leaves: one occurrence's values on both links, depth and colours
+    // zeroed. Plus a cover an external writer linked, and a curated title.
+    let mut links: Vec<musefs_db::TrackArt> = as_scanned
+        .iter()
+        .map(|link| musefs_db::TrackArt {
+            mime: "image/jpeg".to_string(),
+            width: Some(1200),
+            height: Some(1200),
+            depth: 0,
+            colors: 0,
+            ..link.clone()
+        })
+        .collect();
+    let written = db
+        .upsert_art(&musefs_db::NewArt {
+            data: vec![0xEE; 16],
+        })
+        .unwrap();
+    links.push(musefs_db::TrackArt {
+        art_id: written,
+        picture_type: 3,
+        description: String::new(),
+        mime: "image/webp".to_string(),
+        width: None,
+        height: None,
+        depth: 0,
+        colors: 0,
+        ordinal: 2,
+    });
+    db.set_track_art(track.id, &links).unwrap();
+    db.replace_tags(track.id, &[Tag::new("title", "Curated", 0)])
+        .unwrap();
+    // And no recorded inode, as V4 leaves every row, which is what makes
+    // revalidate re-probe a file that has not changed.
+    db.upsert_track(&musefs_db::NewTrack {
+        backing_path: track.backing_path.clone(),
+        format: track.format,
+        audio_offset: track.bounds.audio_offset(),
+        audio_length: track.bounds.audio_length(),
+        backing_size: track.backing_size,
+        backing_mtime_ns: track.backing_mtime_ns,
+        backing_ctime_ns: track.backing_ctime_ns,
+        backing_ino: None,
+    })
+    .unwrap();
+
+    let stats = revalidate(&db, dir.path()).unwrap();
+    assert_eq!(stats.updated, 1);
+
+    let restored = db.get_track_art(track.id).unwrap();
+    assert_eq!(
+        restored[..2],
+        as_scanned[..],
+        "the file's own links read as a fresh scan wrote them"
+    );
+    assert_eq!(
+        restored[2], links[2],
+        "the external writer's link is untouched"
+    );
+    assert_eq!(db.get_tags(track.id).unwrap()[0].value, "Curated");
+}
+
 /// #680: a filename is an arbitrary byte string on Unix, and the scanner used
 /// to store `to_string_lossy()` as the row's identity.
 ///

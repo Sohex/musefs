@@ -66,6 +66,41 @@ def _stored_paths(db):
         conn.close()
 
 
+def _stored_rows(db):
+    """Every ``(id, backing_path)`` row, the path as the raw value SQLite holds.
+
+    Raw on purpose: ``path_value`` also accepts a ``str``, so comparing decoded
+    values would pass a scanner that stored ``TEXT`` — which no ``BLOB`` key
+    ever matches (see ``path_param``).
+    """
+    conn = sqlite3.connect(db)
+    try:
+        return conn.execute("SELECT id, backing_path FROM tracks ORDER BY id").fetchall()
+    finally:
+        conn.close()
+
+
+def _assert_gate(db, path):
+    """The gate, both directions, for a scan that stored exactly one row.
+
+    Store side: the raw value is the realpath's bytes, verbatim. Plugin side:
+    the key decodes from those bytes and looks up that row's id, through
+    ``path_param`` — the direction a plugin actually uses.
+    """
+    rows = _stored_rows(db)
+    assert len(rows) == 1, f"one file, one row: {rows!r}"
+    ((track_id, raw),) = rows
+    assert isinstance(raw, bytes), f"backing_path stored as {type(raw).__name__}"
+    assert raw == os.path.realpath(os.fsencode(path))
+    key = realpath_key(path)
+    assert key == path_value(raw)
+    conn = connect(db)
+    try:
+        assert track_id_for_path(conn, key) == track_id
+    finally:
+        conn.close()
+
+
 @pytest.fixture(autouse=True)
 def require_binary():
     if not MUSEFS_BIN.exists():
@@ -99,17 +134,8 @@ def test_plain_paths_match(tmp_path, rel):
     tree = tmp_path / "music"
     _write_flac(tree / rel)
     db = _scan(tmp_path, tree)
-    stored = _stored_paths(db)
-    assert len(stored) == 1
     # The path beets would hand us is the on-disk file path:
-    item_path = os.fsencode(str(tree / rel))
-    key = realpath_key(item_path)
-    assert key == stored[0]
-    conn = connect(db)
-    try:
-        assert track_id_for_path(conn, key) is not None
-    finally:
-        conn.close()
+    _assert_gate(db, os.fsencode(str(tree / rel)))
 
 
 def test_symlinked_directory_component(tmp_path):
@@ -118,11 +144,8 @@ def test_symlinked_directory_component(tmp_path):
     link_tree = tmp_path / "linked_music"
     link_tree.symlink_to(real_tree)
     db = _scan(tmp_path, link_tree)
-    stored = _stored_paths(db)
-    assert len(stored) == 1
     # beets stores the path as accessed through the symlink; realpath resolves it.
-    key = realpath_key(os.fsencode(str(link_tree / "Artist/Album/01.flac")))
-    assert key == stored[0]
+    _assert_gate(db, os.fsencode(str(link_tree / "Artist/Album/01.flac")))
 
 
 def test_symlink_to_file(tmp_path):
@@ -132,29 +155,25 @@ def test_symlink_to_file(tmp_path):
     link = tree / "link.flac"
     link.symlink_to(real)
     db = _scan(tmp_path, tree)
-    stored = set(_stored_paths(db))
-    # Both names resolve to the same real file and dedup to one canonical row.
-    assert len(stored) == 1
-    assert realpath_key(os.fsencode(str(link))) in stored
+    # Both names resolve to the same real file and dedup to one canonical row,
+    # and either name finds it.
+    _assert_gate(db, os.fsencode(str(link)))
+    _assert_gate(db, os.fsencode(str(real)))
 
 
 def test_relative_and_dotdot_input(tmp_path, monkeypatch):
     tree = tmp_path / "music"
     _write_flac(tree / "Artist/01.flac")
     db = _scan(tmp_path, tree)
-    stored = _stored_paths(db)
     monkeypatch.chdir(tree)
-    key = realpath_key(os.fsencode("Artist/../Artist/01.flac"))
-    assert key == stored[0]
+    _assert_gate(db, os.fsencode("Artist/../Artist/01.flac"))
 
 
 def test_trailing_slash_and_nonnormalised_input(tmp_path):
     tree = tmp_path / "music"
     _write_flac(tree / "Artist/01.flac")
     db = _scan(tmp_path, tree)
-    stored = _stored_paths(db)
-    key = realpath_key(os.fsencode(str(tree) + "/Artist/./01.flac"))
-    assert key == stored[0]
+    _assert_gate(db, os.fsencode(str(tree) + "/Artist/./01.flac"))
 
 
 def test_path_under_different_tree_is_skipped_not_mismatched(tmp_path):
@@ -207,6 +226,10 @@ def test_non_utf8_paths_match_and_stay_distinct(tmp_path):
     stored = _stored_paths(db)
     assert len(stored) == 2, f"two files, two rows: {stored!r}"
 
+    # Each file's own bytes, verbatim, keyed by the row that holds them.
+    by_raw = {raw: track_id for track_id, raw in _stored_rows(db)}
+    assert set(by_raw) == {os.path.realpath(a), os.path.realpath(b)}
+
     conn = connect(db)
     try:
         ids = set()
@@ -215,7 +238,8 @@ def test_non_utf8_paths_match_and_stay_distinct(tmp_path):
             assert key in stored, f"{key!r} not in {stored!r}"
             assert os.fsencode(key) == os.path.realpath(raw)
             track_id = track_id_for_path(conn, key)
-            assert track_id is not None, f"no row for {key!r}"
+            # Not just some row: the one holding this file's bytes.
+            assert track_id == by_raw[os.path.realpath(raw)], f"wrong row for {key!r}"
             ids.add(track_id)
         assert len(ids) == 2, "the two files must not resolve to one row"
     finally:

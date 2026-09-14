@@ -34,7 +34,8 @@ ffmpeg -nostdin -loglevel error -f lavfi -i "sine=frequency=660:duration=1" -c:a
 "$bin" scan "$backing" --db "$db"
 
 # 3. python-musefs writes the tags/art it owns.
-python scripts/contract_writer.py "$db"
+#    It finds each track from the backing file's path, as a plugin does.
+python scripts/contract_writer.py "$db" "$backing"
 
 # 4. Rust synthesizes the served bytes from the externally-written DB.
 MUSEFS_DB="$db" MUSEFS_INTEROP_DIR="$out" \

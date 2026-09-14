@@ -431,7 +431,9 @@ def test_sync_merges_keeps_unmanaged_and_persists(db_path, tmp_path, monkeypatch
     tags = _text_tags(db_path, tid)
     assert tags["artist"] == "New"  # M wins
     assert tags["comment"] == "keep"  # unmanaged B persists (merge, not replace)
-    assert "artist" in item.musefs_managed  # managed set persisted via store()
+    # Managed set persisted via store(). Split, not a substring test: "artist"
+    # is a substring of "albumartist".
+    assert set(item.musefs_managed.split(",")) == {"artist"}
 
 
 def test_reconcile_path_merges_and_sticky_deletes(db_path, tmp_path, monkeypatch):

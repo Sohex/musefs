@@ -58,10 +58,37 @@ def _scan(tmp_path, tree):
     return str(db)
 
 
-def _stored_paths(db):
+def _stored_rows(db):
+    """Every ``(id, backing_path)`` row, the path as the raw value SQLite holds.
+
+    Raw on purpose: ``path_value`` also accepts a ``str``, so comparing decoded
+    values would pass a scanner that stored ``TEXT`` — which no ``BLOB`` key
+    ever matches (see ``path_param``).
+    """
     conn = sqlite3.connect(db)
     try:
-        return [path_value(r[0]) for r in conn.execute("SELECT backing_path FROM tracks")]
+        return conn.execute("SELECT id, backing_path FROM tracks ORDER BY id").fetchall()
+    finally:
+        conn.close()
+
+
+def _assert_gate(db, path):
+    """The gate, both directions, for a scan that stored exactly one row.
+
+    Store side: the raw value is the realpath's bytes, verbatim. Plugin side:
+    the key decodes from those bytes and looks up that row's id, through
+    ``path_param`` — the direction a plugin actually uses.
+    """
+    rows = _stored_rows(db)
+    assert len(rows) == 1, f"one file, one row: {rows!r}"
+    ((track_id, raw),) = rows
+    assert isinstance(raw, bytes), f"backing_path stored as {type(raw).__name__}"
+    assert raw == os.path.realpath(os.fsencode(path))
+    key = realpath_key(path)
+    assert key == path_value(raw)
+    conn = connect(db)
+    try:
+        assert track_id_for_path(conn, key) == track_id
     finally:
         conn.close()
 
@@ -99,16 +126,8 @@ def test_plain_paths_match(tmp_path, rel):
     tree = tmp_path / "music"
     _write_flac(tree / rel)
     db = _scan(tmp_path, tree)
-    stored = _stored_paths(db)
-    assert len(stored) == 1
     # Picard hands us file.filename as a str:
-    key = realpath_key(str(tree / rel))
-    assert key == stored[0]
-    conn = connect(db)
-    try:
-        assert track_id_for_path(conn, key) is not None
-    finally:
-        conn.close()
+    _assert_gate(db, str(tree / rel))
 
 
 def test_symlinked_directory_component(tmp_path):
@@ -117,10 +136,7 @@ def test_symlinked_directory_component(tmp_path):
     link_tree = tmp_path / "linked_music"
     link_tree.symlink_to(real_tree)
     db = _scan(tmp_path, link_tree)
-    stored = _stored_paths(db)
-    assert len(stored) == 1
-    key = realpath_key(str(link_tree / "Artist/Album/01.flac"))
-    assert key == stored[0]
+    _assert_gate(db, str(link_tree / "Artist/Album/01.flac"))
 
 
 def test_symlink_to_file(tmp_path):
@@ -130,28 +146,24 @@ def test_symlink_to_file(tmp_path):
     link = tree / "link.flac"
     link.symlink_to(real)
     db = _scan(tmp_path, tree)
-    stored = set(_stored_paths(db))
-    assert len(stored) == 1
-    assert realpath_key(str(link)) in stored
+    # One canonical row, and either name finds it.
+    _assert_gate(db, str(link))
+    _assert_gate(db, str(real))
 
 
 def test_relative_and_dotdot_input(tmp_path, monkeypatch):
     tree = tmp_path / "music"
     _write_flac(tree / "Artist/01.flac")
     db = _scan(tmp_path, tree)
-    stored = _stored_paths(db)
     monkeypatch.chdir(tree)
-    key = realpath_key("Artist/../Artist/01.flac")
-    assert key == stored[0]
+    _assert_gate(db, "Artist/../Artist/01.flac")
 
 
 def test_nonnormalised_dot_segment_input(tmp_path):
     tree = tmp_path / "music"
     _write_flac(tree / "Artist/01.flac")
     db = _scan(tmp_path, tree)
-    stored = _stored_paths(db)
-    key = realpath_key(str(tree) + "/Artist/./01.flac")
-    assert key == stored[0]
+    _assert_gate(db, str(tree) + "/Artist/./01.flac")
 
 
 def test_path_under_different_tree_is_skipped_not_mismatched(tmp_path):
@@ -164,5 +176,45 @@ def test_path_under_different_tree_is_skipped_not_mismatched(tmp_path):
     conn = connect(db)
     try:
         assert track_id_for_path(conn, key) is None  # skipped, never a wrong hit
+    finally:
+        conn.close()
+
+
+def test_non_utf8_paths_match_and_stay_distinct(tmp_path):
+    """The beets gate's non-UTF-8 case, with the input Picard actually has (#680).
+
+    ``File.filename`` is a ``str``: Python decodes an undecodable byte in a path
+    to a lone surrogate. The vendored ``realpath_key``/``path_param`` pair has to
+    carry that surrogate back to the byte on disk, or Picard skips the file.
+    ``test_vendor_sync.py`` only proves the vendored copy is identical to
+    python-musefs; this is the check against the real scanner.
+    """
+    tree = tmp_path / "music"
+    tree.mkdir(parents=True, exist_ok=True)
+    a = os.fsencode(str(tree)) + b"/bad\x80name.flac"
+    b = os.fsencode(str(tree)) + b"/bad\x81name.flac"
+    try:
+        for raw in (a, b):
+            with open(raw, "wb") as fh:
+                fh.write(MINIMAL_FLAC)
+    except OSError as e:
+        # APFS and HFS+ refuse a non-UTF-8 name with EILSEQ; nothing to reach.
+        pytest.skip(f"filesystem will not accept a non-UTF-8 filename: {e}")
+
+    # The precondition: these collide under a lossy rendering.
+    assert a.decode("utf-8", "replace") == b.decode("utf-8", "replace")
+
+    db = _scan(tmp_path, tree)
+    by_raw = {raw: track_id for track_id, raw in _stored_rows(db)}
+    assert set(by_raw) == {os.path.realpath(a), os.path.realpath(b)}, by_raw
+
+    conn = connect(db)
+    try:
+        for raw in (a, b):
+            filename = os.fsdecode(raw)  # what Picard's File.filename holds
+            assert isinstance(filename, str)
+            key = realpath_key(filename)
+            assert os.fsencode(key) == os.path.realpath(raw)
+            assert track_id_for_path(conn, key) == by_raw[os.path.realpath(raw)]
     finally:
         conn.close()

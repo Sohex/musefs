@@ -35,11 +35,16 @@ def test_do_sync_writes_tags_and_art(db_path, make_track, fake_file, fake_metada
             "SELECT value FROM tags WHERE track_id=? AND key='title'", (tid,)
         ).fetchone()[0]
         assert title == "Song"
+        # Every column the plugin supplies per link, and the bytes behind it: the
+        # mime is declared on the link from schema v4 on (#716), and a link
+        # stored without one synthesizes a picture whose type is "".
         rows = conn.execute(
-            "SELECT picture_type, ordinal FROM track_art WHERE track_id=? ORDER BY ordinal",
+            "SELECT ta.picture_type, ta.description, ta.mime, a.data, ta.ordinal "
+            "FROM track_art ta JOIN art a ON a.id = ta.art_id "
+            "WHERE ta.track_id=? ORDER BY ta.ordinal",
             (tid,),
         ).fetchall()
-        assert rows == [(3, 0), (4, 1)]
+        assert rows == [(3, "", "image/jpeg", JPEG, 0), (4, "", "image/png", png, 1)]
     finally:
         conn.close()
 

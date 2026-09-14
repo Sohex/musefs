@@ -196,9 +196,11 @@ say — proves nothing either way, and still scans and serves as before.
 
 The serve path carries the same check as a belt: a page whose serial is not the
 resolved file's is refused (`EIO`) rather than renumbered. That matters for rows
-written before this check existed, which keep their too-wide audio bounds **until
-the file is rescanned** — `musefs migrate` offers that rescan, and a chained file
-then fails the rescan and leaves the mount.
+written before this check existed, which keep their too-wide audio bounds. A
+rescan cannot fix one: the scanner refuses the file, so nothing is written and
+the row stays, failing every revalidate after it. `musefs revalidate --prune`
+removes such a row, and nothing else it refuses to probe
+([#747](https://github.com/Sohex/musefs/issues/747)).
 
 ## Quirks & invariants
 

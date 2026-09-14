@@ -272,7 +272,9 @@ pub enum Command {
         /// Path to the SQLite database.
         #[arg(long, env = "MUSEFS_DB")]
         db: PathBuf,
-        /// Delete tracks whose backing file is gone and GC orphaned art.
+        /// Delete tracks whose backing file is gone, or whose file this build
+        /// refuses as unsupported (a chained Ogg an older musefs stored), with
+        /// their tags and art links; then GC orphaned art.
         #[arg(long, env = "MUSEFS_PRUNE", value_parser = clap::builder::BoolishValueParser::new())]
         prune: bool,
         /// Probe worker threads (0 = available parallelism). 1 = sequential.
@@ -722,8 +724,9 @@ fn vacuum_summary(path: &Path, before: u64, after: u64) -> String {
     }
 }
 
-/// Compact the SQLite store at `db`. Best-effort: a store in use (a live mount
-/// or a running scan) surfaces `DbError::StoreInUse`'s actionable message.
+/// Compact the SQLite store at `db`. A store anything else has open — a mount,
+/// even one idle between reads, or a scan — is refused with
+/// `DbError::StoreInUse`'s actionable message before anything is rewritten.
 pub fn run_vacuum(db: &Path) -> Result<()> {
     if !db.exists() {
         anyhow::bail!("database not found: {} (nothing to vacuum)", db.display());
@@ -1005,8 +1008,9 @@ pub fn run_migrate(args: &MigrateArgs) -> Result<()> {
 
     if owed > 0 {
         println!(
-            "{owed} track(s) now carry no fingerprint; a revalidate recomputes them, and \
-             until it runs those tracks cannot be recovered by a move."
+            "{owed} track(s) now carry no fingerprint; a revalidate recomputes them and \
+             restores each file's own picture metadata, and until it runs those tracks \
+             cannot be recovered by a move."
         );
         let offer = root
             .as_ref()

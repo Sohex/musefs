@@ -12,6 +12,17 @@ and these packages adhere to [Semantic Versioning](https://semver.org/spec/v2.0.
 
 ### Fixed
 
+- **`upsert_art` refuses an `art` row whose digest names other bytes**
+  (musefs #724). On a `sha256` conflict it returned the row already filed under
+  the digest without looking at it, so a crafted or corrupt store holding a row
+  whose `sha256` does not match its `data` handed that row's image to every
+  track syncing the real one. It now compares the conflicting row's bytes with
+  the incoming image and raises the new `ArtDigestMismatch` on a mismatch. That
+  exception is a `sqlite3.IntegrityError`, so `sync_one` skips the one record
+  and counts it under `skipped_invalid`, exactly as it does for a constraint
+  violation, rather than aborting the sync. `musefs scan` does the same on the
+  Rust side.
+
 - **A backing path that is not valid UTF-8 now resolves to the right track, and
   two such files stay two.** `realpath_key` used to normalize undecodable bytes
   to `U+FFFD`, reproducing what the scanner itself stored back when it wrote a
@@ -119,13 +130,13 @@ and these packages adhere to [Semantic Versioning](https://semver.org/spec/v2.0.
   (musefs #654). It reported both version numbers and said the versions "have
   diverged", leaving the user to work out which side was behind and what to do.
   It now says whether the store was written by a newer musefs (upgrade the
-  plugin) or predates the plugin (upgrade musefs and run `musefs scan`, which
-  migrates in place). This string is what Picard and beets surface verbatim.
+  plugin) or predates the plugin (upgrade musefs and run `musefs migrate`, which
+  upgrades it in place). This string is what Picard and beets surface verbatim.
 - The store schema is now at `user_version` 4 (musefs #644 widens the
   `tags.value` and `track_art.description` caps; musefs #691 retires every
   stored `tracks.fingerprint`, whose value now includes sampled audio).
   `EXPECTED_USER_VERSION` tracks it automatically; no plugin change is needed,
-  but a store must be migrated by `musefs scan`/`musefs mount` from a build
+  but a store must be upgraded with `musefs migrate` from a build
   carrying those migrations before these packages will open it. Neither
   migration touches a column these packages write: `fingerprint` is
   scanner-owned and was never part of the tag contract.

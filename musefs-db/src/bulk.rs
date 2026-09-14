@@ -1,6 +1,6 @@
-use crate::art::{set_track_art_in, upsert_art_in};
+use crate::art::{refresh_embedded_art_in, set_track_art_in, upsert_art_in};
 use crate::models::{
-    BinaryTag, ChecksumWrite, NewArt, NewTrack, StructuralBlock, Tag, Track, TrackArt,
+    BinaryTag, ChecksumWrite, EmbeddedArt, NewArt, NewTrack, StructuralBlock, Tag, Track, TrackArt,
 };
 use crate::structural::set_structural_blocks_in;
 use crate::tags::{replace_tags_in, set_binary_tags_in};
@@ -32,6 +32,7 @@ impl Db<ReadWrite> {
     pub fn bulk_writer(&self) -> Result<BulkWriter<'_>> {
         Ok(BulkWriter {
             tx: self.conn.unchecked_transaction()?,
+            verified_art: std::collections::HashSet::new(),
         })
     }
 }
@@ -43,6 +44,10 @@ impl Db<ReadWrite> {
 /// on a single caller-held transaction so a whole batch commits with one fsync.
 pub struct BulkWriter<'c> {
     tx: Transaction<'c>,
+    /// `art` rows this writer has already verified hold the bytes their digest
+    /// names (#724), so a cover shared by every track of an album is compared
+    /// once per batch rather than once per track.
+    verified_art: std::collections::HashSet<i64>,
 }
 
 impl BulkWriter<'_> {
@@ -113,11 +118,19 @@ impl BulkWriter<'_> {
     }
 
     pub fn upsert_art(&mut self, a: &NewArt) -> Result<i64> {
-        upsert_art_in(&self.tx, a)
+        upsert_art_in(&self.tx, a, &mut self.verified_art)
     }
 
     pub fn set_track_art(&mut self, track_id: i64, items: &[TrackArt]) -> Result<()> {
         set_track_art_in(&self.tx, track_id, items)
+    }
+
+    pub fn refresh_embedded_art(
+        &mut self,
+        track_id: i64,
+        pictures: &[EmbeddedArt],
+    ) -> Result<usize> {
+        refresh_embedded_art_in(&self.tx, track_id, pictures)
     }
 
     /// Run one item's writes inside a `SAVEPOINT`, so an error discards only

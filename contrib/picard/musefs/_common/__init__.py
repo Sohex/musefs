@@ -15,7 +15,7 @@ from .constants import (
     MAX_TAG_VALUE_LEN,
     SCAN_TIMEOUT_SECONDS,
 )
-from .errors import ScanError, SchemaMismatch
+from .errors import ArtDigestMismatch, ScanError, SchemaMismatch
 from .paths import realpath_key
 from .scan import ScanResult, run_scan
 from .store import (
@@ -47,6 +47,7 @@ __all__ = [
     "SCAN_TIMEOUT_SECONDS",
     "SchemaMismatch",
     "ScanError",
+    "ArtDigestMismatch",
     "ScanResult",
     "realpath_key",
     "run_scan",

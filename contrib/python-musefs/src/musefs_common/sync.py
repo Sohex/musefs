@@ -68,7 +68,9 @@ def sync_one(conn, record, stats, *, dry_run=False, merge=False):
     length, ``picture_type`` range, control chars, ...) is rolled back through its
     own savepoint and skipped -- it bumps ``skipped_invalid`` and appends
     ``(record.key, message)`` to ``invalid`` rather than aborting the whole batch
-    with an opaque commit-time ``IntegrityError`` (#420)."""
+    with an opaque commit-time ``IntegrityError`` (#420). A record whose art
+    dedups onto a row holding other bytes is skipped the same way, since
+    ``ArtDigestMismatch`` is an ``IntegrityError`` (musefs #724)."""
     track_id = track_id_for_path(conn, record.key)
     if track_id is None:
         stats.skipped += 1

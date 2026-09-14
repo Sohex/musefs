@@ -10,14 +10,27 @@ curated tags, art, and binary tags in the store**. Unchanged files are skipped,
 and files not yet in the store are ignored (ingesting new files is `scan`'s
 job — see [Scanning](scanning.md)).
 
+The one thing about art it does refresh is what a file declares about its own
+pictures. A link to an image the file embeds, under the same picture type and
+description, takes back the file's MIME type, dimensions, bit depth and colour
+count; a link an external writer made to other bytes, or re-described, is left
+as it is. That is how a revalidate restores the per-file picture metadata the
+schema v4 migration could not carry over
+([#746](https://github.com/Sohex/musefs/issues/746)).
+
 ```bash
 musefs revalidate /path/to/music --db library.db          # refresh changed rows
-musefs revalidate /path/to/music --db library.db --prune  # also delete gone tracks
+musefs revalidate /path/to/music --db library.db --prune  # also delete gone or refused tracks
 ```
 
 By default `revalidate` never deletes anything. Pass `--prune` to delete tracks
 whose backing file is gone from disk (scoped to the revalidated root) and
-garbage-collect any art left unreferenced. Pruning is opt-in because it removes
+garbage-collect any art left unreferenced. It also deletes a track whose file is
+still there but in a form this version refuses to serve — a chained Ogg stored
+by 1.3.0, which no scan can refresh and which otherwise fails every revalidate
+([#747](https://github.com/Sohex/musefs/issues/747)). Only that refusal counts:
+a file that fails to parse, or cannot be read, keeps its row. Without
+`--prune`, a revalidate that meets one says so. Pruning is opt-in because it removes
 a track's curated metadata along with its row, so a transient mount blip or an
 unplugged drive can't silently drop your edits.
 
@@ -58,13 +71,19 @@ into a compact form.
 
 ### Run it while unmounted
 
-`VACUUM` needs a write lock on the store and rewrites the whole file. Run it when
-nothing else is using the database — no mount, no scan. If the store is in use,
-the command fails with an actionable error rather than fighting for the lock:
+`VACUUM` rewrites the whole file, so it takes the store for itself first, the
+same way [`musefs migrate`](#upgrading-the-store-musefs-migrate) does. Anything
+else with the store open — a mount, including one sitting idle between reads, or
+a scan — makes it refuse before anything is rewritten:
 
 ```text
 error: the store is in use — unmount the filesystem or stop any scan before vacuuming
 ```
+
+Once it has the store, nothing else can attach until it finishes. One case it
+cannot see is a process that has opened the store and not yet read from it:
+SQLite only registers a connection on its first statement, so that process is
+kept out from the moment it tries rather than detected in advance.
 
 ### Notes
 
@@ -92,9 +111,14 @@ expect. Those are **gated**, and a major release is the only place they appear.
 Every command that opens a store for ordinary work refuses one that needs it:
 
 ```text
-error: store schema version 3 needs an explicit upgrade to version 4 before this
+error: store schema version 2 needs an explicit upgrade to version 4 before this
 musefs build can open it; run `musefs migrate --db <store>`.
 ```
+
+A command that refuses leaves the store exactly as it found it. While a gated
+step is pending no step is applied, not even an automatic one, so the previous
+release still opens the store until `musefs migrate` has run
+([#749](https://github.com/Sohex/musefs/issues/749)).
 
 `musefs migrate` is where that upgrade happens, deliberately:
 
@@ -107,11 +131,12 @@ schema, takes a snapshot, upgrades the store, and then offers to clean up after
 itself:
 
 ```text
-store library.db is at schema version 3; this build needs 4.
-  v4 — clears every stored fingerprint; a scan or revalidate recomputes them  [needs this command]
+store library.db is at schema version 2; this build needs 4.
+  v3 (musefs 2.0.0) — widens the tags.value and track_art.description caps
+  v4 (musefs 2.0.0) — clears every stored fingerprint; a revalidate recomputes them  [needs this command]
 This rewrites the store in place. Once it is done, musefs builds older than this one will no longer open it.
 store is 412.7 MiB; the upgrade needs about 825.4 MiB free and has 27.7 GiB.
-a snapshot will be written to library.db.v3.bak first.
+a snapshot will be written to library.db.v2.bak first.
 Upgrade library.db now? [y/N]
 ```
 
@@ -181,8 +206,16 @@ An upgrade that rewrites rows leaves the store larger than it was, so `migrate`
 offers a vacuum. It also reports how many tracks lost a scanner-derived value
 the upgrade retired — the fingerprint, in the 2.0.0 upgrade — and offers to run
 a [`revalidate`](#refreshing-the-store-musefs-revalidate) over the directory
-your library shares, which recomputes them. Until that runs, those tracks
-cannot be re-identified after a move; nothing else about the mount is affected.
+your library shares. A plain `scan` does not recompute a stored file's
+fingerprint; the revalidate does. Until it runs, those tracks cannot be
+re-identified after a move.
+
+The 2.0.0 upgrade leaves more than fingerprints for that revalidate: it records
+each file's inode, and restores each file's own picture metadata. The offer
+never prunes, and whatever the revalidate counts as failed, `migrate` still
+exits `0`. The
+[release notes](../release-notes.md#upgrading-from-v130) list what else the
+first revalidate changes, including every synthesized file's modification time.
 
 ### Flags, for scripts
 

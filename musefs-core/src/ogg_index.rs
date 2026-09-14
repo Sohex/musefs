@@ -301,9 +301,7 @@ pub fn serve_ogg_window(
         if ps < pe {
             let within = ps - hdr_end;
             let n = usize_from(pe - ps);
-            let start = out.len();
-            out.resize(start + n, 0);
-            backing.read_exact_at(&mut out[start..], pos + header_len_u64 + within)?;
+            backing.read_append(out, n, pos + header_len_u64 + within)?;
         }
 
         let total_len = header_len_u64

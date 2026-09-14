@@ -1,9 +1,10 @@
 use crate::error::{check_art_count, check_field_bytes, check_text_field};
 use crate::limits::{ART_SHA256_LEN, MAX_ART_BYTES, MAX_ART_DESCRIPTION_LEN, MAX_ART_MIME_LEN};
-use crate::models::{Art, ArtMeta, NewArt, TrackArt};
+use crate::models::{Art, ArtMeta, EmbeddedArt, NewArt, TrackArt};
 use crate::{Db, ReadWrite, Result};
 use rusqlite::params;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 
 pub(crate) fn sha256_hex(data: &[u8]) -> String {
     format!("{:x}", base16ct::HexDisplay(&Sha256::digest(data)))
@@ -167,18 +168,47 @@ impl<M> Db<M> {
 
 /// Insert `a` (deduplicated by content sha256) and return its `art` id. Runs on
 /// `conn` so `Db<ReadWrite>` and `BulkWriter` share one body.
-pub(crate) fn upsert_art_in(conn: &rusqlite::Connection, a: &NewArt) -> Result<i64> {
+///
+/// A conflict hands back the row already filed under the digest, and a store is
+/// only content-addressed if that row really holds these bytes. Nothing in the
+/// schema ties `sha256` to `data`, so a crafted row can claim a digest it does
+/// not match (#724). A conflicting row is therefore compared with the incoming
+/// bytes — in SQL, so nothing is re-hashed — and a mismatch is an error rather
+/// than a link. A fresh insert needs no comparison: it just stored these bytes.
+///
+/// `verified` records rows already compared, so a writer that meets one cover
+/// on every track of an album pays one blob comparison for it, not one per
+/// track. Only compared rows are recorded; a rolled-back insert cannot leave an
+/// id in it that some other row later reuses.
+pub(crate) fn upsert_art_in(
+    conn: &rusqlite::Connection,
+    a: &NewArt,
+    verified: &mut std::collections::HashSet<i64>,
+) -> Result<i64> {
     let sha = sha256_hex(&a.data);
-    conn.execute(
+    let inserted = conn.execute(
         "INSERT INTO art (sha256, byte_len, data)
          VALUES (?1, ?2, ?3) ON CONFLICT(sha256) DO NOTHING",
         params![sha, a.data.len() as u64, a.data],
     )?;
-    Ok(
-        conn.query_row("SELECT id FROM art WHERE sha256 = ?1", params![sha], |r| {
-            r.get(0)
-        })?,
-    )
+    let id: i64 = conn.query_row("SELECT id FROM art WHERE sha256 = ?1", params![sha], |r| {
+        r.get(0)
+    })?;
+    if inserted == 0 && !verified.contains(&id) {
+        let holds_these_bytes: bool = conn.query_row(
+            "SELECT data = ?2 FROM art WHERE id = ?1",
+            params![id, a.data],
+            |r| r.get(0),
+        )?;
+        if !holds_these_bytes {
+            return Err(crate::error::DbError::ArtDigestMismatch {
+                art_id: id,
+                sha256: sha,
+            });
+        }
+        verified.insert(id);
+    }
+    Ok(id)
 }
 
 /// Replace a track's `track_art` links. Runs on `conn` so `Db<ReadWrite>` (own
@@ -214,9 +244,71 @@ pub(crate) fn set_track_art_in(
     Ok(())
 }
 
+/// Restore the per-embedding metadata of the links `track_id`'s backing file
+/// supplied itself, from `pictures` as the file embeds them now (#746). Returns
+/// how many links changed.
+///
+/// A link is the file's when its art row is filed under the picture's digest
+/// and it carries the picture's type and description. A link an external writer
+/// made to other bytes, or re-described, matches nothing and is left as it is —
+/// which is what lets a pass that must not touch curated art call this at all.
+/// Only the columns describing the embedding are written: mime, dimensions,
+/// depth and colours.
+///
+/// A file can embed the same bytes twice under one type and description with
+/// different metadata, so the key alone does not pick a link. Matches pair up
+/// in order instead: the file's n-th picture under a key with the n-th link
+/// under it by ordinal, the order ingest wrote them in.
+///
+/// A link already holding these values is not rewritten, so an unchanged file
+/// does not bump `content_version` and invalidate what readers hold.
+pub(crate) fn refresh_embedded_art_in(
+    conn: &rusqlite::Connection,
+    track_id: i64,
+    pictures: &[EmbeddedArt],
+) -> Result<usize> {
+    let mut links = conn.prepare_cached(
+        "SELECT ta.ordinal FROM track_art ta JOIN art a ON a.id = ta.art_id
+         WHERE ta.track_id = ?1 AND a.sha256 = ?2
+           AND ta.picture_type = ?3 AND ta.description = ?4
+         ORDER BY ta.ordinal",
+    )?;
+    let mut restore = conn.prepare_cached(
+        "UPDATE track_art SET mime = ?3, width = ?4, height = ?5, depth = ?6, colors = ?7
+         WHERE track_id = ?1 AND ordinal = ?2
+           AND (mime IS NOT ?3 OR width IS NOT ?4 OR height IS NOT ?5
+                OR depth IS NOT ?6 OR colors IS NOT ?7)",
+    )?;
+    let mut paired: HashMap<(String, u32, &str), usize> = HashMap::new();
+    let mut changed = 0;
+    for pic in pictures {
+        let sha = sha256_hex(&pic.data);
+        let ordinals = links
+            .query_map(
+                params![track_id, sha, pic.picture_type, pic.description],
+                |r| r.get::<_, i64>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<i64>>>()?;
+        let nth = paired
+            .entry((sha, pic.picture_type, pic.description.as_str()))
+            .or_insert(0);
+        if let Some(&ordinal) = ordinals.get(*nth) {
+            changed += restore.execute(params![
+                track_id, ordinal, pic.mime, pic.width, pic.height, pic.depth, pic.colors
+            ])?;
+        }
+        *nth += 1;
+    }
+    Ok(changed)
+}
+
 impl Db<ReadWrite> {
+    /// Insert `a`, deduplicated by content, and return its `art` id. A row filed
+    /// under the same digest is verified to hold these bytes before it is
+    /// returned (#724); see [`upsert_art_in`]. Each call verifies afresh — a
+    /// bulk scan remembers what it verified through [`crate::BulkWriter`].
     pub fn upsert_art(&self, a: &NewArt) -> Result<i64> {
-        upsert_art_in(&self.conn, a)
+        upsert_art_in(&self.conn, a, &mut std::collections::HashSet::new())
     }
 
     pub fn set_track_art(&self, track_id: i64, items: &[TrackArt]) -> Result<()> {
@@ -224,6 +316,16 @@ impl Db<ReadWrite> {
         set_track_art_in(&tx, track_id, items)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Restore what `track_id`'s backing file declares about its own embedded
+    /// pictures onto the links it supplied, leaving every other link alone, and
+    /// return how many changed (#746).
+    pub fn refresh_embedded_art(&self, track_id: i64, pictures: &[EmbeddedArt]) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        let changed = refresh_embedded_art_in(&tx, track_id, pictures)?;
+        tx.commit()?;
+        Ok(changed)
     }
 
     /// Delete `art` rows no longer referenced by any `track_art`. Returns the
@@ -247,7 +349,7 @@ impl Db<ReadWrite> {
 mod guard_tests {
     use crate::error::DbError;
     use crate::limits::{ART_SHA256_LEN, MAX_ART_BYTES, MAX_ART_DESCRIPTION_LEN, MAX_ART_MIME_LEN};
-    use crate::models::{NewArt, TrackArt};
+    use crate::models::{EmbeddedArt, NewArt, TrackArt};
     use crate::{Db, Format, NewTrack};
 
     fn db_track_art() -> (Db, i64, i64) {
@@ -266,6 +368,213 @@ mod guard_tests {
             .unwrap();
         let art = db.upsert_art(&NewArt { data: vec![0u8] }).unwrap();
         (db, track, art)
+    }
+
+    fn file_art(data: &[u8], mime: &str, side: u32, depth: u32, colors: u32) -> EmbeddedArt {
+        EmbeddedArt {
+            data: data.to_vec(),
+            picture_type: 3,
+            description: String::new(),
+            mime: mime.to_string(),
+            width: Some(side),
+            height: Some(side),
+            depth,
+            colors,
+        }
+    }
+
+    /// #746: a link takes the file's metadata back only where it is the file's
+    /// own — its bytes, type and description; identical keys pair up by
+    /// ordinal; and a link already right is not rewritten, so the track's
+    /// version holds.
+    #[test]
+    fn refreshing_embedded_art_restores_only_the_files_own_links() {
+        let (db, track, _) = db_track_art();
+        let cover = db
+            .upsert_art(&NewArt {
+                data: b"COVER".to_vec(),
+            })
+            .unwrap();
+        let other = db
+            .upsert_art(&NewArt {
+                data: b"OTHER".to_vec(),
+            })
+            .unwrap();
+        let link = |art_id, description: &str, ordinal| TrackArt {
+            art_id,
+            picture_type: 3,
+            description: description.to_string(),
+            mime: "image/gif".to_string(),
+            width: Some(1),
+            height: Some(1),
+            depth: 0,
+            colors: 0,
+            ordinal,
+        };
+        db.set_track_art(
+            track,
+            &[
+                link(cover, "", 0),
+                link(cover, "", 1),
+                link(other, "", 2),
+                link(cover, "re-described", 3),
+            ],
+        )
+        .unwrap();
+        // The same bytes twice, described two ways.
+        let file = [
+            file_art(b"COVER", "image/jpeg", 1200, 24, 0),
+            file_art(b"COVER", "image/png", 64, 8, 256),
+        ];
+
+        assert_eq!(db.refresh_embedded_art(track, &file).unwrap(), 2);
+        let described = |ordinal: usize| {
+            let l = &db.get_track_art(track).unwrap()[ordinal];
+            (l.mime.clone(), l.width, l.depth, l.colors)
+        };
+        assert_eq!(described(0), ("image/jpeg".to_string(), Some(1200), 24, 0));
+        assert_eq!(described(1), ("image/png".to_string(), Some(64), 8, 256));
+        let untouched = ("image/gif".to_string(), Some(1), 0, 0);
+        assert_eq!(described(2), untouched, "another image's link");
+        assert_eq!(described(3), untouched, "a re-described link");
+
+        let version = db.track_content_version(track).unwrap();
+        assert_eq!(db.refresh_embedded_art(track, &file).unwrap(), 0);
+        assert_eq!(
+            db.track_content_version(track).unwrap(),
+            version,
+            "nothing rewritten, nothing invalidated"
+        );
+
+        let mut bulk = db.bulk_writer().unwrap();
+        let changed = bulk
+            .refresh_embedded_art(track, &[file_art(b"COVER", "image/webp", 1200, 24, 0)])
+            .unwrap();
+        assert_eq!(changed, 1, "the bulk writer runs the same body");
+        assert_eq!(described(0).0, "image/webp", "and writes, not just counts");
+    }
+
+    /// #724: a row filed under the digest of bytes it does not hold is refused
+    /// rather than linked — through `Db` and through a bulk writer, on every
+    /// attempt, since a refused row is never recorded as verified — while an
+    /// honest duplicate still dedups to the row it matches.
+    #[test]
+    fn a_row_whose_digest_names_other_bytes_is_refused_not_linked() {
+        let (db, _track, honest) = db_track_art();
+        let real = b"REAL-IMAGE-X".to_vec();
+        let planted_sha = crate::art::sha256_hex(&real);
+        db.conn
+            .execute(
+                "INSERT INTO art (sha256, byte_len, data) VALUES (?1, 3, X'595959')",
+                rusqlite::params![planted_sha],
+            )
+            .unwrap();
+        let planted = db.conn.last_insert_rowid();
+
+        let err = db.upsert_art(&NewArt { data: real.clone() }).unwrap_err();
+        assert!(
+            matches!(err, DbError::ArtDigestMismatch { art_id, .. } if art_id == planted),
+            "{err:?}"
+        );
+
+        let mut bulk = db.bulk_writer().unwrap();
+        for _ in 0..2 {
+            let err = bulk.upsert_art(&NewArt { data: real.clone() }).unwrap_err();
+            assert!(matches!(err, DbError::ArtDigestMismatch { .. }), "{err:?}");
+        }
+        let again = bulk.upsert_art(&NewArt { data: vec![0u8] }).unwrap();
+        assert_eq!(again, honest, "an honest duplicate still dedups");
+        let again = bulk.upsert_art(&NewArt { data: vec![0u8] }).unwrap();
+        assert_eq!(again, honest, "and a verified one dedups again");
+    }
+
+    /// #724: a bulk writer compares a row once and trusts it for the rest of the
+    /// batch — the point of `verified`, so a cover shared by every track of an
+    /// album costs one blob comparison rather than one per track. Pinned by
+    /// changing the row's bytes behind the writer after it compared them: the
+    /// next dedup returns the row without looking again.
+    #[test]
+    fn a_bulk_writer_compares_a_shared_row_once() {
+        let (db, _track, _) = db_track_art();
+        let cover = b"ALBUM-COVER".to_vec();
+        let id = db
+            .upsert_art(&NewArt {
+                data: cover.clone(),
+            })
+            .unwrap();
+
+        let mut bulk = db.bulk_writer().unwrap();
+        let first = bulk
+            .upsert_art(&NewArt {
+                data: cover.clone(),
+            })
+            .unwrap();
+        assert_eq!(first, id, "compared, and it holds these bytes");
+        // `art` rows are immutable, so the substitution is a delete and a
+        // re-insert under the same id and digest — what a writer ignoring the
+        // contract could leave. Same length, so only a comparison could notice.
+        db.conn
+            .execute("DELETE FROM art WHERE id = ?1", rusqlite::params![id])
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO art (id, sha256, byte_len, data) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    id,
+                    crate::art::sha256_hex(&cover),
+                    cover.len() as u64,
+                    vec![0u8; cover.len()]
+                ],
+            )
+            .unwrap();
+        let again = bulk.upsert_art(&NewArt { data: cover }).unwrap();
+        assert_eq!(
+            again, id,
+            "already verified by this writer, so not read again"
+        );
+    }
+
+    /// #724: only a row this writer compared is remembered as verified. A fresh
+    /// insert needs no comparison, and must not be recorded as though it had
+    /// one: inside a bulk write its item can roll back, SQLite hands the freed
+    /// id to the next row inserted, and that row would then be linked unchecked.
+    #[test]
+    fn a_rolled_back_insert_leaves_nothing_verified_for_its_id_to_reuse() {
+        struct RolledBack;
+        impl From<DbError> for RolledBack {
+            fn from(_: DbError) -> RolledBack {
+                RolledBack
+            }
+        }
+
+        let (db, _track, _) = db_track_art();
+        let real = b"REAL-IMAGE-Z".to_vec();
+        let mut bulk = db.bulk_writer().unwrap();
+        let mut freed = 0;
+        let rolled_back = bulk.item(|w| -> Result<(), RolledBack> {
+            freed = w.upsert_art(&NewArt { data: real.clone() })?;
+            Err(RolledBack)
+        });
+        assert!(rolled_back.is_err());
+
+        // Another image's bytes, filed under this one's digest, at the freed id.
+        db.conn
+            .execute(
+                "INSERT INTO art (sha256, byte_len, data) VALUES (?1, 3, X'595959')",
+                rusqlite::params![crate::art::sha256_hex(&real)],
+            )
+            .unwrap();
+        assert_eq!(
+            db.conn.last_insert_rowid(),
+            freed,
+            "precondition: the planted row reuses the rolled-back id"
+        );
+
+        let err = bulk.upsert_art(&NewArt { data: real }).unwrap_err();
+        assert!(
+            matches!(err, DbError::ArtDigestMismatch { art_id, .. } if art_id == freed),
+            "{err:?}"
+        );
     }
 
     /// A value whose SQLite character length is 1 and whose byte length is

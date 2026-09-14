@@ -52,8 +52,20 @@ Independently of the cache, **every**
 resolve re-stats the backing file and errors with `BackingChanged` if its
 size, mtime, ctime, or inode drifted from the scanned values, so a silently replaced
 backing file is never spliced at stale offsets. The per-handle read path
-re-stats the held descriptor on every read too, so this guarantee holds on the
-hot path and not only through `resolve()`.
+re-stats the held descriptor on every read it serves too — after acquiring the
+bytes, so a rewrite that lands mid-read fails that read — and this guarantee
+holds on the hot path and not only through `resolve()`.
+
+It covers the reads that reach musefs, which is not every read. With
+`--keep-cache`, on by default, a read the kernel can satisfy from its page cache
+never becomes a FUSE request, so no re-stat runs for it. An in-place rewrite of a
+backing file behind a file that is already open and cached is therefore not seen
+by those cached reads. The next open resolves the file again, and fails with `EIO`
+if the rewrite moved the freshness stamp — size, mtime, ctime or inode. A
+same-size rewrite in place on a filesystem with coarse timestamps can leave all
+four unchanged, and then no open catches it either (see above). That is deliberate rather than an oversight: bypassing the
+page cache would give up the one measured storage win in the benchmarks, and an
+in-place rewrite of a backing file is outside the contract to begin with.
 
 **`--trust-backing-mtime`** opts out of the `getattr` half of that, and of
 nothing else ([#668](https://github.com/Sohex/musefs/issues/668)). On a
@@ -90,7 +102,9 @@ Polling is debounced (`--poll-interval-ms`) and rebuilds are single-flighted:
 a metadata-op storm costs at most one rebuild per interval. When mounted with
 `--keep-cache`, the changed-inode notifications drive kernel page-cache
 invalidation (`inval_inode`), so a re-tagged file never serves stale cached
-bytes.
+bytes. That covers changes recorded in the store; a backing file rewritten in
+place writes nothing to the store and raises no notification (see
+[above](#freshness-two-version-counters)).
 
 ## Virtual tree
 
@@ -215,7 +229,9 @@ one is what makes it the repopulation path for a store upgraded to v4, where
 every row starts without one. New files are
 ignored: `revalidate` only touches rows that already exist in the store.
 Deletion is opt-in via `--prune`, which removes tracks under the scanned root
-whose backing file is gone and garbage-collects now-unreferenced art. Pruning
+whose backing file is gone, or is present but refused as unsupported (a chained
+Ogg an older binary stored, [#747](https://github.com/Sohex/musefs/issues/747)),
+and garbage-collects now-unreferenced art. Pruning
 is scoped to the scanned root, so revalidating one library root never removes
 tracks belonging to another. Because a track is keyed by its *canonical*
 backing path, a file scanned via `--follow-symlinks` whose real target lives

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use musefs_db::convert::usize_from;
-use musefs_db::{ChecksumWrite, Db, Format, NewArt, NewTrack, Tag, TrackArt};
+use musefs_db::{ChecksumWrite, Db, EmbeddedArt, Format, NewArt, NewTrack, Tag, TrackArt};
 use musefs_format::{EmbeddedBinaryTag, EmbeddedPicture, Extent, flac, mp3, mp4, ogg, wav};
 
 use crate::byte_budget::ByteBudget;
@@ -86,6 +86,38 @@ fn set_after_s1_hook(f: impl FnMut() + 'static) {
 #[cfg(test)]
 fn clear_after_s1_hook() {
     AFTER_S1_HOOK.with(|h| *h.borrow_mut() = None);
+}
+
+/// A hook that runs on a scan worker after it resolves a walked path and before
+/// it probes it, for the one walked path it names (#684). Process-wide rather
+/// than `thread_local!` like the one above, because the workers are threads the
+/// test never touches; keyed by path so a scan in a parallel test cannot fire it.
+#[cfg(test)]
+type ResolveHook = (PathBuf, Box<dyn FnMut() + Send>);
+#[cfg(test)]
+static AFTER_RESOLVE_HOOK: std::sync::Mutex<Option<ResolveHook>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+fn fire_after_resolve(walked: &Path) {
+    let mut hook = AFTER_RESOLVE_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((path, f)) = hook.as_mut()
+        && path == walked
+    {
+        f();
+    }
+}
+#[cfg(test)]
+fn set_after_resolve_hook(walked: PathBuf, f: impl FnMut() + Send + 'static) {
+    *AFTER_RESOLVE_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((walked, Box::new(f)));
+}
+#[cfg(test)]
+fn clear_after_resolve_hook() {
+    *AFTER_RESOLVE_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
 /// A progress event emitted during a scan or revalidate. Borrows the current
@@ -208,6 +240,10 @@ const SCAN_WARN_BURST: u64 = 10;
 enum SkipReason {
     /// Supported extension, but the bytes did not parse.
     Unparseable,
+    /// Parsed, but in a shape musefs refuses to serve: a chained Ogg (#722). A
+    /// property of the file rather than of the attempt, which is what lets
+    /// `revalidate --prune` act on it (#747).
+    Unsupported,
     /// Metadata over a storage cap — art, tag field, or binary frame (#644).
     Oversize,
     /// The store refused this file's rows on a constraint the scanner does not
@@ -232,8 +268,9 @@ enum SkipReason {
 impl SkipReason {
     /// Every reason, in [`FailureTally`]'s array order (each reason indexes that
     /// array by its discriminant).
-    const ALL: [SkipReason; 9] = [
+    const ALL: [SkipReason; 10] = [
         SkipReason::Unparseable,
+        SkipReason::Unsupported,
         SkipReason::Oversize,
         SkipReason::Rejected,
         SkipReason::Io,
@@ -246,8 +283,9 @@ impl SkipReason {
 
     /// The reasons that increment `ScanStats::failed`. They partition it
     /// exactly, which is what makes the `failed N: ...` breakdown trustworthy.
-    const FAILED: [SkipReason; 6] = [
+    const FAILED: [SkipReason; 7] = [
         SkipReason::Unparseable,
+        SkipReason::Unsupported,
         SkipReason::Oversize,
         SkipReason::Rejected,
         SkipReason::Io,
@@ -263,6 +301,7 @@ impl SkipReason {
     fn label(self) -> &'static str {
         match self {
             SkipReason::Unparseable => "unparseable",
+            SkipReason::Unsupported => "unsupported",
             SkipReason::Oversize => "oversize",
             SkipReason::Rejected => "rejected",
             SkipReason::Io => "io",
@@ -416,11 +455,19 @@ enum ProbeBody {
 struct Failure {
     reason: SkipReason,
     message: String,
+    /// The file's stamp, when the verdict came from a probe that held the file
+    /// still across it (`probe_file`'s fstat sandwich). `revalidate --prune`
+    /// deletes a refused row only while its file still carries this (#747).
+    stamp: Option<BackingStamp>,
 }
 
 impl Failure {
     fn new(reason: SkipReason, message: String) -> Failure {
-        Failure { reason, message }
+        Failure {
+            reason,
+            message,
+            stamp: None,
+        }
     }
 }
 
@@ -958,7 +1005,10 @@ fn probe_file(path: &Path, window: usize, tier: ChecksumTier) -> std::io::Result
     }
     Ok(match settled {
         Ok((p, c)) => ProbeOutcome::Probed(p, s1, c),
-        Err(f) => ProbeOutcome::Failed(f),
+        Err(f) => ProbeOutcome::Failed(Failure {
+            stamp: Some(s1),
+            ..f
+        }),
     })
 }
 
@@ -1111,6 +1161,12 @@ fn probe_body(
                     format!("skipping {}: {why}", path.display()),
                 )));
             }
+            Probe::Unsupported(why) => {
+                return Ok(ProbeBody::Failed(Failure::new(
+                    SkipReason::Unsupported,
+                    format!("skipping {}: {why}", path.display()),
+                )));
+            }
             Probe::NeedMore(up_to) => {
                 // Read everything we're willing to probe? Widening can't help.
                 if want as u64 >= probe_cap {
@@ -1166,6 +1222,9 @@ enum Probe {
     /// The file is not servable, for the reason named — which reaches the user as
     /// `skipping <path>: <reason>`.
     Skip(&'static str),
+    /// The file parsed, but is in a shape musefs refuses to serve. Reported the
+    /// same way as [`Probe::Skip`], under its own reason (#747).
+    Unsupported(&'static str),
 }
 
 /// What [`Probe::Skip`] says when nothing about a file parsed at all.
@@ -1231,7 +1290,7 @@ fn probe_prefix(
                 if ogg_tail.is_some_and(|t| {
                     ogg::classify_tail(&t.bytes, t.start, header.serial) == ogg::Chaining::Chained
                 }) {
-                    return Probe::Skip("chained Ogg (more than one logical bitstream)");
+                    return Probe::Unsupported("chained Ogg (more than one logical bitstream)");
                 }
                 let format = match header.codec {
                     ogg::Codec::Opus => Format::Opus,
@@ -1328,7 +1387,8 @@ pub struct ScanOptions {
     /// Scan only: re-ingest files already present in the DB, overwriting
     /// curated metadata. Off by default; bare scan is additive.
     pub force: bool,
-    /// Revalidate only: delete tracks whose backing file is gone and GC
+    /// Revalidate only: delete tracks whose backing file is gone, and tracks
+    /// whose file is present but refused as unsupported (#747), then GC
     /// orphaned art. Off by default.
     pub prune: bool,
 }
@@ -1678,6 +1738,11 @@ trait TrackSink {
     ) -> musefs_db::Result<()>;
     fn upsert_art(&mut self, a: &NewArt) -> musefs_db::Result<i64>;
     fn set_track_art(&mut self, track_id: i64, items: &[TrackArt]) -> musefs_db::Result<()>;
+    fn refresh_embedded_art(
+        &mut self,
+        track_id: i64,
+        pictures: &[EmbeddedArt],
+    ) -> musefs_db::Result<usize>;
     fn set_track_checksums(
         &mut self,
         track_id: i64,
@@ -1728,6 +1793,13 @@ impl TrackSink for &Db {
     }
     fn set_track_art(&mut self, track_id: i64, items: &[TrackArt]) -> musefs_db::Result<()> {
         Db::set_track_art(self, track_id, items)
+    }
+    fn refresh_embedded_art(
+        &mut self,
+        track_id: i64,
+        pictures: &[EmbeddedArt],
+    ) -> musefs_db::Result<usize> {
+        Db::refresh_embedded_art(self, track_id, pictures)
     }
     fn set_track_checksums(
         &mut self,
@@ -1795,6 +1867,13 @@ impl TrackSink for &mut musefs_db::BulkWriter<'_> {
     }
     fn set_track_art(&mut self, track_id: i64, items: &[TrackArt]) -> musefs_db::Result<()> {
         musefs_db::BulkWriter::set_track_art(self, track_id, items)
+    }
+    fn refresh_embedded_art(
+        &mut self,
+        track_id: i64,
+        pictures: &[EmbeddedArt],
+    ) -> musefs_db::Result<usize> {
+        musefs_db::BulkWriter::refresh_embedded_art(self, track_id, pictures)
     }
     fn set_track_checksums(
         &mut self,
@@ -1888,21 +1967,17 @@ fn ingest_into(
     w.set_structural_blocks(track_id, &structural_blocks)?;
 
     let mut track_arts = Vec::new();
-    for (ordinal, pic) in probed.pictures.into_iter().enumerate() {
+    for (ordinal, pic) in probed.pictures.into_iter().map(embedded_art).enumerate() {
         let art_id = w.upsert_art(&NewArt { data: pic.data })?;
-        let picture_type = pic.picture_type.get();
         // The picture metadata goes on the link, where it describes this file's
         // block rather than the bytes every file sharing the blob holds (#716).
-        // Zero stays the "not declared" sentinel the formats themselves use:
-        // `None` for the dimensions, which the model makes nullable, and 0 for
-        // depth and colours, which the FLAC block spells that way.
         track_arts.push(TrackArt {
             art_id,
-            picture_type,
+            picture_type: pic.picture_type,
             description: pic.description,
             mime: pic.mime,
-            width: (pic.width != 0).then_some(pic.width),
-            height: (pic.height != 0).then_some(pic.height),
+            width: pic.width,
+            height: pic.height,
             depth: pic.depth,
             colors: pic.colors,
             ordinal: ordinal as u64,
@@ -1912,8 +1987,29 @@ fn ingest_into(
     Ok(())
 }
 
-/// Refresh only the structural serving facts for an already-probed file.
-/// Leaves curated tags, binary tags, and art untouched.
+/// What a file's embedded picture declares, in the store's terms. The one
+/// conversion both ingest and the structural refresh use, so a link a scan
+/// wrote is one the refresh recognises as the file's (#746).
+fn embedded_art(pic: EmbeddedPicture) -> EmbeddedArt {
+    // Zero stays the "not declared" sentinel the formats themselves use: `None`
+    // for the dimensions, which the model makes nullable, and 0 for depth and
+    // colours, which the FLAC block spells that way.
+    EmbeddedArt {
+        picture_type: pic.picture_type.get(),
+        description: pic.description,
+        mime: pic.mime,
+        width: (pic.width != 0).then_some(pic.width),
+        height: (pic.height != 0).then_some(pic.height),
+        depth: pic.depth,
+        colors: pic.colors,
+        data: pic.data,
+    }
+}
+
+/// Refresh only the structural serving facts for an already-probed file, plus
+/// what the file declares about its own embedded pictures. Leaves curated tags,
+/// binary tags, and art untouched: a picture link is restored only where it is
+/// the file's own (see `Db::refresh_embedded_art`).
 fn refresh_structural_into(
     mut w: impl TrackSink,
     abs_path: &Path,
@@ -1935,6 +2031,11 @@ fn refresh_structural_into(
     w.set_track_checksums(track_id, fingerprint, content_hash)?;
     let structural_blocks = structural_blocks_from(probed.structural_blocks);
     w.set_structural_blocks(track_id, &structural_blocks)?;
+    // The V4 migration could only copy each blob's shared metadata onto every
+    // link, with FLAC's depth and colours at 0; this pass is the one `migrate`
+    // offers afterwards, so it is where the file's own values come back (#746).
+    let pictures: Vec<EmbeddedArt> = probed.pictures.into_iter().map(embedded_art).collect();
+    w.refresh_embedded_art(track_id, &pictures)?;
     Ok(())
 }
 
@@ -1952,7 +2053,15 @@ fn refresh_structural_into(
 /// for, and adding one pre-check per newly discovered constraint does not
 /// converge.
 fn is_store_rejection(e: &crate::error::CoreError) -> bool {
-    matches!(e, crate::error::CoreError::Db(db) if db.is_constraint_violation())
+    // A digest mismatch is the store refusing this file's picture too (#724): the
+    // row it would link holds another image's bytes, and only this file's rows
+    // are affected, so it fails the file like a constraint rather than the scan.
+    matches!(
+        e,
+        crate::error::CoreError::Db(db)
+            if db.is_constraint_violation()
+                || matches!(db, musefs_db::DbError::ArtDigestMismatch { .. })
+    )
 }
 
 /// Do the bytes this unit records look like the ones a stored row already
@@ -2216,7 +2325,14 @@ pub fn scan_directory_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<S
         });
     }
     db.apply_bulk_pragmas_self()?; // scan-scoped tuning on the caller's connection
-    let mut stats = run_pipeline(db, files, opts, WritePolicy::Full, &failures)?;
+    let mut stats = run_pipeline(
+        db,
+        files,
+        opts,
+        WritePolicy::Full,
+        &failures,
+        &Arc::default(),
+    )?;
     // skipped is tallied during the walk, not the pipeline
     stats.skipped = tally.total;
     stats.already_present = already_present;
@@ -2277,6 +2393,7 @@ fn run_pipeline(
     opts: &ScanOptions,
     policy: WritePolicy,
     failures: &Arc<FailureTally>,
+    unsupported: &Arc<std::sync::Mutex<Vec<(PathBuf, BackingStamp)>>>,
 ) -> Result<ScanStats> {
     use std::sync::atomic::AtomicUsize;
 
@@ -2308,37 +2425,46 @@ fn run_pipeline(
         let failed = Arc::clone(&failed);
         let raced = Arc::clone(&raced);
         let failures = Arc::clone(failures);
+        let unsupported = Arc::clone(unsupported);
         workers.push(std::thread::spawn(move || {
             loop {
                 let i = cursor.fetch_add(1, Ordering::Relaxed);
                 let Some(path) = files.get(i) else { break };
-                match probe_file_caught(path, window, tier) {
+                // No-follow paths are canonical by construction (the root was
+                // canonicalized up front); only the opt-in symlink walk can yield a
+                // path with a symlink component to resolve (#440). It is resolved
+                // once, and the probe reads what was resolved: probing the walked
+                // name and canonicalizing it separately were two lookups, and a
+                // retarget between them stored one target's geometry and stamp
+                // against another's path (#684).
+                let abs_path = if follow_symlinks {
+                    match std::fs::canonicalize(path) {
+                        Ok(abs) => abs,
+                        Err(e) => {
+                            failures.record(
+                                SkipReason::Io,
+                                format_args!("skipping {}: {e}", path.display()),
+                            );
+                            failed.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                    }
+                } else {
+                    path.clone()
+                };
+                #[cfg(test)]
+                fire_after_resolve(path);
+                match probe_file_caught(&abs_path, window, tier) {
                     Ok(ProbeOutcome::Probed(probed, stamp, checksums)) => {
-                        // No-follow paths are canonical by construction (the root
-                        // was canonicalized up front); only the opt-in symlink walk
-                        // can yield a path with a symlink component to resolve (#440).
-                        let abs_path = if follow_symlinks {
-                            match std::fs::canonicalize(path) {
-                                Ok(abs) => abs,
-                                Err(e) => {
-                                    failures.record(
-                                        SkipReason::Io,
-                                        format_args!("skipping {}: {e}", path.display()),
-                                    );
-                                    failed.fetch_add(1, Ordering::Relaxed);
-                                    continue;
-                                }
-                            }
-                        } else {
-                            path.clone()
-                        };
                         // Reject an over-cap file here, before its payload is
                         // charged to the budget and buffered into a batch: a
                         // `CHECK` violation discovered at commit time is fatal
                         // to the whole scan and has lost the path by then
                         // (#644). Full-write policy only — `StructuralOnly`
-                        // (revalidate) writes neither tags nor art, so failing
-                        // a stored track for them would be inventing a failure.
+                        // (revalidate) writes no tags and links no art, so
+                        // failing a stored track for them would be inventing a
+                        // failure. It only restores metadata onto links the file
+                        // already supplied (#746), which the store still checks.
                         if policy == WritePolicy::Full
                             && let Err(e) = check_storable(&abs_path, &probed)
                         {
@@ -2365,6 +2491,16 @@ fn run_pipeline(
                         }
                     }
                     Ok(ProbeOutcome::Failed(f)) => {
+                        // A refusal of the file's shape, from a probe that held
+                        // it still: what `revalidate --prune` may act on (#747).
+                        if f.reason == SkipReason::Unsupported
+                            && let Some(stamp) = f.stamp
+                        {
+                            unsupported
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push((abs_path.clone(), stamp));
+                        }
                         failures.record(f.reason, format_args!("{}", f.message));
                         failed.fetch_add(1, Ordering::Relaxed);
                     }
@@ -2652,6 +2788,11 @@ pub fn scan_directory_full_oracle(db: &Db, root: &Path) -> Result<ScanStats> {
 /// dispatched, so workers remain DB-free. A `stat`/`canonicalize` failure on a
 /// candidate during the skip pass is counted in `failed` (and the file is left
 /// for the next revalidation) rather than re-probed or pruned.
+///
+/// With `prune`, a track whose file is present but refused as unsupported
+/// (chained Ogg an older binary stored) is deleted as well, provided the file
+/// is unchanged since the refusing probe (#747). It still counts in `failed`
+/// for that pass: the file was refused.
 pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<RevalidateStats> {
     // Canonicalize once; see scan_directory_with (#440). The prune pass below reuses
     // this canonical root for its `starts_with` scope check.
@@ -2770,9 +2911,36 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
     }
 
     let mut pruned = 0u64;
-    let scan = run_pipeline(db, changed, opts, WritePolicy::StructuralOnly, &failures)?;
+    let unsupported: Arc<std::sync::Mutex<Vec<(PathBuf, BackingStamp)>>> = Arc::default();
+    let scan = run_pipeline(
+        db,
+        changed,
+        opts,
+        WritePolicy::StructuralOnly,
+        &failures,
+        &unsupported,
+    )?;
+    let refused = std::mem::take(
+        &mut *unsupported
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
 
     if opts.prune {
+        // A stored file this build refuses to serve — a chained Ogg an older
+        // binary accepted (#722) — can be neither re-probed nor rescanned into a
+        // row, so it failed every revalidate for as long as it existed (#747).
+        // Only that refusal counts, never a file that failed to parse or could
+        // not be read, and only while the file still carries the stamp the
+        // refusing probe saw: one rewritten since deserves the next pass.
+        for (path, stamp) in refused {
+            let as_refused = std::fs::metadata(&path)
+                .is_ok_and(|meta| BackingStamp::from_metadata(&meta) == stamp);
+            if as_refused && let Some(track) = db.get_track_by_path(&path)? {
+                db.delete_track(track.id)?;
+                pruned += 1;
+            }
+        }
         let canon_root = root;
         for track in db.list_tracks()? {
             if !Path::new(&track.backing_path).starts_with(canon_root) {
@@ -2786,6 +2954,12 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
             }
         }
         db.gc_orphan_art()?;
+    } else if !refused.is_empty() {
+        log::warn!(
+            "{} stored track(s) are in a form this version refuses to serve and fail every \
+             revalidate; `musefs revalidate --prune` removes them",
+            refused.len()
+        );
     }
 
     log_failure_summaries(&failures);

@@ -1073,7 +1073,7 @@ const MIGRATIONS: &[Migration] = &[
         MIGRATION_V4,
         Gate::Gated,
         "2.0.0",
-        "clears every stored fingerprint; a scan or revalidate recomputes them",
+        "clears every stored fingerprint; a revalidate recomputes them",
     ),
 ];
 
@@ -1197,22 +1197,34 @@ enum GatePolicy {
 }
 
 /// The highest version a run under `policy` may take a store sitting at
-/// `current`, which is `current` itself when the very next step is gated.
+/// `current`, which is `current` itself whenever any step still to come is
+/// gated. A transparent step ahead of a gate is held back with it: every step
+/// bumps `user_version`, which the previous release refuses, so applying one on
+/// the way to a refusal would lock that release out with no snapshot taken
+/// (#749). It waits for `musefs migrate`, which applies the lot.
 ///
 /// A store at version 0 is one this binary is *creating*: it has no data to
 /// endanger, and gating it would stop `scan` from ever building a new library.
 /// That is the same "creating versus upgrading" distinction the announcement
 /// below already draws for its log level (#706).
 fn reachable(current: i64, policy: GatePolicy) -> i64 {
+    reachable_in(MIGRATIONS, current, policy)
+}
+
+/// [`reachable`] over any migration table, so the rule can be tested against a
+/// shape this build does not ship yet: a transparent step after an applied
+/// gate, which the first migration after 2.0.0 will be.
+fn reachable_in(migrations: &[Migration], current: i64, policy: GatePolicy) -> i64 {
+    let latest = i64::try_from(migrations.len()).expect("a migration count fits an i64");
     if current == 0 || policy == GatePolicy::Bypass {
-        return LATEST_VERSION;
+        return latest;
     }
-    for (target, migration) in (1i64..).zip(MIGRATIONS) {
+    for (target, migration) in (1i64..).zip(migrations) {
         if target > current && migration.gate.is_gated() {
-            return target - 1;
+            return current;
         }
     }
-    LATEST_VERSION
+    latest
 }
 
 /// The refusal a gated step raises, naming the version reached and the command
@@ -1327,9 +1339,8 @@ fn run(conn: &mut Connection, policy: GatePolicy) -> Result<()> {
         let secs = started.elapsed().as_secs_f64();
         log::info!("store schema{at} is now at version {stop} (took {secs:.1}s)");
     }
-    // The transparent steps are committed either way: a step is transparent
-    // because applying it needs no permission, and the gated step that follows
-    // it does not retroactively make it need one.
+    // A pending gated step held every step back (`reachable` answered
+    // `current`), so the refusal leaves the store exactly as it was (#749).
     if stop < latest {
         return Err(gated(stop));
     }
@@ -1547,12 +1558,11 @@ mod migration_logging_tests {
         );
     }
 
-    /// A run the gate cuts short must announce the version it actually reached.
-    /// The warning is the user's record of an irreversible change; naming the
-    /// latest version there would claim an upgrade that is about to be refused
-    /// in the same breath.
+    /// A store the gate refuses is left exactly as it was (#749), so the run must
+    /// announce no upgrade. The warning is the user's record of an irreversible
+    /// change, and nothing irreversible happened.
     #[test]
-    fn a_gated_stop_announces_the_version_it_reached() {
+    fn a_gated_refusal_announces_no_upgrade() {
         let captured = capture();
         let mut conn = Connection::open_in_memory().unwrap();
         store_at_v1(&conn);
@@ -1561,18 +1571,15 @@ mod migration_logging_tests {
         super::migrate(&mut conn).expect_err("V4 is gated, so a V1 store cannot open");
 
         let records = captured.records();
-        let warning = records
-            .iter()
-            .find(|(level, _)| *level == Level::Warn)
-            .map(|(_, msg)| msg)
-            .expect("the transparent steps were applied, so the upgrade is announced");
         assert!(
-            warning.contains("from version 1") && warning.contains("to version 3"),
-            "the warning must name the version the gate stopped at, not the latest: {warning}"
+            records.iter().all(|(level, _)| *level != Level::Warn),
+            "nothing was applied, so no upgrade may be announced: {records:?}"
         );
-        assert!(
-            !warning.contains(&format!("to version {}", super::LATEST_VERSION)),
-            "the run did not reach the latest version: {warning}"
+        assert_eq!(
+            conn.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
+                .unwrap(),
+            1,
+            "and the store is still at the version it was"
         );
     }
 
@@ -1719,13 +1726,33 @@ mod gate_tests {
         assert!(!super::pending(1)[0].gated);
     }
 
+    /// The rule over a table this build does not ship: a transparent step after
+    /// the gate, as the first post-2.0.0 migration will be. A store behind the
+    /// gate stays put; one whose gated step is already applied takes the later
+    /// transparent step on open, like any other.
     #[test]
-    fn reachable_stops_at_the_step_before_the_gate() {
-        // An existing store walks up to the wall and no further, from wherever
-        // it starts. The `> current` filter is what keeps an already-applied
-        // gated step from pulling the answer backwards.
+    fn a_transparent_step_after_an_applied_gate_still_applies_on_open() {
+        let table = [
+            super::Migration::new("", super::Gate::Transparent, "1.0.0", "before"),
+            super::Migration::new("", super::Gate::Gated, "2.0.0", "the gate"),
+            super::Migration::new("", super::Gate::Transparent, "2.1.0", "after"),
+        ];
+        assert_eq!(super::reachable_in(&table, 1, GatePolicy::Enforce), 1);
+        assert_eq!(
+            super::reachable_in(&table, 2, GatePolicy::Enforce),
+            3,
+            "an applied gated step is not pending"
+        );
+        assert_eq!(super::reachable_in(&table, 3, GatePolicy::Enforce), 3);
+    }
+
+    #[test]
+    fn reachable_holds_an_existing_store_behind_a_gate() {
+        // An existing store behind the gate stays where it is, from wherever it
+        // starts (#749). The `> current` filter is what keeps an already-applied
+        // gated step from counting as pending.
         for current in [1, 2, 3] {
-            assert_eq!(super::reachable(current, GatePolicy::Enforce), WALL);
+            assert_eq!(super::reachable(current, GatePolicy::Enforce), current);
         }
         // A store being created has no data to endanger, so it is exempt.
         assert_eq!(super::reachable(0, GatePolicy::Enforce), LATEST_VERSION);
@@ -1738,12 +1765,12 @@ mod gate_tests {
         }
     }
 
-    /// A store whose next step is gated is refused, and the transparent steps
-    /// ahead of it are applied and committed on the way — a step is transparent
-    /// because it needs no permission, and a later gated step does not
-    /// retroactively give it one.
+    /// A store with a gated step anywhere ahead is refused before anything is
+    /// applied, the transparent steps included: each bumps `user_version` past
+    /// what the previous release opens, so applying them on the way to a
+    /// refusal would lock that release out with no snapshot taken (#749).
     #[test]
-    fn an_existing_store_stops_at_the_gate_with_the_transparent_steps_applied() {
+    fn an_existing_store_behind_a_gate_is_refused_untouched() {
         let mut conn = Connection::open_in_memory().unwrap();
         store_at(&conn, 1);
 
@@ -1753,14 +1780,14 @@ mod gate_tests {
             matches!(
                 err,
                 DbError::StoreNeedsMigration { found, target }
-                    if found == WALL && target == LATEST_VERSION
+                    if found == 1 && target == LATEST_VERSION
             ),
             "{err:?}"
         );
         assert_eq!(
             user_version(&conn),
-            WALL,
-            "the transparent steps must be committed, not rolled back with the refusal"
+            1,
+            "nothing is applied while a gated step is pending"
         );
     }
 

@@ -116,7 +116,7 @@ def test_replace_track_art_atomic_on_fk_violation(db_path):
         with pytest.raises(sqlite3.IntegrityError):
             replace_track_art(conn, tid, [(999999, 3, "", "image/png")])
         rows = conn.execute(
-            "SELECT art_id, picture_type, ordinal FROM track_art WHERE track_id = ?", (tid,)
+            "SELECT art_id, picture_type, mime, ordinal FROM track_art WHERE track_id = ?", (tid,)
         ).fetchall()
         after_cv = conn.execute(
             "SELECT content_version FROM tracks WHERE id = ?", (tid,)
@@ -124,7 +124,7 @@ def test_replace_track_art_atomic_on_fk_violation(db_path):
     finally:
         conn.close()
     # The DELETE + the content_version trigger bump both rolled back with the FK failure.
-    assert rows == [(art_id, 3, 0)]
+    assert rows == [(art_id, 3, "image/png", 0)]
     assert after_cv == before_cv
 
 

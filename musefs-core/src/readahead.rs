@@ -352,7 +352,36 @@ impl ReadAhead {
         backing_len: u64,
         mut fill: impl FnMut(&mut [u8], u64) -> io::Result<()>,
     ) -> io::Result<(u64, u64)> {
-        let len = dst.len();
+        self.serve_with(
+            off,
+            dst.len(),
+            backing_len,
+            |want, at| {
+                let mut window = vec![0u8; want];
+                fill(&mut window, at)?;
+                Ok(window)
+            },
+            |bytes| dst.copy_from_slice(bytes),
+        )
+    }
+
+    /// The window logic behind every read: serve `len` bytes at `off` from a
+    /// cached window when one covers them; otherwise grow or reset the adaptive
+    /// window, build a fresh one with `fill_window(want, off)` — which returns
+    /// exactly `want` bytes — and cache it. `take` receives the requested bytes.
+    ///
+    /// Taking the window from `fill_window` rather than handing it a buffer is
+    /// what lets the serve path fill one without zero-filling it first (#670):
+    /// the buffer is moved into the cache as the window, so it cannot be a
+    /// reused scratch buffer, and zeroing a fresh one cost ~69 µs per 8 MiB.
+    fn serve_with(
+        &mut self,
+        off: u64,
+        len: usize,
+        backing_len: u64,
+        fill_window: impl FnOnce(usize, u64) -> io::Result<Vec<u8>>,
+        take: impl FnOnce(&[u8]),
+    ) -> io::Result<(u64, u64)> {
         if len == 0 {
             let n = self.len();
             return Ok((n, n));
@@ -360,7 +389,7 @@ impl ReadAhead {
         if let Some(w) = self.window_containing(off, len) {
             #[expect(clippy::cast_possible_truncation)]
             let lo = (off - w.start) as usize;
-            dst.copy_from_slice(&w.bytes[lo..lo + len]);
+            take(&w.bytes[lo..lo + len]);
             self.next_expected = off + len as u64;
             let n = self.len();
             return Ok((n, n));
@@ -384,9 +413,8 @@ impl ReadAhead {
             .min(self.cap.max(len as u64))
             .min(backing_len.saturating_sub(off));
         #[expect(clippy::cast_possible_truncation)]
-        let mut buf = vec![0u8; want as usize];
-        fill(&mut buf, off)?;
-        dst.copy_from_slice(&buf[..len]);
+        let buf = fill_window(want as usize, off)?;
+        take(&buf[..len]);
         // Advance the frontier BEFORE inserting (#671): the insert may trim the
         // ring, and the trim must see where the reader now is. A stale frontier
         // still points into the window this read seeked away FROM, so the freshly
@@ -623,6 +651,106 @@ impl PrefetchWorkers {
     }
 }
 
+/// Append exactly `n` bytes of `file`, read at `offset`, to `out` — into its
+/// spare capacity, without zero-filling them first (#670). On error `out` is
+/// left as it was.
+///
+/// Forming a `&mut [u8]` over uninitialized memory is undefined behaviour
+/// whether or not a read then fills it, so the read targets the spare capacity
+/// as `MaybeUninit` and only the bytes `pread` reports as initialized are
+/// committed to the length.
+pub(crate) fn pread_append(
+    file: &std::fs::File,
+    out: &mut Vec<u8>,
+    n: usize,
+    offset: u64,
+) -> io::Result<()> {
+    let start = out.len();
+    let result = pread_append_unwound(file, out, n, offset);
+    if result.is_err() {
+        out.truncate(start);
+    }
+    result
+}
+
+// Caps each `pread` below, so a test can make a regular file return the short
+// reads a network filesystem can; nothing else reaches the resume path.
+#[cfg(test)]
+thread_local! {
+    static PREAD_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
+fn pread_append_unwound(
+    file: &std::fs::File,
+    out: &mut Vec<u8>,
+    n: usize,
+    offset: u64,
+) -> io::Result<()> {
+    out.reserve(n);
+    let end = out.len() + n;
+    let mut at = offset;
+    while out.len() < end {
+        let remaining = end - out.len();
+        #[cfg(test)]
+        let remaining = remaining.min(PREAD_CAP.with(std::cell::Cell::get));
+        let spare = &mut out.spare_capacity_mut()[..remaining];
+        let read = match rustix::io::pread(file, spare, at) {
+            Ok((init, _)) => init.len(),
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) => return Err(e.into()),
+        };
+        if read == 0 {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        }
+        // SAFETY: `pread` initialized the first `read` bytes of the spare
+        // capacity it was handed, and that slice ends at `end`, inside the
+        // capacity reserved above — so every byte this commits is initialized.
+        #[expect(
+            unsafe_code,
+            reason = "commits bytes `pread` initialized in spare capacity instead of \
+                      zero-filling them first (#670)"
+        )]
+        unsafe {
+            out.set_len(out.len() + read);
+        }
+        at += read as u64;
+    }
+    Ok(())
+}
+
+/// Where a backing read's bytes go: into a caller's slice, or appended to a
+/// `Vec` without being zero-filled first (#670).
+enum Dest<'a> {
+    Slice(&'a mut [u8]),
+    Append { out: &'a mut Vec<u8>, len: usize },
+}
+
+impl Dest<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Dest::Slice(dst) => dst.len(),
+            Dest::Append { len, .. } => *len,
+        }
+    }
+
+    /// Read straight from the backing file, with read-ahead disabled.
+    fn read_direct(&mut self, file: &std::fs::File, offset: u64) -> io::Result<()> {
+        match self {
+            Dest::Slice(dst) => crate::metrics::backing_read_exact_at(file, dst, offset),
+            Dest::Append { out, len } => {
+                crate::metrics::backing_read_append(file, out, *len, offset)
+            }
+        }
+    }
+
+    fn take(&mut self, bytes: &[u8]) {
+        match self {
+            Dest::Slice(dst) => dst.copy_from_slice(bytes),
+            Dest::Append { out, .. } => out.extend_from_slice(bytes),
+        }
+    }
+}
+
 pub struct BackingReader<'a> {
     file: &'a std::fs::File,
     buf: &'a Arc<Mutex<ReadAhead>>,
@@ -688,14 +816,32 @@ impl<'a> BackingReader<'a> {
     }
 
     pub fn read_exact_at(&self, dst: &mut [u8], abs_offset: u64) -> std::io::Result<()> {
+        self.serve(Dest::Slice(dst), abs_offset)
+    }
+
+    /// Append `len` backing bytes at `abs_offset` to `out` — the serve path's
+    /// form. The bytes are read into `out`'s spare capacity or copied out of a
+    /// cached window, rather than written over a zero-filled region reserved
+    /// for them first (#670). On error `out` is left as it was.
+    pub fn read_append(
+        &self,
+        out: &mut Vec<u8>,
+        len: usize,
+        abs_offset: u64,
+    ) -> std::io::Result<()> {
+        self.serve(Dest::Append { out, len }, abs_offset)
+    }
+
+    fn serve(&self, mut dest: Dest<'_>, abs_offset: u64) -> std::io::Result<()> {
+        let len = dest.len();
         if !self.pool.enabled() {
             self.fills.set(self.fills.get() + 1);
             crate::metrics::on_readahead_miss();
-            crate::metrics::on_pread(dst.len() as u64);
-            return crate::metrics::backing_read_exact_at(self.file, dst, abs_offset);
+            crate::metrics::on_pread(len as u64);
+            return dest.read_direct(self.file, abs_offset);
         }
         let mut ra = lock_buf_or_clear(self.buf, self.pool);
-        if ra.covers(abs_offset, dst.len()) {
+        if ra.covers(abs_offset, len) {
             crate::metrics::on_readahead_hit();
         } else {
             crate::metrics::on_readahead_miss();
@@ -709,11 +855,19 @@ impl<'a> BackingReader<'a> {
         }
         let file = self.file;
         let fills = &self.fills;
-        let (old_len, new_len) = ra.read_into(dst, abs_offset, self.backing_len, |b, o| {
-            fills.set(fills.get() + 1);
-            crate::metrics::on_pread(b.len() as u64);
-            crate::metrics::backing_read_exact_at(file, b, o)
-        })?;
+        let (old_len, new_len) = ra.serve_with(
+            abs_offset,
+            len,
+            self.backing_len,
+            |want, at| {
+                fills.set(fills.get() + 1);
+                crate::metrics::on_pread(want as u64);
+                let mut window = Vec::with_capacity(want);
+                crate::metrics::backing_read_append(file, &mut window, want, at)?;
+                Ok(window)
+            },
+            |bytes| dest.take(bytes),
+        )?;
         if self.prefetch {
             // Size the eviction ring and capture the post-read frontier/window
             // under the lock we already hold, so the caller plans prefetch
@@ -1034,6 +1188,94 @@ mod eviction_tests {
                 assert_eq!(a, b, "read-ahead byte mismatch at {off}+{len}");
             }
         }
+
+        /// #670: the appending read serves exactly the bytes the slice read does,
+        /// with read-ahead on and off, after whatever `out` already held.
+        #[test]
+        fn read_append_matches_the_file_with_and_without_read_ahead() {
+            let (_d, file, data) = temp_file(2 * 1024 * 1024);
+            for budget in [64 * 1024 * 1024, 0] {
+                let pool = ReadAheadPool::new(budget);
+                let buf = Arc::new(Mutex::new(ReadAhead::new(pool.per_stream_cap())));
+                pool.register(1, Arc::clone(&buf));
+                let epoch = std::sync::atomic::AtomicU64::new(0);
+                let br = BackingReader::new(&file, &buf, &pool, 1, data.len() as u64, &epoch);
+                for &(off, len) in &[
+                    (0u64, 100usize),
+                    (1_000_000, 4096),
+                    (5000, 700),
+                    (2_097_000, 152),
+                ] {
+                    let mut out = b"prefix".to_vec();
+                    br.read_append(&mut out, len, off).unwrap();
+                    #[expect(clippy::cast_possible_truncation)]
+                    let o = off as usize;
+                    assert_eq!(&out[..6], b"prefix", "budget {budget}: existing bytes kept");
+                    assert_eq!(out[6..], data[o..o + len], "budget {budget}: {off}+{len}");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod pread_append_tests {
+    use super::pread_append;
+    use std::io::Write;
+
+    fn file_holding(bytes: &[u8]) -> (tempfile::NamedTempFile, std::fs::File) {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(bytes).unwrap();
+        let file = std::fs::File::open(tmp.path()).unwrap();
+        (tmp, file)
+    }
+
+    #[test]
+    fn appends_exactly_the_requested_bytes_after_existing_contents() {
+        let (_tmp, file) = file_holding(b"0123456789");
+        let mut out = b"ab".to_vec();
+        pread_append(&file, &mut out, 4, 3).unwrap();
+        assert_eq!(out, b"ab3456");
+        pread_append(&file, &mut out, 0, 9).unwrap();
+        assert_eq!(out, b"ab3456", "a zero-length append changes nothing");
+    }
+
+    /// A `pread` may return fewer bytes than asked — a network filesystem's can —
+    /// and the next one has to resume at the offset just past them, or the
+    /// append splices the wrong bytes in.
+    #[test]
+    fn short_reads_resume_where_the_last_one_ended() {
+        let (_tmp, file) = file_holding(b"0123456789abcdef");
+        super::PREAD_CAP.with(|cap| cap.set(3));
+        let mut out = b"ab".to_vec();
+        let result = pread_append(&file, &mut out, 10, 2);
+        super::PREAD_CAP.with(|cap| cap.set(usize::MAX));
+        result.unwrap();
+        assert_eq!(out, b"ab23456789ab");
+    }
+
+    /// A read that runs out of file part-way must not leave the bytes it did get
+    /// behind: callers splice `out`, and a half-filled segment is wrong bytes.
+    #[test]
+    fn a_read_past_the_end_fails_and_leaves_out_as_it_was() {
+        let (_tmp, file) = file_holding(b"0123456789");
+        let mut out = b"ab".to_vec();
+        let err = pread_append(&file, &mut out, 8, 6).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(out, b"ab");
+    }
+
+    #[test]
+    fn a_failing_read_reports_its_error_and_leaves_out_as_it_was() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let write_only = std::fs::OpenOptions::new()
+            .write(true)
+            .open(tmp.path())
+            .unwrap();
+        let mut out = b"ab".to_vec();
+        let err = pread_append(&write_only, &mut out, 4, 0).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EBADF));
+        assert_eq!(out, b"ab");
     }
 }
 

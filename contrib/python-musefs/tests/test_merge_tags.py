@@ -70,9 +70,11 @@ def test_merge_preserves_binary_tags(db_path):
         conn.commit()
         # Binary row survives; text row added.
         bin_rows = conn.execute(
-            "SELECT COUNT(*) FROM tags WHERE track_id=? AND value_blob IS NOT NULL", (tid,)
-        ).fetchone()[0]
-        assert bin_rows == 1
+            "SELECT key, value, value_blob, ordinal FROM tags "
+            "WHERE track_id=? AND value_blob IS NOT NULL",
+            (tid,),
+        ).fetchall()
+        assert bin_rows == [("comment", "", b"\x00\x01", 1)]
         assert text_tags(conn, tid)["comment"] == ["text"]
     finally:
         conn.close()
