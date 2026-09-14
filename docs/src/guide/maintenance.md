@@ -181,10 +181,12 @@ is not there — the kind an external tool can leave behind with foreign keys
 turned off. Such a row passes every constraint in its own table and fails only
 when the upgrade puts it back.
 
-The check costs one pass over the store and reports what the migration would
-actually do, because it asks the migration's own schema rather than a second
-description of it: the target tables are built exactly as the upgrade builds
-them, and every row is offered to them.
+The check reports what the migration would actually do, because it asks the
+migration's own schema rather than a second description of it: the target
+tables are built exactly as the upgrade builds them, and every row is offered to
+them. That is one pass over the store. A second pass, over what the first
+accepted, finds the rows whose parent did not survive it, which is how a child
+of a refused track is reported with it.
 
 ### The snapshot
 

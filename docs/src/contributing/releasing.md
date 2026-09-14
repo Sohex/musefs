@@ -119,8 +119,10 @@ covering the full matrix including the FreeBSD VM e2e).
 1. `gate` — verifies the tag matches the workspace version and waits for the
    required CI checks to pass on the tagged commit (fails closed on a failed
    check or timeout).
-2. `build` — cross-compiles the four target binaries.
-3. `smoke` — runs the binary smoke on each target (host + Alpine).
+2. `build` — cross-compiles the six target binaries.
+3. `smoke` — runs the binary smoke on each target: natively (host or Alpine)
+   for x86_64 and aarch64, and emulated for riscv64, whose legs do not block
+   the release.
 4. `publish` — publishes crates in dependency order. For each crate it **skips**
    the publish if `name@version` already resolves from the crates.io index, then
    **waits** for that version to appear before publishing the next dependent
@@ -145,7 +147,7 @@ covering the full matrix including the FreeBSD VM e2e).
    clean machine/container.
 2. Download a release tarball and verify its checksum:
    `sha256sum -c musefs-X.Y.Z-<triple>.tar.gz.sha256`.
-3. Confirm all four target tarballs + `.sha256` files are attached to the
+3. Confirm all six target tarballs + `.sha256` files are attached to the
    GitHub Release.
 
 **Lidarr gate at a v1.0.0 milestone.** The Lidarr real-instance e2e
