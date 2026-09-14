@@ -516,8 +516,8 @@ impl<M> Db<M> {
 impl Db<ReadWrite> {
     /// Upsert a track by path, leaving its checksums as they are. That is a claim
     /// that the recorded bytes did not change: a re-probe that computed checksums,
-    /// or cannot vouch for the old ones, writes them in the same statement
-    /// instead.
+    /// or cannot vouch for the old ones, writes through
+    /// [`Db::upsert_track_with_checksums`] instead.
     pub fn upsert_track(&self, t: &NewTrack) -> Result<i64> {
         upsert_track_in(&self.conn, t, ChecksumWrite::Keep, ChecksumWrite::Keep)
     }
@@ -527,10 +527,6 @@ impl Db<ReadWrite> {
     /// exactly when neither checksum proves the bytes unchanged. A scanner
     /// re-probing a file writes through this rather than `upsert_track` followed
     /// by [`Db::set_track_checksums`].
-    ///
-    /// Test scaffolding (#710): the scanner writes through its own sink, and
-    /// this exposes the same statement to the trigger tests.
-    #[cfg(any(test, feature = "test-support"))]
     pub fn upsert_track_with_checksums(
         &self,
         t: &NewTrack,
