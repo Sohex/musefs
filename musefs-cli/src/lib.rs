@@ -762,6 +762,28 @@ fn free_space_for(path: &Path) -> Result<u64> {
     fs4::available_space(dir).with_context(|| format!("checking free space on {}", dir.display()))
 }
 
+/// Whether `a` and `b` would be written to the same filesystem, judged by the
+/// device of the directories they sit in. Where either directory cannot be
+/// stat'd, or on a platform without device ids, it falls back to the two being
+/// the same directory.
+fn same_filesystem(a: &Path, b: &Path) -> bool {
+    let dir = |p: &Path| {
+        p.parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .to_path_buf()
+    };
+    let (dir_a, dir_b) = (dir(a), dir(b));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(meta_a), Ok(meta_b)) = (std::fs::metadata(&dir_a), std::fs::metadata(&dir_b)) {
+            return meta_a.dev() == meta_b.dev();
+        }
+    }
+    dir_a == dir_b
+}
+
 /// Where a snapshot goes when the user did not say: the store's own path with
 /// the version it is being taken from appended, so two upgrades of one store
 /// never collide and the file says what it is.
@@ -901,9 +923,11 @@ pub fn run_migrate(args: &MigrateArgs) -> Result<u64> {
     }
 
     // The store's own filesystem carries the rewrite, and the snapshot too when
-    // it is going alongside; a --snapshot elsewhere is checked on its own.
-    let snapshot_is_alongside = snapshot.as_ref().is_some_and(|d| d.parent() == db.parent());
-    let copies = 1 + u64::from(snapshot_is_alongside);
+    // the snapshot lands on that same filesystem. That is decided by device, not
+    // by directory: a `--snapshot` elsewhere on the same disk draws on the same
+    // free space. A snapshot on another filesystem is checked on its own.
+    let snapshot_shares_store_fs = snapshot.as_ref().is_some_and(|d| same_filesystem(d, db));
+    let copies = 1 + u64::from(snapshot_shares_store_fs);
     let needed = space_needed(footprint, copies);
     let available = free_space_for(db)?;
     println!(
@@ -922,7 +946,7 @@ pub fn run_migrate(args: &MigrateArgs) -> Result<u64> {
         );
     }
     if let Some(dest) = &snapshot
-        && !snapshot_is_alongside
+        && !snapshot_shares_store_fs
     {
         let there = free_space_for(dest)?;
         if there < footprint {
@@ -1044,10 +1068,20 @@ pub fn run_migrate(args: &MigrateArgs) -> Result<u64> {
                 root.display(),
                 db.display()
             ),
-            (None, _) => println!(
-                "  run later: musefs revalidate <library path> --db {}",
-                db.display()
-            ),
+            (None, _) => {
+                if args.revalidate == Some(true) {
+                    // Asked for and not done: say so, rather than let a script
+                    // read the absence of a revalidate as a clean one.
+                    eprintln!(
+                        "musefs: --revalidate was not run: the stored tracks share no \
+                         directory below the filesystem root to revalidate from"
+                    );
+                }
+                println!(
+                    "  run later: musefs revalidate <library path> --db {}",
+                    db.display()
+                );
+            }
         }
     }
     Ok(failed)
@@ -1208,6 +1242,31 @@ mod tests {
         assert_ne!(
             default_snapshot_path(Path::new("/srv/library.db"), 3),
             default_snapshot_path(Path::new("/srv/library.db"), 4)
+        );
+    }
+
+    /// A `--snapshot` in another directory on the store's filesystem draws on
+    /// the same free space as the rewrite, so the pre-flight has to count both
+    /// against it; one on another filesystem does not.
+    #[test]
+    fn same_filesystem_is_decided_by_device_not_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("db")).unwrap();
+        std::fs::create_dir(dir.path().join("backups")).unwrap();
+        assert!(
+            same_filesystem(
+                &dir.path().join("backups/library.db.v3.bak"),
+                &dir.path().join("db/library.db")
+            ),
+            "different directories on one filesystem"
+        );
+        #[cfg(target_os = "linux")]
+        assert!(
+            !same_filesystem(
+                Path::new("/proc/library.db.v3.bak"),
+                &dir.path().join("db/library.db")
+            ),
+            "procfs is another filesystem"
         );
     }
 
