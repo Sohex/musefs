@@ -316,6 +316,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   now documents the post-enumeration steady state as the number to size a host
   against, and the transparent-hugepage inflation some distros' `THP=always`
   default adds on top.
+
 - **Migrations are classified transparent or gated.** A schema step used to be
   applied as a side effect of opening the store, whatever it did. A gated step —
   one that rewrites data, needs the store's size again in free disk, or ends
@@ -369,12 +370,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   now a usage error, and `scan` refuses to start while the variable is set
   rather than silently running a full scan in its place. `musefs_cli::run_scan`
   loses its `revalidate` parameter.
+
 - **`scan --fast` and `--strict`**, replaced by `--match=auto|fast|strict`, and
   `MUSEFS_FAST`/`MUSEFS_STRICT` by `MUSEFS_MATCH`
   ([#709](https://github.com/Sohex/musefs/issues/709)). `auto` is the
   default and behaves as passing neither flag did. The old flags are usage
   errors, and the old variables are refused with the value to use instead.
   `musefs_cli::run_scan` takes a `MatchMode` in their place.
+
 - **Test scaffolding is no longer published API**
   ([#710](https://github.com/Sohex/musefs/issues/710),
   [#751](https://github.com/Sohex/musefs/issues/751)):
@@ -393,10 +396,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   have survived the first revalidate and been treated as current from then on.
   Such a row's uncomputed checksums are now cleared rather than kept
   ([#689](https://github.com/Sohex/musefs/issues/689)).
+
 - **`musefs migrate` exits `2` when the revalidate it ran counted failures**
   ([#750](https://github.com/Sohex/musefs/issues/750)), as `musefs revalidate`
   itself does; it used to exit `0`. The store upgrade has succeeded either way,
   and the run says so. `musefs_cli::run_migrate` returns the failure count.
+  An explicit `--revalidate` that cannot run, because the stored tracks share
+  no directory below `/`, now fails the command after the upgrade instead of
+  exiting `0`. `run_migrate` also refuses `--repair` with `--no-snapshot` itself,
+  rather than relying on the parser: called directly with both, it used to
+  delete the refused rows without a snapshot and then panic.
 
 - **A chained Ogg file stored by 1.3.0 no longer fails every revalidate for
   good** ([#747](https://github.com/Sohex/musefs/issues/747)). 2.0.0 refuses

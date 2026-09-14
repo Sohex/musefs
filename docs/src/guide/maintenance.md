@@ -233,7 +233,7 @@ The two offers decline themselves unless you ask for them:
 | `--snapshot PATH` | Write the snapshot here instead of beside the store. |
 | `--no-snapshot` | Take no snapshot. The upgrade is then not reversible. |
 | `--vacuum` / `--vacuum=false` | Compact afterwards, or do not. Omit to be asked. |
-| `--revalidate` / `--revalidate=false` | Revalidate afterwards, or do not. Omit to be asked. A revalidate that counts failures makes `migrate` exit `2`. |
+| `--revalidate` / `--revalidate=false` | Revalidate afterwards, or do not. Omit to be asked. A revalidate that counts failures makes `migrate` exit `2`; one that cannot run at all, because the tracks share no directory below `/`, fails the command once the store is upgraded. |
 | `--jobs N` | Probe worker threads for that revalidate. |
 
 Running it against a store that is already current reports so and changes

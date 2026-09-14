@@ -832,6 +832,16 @@ fn common_library_root(paths: &[PathBuf]) -> Option<PathBuf> {
 /// (#750): the store is upgraded either way, but a script chaining on the exit
 /// status must be able to tell a partial revalidate from a clean one.
 pub fn run_migrate(args: &MigrateArgs) -> Result<u64> {
+    // The parser refuses these combinations, but this function is public and
+    // its arguments are plain fields, so it enforces them itself. The first one
+    // guards the only destructive step: `--repair` deletes rows, and the
+    // snapshot is the only copy they survive in.
+    if args.repair && args.no_snapshot {
+        anyhow::bail!("--repair requires a snapshot; it cannot be combined with --no-snapshot");
+    }
+    if args.snapshot.is_some() && args.no_snapshot {
+        anyhow::bail!("--snapshot names a snapshot path; it cannot be combined with --no-snapshot");
+    }
     let db = args.db.as_path();
     if !db.exists() {
         anyhow::bail!(
@@ -1069,18 +1079,20 @@ pub fn run_migrate(args: &MigrateArgs) -> Result<u64> {
                 db.display()
             ),
             (None, _) => {
-                if args.revalidate == Some(true) {
-                    // Asked for and not done: say so, rather than let a script
-                    // read the absence of a revalidate as a clean one.
-                    eprintln!(
-                        "musefs: --revalidate was not run: the stored tracks share no \
-                         directory below the filesystem root to revalidate from"
-                    );
-                }
                 println!(
                     "  run later: musefs revalidate <library path> --db {}",
                     db.display()
                 );
+                if args.revalidate == Some(true) {
+                    // Asked for explicitly and not done: fail, rather than let a
+                    // script read the missing revalidate as a clean one. The
+                    // upgrade itself stands, and the message says so.
+                    anyhow::bail!(
+                        "the store is upgraded, but --revalidate was not run: the stored \
+                         tracks share no directory below the filesystem root to \
+                         revalidate from; run `musefs revalidate` over each library root"
+                    );
+                }
             }
         }
     }

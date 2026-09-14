@@ -281,3 +281,68 @@ fn a_revalidate_with_failures_is_reported_to_the_caller() {
         "the upgrade itself landed"
     );
 }
+
+/// `run_migrate` is public and its arguments are plain fields, so the parser's
+/// refusal of `--repair` with `--no-snapshot` cannot be the only guard. Called
+/// directly with both, it must refuse before deleting anything, rather than
+/// repair the store without a snapshot and then panic.
+#[test]
+fn repair_without_a_snapshot_is_refused_by_the_function_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = store_with_a_refused_row(dir.path());
+    let before = user_version(&db);
+    let tags_before: i64 = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row("SELECT count(*) FROM tags", [], |r| r.get(0))
+        .unwrap();
+
+    let mut migrate_args = args(&db);
+    migrate_args.repair = true;
+    migrate_args.no_snapshot = true;
+    let err = run_migrate(&migrate_args).unwrap_err().to_string();
+    assert!(err.contains("--repair requires a snapshot"), "{err}");
+
+    let tags_after: i64 = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row("SELECT count(*) FROM tags", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(tags_after, tags_before, "the refused row is still there");
+    assert_eq!(user_version(&db), before, "and nothing was migrated");
+
+    let mut migrate_args = args(&db);
+    migrate_args.snapshot = Some(dir.path().join("elsewhere.bak"));
+    migrate_args.no_snapshot = true;
+    let err = run_migrate(&migrate_args).unwrap_err().to_string();
+    assert!(err.contains("--snapshot"), "{err}");
+    assert_eq!(user_version(&db), before);
+}
+
+/// An explicit `--revalidate` that cannot run, because the stored tracks share
+/// no directory below `/`, fails the command: the store is upgraded, but the
+/// revalidate the caller asked for did not happen, and exit 0 would say it did.
+#[test]
+fn an_explicit_revalidate_that_cannot_run_fails_after_upgrading() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = gated_store(dir.path());
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    for path in ["/home/u/music/a.flac", "/srv/music/b.flac"] {
+        conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime_ns, backing_ctime_ns, updated_at) \
+             VALUES (CAST(?1 AS BLOB), 'flac', 0, 0, 0, 0, 0, 0)",
+            [path],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let mut migrate_args = args(&db);
+    migrate_args.revalidate = Some(true);
+    let err = run_migrate(&migrate_args).unwrap_err().to_string();
+    assert!(err.contains("--revalidate was not run"), "{err}");
+    assert_eq!(
+        user_version(&db),
+        LATEST_VERSION,
+        "the upgrade itself stands"
+    );
+}

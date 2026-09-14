@@ -515,6 +515,7 @@ see the [Release notes](release-notes.md).
   exit code and that summary are the signals to key on. The engineering is in
   Fixed below. See [Scanning](guide/scanning.md#scan) and
   [Exit codes](guide/troubleshooting.md#exit-codes).
+
 - **Schema migration (`user_version` 3 → 4).** `MIGRATION_V4` sets every
   `tracks.fingerprint` to NULL. The fingerprint's input domain changed (it now
   includes sampled audio), so a value computed by an earlier musefs claims to be
@@ -620,12 +621,19 @@ see the [Release notes](release-notes.md).
   have survived the first revalidate and been treated as current from then on.
   Such a row's uncomputed checksums are now cleared rather than kept
   ([#689](https://github.com/Sohex/musefs/issues/689)).
+
 - **`musefs migrate` exits `2` when the revalidate it ran counted failures**
   ([#750](https://github.com/Sohex/musefs/issues/750)). It discarded the count
   and exited `0`, so `musefs migrate --yes --revalidate && …` treated a partial
   revalidate as a clean one, while `musefs revalidate` run on its own exits `2`
   for the same result. The store upgrade has succeeded either way, and the run
   says so before exiting. `musefs_cli::run_migrate` returns the failure count.
+  An explicit `--revalidate` that cannot run, because the stored tracks share
+  no directory below `/`, now fails the command after the upgrade instead of
+  exiting `0`. `run_migrate` also refuses `--repair` with `--no-snapshot` itself,
+  rather than relying on the parser: called directly with both, it used to
+  delete the refused rows without a snapshot and then panic.
+
 - **A chained Ogg file stored by 1.3.0 no longer fails every revalidate for
   good.** 2.0.0 refuses chained Ogg at scan time, which left the rows an older
   binary stored with no way out: `revalidate` re-probed each one, was refused,
@@ -636,6 +644,7 @@ see the [Release notes](release-notes.md).
   while the file is unchanged since; without `--prune` the run says how many
   there are. The failure breakdown gains an `unsupported` reason
   ([#747](https://github.com/Sohex/musefs/issues/747)).
+
 - **A revalidate restores each file's own picture metadata.** The schema v4
   migration can only copy one blob's MIME type and dimensions onto every link
   to it, with FLAC's depth and colour count at 0, and said the real values
@@ -645,6 +654,7 @@ see the [Release notes](release-notes.md).
   and colours of every link whose image, picture type and description are one
   the file embeds, and leaves every other link alone
   ([#746](https://github.com/Sohex/musefs/issues/746)).
+
 - **Metadata work can no longer grow the worker-pool queue without bound.**
   Reads were capped; `lookup`, `getattr`, `open`, `opendir` and directory
   listings queued without limit. They now pass an admission gate of 4096 jobs,
@@ -653,6 +663,7 @@ see the [Release notes](release-notes.md).
   uncached attributes. Store refreshes moved to a thread of their own. The new
   `musefs_pool_over_cap_total` counter shows when the cap is met.
   ([#694](https://github.com/Sohex/musefs/issues/694))
+
 - **A directory listed without a handle can no longer repeat or skip entries
   when the library changes mid-listing**
   ([#695](https://github.com/Sohex/musefs/issues/695)). Past the 1,024
