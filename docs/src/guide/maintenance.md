@@ -275,12 +275,22 @@ overwrite an existing snapshot.
 
 The copy is written under a temporary name beside the snapshot's —
 `library.db.v2.bak.partial-<pid>-<seq>-<nanos>`, three numbers — synced to disk,
-and only then renamed into place, so a file under the snapshot's own name is
-always complete. A run that is killed or crashes while copying leaves the
+and only then given the snapshot's name, so a file under the snapshot's own name
+is always complete. A run that is killed or crashes while copying leaves the
 temporary file instead. It can never be a usable snapshot, so the next `migrate`
 removes it, says so, and takes the snapshot again. Only a name of exactly that
 shape is removed: `library.db.v2.bak.partial-2026` or any other file that merely
 resembles one is left alone.
+
+The name is given by an operation that fails rather than replace a file already
+there, so a file something else creates under the snapshot's name while the copy
+is written is never overwritten. That operation is a hard link. On a filesystem
+without hard links — FAT, exFAT, some network shares — it is a rename that
+checks the name is free in the same step as the move, on Linux and macOS. Where
+neither exists, as on such a filesystem under FreeBSD, `migrate` stops before
+the upgrade: it removes the copy, leaves nothing under the snapshot's name, and
+changes nothing in the store. Give `--snapshot PATH` on a filesystem that
+supports hard links, or pass `--no-snapshot`.
 
 ### Disk space
 

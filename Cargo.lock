@@ -1036,6 +1036,7 @@ dependencies = [
  "log",
  "musefs-db",
  "rusqlite",
+ "rustix",
  "sha2",
  "strum",
  "tempfile",

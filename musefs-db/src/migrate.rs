@@ -249,16 +249,26 @@ impl PendingMigration {
     /// [`PendingMigration::clear_partial_snapshots`] recognises and removes,
     /// rather than a torn file that looks like a snapshot to anyone restoring
     /// from it and blocks the rerun from writing a real one.
+    ///
+    /// The name is given by an operation that refuses an existing `dest`: a hard
+    /// link, or on a filesystem without hard links, a rename that checks and moves
+    /// in one step (`renameat2` with `RENAME_NOREPLACE` on Linux, `renameatx_np`
+    /// with `RENAME_EXCL` on Apple platforms). Where neither is available the
+    /// snapshot is refused with [`crate::DbError::Snapshot`] carrying an
+    /// [`std::io::ErrorKind::Unsupported`] error, and nothing is left under
+    /// `dest` or beside it.
     pub fn snapshot_to(&self, dest: &Path) -> Result<()> {
-        self.snapshot_via(dest, |_| Ok(()))
+        self.snapshot_via(dest, PUBLISH, |_| Ok(()))
     }
 
-    /// [`PendingMigration::snapshot_to`], running `before_publish` in the window
-    /// between the finished, synced copy and its move into place — the window a
-    /// kill has to land in for the promise above to matter.
+    /// [`PendingMigration::snapshot_to`], naming the copy with `ops` and running
+    /// `before_publish` in the window between the finished, synced copy and its
+    /// move into place — the window a kill has to land in for the promise above
+    /// to matter.
     fn snapshot_via(
         &self,
         dest: &Path,
+        ops: PublishOps,
         before_publish: impl FnOnce(&Path) -> std::io::Result<()>,
     ) -> Result<()> {
         let refuse = |source| crate::DbError::Snapshot {
@@ -281,7 +291,7 @@ impl PendingMigration {
         }
         let partial = partial_snapshot_path(dest);
         let written = maintenance::snapshot_into(&self.conn, &partial, OP)
-            .and_then(|()| publish_snapshot(&partial, dest, before_publish).map_err(refuse));
+            .and_then(|()| publish_snapshot(&partial, dest, ops, before_publish).map_err(refuse));
         if written.is_err() {
             // Whatever there is of it can never become a snapshot. Best effort:
             // a copy this could not remove is cleared by the next run.
@@ -738,11 +748,68 @@ fn snapshot_exists() -> std::io::Error {
     )
 }
 
+/// The operations that give a finished copy its name. A test substitutes them to
+/// fail one, or to act just before one runs.
+#[derive(Clone, Copy)]
+struct PublishOps {
+    link: fn(&Path, &Path) -> std::io::Result<()>,
+    rename: fn(&Path, &Path) -> std::io::Result<()>,
+}
+
+const PUBLISH: PublishOps = PublishOps {
+    link: |from, to| std::fs::hard_link(from, to),
+    rename: rename_no_replace,
+};
+
+/// Move `from` to `to` in one step that fails with `AlreadyExists` if `to`
+/// exists: `renameat2` with `RENAME_NOREPLACE` on Linux, `renameatx_np` with
+/// `RENAME_EXCL` on Apple platforms. `Unsupported` where the kernel or the
+/// filesystem lacks it.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+    use rustix::io::Errno;
+    renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE).map_err(|errno| {
+        // Linux answers EINVAL where the filesystem does not implement the flag
+        // and ENOSYS before 3.15; Apple answers ENOTSUP where the volume lacks it
+        // and ENOSYS before 10.12.
+        if [Errno::INVAL, Errno::NOSYS, Errno::NOTSUP].contains(&errno) {
+            std::io::Error::new(std::io::ErrorKind::Unsupported, errno)
+        } else {
+            errno.into()
+        }
+    })
+}
+
+/// No rename here refuses an existing name in the same step. FreeBSD's
+/// `renameat2` checks `AT_RENAME_NOREPLACE` before a filesystem's own rename,
+/// which may relock and reopen the window, so it is not atomic everywhere.
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn rename_no_replace(_: &Path, _: &Path) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
+/// The snapshot cannot be named without risking a file someone else creates
+/// under its name, since neither operation that refuses one is available.
+fn no_safe_publish(link: &std::io::Error, rename: &std::io::Error) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!(
+            "this filesystem refused a hard link ({link}) and has no rename that refuses \
+             an existing file ({rename}), so the snapshot cannot be given its name without \
+             risking replacing a file created there meanwhile; write it to a filesystem \
+             that supports hard links with `musefs migrate --snapshot PATH`, or skip it \
+             with `--no-snapshot`"
+        ),
+    )
+}
+
 /// Give the finished copy at `partial` the name `dest`, never replacing a file
 /// already there, and make the name durable.
 fn publish_snapshot(
     partial: &Path,
     dest: &Path,
+    ops: PublishOps,
     before_publish: impl FnOnce(&Path) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     // `VACUUM INTO` does not sync what it writes. Without this, a crash after
@@ -751,21 +818,29 @@ fn publish_snapshot(
     before_publish(partial)?;
     // A hard link is the portable rename that refuses to replace: it fails when
     // `dest` exists, where `rename` would silently overwrite it.
-    if std::fs::hard_link(partial, dest).is_ok() {
-        // The snapshot is in place under both names. A temporary name this
-        // could not remove is only a second link to a complete copy, and the
-        // next run clears it.
-        let _ = std::fs::remove_file(partial);
-    } else {
-        // Refused because `dest` is taken, or by a filesystem without hard links
-        // (FAT, exFAT, some network shares). A taken name stays refused;
-        // otherwise the copy is renamed into place after all. The command holds
-        // the store throughout, so only a writer unrelated to musefs could take
-        // the name in between.
-        if std::fs::symlink_metadata(dest).is_ok() {
-            return Err(snapshot_exists());
+    match (ops.link)(partial, dest) {
+        Ok(()) => {
+            // The snapshot is in place under both names. A temporary name this
+            // could not remove is only a second link to a complete copy, and the
+            // next run clears it.
+            let _ = std::fs::remove_file(partial);
         }
-        std::fs::rename(partial, dest)?;
+        // Taken: refused there and then, with nothing else tried.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(snapshot_exists()),
+        // A filesystem without hard links (FAT, exFAT, some network shares). The
+        // fallback checks that `dest` is free in the same step that moves the
+        // copy, so a file created there in the meantime is refused, not replaced.
+        // Without such a step the snapshot is not published at all.
+        Err(link) => match (ops.rename)(partial, dest) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(snapshot_exists());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                return Err(no_safe_publish(&link, &e));
+            }
+            Err(e) => return Err(e),
+        },
     }
     sync_dir(parent_dir(dest))
 }
@@ -839,7 +914,7 @@ mod snapshot_tests {
         let pending = PendingMigration::open(&store).unwrap();
 
         let err = pending
-            .snapshot_via(&dest, |partial| {
+            .snapshot_via(&dest, super::PUBLISH, |partial| {
                 assert!(
                     !dest.exists(),
                     "the snapshot's name must stay free until the copy is complete"
@@ -934,11 +1009,158 @@ mod snapshot_tests {
         // Taken between the check and the rename, it is refused there too.
         std::fs::remove_file(&dest).unwrap();
         let err = pending
-            .snapshot_via(&dest, |_| std::fs::write(&dest, b"a racing writer"))
+            .snapshot_via(&dest, super::PUBLISH, |_| {
+                std::fs::write(&dest, b"a racing writer")
+            })
             .unwrap_err();
         assert!(matches!(err, crate::DbError::Snapshot { .. }), "{err:?}");
         assert_eq!(std::fs::read(&dest).unwrap(), b"a racing writer");
         assert!(partials(dir.path()).is_empty());
+    }
+
+    /// A hard link the filesystem refuses, as FAT does, with `EPERM`.
+    fn no_hard_links(_: &Path, _: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "no hard links here",
+        ))
+    }
+
+    /// Where the hard link is refused, a file another party creates under the
+    /// name in the last moment before the fallback runs is still never replaced:
+    /// the fallback refuses an existing name in the same step that moves the copy.
+    #[test]
+    fn a_name_taken_just_before_the_fallback_is_never_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_at_v3(dir.path());
+        let dest = dir.path().join("s.db.v3.bak");
+        let racing = super::PublishOps {
+            link: no_hard_links,
+            rename: |from, to| {
+                std::fs::write(to, b"a racing writer")?;
+                (super::PUBLISH.rename)(from, to)
+            },
+        };
+
+        let err = PendingMigration::open(&store)
+            .unwrap()
+            .snapshot_via(&dest, racing, |_| Ok(()))
+            .unwrap_err();
+        assert!(matches!(err, crate::DbError::Snapshot { .. }), "{err:?}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"a racing writer");
+        assert!(partials(dir.path()).is_empty());
+    }
+
+    /// A name the hard link finds taken is refused there and then. Nothing else
+    /// is tried, so no fallback can reach the file that took it.
+    #[test]
+    fn a_name_the_hard_link_finds_taken_goes_no_further() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_at_v3(dir.path());
+        let dest = dir.path().join("s.db.v3.bak");
+        let ops = super::PublishOps {
+            link: super::PUBLISH.link,
+            rename: |_, _| panic!("a name the hard link found taken reached the fallback"),
+        };
+
+        let err = PendingMigration::open(&store)
+            .unwrap()
+            .snapshot_via(&dest, ops, |_| std::fs::write(&dest, b"a racing writer"))
+            .unwrap_err();
+        assert!(
+            matches!(&err, crate::DbError::Snapshot { source, .. }
+                if source.kind() == std::io::ErrorKind::AlreadyExists),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"a racing writer");
+        assert!(partials(dir.path()).is_empty());
+    }
+
+    /// Where the hard link is refused and the name is free, the fallback gives the
+    /// copy its name.
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn without_hard_links_the_fallback_names_a_free_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_at_v3(dir.path());
+        let dest = dir.path().join("s.db.v3.bak");
+        let ops = super::PublishOps {
+            link: no_hard_links,
+            rename: super::PUBLISH.rename,
+        };
+
+        PendingMigration::open(&store)
+            .unwrap()
+            .snapshot_via(&dest, ops, |_| Ok(()))
+            .unwrap();
+        assert_eq!(user_version(&dest), 3);
+        assert!(partials(dir.path()).is_empty());
+    }
+
+    /// With neither a hard link nor a rename that refuses an existing name, the
+    /// snapshot is not published: nothing is left under its name or beside it,
+    /// and the error says what to do instead.
+    #[test]
+    fn with_no_safe_way_to_name_it_nothing_is_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_at_v3(dir.path());
+        let dest = dir.path().join("s.db.v3.bak");
+        let ops = super::PublishOps {
+            link: no_hard_links,
+            rename: |_, _| Err(std::io::ErrorKind::Unsupported.into()),
+        };
+
+        let err = PendingMigration::open(&store)
+            .unwrap()
+            .snapshot_via(&dest, ops, |_| Ok(()))
+            .unwrap_err();
+        let crate::DbError::Snapshot { source, .. } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(source.kind(), std::io::ErrorKind::Unsupported);
+        let message = source.to_string();
+        assert!(
+            message.contains("--snapshot PATH") && message.contains("--no-snapshot"),
+            "the refusal must name both ways forward: {message}"
+        );
+        assert!(!dest.exists(), "nothing is published");
+        assert!(partials(dir.path()).is_empty(), "nor left beside it");
+    }
+
+    /// The fallback itself moves a file onto a free name and refuses a taken one,
+    /// leaving both files as they were. Where no such rename exists it reports
+    /// that, and never falls back to one that replaces.
+    #[test]
+    fn the_no_replace_rename_refuses_a_taken_name() {
+        let supported = cfg!(any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple"
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let (from, to) = (dir.path().join("from"), dir.path().join("to"));
+        std::fs::write(&from, b"copy").unwrap();
+        std::fs::write(&to, b"theirs").unwrap();
+
+        let taken = super::rename_no_replace(&from, &to).unwrap_err();
+        let expected = if supported {
+            std::io::ErrorKind::AlreadyExists
+        } else {
+            std::io::ErrorKind::Unsupported
+        };
+        assert_eq!(taken.kind(), expected, "{taken}");
+        assert_eq!(std::fs::read(&from).unwrap(), b"copy");
+        assert_eq!(std::fs::read(&to).unwrap(), b"theirs");
+
+        std::fs::remove_file(&to).unwrap();
+        if supported {
+            super::rename_no_replace(&from, &to).unwrap();
+            assert_eq!(std::fs::read(&to).unwrap(), b"copy");
+            assert!(!from.exists());
+        } else {
+            super::rename_no_replace(&from, &to).unwrap_err();
+            assert!(!to.exists());
+        }
     }
 
     /// Beside a directory that is not there, there is nothing to clear. One that

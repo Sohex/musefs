@@ -135,6 +135,10 @@ a store 1.3.0 left. `--snapshot PATH` puts it elsewhere; `--no-snapshot` skips
 it, and the upgrade is then one-way. `migrate` refuses to overwrite an existing
 snapshot, and moves the copy under the snapshot's name only once it is complete,
 so a run killed while copying leaves nothing there to restore from by mistake.
+On a filesystem without hard links, under FreeBSD, the copy cannot be given its
+name without risking replacing a file, so `migrate` refuses before upgrading:
+put the snapshot on another filesystem with `--snapshot PATH`, or pass
+`--no-snapshot`.
 There is no restore command: to go back, stop everything, replace the
 store with the snapshot, delete any leftover `library.db-wal` and
 `library.db-shm`, and run 1.3.0.

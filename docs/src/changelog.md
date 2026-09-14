@@ -144,10 +144,15 @@ see the [Release notes](release-notes.md).
 
   The snapshot is written to `<dest>.partial-<pid>-<seq>-<nanos>` beside it,
   synced, hard-linked to its final name (which, unlike `rename`, refuses an
-  existing file; a filesystem without hard links gets a checked rename), and the
-  directory synced. So a `migrate` killed mid-copy never leaves a torn file under
-  the snapshot's name for someone to restore from, and a rerun removes the
-  leftover temporary copy and says so.
+  existing file), and the directory synced. A filesystem without hard links gets
+  a rename that refuses an existing file in the same step,
+  `renameat2(RENAME_NOREPLACE)` on Linux and `renameatx_np(RENAME_EXCL)` on
+  macOS; where there is none, as under FreeBSD, `migrate` takes no snapshot,
+  leaves nothing under its name, and names `--snapshot PATH` and `--no-snapshot`.
+  So a `migrate` killed mid-copy never leaves a torn file under the snapshot's
+  name for someone to restore from, a file created under that name meanwhile is
+  never replaced, and a rerun removes the leftover temporary copy, and only a
+  file of exactly that name's shape, and says so.
   Afterwards it reports that the store grew and offers a vacuum, and reports
   how many tracks lost the fingerprint this upgrade retires and offers a
   `revalidate` over the directory the library shares, which recomputes them.
