@@ -3248,6 +3248,54 @@ fn synthesize_strips_the_readable_prefix_of_a_garbled_second_mdia() {
 }
 
 #[test]
+fn synthesize_keeps_a_keyed_meta_nested_in_track_udta() {
+    // The reader takes keyed metadata from `trak/meta` and `trak/mdia/meta` only,
+    // so a keyed `meta` inside `trak/udta` is not ingested — and must not be
+    // dropped either. Only `mdia` is descended into; every other track child is
+    // copied through byte for byte.
+    let nested = keyed_meta(&[("com.apple.quicktime.title", text("Nested"))]);
+    let trak_udta = bx(b"udta", &nested);
+    let trak = bx(b"trak", &[soun_mdia(&[]), trak_udta.clone()].concat());
+    let buf = mp4_around(&trak, b"AUDIODATA", &[0]);
+    assert!(
+        read_tags(&buf).is_empty(),
+        "trak/udta is not a keyed location"
+    );
+
+    let scan = read_structure(&buf).unwrap();
+    let layout = synthesize_layout(&scan, &[], &[], &[]).unwrap();
+    let served = serve_unstreamed(&layout, &buf);
+    let s = read_structure(&served).unwrap();
+    let mp = &s.moov[8..];
+    let new_trak = child_boxes(mp).unwrap()[1];
+    assert_eq!(new_trak.total_len, trak.len());
+    assert_eq!(
+        child_box_bytes(new_trak.payload(mp), b"udta"),
+        vec![trak_udta]
+    );
+}
+
+#[test]
+fn chunk_offsets_reads_every_tracks_stco_or_co64_table() {
+    // Several entries, so an entry's position depends on its index and width.
+    let stco = mk_mp4(true, b"AUDIODATA", &[42, 100, 7]);
+    assert_eq!(
+        chunk_offsets(&read_structure(&stco).unwrap().moov).unwrap(),
+        vec![vec![42, 100, 7]]
+    );
+    let co64 = mk_mp4_co64(b"AUDIODATA", &[1 << 40, 5, 9]);
+    assert_eq!(
+        chunk_offsets(&read_structure(&co64).unwrap().moov).unwrap(),
+        vec![vec![1 << 40, 5, 9]]
+    );
+    let chaptered = mk_mp4_chaptered(b"text", 3, 9);
+    assert_eq!(
+        chunk_offsets(&read_structure(&chaptered).unwrap().moov).unwrap(),
+        vec![vec![3], vec![9]]
+    );
+}
+
+#[test]
 fn read_binary_tags_never_reads_keyed_items() {
     let meta = keyed_meta(&[
         ("com.example.blob", data_atom(0, &[1, 2, 3])),

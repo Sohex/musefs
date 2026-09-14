@@ -51,6 +51,51 @@ fn normalized(db: &Db) -> Vec<NormalizedTrack> {
     out
 }
 
+/// QuickTime keyed metadata (#771) reaches the store identically through the
+/// legacy whole-file probe and the bounded seek probe — which hands the readers
+/// `scan.moov` alone — whether `moov` precedes or follows `mdat`. The iTunes
+/// `©nam` beats the keyed title; the keyed artist, the track- and media-level
+/// values and the keyed artwork fill in what the iTunes tags lack.
+#[test]
+fn bounded_probe_ingests_m4a_keyed_metadata_like_the_full_probe() {
+    use musefs_format::fuzz_check::fixtures;
+    for bytes in [
+        fixtures::m4a_keyed(&[9u8; 64]),
+        fixtures::m4a_keyed_moov_last(&[9u8; 64]),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("keyed.m4a"), &bytes).unwrap();
+
+        let oracle_db = Db::open_in_memory().unwrap();
+        musefs_core::scan_directory_full_oracle(&oracle_db, dir.path()).unwrap();
+        let oracle = normalized(&oracle_db);
+
+        let bounded_db = Db::open_in_memory().unwrap();
+        let mut options = musefs_core::ScanOptions::default();
+        options.window = 64;
+        musefs_core::scan_directory_with(&bounded_db, dir.path(), &options).unwrap();
+        assert_eq!(oracle, normalized(&bounded_db));
+
+        assert_eq!(oracle.len(), 1, "the keyed file was scanned");
+        let mut tags: Vec<(&str, &str)> = oracle[0]
+            .3
+            .iter()
+            .map(|(k, v, _)| (k.as_str(), v.as_str()))
+            .collect();
+        tags.sort_unstable();
+        assert_eq!(
+            tags,
+            vec![
+                ("artist", "Keyed Artist"),
+                ("comment", "Keyed Comment"),
+                ("player.movie.audio.mute", "1"),
+                ("title", "Orig M4A"),
+            ]
+        );
+        assert_eq!(oracle[0].4.len(), 1, "the keyed artwork became art");
+    }
+}
+
 #[test]
 fn bounded_probe_equivalent_to_full_for_every_format() {
     for fmt in bench_formats() {

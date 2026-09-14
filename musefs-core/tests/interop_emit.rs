@@ -14,7 +14,7 @@ use std::path::Path;
 // `mutagen.mp4.MP4(path)` opens the synthesized output without error:
 //
 //   • `mdhd` (Media Header, FullBox v0) inside `trak/mdia`
-//   • `stsd` (Sample Description, FullBox, entry_count=0) inside `stbl`
+//   • `stsd` (Sample Description, FullBox, one bare `mp4a` entry) inside `stbl`
 //
 // musefs's own `read_structure` / `validate_moov` is unaffected: it only
 // requires `ftyp`, `mvhd`, exactly one `soun` trak whose `stbl` has `stco`,
@@ -39,7 +39,7 @@ fn m4a_data_atom(type_code: u32, value: &[u8]) -> Vec<u8> {
 /// Richer M4A fixture accepted by both musefs's `read_structure` and
 /// `mutagen.mp4.MP4`.  Differences from `fuzz_check::fixtures::m4a`:
 ///   - `mdhd` v0 FullBox added before `hdlr` inside `trak/mdia`
-///   - empty `stsd` FullBox added before `stco` inside `stbl`
+///   - `stsd` FullBox with one bare `mp4a` entry added before `stco` inside `stbl`
 fn richer_m4a(mdat_payload: &[u8]) -> Vec<u8> {
     // ilst tag atoms
     let ilst_atoms = [
@@ -70,10 +70,22 @@ fn richer_m4a(mdat_payload: &[u8]) -> Vec<u8> {
     stco_payload.extend_from_slice(&1u32.to_be_bytes());
     stco_payload.extend_from_slice(&0u32.to_be_bytes());
 
-    // stsd FullBox (empty — entry_count=0); mutagen reads it but does not
-    // require actual codec entries to open the file.
+    // stsd FullBox with one bare `mp4a` AudioSampleEntry. mutagen opens a file
+    // whose stsd is empty, but ffprobe refuses one ("invalid STSD entries 0"), and
+    // the keyed-metadata test (#771) reads these fixtures with ffprobe too. The
+    // entry is the 28 fixed AudioSampleEntry bytes and a `free` child: mutagen
+    // reads one child atom there and ignores any that is not `esds`.
+    let mut mp4a = vec![0u8; 6]; // reserved
+    mp4a.extend_from_slice(&1u16.to_be_bytes()); // data_reference_index
+    mp4a.extend_from_slice(&[0u8; 8]); // version, revision, vendor
+    mp4a.extend_from_slice(&2u16.to_be_bytes()); // channels
+    mp4a.extend_from_slice(&16u16.to_be_bytes()); // sample size
+    mp4a.extend_from_slice(&[0u8; 4]); // compression id, packet size
+    mp4a.extend_from_slice(&(44_100u32 << 16).to_be_bytes()); // sample rate, 16.16
+    mp4a.extend(bx(b"free", b""));
     let mut stsd_payload = vec![0u8; 4]; // version=0, flags=0
-    stsd_payload.extend_from_slice(&0u32.to_be_bytes()); // entry_count = 0
+    stsd_payload.extend_from_slice(&1u32.to_be_bytes()); // entry_count = 1
+    stsd_payload.extend(bx(b"mp4a", &mp4a));
     let stbl = bx(
         b"stbl",
         &[bx(b"stsd", &stsd_payload), bx(b"stco", &stco_payload)].concat(),
@@ -96,6 +108,76 @@ fn richer_m4a(mdat_payload: &[u8]) -> Vec<u8> {
     let moov = bx(b"moov", &[bx(b"mvhd", &[0u8; 8]), trak, udta].concat());
 
     [bx(b"ftyp", b"M4A isom"), moov, bx(b"mdat", mdat_payload)].concat()
+}
+
+/// A bare (QuickTime-style) keyed-metadata `meta`: an `mdta` `hdlr`, a `keys`
+/// table naming each item's key, and an `ilst` whose items are typed by their
+/// 1-based key index (#771).
+fn keyed_meta(items: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut hdlr = vec![0u8; 8];
+    hdlr.extend_from_slice(b"mdta");
+    hdlr.extend_from_slice(&[0u8; 13]);
+    let mut keys = vec![0u8; 4];
+    keys.extend_from_slice(&u32::try_from(items.len()).unwrap().to_be_bytes());
+    let mut ilst = Vec::new();
+    for (i, (name, value)) in items.iter().enumerate() {
+        keys.extend_from_slice(&u32::try_from(8 + name.len()).unwrap().to_be_bytes());
+        keys.extend_from_slice(b"mdta");
+        keys.extend_from_slice(name.as_bytes());
+        let index = u32::try_from(i + 1).unwrap().to_be_bytes();
+        ilst.extend(bx(&index, &m4a_data_atom(1, value)));
+    }
+    bx(
+        b"meta",
+        &[bx(b"hdlr", &hdlr), bx(b"keys", &keys), bx(b"ilst", &ilst)].concat(),
+    )
+}
+
+/// `richer_m4a` plus Apple-style keyed metadata at the movie level and in the
+/// audio track, whose values must not survive synthesis. Appended to the end of
+/// `moov` and `trak`, which precede `mdat`, so the fixture's `stco` placeholder
+/// is unaffected.
+fn richer_m4a_with_keyed_metadata(mdat_payload: &[u8]) -> Vec<u8> {
+    let plain = richer_m4a(mdat_payload);
+    let movie = keyed_meta(&[
+        ("com.apple.quicktime.artist", b"Old Keyed Artist"),
+        ("com.apple.quicktime.title", b"Old Keyed Title"),
+    ]);
+    let track = keyed_meta(&[("com.apple.quicktime.comment", b"Old Keyed Comment")]);
+    // Re-box: splice `track` at the end of the trak, `movie` at the end of moov.
+    let moov_at = plain.windows(4).position(|w| w == b"moov").unwrap() - 4;
+    let moov_len = usize::try_from(u32::from_be_bytes(
+        plain[moov_at..moov_at + 4].try_into().unwrap(),
+    ))
+    .unwrap();
+    let trak_at = plain.windows(4).position(|w| w == b"trak").unwrap() - 4;
+    let trak_len = usize::try_from(u32::from_be_bytes(
+        plain[trak_at..trak_at + 4].try_into().unwrap(),
+    ))
+    .unwrap();
+    let trak = bx(
+        b"trak",
+        &[&plain[trak_at + 8..trak_at + trak_len], &track[..]].concat(),
+    );
+    let moov_body = [
+        &plain[moov_at + 8..trak_at],
+        &trak[..],
+        &plain[trak_at + trak_len..moov_at + moov_len],
+        &movie[..],
+    ]
+    .concat();
+    let mut out = [
+        &plain[..moov_at],
+        &bx(b"moov", &moov_body)[..],
+        &plain[moov_at + moov_len..],
+    ]
+    .concat();
+    // Point the `stco` entry at the real payload: synthesis drops the keyed
+    // metas, shrinking `moov`, so a placeholder 0 would relocate below zero.
+    let payload_at = u32::try_from(out.len() - mdat_payload.len()).unwrap();
+    let entry = out.windows(4).position(|w| w == b"stco").unwrap() + 12;
+    out[entry..entry + 4].copy_from_slice(&payload_at.to_be_bytes());
+    out
 }
 // ── end local M4A helper ─────────────────────────────────────────────────────
 
@@ -395,6 +477,34 @@ fn emit_interop_fixtures() {
             synth_audio_length: al,
             ogg_payload_only: false,
             covr_count: 2,
+        });
+    }
+
+    // MP4 whose source carries QuickTime keyed metadata (#771): the served file
+    // must carry only the store's tags, so no reader sees the old keyed values.
+    {
+        let bytes = richer_m4a_with_keyed_metadata(&[7u8; 64]);
+        let scan = musefs_format::mp4::read_structure(&bytes).unwrap();
+        let (ao, al) = emit(
+            &dir.join("src_keyed.m4a"),
+            &dir.join("out_keyed.m4a"),
+            &bytes,
+            Format::M4a,
+            scan.mdat_payload_offset,
+            scan.mdat_payload_len,
+            &[],
+        );
+        manifest.push(ManifestRow {
+            file: "out_keyed.m4a",
+            source_file: "src_keyed.m4a",
+            title: "Interop Title",
+            artist: "Interop Artist",
+            source_audio_offset: scan.mdat_payload_offset,
+            source_audio_length: scan.mdat_payload_len,
+            synth_audio_offset: ao,
+            synth_audio_length: al,
+            ogg_payload_only: false,
+            covr_count: 0,
         });
     }
 

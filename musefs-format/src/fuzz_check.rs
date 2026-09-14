@@ -656,6 +656,7 @@ mod tests {
 #[cfg(test)]
 mod fixtures_tests {
     use super::fixtures;
+    use crate::layout::{RegionLayout, Segment};
 
     #[test]
     fn flac_fixture_parses() {
@@ -719,6 +720,108 @@ mod fixtures_tests {
         let off = u32::from_be_bytes(f[stco + 12..stco + 16].try_into().unwrap());
         assert_eq!(off, expected);
         assert!(off > 0);
+    }
+
+    #[test]
+    fn m4a_keyed_fixtures_carry_keyed_metadata_at_every_level() {
+        // Both box orders: the iTunes title wins, the movie-level artist and
+        // artwork, track-level setting and media-level comment fill in, three keyed
+        // `meta`s exist, and the `stco` entry is the real payload offset.
+        let payload = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        for f in [
+            fixtures::m4a_keyed(&payload),
+            fixtures::m4a_keyed_moov_last(&payload),
+        ] {
+            let scan = crate::mp4::read_structure(&f).unwrap();
+            assert_eq!(
+                &f[crate::convert::usize_from(scan.mdat_payload_offset)..][..payload.len()],
+                payload
+            );
+            let mut tags = crate::mp4::read_tags(&f);
+            tags.sort();
+            let want: Vec<(String, String)> = [
+                ("artist", "Keyed Artist"),
+                ("comment", "Keyed Comment"),
+                ("player.movie.audio.mute", "1"),
+                ("title", "Orig M4A"),
+            ]
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+            assert_eq!(tags, want);
+            let pics = crate::mp4::read_pictures(&f, usize::MAX);
+            assert_eq!(pics.len(), 1);
+            assert_eq!(pics[0].mime, "image/png");
+            assert_eq!(pics[0].data, b"\x89PNG\r\n\x1a\nkeyed-artwork");
+            assert_eq!(crate::mp4::keyed_metas(&f).len(), 3);
+            assert_eq!(
+                crate::mp4::chunk_offsets(&scan.moov).unwrap(),
+                vec![vec![scan.mdat_payload_offset]]
+            );
+        }
+    }
+
+    /// The whole file as an unsynthesized layout: everything before the `mdat`
+    /// payload inline, then the payload as backing audio starting at `audio_at`.
+    fn identity_layout(f: &[u8], audio_at: u64, audio_len: u64) -> RegionLayout {
+        let head = f[..crate::convert::usize_from(audio_at)].to_vec();
+        RegionLayout::validated(vec![
+            Segment::Inline(head),
+            Segment::BackingAudio {
+                offset: audio_at,
+                len: audio_len,
+            },
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn mp4_single_metadata_system_holds_for_a_real_synthesis() {
+        let f = fixtures::m4a_keyed(&[9u8; 16]);
+        let scan = crate::mp4::read_structure(&f).unwrap();
+        let tags = [crate::input::TagInput::new("title", "New")];
+        let layout = crate::mp4::synthesize_layout(&scan, &tags, &[], &[]).unwrap();
+        super::assert_mp4_single_metadata_system(&f, &scan, &layout);
+    }
+
+    #[test]
+    #[should_panic(expected = "a QuickTime keyed-metadata meta survived synthesis")]
+    fn mp4_single_metadata_system_rejects_surviving_keyed_metadata() {
+        let f = fixtures::m4a_keyed(&[9u8; 16]);
+        let scan = crate::mp4::read_structure(&f).unwrap();
+        let layout = identity_layout(&f, scan.mdat_payload_offset, scan.mdat_payload_len);
+        super::assert_mp4_single_metadata_system(&f, &scan, &layout);
+    }
+
+    #[test]
+    #[should_panic(expected = "chunk offsets not shifted by the delta")]
+    fn mp4_single_metadata_system_rejects_a_skewed_chunk_offset() {
+        let f = fixtures::m4a(&[9u8; 16]);
+        let scan = crate::mp4::read_structure(&f).unwrap();
+        let mut skewed = f.clone();
+        let entry = skewed.windows(4).position(|w| w == b"stco").unwrap() + 12;
+        let v = u32::from_be_bytes(skewed[entry..entry + 4].try_into().unwrap()) + 1;
+        skewed[entry..entry + 4].copy_from_slice(&v.to_be_bytes());
+        let layout = identity_layout(&skewed, scan.mdat_payload_offset, scan.mdat_payload_len);
+        super::assert_mp4_single_metadata_system(&f, &scan, &layout);
+    }
+
+    #[test]
+    #[should_panic(expected = "served audio differs")]
+    fn mp4_single_metadata_system_rejects_shifted_audio() {
+        let f = fixtures::m4a(&[1u8, 2, 3, 4]);
+        let scan = crate::mp4::read_structure(&f).unwrap();
+        let head = f[..crate::convert::usize_from(scan.mdat_payload_offset)].to_vec();
+        // One byte early: the served payload starts with the last mdat header byte.
+        let layout = RegionLayout::validated(vec![
+            Segment::Inline(head),
+            Segment::BackingAudio {
+                offset: scan.mdat_payload_offset - 1,
+                len: scan.mdat_payload_len,
+            },
+        ])
+        .unwrap();
+        super::assert_mp4_single_metadata_system(&f, &scan, &layout);
     }
 
     #[test]
