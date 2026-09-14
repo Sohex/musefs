@@ -165,7 +165,7 @@ offset/length, tags, pictures, structural blocks) on a parallel probe
 pipeline feeding a single DB writer, committing in batches. Probing reads
 are bounded — the scanner never slurps whole files — and ingestion caps
 per-item sizes (`MAX_ART_BYTES`, `MAX_BINARY_TAG_BYTES`, and the store's
-`tags.key`/`tags.value`/`art.mime`/`track_art.description` limits) so a crafted
+`tags.key`/`tags.value`/`track_art.mime`/`track_art.description` limits) so a crafted
 file cannot balloon the store.
 
 `check_storable` applies every one of those caps in a single place, before

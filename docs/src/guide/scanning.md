@@ -130,8 +130,11 @@ library, run a normal `musefs scan` on the new locations. For each file not
 already in the store, the scanner looks up rows whose fingerprint matches and
 whose old path is gone, and retargets the unique match in place — its `id`,
 tags, and art are preserved. Move recovery only applies to rows that were
-fingerprinted before the move (rows scanned under `--checksum=none` have no
-fingerprint and cannot be retargeted until a later fingerprint-tier `revalidate`).
+fingerprinted before the move. Rows scanned under `--checksum=none` have no
+fingerprint, and once their files move nothing can give them one: `revalidate`
+ignores files at new paths, and the old ones are gone. Run a fingerprint-tier
+`musefs revalidate` over them *before* moving the files, while each row still
+points at its file.
 
 A `content_hash` only ever describes the file a row currently points at. A pass
 that computes no full hash — a `fingerprint`-tier revalidate of a rewritten file,
