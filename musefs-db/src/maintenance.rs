@@ -75,7 +75,7 @@ impl Db<ReadWrite> {
     /// `-wal`.
     ///
     /// The store is claimed first, exactly as `migrate` claims it
-    /// ([`claim_exclusive`]), and refused with [`DbError::StoreInUse`] if anything
+    /// (`claim_exclusive`), and refused with [`DbError::StoreInUse`] if anything
     /// else has it open (#721). Mapping a busy `VACUUM` alone was not that check:
     /// in WAL mode a mount idle between reads holds no lock, so the rewrite ran
     /// underneath it. The claim is held through the vacuum and the checkpoint,

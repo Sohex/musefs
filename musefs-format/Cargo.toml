@@ -6,6 +6,15 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../README.md"
+keywords = ["audio", "metadata", "tags", "flac", "id3"]
+categories = ["multimedia::audio", "parser-implementations", "encoding"]
+# Integration tests stay in the repository: they need the `fuzzing` feature,
+# which only the path self-dev-dependency below turns on, and cargo strips path
+# dev-dependencies at publish. From the published crate some would fail to
+# build and the `#![cfg(feature = "fuzzing")]` proptests would silently
+# compile to nothing.
+exclude = ["tests/"]
 
 [dependencies]
 thiserror = "2"

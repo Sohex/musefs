@@ -8,9 +8,9 @@
 //! `reply_errno` through [`serve_warn!`](crate::serve_warn) rather than owning
 //! a limiter of its own.
 //!
-//! Lives in `musefs-core` (the integration layer) next to [`crate::telemetry`],
+//! Lives in `musefs-core` (the integration layer) next to `crate::telemetry`,
 //! since both crates above it feed the same budget — which is also what makes
-//! [`serve_warns_suppressed`] a local read for
+//! `serve_warns_suppressed` a local read for
 //! `musefs_serve_warns_suppressed_total` (#653).
 //!
 //! The emit side is a **macro**, not a function, and deliberately so: a `log`
@@ -112,7 +112,7 @@ impl WarnLimiter {
 /// The one process-wide limiter for serve-path failure warns.
 static SERVE_WARN_LIMITER: WarnLimiter = WarnLimiter::new();
 
-/// Ask [`SERVE_WARN_LIMITER`] what to do with one serve-path warn, now.
+/// Ask `SERVE_WARN_LIMITER` what to do with one serve-path warn, now.
 /// Public as the decision half of [`serve_warn!`](crate::serve_warn), which
 /// owns the emit half; nothing else should need it.
 pub fn decide() -> WarnDecision {

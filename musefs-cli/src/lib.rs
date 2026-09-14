@@ -1,5 +1,7 @@
 //! The `musefs` command-line interface: `scan` (ingest a backing directory into a
-//! SQLite store) and `mount` (serve a read-only FUSE view of that store).
+//! SQLite store), `revalidate` (re-check stored tracks against their backing
+//! files), `mount` (serve a read-only FUSE view of that store), and the store
+//! maintenance commands `vacuum` and `migrate`.
 
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
@@ -160,6 +162,9 @@ pub struct MountArgs {
     /// single-stream throughput over a 200 ms-RTT NFS mount. On local or
     /// low-latency storage it instead reads the stream a second time
     /// speculatively for no gain. See the benchmarks docs: https://sohex.github.io/musefs/benchmarks.html
+    // This doc comment is also the `--help` text, where `<…>` around the URL
+    // would print verbatim, so the rustdoc lint is silenced rather than obeyed.
+    #[allow(rustdoc::bare_urls)]
     #[arg(long, env = "MUSEFS_READ_AHEAD_PREFETCH", value_parser = clap::builder::BoolishValueParser::new())]
     pub read_ahead_prefetch: bool,
     /// Max outstanding background (readahead/async) requests the kernel queues.
@@ -494,8 +499,9 @@ const RETIRED_SCAN_ENV: &[(&str, &str)] = &[
     ("MUSEFS_STRICT", "set `MUSEFS_MATCH=strict` instead"),
 ];
 
-/// Refuse to run while any of `retired` is set. An empty value counts as unset,
-/// which is how clap treats a declared variable too.
+/// Refuse to run while any of `retired` is set. An empty value counts as unset
+/// here. clap does not treat a variable it declares that way: it hands the empty
+/// string to the flag's value parser, so e.g. `MUSEFS_QUIET=` is rejected.
 fn refuse_retired_env(retired: &[(&str, &str)]) -> Result<()> {
     for (var, instead) in retired {
         if std::env::var_os(var).is_some_and(|v| !v.is_empty()) {

@@ -603,7 +603,7 @@ impl Musefs {
     /// prefetch is off). Serving never needs this — prefetch is speculative and
     /// fire-and-forget — but a caller that samples the prefetch counters, or
     /// that owns the backing filesystem itself and is about to tear it down,
-    /// does. See [`crate::readahead::PrefetchWorkers::drain`].
+    /// does. See `PrefetchWorkers::drain`.
     pub fn drain_prefetch(&self, timeout: std::time::Duration) -> bool {
         self.prefetch.as_ref().is_none_or(|pf| pf.drain(timeout))
     }

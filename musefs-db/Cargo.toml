@@ -6,6 +6,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../README.md"
+keywords = ["music", "metadata", "sqlite", "tags", "fuse"]
+categories = ["database", "multimedia::audio"]
+# Integration tests stay in the repository: they need this crate's
+# `test-support` feature, which only a path dev-dependency turns on, and cargo
+# strips path dev-dependencies at publish, so they could not build from the
+# published crate.
+exclude = ["tests/"]
 
 [dependencies]
 # HexDisplay is the RustCrypto-recommended way to hex-format a digest since

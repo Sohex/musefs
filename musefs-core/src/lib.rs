@@ -1,3 +1,8 @@
+//! The musefs integration layer: scanning a library into the store
+//! ([`scan_directory`]), the virtual tree of re-tagged paths ([`VirtualTree`]),
+//! and serving any byte range of a synthesized file ([`read_at`]), behind the
+//! [`Musefs`] facade the FUSE adapter drives.
+
 mod byte_budget;
 mod db_pool;
 mod error;

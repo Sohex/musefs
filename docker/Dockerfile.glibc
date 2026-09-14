@@ -19,7 +19,7 @@ RUN groupadd -g "${MUSEFS_GID}" musefs \
  && useradd -u "${MUSEFS_UID}" -g "${MUSEFS_GID}" -M -s /usr/sbin/nologin musefs \
  && echo 'user_allow_other' >> /etc/fuse.conf
 
-# TARGETARCH is auto-populated by buildx per platform (amd64 / arm64); the build
+# TARGETARCH is auto-populated by buildx per platform (amd64 / arm64 / riscv64); the build
 # context root holds <arch>/musefs for each.
 ARG TARGETARCH
 COPY ${TARGETARCH}/musefs /usr/local/bin/musefs

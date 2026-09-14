@@ -139,6 +139,31 @@ def test_decide_since_fails_on_fresh_failure_despite_stale_success():
     assert decide(runs, ["ci-ok"], since="2026-06-11T00:00:00Z") is Decision.FAIL
 
 
+def test_decide_since_passes_on_ci_rerun_after_a_failed_attempt():
+    # A release re-run keeps the run's created_at as the cutoff. CI's failed
+    # jobs were re-run on the tag after the first attempt went red: the fresh
+    # ci-ok started well after the cutoff and completed after the failure, so
+    # it is the one the gate must trust.
+    runs = [
+        _run("ci-ok", "completed", "failure", "2026-06-11T00:40:00Z", "2026-06-11T00:05:00Z"),
+        _run("ci-ok", "completed", "success", "2026-06-11T02:30:00Z", "2026-06-11T02:05:00Z"),
+        _run("coverage-ok", "completed", "success", "2026-06-11T00:32:00Z", "2026-06-11T00:06:00Z"),
+    ]
+    assert decide(runs, ["ci-ok", "coverage-ok"], since="2026-06-11T00:00:00Z") is Decision.PASS
+
+
+def test_decide_since_after_the_ci_rerun_waits_forever():
+    # Why the cutoff is the release run's created_at and not its
+    # run_started_at: a release re-run attempt that starts after the CI re-run
+    # finished would set the cutoff past every check-run, and the gate would
+    # wait out its deadline on a green tree.
+    runs = [
+        _run("ci-ok", "completed", "success", "2026-06-11T02:30:00Z", "2026-06-11T02:05:00Z"),
+        _run("coverage-ok", "completed", "success", "2026-06-11T00:32:00Z", "2026-06-11T00:06:00Z"),
+    ]
+    assert decide(runs, ["ci-ok", "coverage-ok"], since="2026-06-11T03:00:00Z") is Decision.WAIT
+
+
 def test_cli_since_waits_on_stale_completed():
     payload = {
         "check_runs": [
