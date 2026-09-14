@@ -69,9 +69,12 @@ Nothing about the classification is stored: the binary owns it, so a user
 jumping from 1.2 straight to 2.1 is still gated on the step that needs it. Two
 further rules follow from what the runner already knows. A store being *created*
 is exempt — it has no data to endanger, and gating it would stop `scan` from
-ever building a new library. And the transparent steps ahead of a gate are
-applied and committed before the refusal, because a step is transparent for
-reasons a later gated step does not retroactively change.
+ever building a new library. And while a gated step is pending, an open applies
+nothing at all, not even the transparent steps ahead of it. Every step bumps
+`user_version`, which the previous release refuses, so a transparent step
+applied on the way to a refusal would lock that release out of the store with no
+snapshot taken. It waits for `musefs migrate` instead
+([#749](https://github.com/Sohex/musefs/issues/749)).
 
 `DbError::StoreNeedsMigration` is the opposite direction from
 `DbError::StoreTooNew`, and carries the opposite remedy: upgrade the store, not

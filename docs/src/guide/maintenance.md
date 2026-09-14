@@ -111,14 +111,13 @@ expect. Those are **gated**, and a major release is the only place they appear.
 Every command that opens a store for ordinary work refuses one that needs it:
 
 ```text
-error: store schema version 3 needs an explicit upgrade to version 4 before this
+error: store schema version 2 needs an explicit upgrade to version 4 before this
 musefs build can open it; run `musefs migrate --db <store>`.
 ```
 
-A command that refuses is not quite hands-off. It still applies the automatic
-steps ahead of the gate, and that alone takes a store past what the previous
-release can open, without a snapshot. So when upgrading, make `musefs migrate`
-the first command the new build runs against the store
+A command that refuses leaves the store exactly as it found it. While a gated
+step is pending no step is applied, not even an automatic one, so the previous
+release still opens the store until `musefs migrate` has run
 ([#749](https://github.com/Sohex/musefs/issues/749)).
 
 `musefs migrate` is where that upgrade happens, deliberately:

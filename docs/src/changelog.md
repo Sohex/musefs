@@ -516,8 +516,10 @@ see the [Release notes](release-notes.md).
   rewrites data the user did not ask to have rewritten, transiently needs the
   store's size again in free disk, or ends compatibility with the binary they
   were running yesterday. Each entry in `MIGRATIONS` now declares which it is.
-  An open applies the transparent steps and stops at the first gated one,
-  refusing with `DbError::StoreNeedsMigration`, which names the `musefs migrate`
+  An open that finds a gated step pending applies nothing — not even the
+  transparent steps ahead of it, each of which would already lock the previous
+  release out ([#749](https://github.com/Sohex/musefs/issues/749)) — and
+  refuses with `DbError::StoreNeedsMigration`, which names the `musefs migrate`
   command. That is the opposite direction from `StoreTooNew` and carries the
   opposite remedy — upgrade the store, not the binary — so the two are separate
   variants with separate messages. Nothing is stored: the binary owns the

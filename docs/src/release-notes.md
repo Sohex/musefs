@@ -17,7 +17,7 @@ The store's schema changes in this release, and part of that change is one
 musefs will not make without being asked. Steps 1 to 4 are that upgrade and
 what follows it. Do them in order, and before anything else below.
 
-**1. Run `musefs migrate` first — before any other 2.0.0 command** ([#705],
+**1. Run `musefs migrate`** ([#705],
 [#706]). `mount`, `scan`, `revalidate` and `vacuum` refuse a 1.3.0 store and
 name the command:
 
@@ -25,12 +25,9 @@ name the command:
 musefs migrate --db library.db
 ```
 
-Run it **first**, with the old mount and any scheduled scan stopped. The
-commands that refuse the store do not leave it untouched: each commits an
-earlier, automatic schema step before refusing, and from then on 1.3.0 no
-longer opens the store, and the snapshot `migrate` takes can no longer take you
-back to it ([#749]). If a 2.0.0 command has already run against the store, the
-only way back to 1.3.0 is a copy you made beforehand.
+Stop the old mount and any scheduled scan first. The commands that refuse the
+store leave it exactly as it was, so 1.3.0 still opens it until `migrate` has
+run ([#749]).
 
 `migrate` refuses a store anything else has open — a mount, even an idle one, a
 running scan, another `migrate`. In a script it needs `--yes`, since there is no
