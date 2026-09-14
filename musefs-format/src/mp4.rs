@@ -641,13 +641,10 @@ fn be_signed(value: &[u8]) -> i64 {
 /// Decode UTF-16BE text, dropping a leading byte-order mark. An odd byte count
 /// or an unpaired surrogate is not text.
 fn utf16_be(value: &[u8]) -> Option<String> {
-    if !value.len().is_multiple_of(2) {
+    let (pairs, []) = value.as_chunks::<2>() else {
         return None;
-    }
-    let units: Vec<u16> = value
-        .chunks_exact(2)
-        .map(|c| u16::from_be_bytes([c[0], c[1]]))
-        .collect();
+    };
+    let units: Vec<u16> = pairs.iter().map(|&pair| u16::from_be_bytes(pair)).collect();
     String::from_utf16(units.strip_prefix(&[0xFEFF]).unwrap_or(&units)).ok()
 }
 
