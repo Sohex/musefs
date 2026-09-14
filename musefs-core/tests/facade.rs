@@ -925,6 +925,203 @@ fn poll_refresh_notify_reports_old_inode_for_path_changing_retag() {
     assert_ne!(old_inode, new_inode);
 }
 
+/// One FLAC per title under artist "Alice", scanned into an on-disk store, the
+/// titles assigned in ascending track-id order so a collision's ranking is
+/// known, and mounted. Returns the store's directory (keep it alive), the store
+/// path, the mount, and the ids in ascending order, one per title.
+fn collision_mount(titles: &[&str]) -> (tempfile::TempDir, std::path::PathBuf, Musefs, Vec<i64>) {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..titles.len() {
+        let bytes = make_flac(
+            &[
+                (0, streaminfo_body()),
+                (4, vorbis_comment_body("v", &["ARTIST=Alice", "TITLE=Scan"])),
+            ],
+            &[0xAB; 64],
+        );
+        std::fs::write(dir.path().join(format!("{i}.flac")), &bytes).unwrap();
+    }
+    let db_path = dir.path().join("m.db");
+    let writer = musefs_db::Db::open(&db_path).unwrap();
+    scan_directory(&writer, dir.path()).unwrap();
+    let mut ids: Vec<i64> = writer.list_tracks().unwrap().iter().map(|t| t.id).collect();
+    ids.sort_unstable();
+    assert_eq!(ids.len(), titles.len());
+    for (id, title) in ids.iter().zip(titles) {
+        retitle_alice(&writer, *id, title);
+    }
+    let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), config()).unwrap();
+    (dir, db_path, fs, ids)
+}
+
+/// Give track `id` artist "Alice" and `title`.
+fn retitle_alice(db: &musefs_db::Db, id: i64, title: &str) {
+    db.replace_tags(
+        id,
+        &[
+            musefs_db::Tag::new("artist", "Alice", 0),
+            musefs_db::Tag::new("title", title, 0),
+        ],
+    )
+    .unwrap();
+}
+
+/// The inode `name` resolves to in Alice's directory.
+fn alice_inode(fs: &Musefs, name: &str) -> u64 {
+    let alice = fs.lookup(VirtualTree::ROOT, "Alice").unwrap();
+    fs.lookup(alice, name)
+        .unwrap_or_else(|| panic!("{name} is not listed"))
+}
+
+/// Refresh, and return every inode the refresh reported, sorted with any
+/// duplicates kept, so a test can assert the exact notifications.
+fn refresh_notified(fs: &Musefs) -> Vec<u64> {
+    let mut changed = Vec::new();
+    assert!(fs.poll_refresh_notify(|ino| changed.push(ino)).unwrap());
+    changed.sort_unstable();
+    changed
+}
+
+/// Route the next refresh down the changelog-gap full rebuild, whose notifier
+/// is `notify_changed` rather than the delta path's `notify_changed_delta`.
+fn force_full_rebuild_refresh(db_path: &std::path::Path) {
+    let writer = musefs_db::Db::open(db_path).unwrap();
+    let max_seq = writer.changelog_since(0).unwrap().max_seq;
+    writer.delete_changelog_through_for_test(max_seq).unwrap();
+}
+
+/// Sorted, for comparing with [`refresh_notified`].
+fn sorted(mut inodes: Vec<u64>) -> Vec<u64> {
+    inodes.sort_unstable();
+    inodes
+}
+
+/// #778: a re-rank that hands a name to another track invalidates that name's
+/// inode. Inodes are keyed by the disambiguated path, so when the lower id takes
+/// `X.flac` from the track that held it, `X.flac` keeps its inode and starts
+/// serving the other track, while neither track's rendered path names it.
+/// Exactly two inodes change hands: the one the moved track left, and
+/// `X.flac`'s. The displaced track's `X (2).flac` is a new inode no kernel has
+/// seen, so it needs nothing.
+#[test]
+fn a_rerank_invalidates_the_inode_it_hands_to_another_track() {
+    let (_dir, db_path, fs, ids) = collision_mount(&["Other", "X"]);
+    let other = alice_inode(&fs, "Other.flac");
+    let x = alice_inode(&fs, "X.flac");
+
+    retitle_alice(&musefs_db::Db::open(&db_path).unwrap(), ids[0], "X");
+    let changed = refresh_notified(&fs);
+
+    assert_eq!(
+        fs.lookup_track_inode_for_test(ids[0]),
+        Some(x),
+        "precondition: the lower id took X.flac's inode"
+    );
+    assert_eq!(changed, sorted(vec![other, x]));
+}
+
+/// #778, through the full-rebuild notifier.
+#[test]
+fn a_rerank_invalidates_the_inode_it_hands_to_another_track_on_a_full_rebuild() {
+    let (_dir, db_path, fs, ids) = collision_mount(&["Other", "X"]);
+    let other = alice_inode(&fs, "Other.flac");
+    let x = alice_inode(&fs, "X.flac");
+
+    retitle_alice(&musefs_db::Db::open(&db_path).unwrap(), ids[0], "X");
+    force_full_rebuild_refresh(&db_path);
+    let changed = refresh_notified(&fs);
+
+    assert_eq!(
+        fs.lookup_track_inode_for_test(ids[0]),
+        Some(x),
+        "precondition: the lower id took X.flac's inode"
+    );
+    assert_eq!(changed, sorted(vec![other, x]));
+}
+
+/// #778, when the incremental mutation fails and the refresh falls back to a full
+/// build inside the incremental path: the notifier then has no list of re-inserted
+/// tracks and must check every one.
+#[test]
+fn a_rerank_invalidates_the_inode_it_hands_to_another_track_when_the_mutation_falls_back() {
+    let (_dir, db_path, fs, ids) = collision_mount(&["Other", "X"]);
+    let other = alice_inode(&fs, "Other.flac");
+    let x = alice_inode(&fs, "X.flac");
+
+    retitle_alice(&musefs_db::Db::open(&db_path).unwrap(), ids[0], "X");
+    fs.force_apply_failure_for_test(true);
+    let changed = refresh_notified(&fs);
+
+    assert_eq!(
+        fs.lookup_track_inode_for_test(ids[0]),
+        Some(x),
+        "precondition: the lower id took X.flac's inode"
+    );
+    assert_eq!(changed, sorted(vec![other, x]));
+}
+
+/// #778: a re-rank cascades through a collision group, and every inode that
+/// changes track is invalidated, including one whose new track the refresh did
+/// not otherwise touch. Three tracks hold `X.flac`, `X (2).flac` and
+/// `X (3).flac`; the first moves away, so the second takes `X.flac` and the
+/// third `X (2).flac`. `X.flac` is also the moved track's old inode, and is
+/// reported once.
+#[test]
+fn a_rerank_cascade_invalidates_every_inode_that_changes_track() {
+    let (_dir, db_path, fs, ids) = collision_mount(&["X", "X", "X"]);
+    let x = alice_inode(&fs, "X.flac");
+    let x2 = alice_inode(&fs, "X (2).flac");
+
+    retitle_alice(&musefs_db::Db::open(&db_path).unwrap(), ids[0], "Y");
+    let changed = refresh_notified(&fs);
+
+    assert_eq!(fs.lookup_track_inode_for_test(ids[1]), Some(x));
+    assert_eq!(fs.lookup_track_inode_for_test(ids[2]), Some(x2));
+    assert_eq!(changed, sorted(vec![x, x2]));
+}
+
+/// Add a track with the highest id rendering "X" to `db_path`'s store.
+fn add_highest_x(dir: &std::path::Path, db_path: &std::path::Path) {
+    let writer = musefs_db::Db::open(db_path).unwrap();
+    let id = writer
+        .upsert_track(&musefs_db::NewTrack {
+            backing_path: dir.join("added.flac"),
+            format: musefs_db::Format::Flac,
+            audio_offset: 0,
+            audio_length: 1,
+            backing_size: 1,
+            backing_mtime_ns: 0,
+            backing_ctime_ns: 0,
+            backing_ino: None,
+        })
+        .unwrap();
+    retitle_alice(&writer, id, "X");
+}
+
+/// #778's counterpart: an inode whose track does not change is not invalidated,
+/// because each invalidation drops the kernel's cache for it. A track joining a
+/// collision group at its end rebuilds the group, re-inserting every member at
+/// the name it already had.
+#[test]
+fn a_collision_rebuild_that_keeps_every_name_on_its_track_invalidates_nothing() {
+    let (dir, db_path, fs, _ids) = collision_mount(&["X", "X"]);
+    add_highest_x(dir.path(), &db_path);
+    let changed = refresh_notified(&fs);
+    alice_inode(&fs, "X (3).flac");
+    assert_eq!(changed, Vec::<u64>::new());
+}
+
+/// The same, through the full-rebuild notifier, which walks every track.
+#[test]
+fn a_full_rebuild_that_keeps_every_name_on_its_track_invalidates_nothing() {
+    let (dir, db_path, fs, _ids) = collision_mount(&["X", "X"]);
+    add_highest_x(dir.path(), &db_path);
+    force_full_rebuild_refresh(&db_path);
+    let changed = refresh_notified(&fs);
+    alice_inode(&fs, "X (3).flac");
+    assert_eq!(changed, Vec::<u64>::new());
+}
+
 #[test]
 fn poll_refresh_notify_invalidates_old_inode_for_removed_track() {
     let dir = tempfile::tempdir().unwrap();

@@ -15,6 +15,11 @@
 //! case that would break that, a name taken from one track by another, and
 //! compares the mount that re-read its old listing with one that did not.
 //!
+//! Both mounts must also serve the name's new track the moment the refresh
+//! completes, attrs and bytes, with the kernel keeping its page cache across
+//! opens (`--keep-cache`): a refresh invalidates every inode whose track changes
+//! (#778), so nothing is left waiting for the attr TTL to pass.
+//!
 //! Run with:
 //!   cargo test -p musefs-fuse --test held_dir_refresh -- --ignored --nocapture
 
@@ -39,13 +44,18 @@ fn metric(text: &str, name: &str) -> u64 {
     line[name.len() + 1..].trim().parse().unwrap()
 }
 
-fn readdirplus_calls(mountpoint: &Path) -> u64 {
+fn read_metrics(mountpoint: &Path) -> String {
     // `/proc`-style: st_size is 0, so read to EOF rather than trusting it.
     let bytes = std::fs::read(mountpoint.join(".musefs-metrics").join("metrics")).unwrap();
-    metric(
-        &String::from_utf8(bytes).unwrap(),
-        "musefs_readdirplus_total",
-    )
+    String::from_utf8(bytes).unwrap()
+}
+
+fn readdirplus_calls(mountpoint: &Path) -> u64 {
+    metric(&read_metrics(mountpoint), "musefs_readdirplus_total")
+}
+
+fn refresh_generation(mountpoint: &Path) -> u64 {
+    metric(&read_metrics(mountpoint), "musefs_refresh_generation")
 }
 
 /// Every name `dir` yields from its current position to the end, `.` and `..`
@@ -101,8 +111,6 @@ struct Outcome {
     right_after: Served,
     /// `X (2).flac`'s inode on the held mount right after the refresh.
     displaced_ino: u64,
-    /// `X.flac` on the held mount once the attr TTL has passed.
-    after_ttl: Served,
     /// `X.flac` on a mount of the same store that never saw the old generation.
     reference: Served,
 }
@@ -142,6 +150,12 @@ fn run(reread: bool, tag: &str) -> Outcome {
     let held_mount = tempfile::tempdir().unwrap();
     let mut fuse_config = FuseConfig::default();
     fuse_config.expose_metrics = true;
+    // `--keep-cache`, stated rather than inherited from the default: with it the
+    // kernel drops a file's cached pages only when musefs invalidates the inode.
+    fuse_config.keep_cache = true;
+    // An attr and entry TTL far longer than the test, so a stale cache cannot
+    // expire into the right answer: only an invalidation can correct it in time.
+    fuse_config.ttl = Duration::from_mins(1);
     let held_session = musefs_fuse::spawn_with(
         Musefs::open(musefs_db::Db::open(&db_path).unwrap(), config()).unwrap(),
         held_mount.path(),
@@ -156,15 +170,25 @@ fn run(reread: bool, tag: &str) -> Outcome {
     assert_eq!(read_names(&mut held), ["Other.flac", "X.flac"]);
     let before = served(&art, "X.flac");
 
+    let generation = refresh_generation(held_mount.path());
     retitle(&db_path, low, "X");
-    // Any metadata op polls the store; wait until the new generation serves.
-    let displaced = art.join("X (2).flac");
-    for _ in 0..100 {
-        if displaced.exists() {
+    // Wait for the refresh itself rather than for its tree: the mount publishes
+    // the new tree before it writes the kernel its invalidations, and the
+    // generation counter moves only after both. Listing the mount root drives the
+    // poll: a directory open reaches the daemon whatever the TTL, and the root
+    // does not hold X.flac.
+    for _ in 0..200 {
+        std::fs::read_dir(held_mount.path()).unwrap().for_each(drop);
+        if refresh_generation(held_mount.path()) > generation {
             break;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(25));
     }
+    assert!(
+        refresh_generation(held_mount.path()) > generation,
+        "the refresh must complete"
+    );
+    let displaced = art.join("X (2).flac");
     assert!(displaced.exists(), "the refresh must publish the collision");
 
     if reread {
@@ -185,9 +209,6 @@ fn run(reread: bool, tag: &str) -> Outcome {
 
     let right_after = served(&art, "X.flac");
     let displaced_ino = std::fs::metadata(&displaced).unwrap().ino();
-    // Past the 1 s attr and entry TTL, so the next stat is a fresh getattr.
-    std::thread::sleep(Duration::from_millis(1500));
-    let after_ttl = served(&art, "X.flac");
 
     let reference_mount = tempfile::tempdir().unwrap();
     let reference_session = musefs_fuse::spawn_with(
@@ -206,7 +227,6 @@ fn run(reread: bool, tag: &str) -> Outcome {
         before,
         right_after,
         displaced_ino,
-        after_ttl,
         reference,
     }
 }
@@ -234,29 +254,16 @@ fn a_held_directory_reread_after_a_refresh_cannot_point_a_name_at_another_track(
         "the displaced track must not keep X.flac's inode under its new name"
     );
 
-    // Right after the re-read, X.flac serves either the track that holds the name
-    // now or exactly what the same refresh leaves without the re-read. What the
-    // kernel still holds for a name's inode in the attr TTL right after a
-    // refresh is the refresh notifier's to invalidate, not the directory
-    // handle's; the re-read's attrs may already replace it (they are the
-    // current track's), but they can never name a third state.
-    let reread_now = (reread.right_after.size, &reread.right_after.bytes);
-    assert!(
-        reread_now == (reread.reference.size, &reread.reference.bytes)
-            || reread_now == (control.right_after.size, &control.right_after.bytes),
-        "right after the re-read X.flac served {} bytes, which is neither the track \
-         holding the name now ({} bytes) nor what the refresh alone leaves ({} bytes)",
-        reread.right_after.bytes.len(),
-        reread.reference.bytes.len(),
-        control.right_after.bytes.len()
-    );
-
-    // Once the TTL has passed, X.flac is the new generation's on both mounts.
+    // The moment the refresh completes, X.flac serves the track that holds the
+    // name now, attrs and bytes, on both mounts, although the held mount's TTL
+    // outlasts the test: the refresh invalidated the inode it handed to another
+    // track (#778), so neither the old listing nor the kernel's cached attrs and
+    // pages can keep the previous track behind it.
     for (label, outcome) in [("reread", &reread), ("control", &control)] {
         assert_eq!(
-            (outcome.after_ttl.size, &outcome.after_ttl.bytes),
+            (outcome.right_after.size, &outcome.right_after.bytes),
             (outcome.reference.size, &outcome.reference.bytes),
-            "{label}: past the TTL X.flac must serve the track that holds the name now"
+            "{label}: right after the refresh X.flac must serve the track that holds the name now"
         );
     }
 }
