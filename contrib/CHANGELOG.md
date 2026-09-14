@@ -257,3 +257,9 @@ First stable release.
 
 - PyPI distribution: `python-musefs`, `beets-musefs`, and `lidarr-musefs` are
   published to PyPI on `py-v*` tags via a trusted-publishing release workflow.
+
+[Unreleased]: https://github.com/Sohex/musefs/compare/py-v2.0.0...HEAD
+[2.0.0]: https://github.com/Sohex/musefs/releases/tag/py-v2.0.0
+[1.2.0]: https://github.com/Sohex/musefs/releases/tag/py-v1.2.0
+[1.1.0]: https://github.com/Sohex/musefs/releases/tag/py-v1.1.0
+[1.0.0]: https://github.com/Sohex/musefs/releases/tag/py-v1.0.0
