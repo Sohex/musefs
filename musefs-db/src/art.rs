@@ -305,7 +305,7 @@ pub(crate) fn refresh_embedded_art_in(
 impl Db<ReadWrite> {
     /// Insert `a`, deduplicated by content, and return its `art` id. A row filed
     /// under the same digest is verified to hold these bytes before it is
-    /// returned (#724); see [`upsert_art_in`]. Each call verifies afresh — a
+    /// returned (#724); see `upsert_art_in`. Each call verifies afresh — a
     /// bulk scan remembers what it verified through [`crate::BulkWriter`].
     pub fn upsert_art(&self, a: &NewArt) -> Result<i64> {
         upsert_art_in(&self.conn, a, &mut std::collections::HashSet::new())

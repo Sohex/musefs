@@ -1209,7 +1209,7 @@ const fn is_major_release(version: &str) -> bool {
     i == b.len() || b[i] == b'-' || b[i] == b'+'
 }
 
-/// One step a store has yet to receive, as [`pending`] reports it.
+/// One step a store has yet to receive, as [`crate::PendingMigration::pending`] reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PendingStep {

@@ -1,8 +1,8 @@
 //! Size and identity caps enforced at the DB boundary (#267/#269/#278).
 //!
-//! The `CHECK` constraints in [`crate::schema`] (`MIGRATION_V1`) enforce these
-//! at write time for honest writers; the reader guards in [`crate::tags`],
-//! [`crate::art`] and [`crate::structural`] re-enforce them at read time,
+//! The `CHECK` constraints in `crate::schema` (`MIGRATION_V1`) enforce these
+//! at write time for honest writers; the reader guards in `crate::tags`,
+//! `crate::art` and `crate::structural` re-enforce them at read time,
 //! because a crafted DB can carry the canonical schema yet smuggle a
 //! CHECK-violating row (`PRAGMA ignore_check_constraints`). Values are public so
 //! cross-layer drift tests can assert they match the format ceiling and the
@@ -12,7 +12,7 @@
 pub const MAX_TAG_KEY_LEN: i64 = 256;
 /// Max `tags.value` length in bytes — 16 MiB − 1. Both the schema `CHECK`
 /// (`length(CAST(value AS BLOB)) <= 16777215`) and the read-time guard in
-/// [`crate::tags`] count bytes, not UTF-8 characters, so the
+/// `crate::tags` count bytes, not UTF-8 characters, so the
 /// materialized-memory bound is exact rather than ~4x looser for multibyte
 /// text (#505).
 ///
@@ -36,7 +36,7 @@ pub const MAX_TAG_VALUE_LEN: i64 = 0x00FF_FFFF;
 /// (#716).
 pub const MAX_ART_MIME_LEN: i64 = 255;
 /// Max `tracks.backing_path` length in bytes — 64 KiB (#758). The column is a
-/// BLOB, so the schema `CHECK` and the reader guard in [`crate::tracks`] both
+/// BLOB, so the schema `CHECK` and the reader guard in `crate::tracks` both
 /// count bytes.
 ///
 /// A generous portable ceiling rather than `PATH_MAX`, which is 4096 on Linux and
@@ -47,7 +47,7 @@ pub const MAX_ART_MIME_LEN: i64 = 255;
 /// store could make that allocation as large as SQLite allows a value.
 pub const MAX_BACKING_PATH_BYTES: i64 = 64 * 1024;
 /// Exact `art.sha256` length: a hex-encoded SHA-256 digest. The schema `CHECK`
-/// pins it to equality; the reader guard in [`crate::art`] bounds only the
+/// pins it to equality; the reader guard in `crate::art` bounds only the
 /// upper side, since a short digest is a correctness problem for the caller
 /// rather than an allocation one.
 pub const ART_SHA256_LEN: i64 = 64;

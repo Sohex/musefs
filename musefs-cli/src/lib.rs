@@ -160,6 +160,9 @@ pub struct MountArgs {
     /// single-stream throughput over a 200 ms-RTT NFS mount. On local or
     /// low-latency storage it instead reads the stream a second time
     /// speculatively for no gain. See the benchmarks docs: https://sohex.github.io/musefs/benchmarks.html
+    // This doc comment is also the `--help` text, where `<…>` around the URL
+    // would print verbatim, so the rustdoc lint is silenced rather than obeyed.
+    #[allow(rustdoc::bare_urls)]
     #[arg(long, env = "MUSEFS_READ_AHEAD_PREFETCH", value_parser = clap::builder::BoolishValueParser::new())]
     pub read_ahead_prefetch: bool,
     /// Max outstanding background (readahead/async) requests the kernel queues.

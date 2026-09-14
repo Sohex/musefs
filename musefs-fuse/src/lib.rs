@@ -1927,7 +1927,7 @@ impl Filesystem for MusefsFs {
     /// attrs: directories and the synthetic entries are filled inline, and the
     /// file entries fan out across the worker pool in rounds, since resolving a
     /// page serially on one worker would be slower for a threaded scanner than
-    /// the `lookup`s it replaces. See [`spawn_plus_round`].
+    /// the `lookup`s it replaces. See `spawn_plus_round`.
     fn readdirplus(
         &self,
         _req: &Request,

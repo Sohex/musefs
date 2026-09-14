@@ -1336,11 +1336,11 @@ pub enum ChecksumTier {
     None,
     /// Compute the cheap fingerprint only. Rides the probe: the hash covers its
     /// parsed output plus three bounded audio windows read from the descriptor
-    /// the probe already holds (see [`audio_sample`]), so the extra I/O is a
+    /// the probe already holds (see `audio_sample`), so the extra I/O is a
     /// per-file constant rather than a pass over the file.
     Fingerprint,
     /// Fingerprint plus an eager full-file SHA-256. A file this tier cannot
-    /// hash is failed under [`SkipReason::Checksum`] rather than ingested one
+    /// hash is failed under `SkipReason::Checksum` rather than ingested one
     /// tier lower (#690).
     Full,
 }

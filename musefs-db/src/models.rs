@@ -251,7 +251,7 @@ pub struct Track {
     pub backing_mtime_ns: i64,
     pub backing_ctime_ns: i64,
     /// The backing file's inode, or `None` for a row written before #674 or
-    /// migrated into V4. See [`ino_from_col`]: the column spells it 0.
+    /// migrated into V4. See `ino_from_col`: the column spells it 0.
     pub backing_ino: Option<u64>,
     pub content_version: i64,
     pub updated_at: i64,
