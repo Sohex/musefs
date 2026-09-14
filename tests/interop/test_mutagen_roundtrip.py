@@ -1,6 +1,8 @@
 import io
 import json
 import os
+import shutil
+import subprocess
 
 import mutagen
 import mutagen.flac
@@ -25,6 +27,7 @@ MANIFEST_FILES = {
     "out.mp3",
     "out_multi.mp3",
     "out.m4a",
+    "out_keyed.m4a",
     "out.ogg",
     "out.wav",
     "out_rifx.wav",
@@ -287,6 +290,59 @@ def test_m4a_multi_cover_art():
         assert covr[0].imageformat == mutagen.mp4.MP4Cover.FORMAT_JPEG
         assert bytes(covr[1]) == COVR_PNG
         assert covr[1].imageformat == mutagen.mp4.MP4Cover.FORMAT_PNG
+
+
+def _ffprobe_format_tags(path):
+    """ffmpeg's view of a file's movie-level tags: its mov demuxer reads the
+    iTunes `ilst` and QuickTime keyed metadata (`mdta` handler) alike."""
+    run = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format_tags", "-of", "json", path],
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    return json.loads(run.stdout).get("format", {}).get("tags", {})
+
+
+def test_m4a_keyed_metadata_is_not_served():
+    """A source M4A carrying QuickTime keyed metadata (an `mdta` `meta` at the
+    movie level and in the audio track) is served with only the store's tags, so
+    no reader can see the old keyed values (#771)."""
+    base = os.environ["MUSEFS_INTEROP_DIR"]
+    src = os.path.join(base, "src_keyed.m4a")
+    out = os.path.join(base, "out_keyed.m4a")
+    old = [b"Old Keyed Artist", b"Old Keyed Title", b"Old Keyed Comment"]
+    with open(src, "rb") as fh:
+        src_bytes = fh.read()
+    with open(out, "rb") as fh:
+        out_bytes = fh.read()
+    # The fixture really carries the keyed values, or this test proves nothing.
+    assert all(v in src_bytes for v in old)
+    assert not any(v in out_bytes for v in old), "an old keyed value was served"
+
+    f = mutagen.mp4.MP4(out)
+    assert f.tags["\xa9ART"] == ["Interop Artist"]
+    assert f.tags["\xa9nam"] == ["Interop Title"]
+    # Every served item is an iTunes FourCC atom, never a 1-based key index.
+    assert not [k for k in f.tags.keys() if k.startswith("\x00")]
+
+    with open(out, "rb") as fh:
+        moov = mutagen.mp4.Atoms(fh).path(b"moov")[-1]
+    assert b"meta" not in [c.name for c in moov.children]
+    for trak in moov.findall(b"trak"):
+        assert b"meta" not in [c.name for c in trak.children]
+        for mdia in trak.findall(b"mdia"):
+            assert b"meta" not in [c.name for c in mdia.children]
+
+    # ffmpeg is the independent reader that does parse keyed metadata. Where it is
+    # installed, it must see the keyed artist in the source and none in the output.
+    if shutil.which("ffprobe"):
+        src_tags = _ffprobe_format_tags(src)
+        assert src_tags.get("com.apple.quicktime.artist") == "Old Keyed Artist"
+        out_tags = _ffprobe_format_tags(out)
+        assert not [k for k in out_tags if k.startswith("com.apple.quicktime.")], out_tags
+        assert out_tags.get("artist") == "Interop Artist"
+        assert out_tags.get("title") == "Interop Title"
 
 
 def test_flac_and_id3_pictures_carry_every_link_field():

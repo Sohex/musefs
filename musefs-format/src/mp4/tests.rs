@@ -2175,3 +2175,1134 @@ fn freeform_binary_prefix_checked_outer_box_size_rejects_overflow() {
         Some(FormatError::TooLarge)
     );
 }
+
+// ── QuickTime keyed metadata (`mdta` handler, #771) ──────────────────────────
+
+/// A QuickTime `hdlr` declaring keyed metadata: `[version/flags][pre_defined]
+/// ['mdta'][reserved]`, the shape ffmpeg's `mov_write_mdta_hdlr_tag` writes.
+fn mdta_hdlr() -> Vec<u8> {
+    let mut p = vec![0u8; 8];
+    p.extend_from_slice(b"mdta");
+    p.extend_from_slice(&[0u8; 13]);
+    bx(b"hdlr", &p)
+}
+
+/// A `keys` FullBox: `[version/flags][entry_count]` then per entry
+/// `[key_size][key_namespace][key_value]`.
+fn keys_box(entries: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+    let mut p = vec![0u8; 4];
+    p.extend_from_slice(&u32::try_from(entries.len()).unwrap().to_be_bytes());
+    for (namespace, name) in entries {
+        p.extend_from_slice(&u32::try_from(8 + name.len()).unwrap().to_be_bytes());
+        p.extend_from_slice(*namespace);
+        p.extend_from_slice(name);
+    }
+    bx(b"keys", &p)
+}
+
+/// A keyed `ilst` item: its box type is the 1-based index into `keys`.
+fn keyed_item(index: u32, datas: &[u8]) -> Vec<u8> {
+    bx(&index.to_be_bytes(), datas)
+}
+
+/// A `data` box with an explicit locale indicator.
+fn data_atom_locale(type_code: u32, locale: u32, value: &[u8]) -> Vec<u8> {
+    let mut p = type_code.to_be_bytes().to_vec();
+    p.extend_from_slice(&locale.to_be_bytes());
+    p.extend_from_slice(value);
+    bx(b"data", &p)
+}
+
+/// The children of a keyed-metadata `meta`: `mdta` hdlr, a `keys` table naming
+/// each item's key, and an `ilst` whose `i`th item (index `i + 1`) carries that
+/// item's `data` boxes.
+fn keyed_meta_children(items: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    let names: Vec<(&[u8; 4], &[u8])> =
+        items.iter().map(|(n, _)| (b"mdta", n.as_bytes())).collect();
+    let ilst: Vec<u8> = items
+        .iter()
+        .enumerate()
+        .flat_map(|(i, (_, datas))| keyed_item(u32::try_from(i + 1).unwrap(), datas))
+        .collect();
+    [mdta_hdlr(), keys_box(&names), bx(b"ilst", &ilst)].concat()
+}
+
+/// A bare (QuickTime-style, no version/flags) keyed-metadata `meta` box, the
+/// shape Apple writes at the movie and track levels.
+fn keyed_meta(items: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    bx(b"meta", &keyed_meta_children(items))
+}
+
+/// A FullBox keyed-metadata `meta` inside `udta`, the shape ffmpeg's
+/// `-movflags use_metadata_tags` writes (`mov_write_udta_tag` → `mov_write_meta_tag`).
+fn ffmpeg_keyed_udta_meta(items: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    let mut p = vec![0u8; 4];
+    p.extend(keyed_meta_children(items));
+    bx(b"meta", &p)
+}
+
+/// An iTunes `meta` (FullBox, `mdir` handler) holding `ilst_atoms`.
+fn itunes_meta(ilst_atoms: &[u8]) -> Vec<u8> {
+    let mut hdlr = vec![0u8; 8];
+    hdlr.extend_from_slice(b"mdir");
+    hdlr.extend_from_slice(b"appl");
+    hdlr.extend_from_slice(&[0u8; 9]);
+    let mut meta = vec![0u8; 4];
+    meta.extend(bx(b"hdlr", &hdlr));
+    meta.extend(bx(b"ilst", ilst_atoms));
+    bx(b"meta", &meta)
+}
+
+/// An accepted moov-first file: one `soun` trak (with `mdia_extra` appended to
+/// its `mdia` and `trak_extra` to the trak), `moov_extra` appended to `moov`, and
+/// `audio` as the `mdat` payload. The single `stco` entry holds the real payload
+/// offset, so synthesis can relocate it in either direction.
+fn mp4_with_keyed(
+    moov_extra: &[u8],
+    trak_extra: &[u8],
+    mdia_extra: &[u8],
+    audio: &[u8],
+) -> Vec<u8> {
+    let mut hdlr_p = vec![0u8; 8];
+    hdlr_p.extend_from_slice(b"soun");
+    hdlr_p.extend_from_slice(&[0u8; 12]);
+    let mut stco = vec![0u8; 4];
+    stco.extend_from_slice(&1u32.to_be_bytes());
+    stco.extend_from_slice(&0u32.to_be_bytes());
+    let minf = bx(b"minf", &bx(b"stbl", &bx(b"stco", &stco)));
+    let mdia = bx(
+        b"mdia",
+        &[bx(b"hdlr", &hdlr_p), minf, mdia_extra.to_vec()].concat(),
+    );
+    let trak = bx(b"trak", &[mdia, trak_extra.to_vec()].concat());
+    let moov = bx(
+        b"moov",
+        &[bx(b"mvhd", &[0u8; 8]), trak, moov_extra.to_vec()].concat(),
+    );
+    let mut out = [bx(b"ftyp", b"M4A isom"), moov, bx(b"mdat", audio)].concat();
+    let payload_at = u32::try_from(out.len() - audio.len()).unwrap();
+    let entry = out.windows(4).position(|w| w == b"stco").unwrap() + 12;
+    out[entry..entry + 4].copy_from_slice(&payload_at.to_be_bytes());
+    out
+}
+
+fn text(value: &str) -> Vec<u8> {
+    data_atom(1, value.as_bytes())
+}
+
+#[test]
+fn read_tags_ingests_movie_level_keyed_metadata() {
+    // Apple's movie-level `moov/meta`: well-known keys fold onto the canonical
+    // vocabulary; an unknown key is kept under its verbatim name, like an
+    // unknown `----` freeform atom.
+    let meta = keyed_meta(&[
+        ("com.apple.quicktime.title", text("Keyed Title")),
+        ("com.apple.quicktime.artist", text("Keyed Artist")),
+        ("com.apple.quicktime.album", text("Keyed Album")),
+        ("com.apple.quicktime.year", text("2012")),
+        (
+            "com.apple.quicktime.location.ISO6709",
+            text("+27.5916+086.5640+8850/"),
+        ),
+    ]);
+    let buf = mp4_with_keyed(&meta, &[], &[], b"AUDIO");
+    assert_eq!(
+        read_tags(&buf),
+        vec![
+            ("title".to_string(), "Keyed Title".to_string()),
+            ("artist".to_string(), "Keyed Artist".to_string()),
+            ("album".to_string(), "Keyed Album".to_string()),
+            ("date".to_string(), "2012".to_string()),
+            (
+                "com.apple.quicktime.location.ISO6709".to_string(),
+                "+27.5916+086.5640+8850/".to_string()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn read_tags_ingests_every_well_known_quicktime_key() {
+    let cases = [
+        ("com.apple.quicktime.title", "title"),
+        ("com.apple.quicktime.artist", "artist"),
+        ("com.apple.quicktime.album", "album"),
+        ("com.apple.quicktime.genre", "genre"),
+        ("com.apple.quicktime.comment", "comment"),
+        ("com.apple.quicktime.copyright", "copyright"),
+        ("com.apple.quicktime.year", "date"),
+        ("album_artist", "albumartist"),
+        ("track", "tracknumber"),
+        ("disc", "discnumber"),
+    ];
+    for (name, canonical) in cases {
+        let buf = mp4_with_keyed(&keyed_meta(&[(name, text("v"))]), &[], &[], b"A");
+        assert_eq!(
+            read_tags(&buf),
+            vec![(canonical.to_string(), "v".to_string())],
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn read_tags_ingests_ffmpeg_keyed_metadata_in_udta() {
+    // ffmpeg `-movflags use_metadata_tags` writes `moov/udta/meta` (FullBox) with
+    // an `mdta` handler and its own generic key names. `album_artist`, `track`
+    // and `disc` fold; names already canonical (`artist`) need no mapping; the rest
+    // (`encoder`) are kept verbatim.
+    let meta = ffmpeg_keyed_udta_meta(&[
+        ("artist", text("Old Artist")),
+        ("album_artist", text("Band")),
+        ("track", text("3/12")),
+        ("encoder", text("Lavf63.1.101")),
+    ]);
+    let buf = mp4_with_keyed(&bx(b"udta", &meta), &[], &[], b"AUDIO");
+    assert_eq!(
+        read_tags(&buf),
+        vec![
+            ("artist".to_string(), "Old Artist".to_string()),
+            ("albumartist".to_string(), "Band".to_string()),
+            ("tracknumber".to_string(), "3/12".to_string()),
+            ("encoder".to_string(), "Lavf63.1.101".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn read_tags_ingests_track_and_media_level_keyed_metadata() {
+    // Apple devices write keyed metadata in the audio track too (ExifTool's
+    // "AudioKeys": `player.movie.audio.*`); the QTFF allows `trak` and `mdia`.
+    let trak_meta = keyed_meta(&[("player.movie.audio.mute", data_atom(75, &[1]))]);
+    let mdia_meta = keyed_meta(&[("com.apple.quicktime.comment", text("From mdia"))]);
+    let buf = mp4_with_keyed(&[], &trak_meta, &mdia_meta, b"AUDIO");
+    assert_eq!(
+        read_tags(&buf),
+        vec![
+            ("player.movie.audio.mute".to_string(), "1".to_string()),
+            ("comment".to_string(), "From mdia".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn read_tags_itunes_values_win_over_keyed_values_per_key() {
+    // Both systems name `artist`: the iTunes `ilst` is what music taggers edit,
+    // so it wins outright. A key only the keyed metadata carries still fills in.
+    let udta = bx(
+        b"udta",
+        &itunes_meta(&bx(b"\xa9ART", &text("iTunes Artist"))),
+    );
+    let meta = keyed_meta(&[
+        ("com.apple.quicktime.artist", text("Keyed Artist")),
+        ("com.apple.quicktime.genre", text("Keyed Genre")),
+    ]);
+    let buf = mp4_with_keyed(&[udta, meta].concat(), &[], &[], b"AUDIO");
+    assert_eq!(
+        read_tags(&buf),
+        vec![
+            ("artist".to_string(), "iTunes Artist".to_string()),
+            ("genre".to_string(), "Keyed Genre".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn read_tags_itunes_multi_value_is_not_topped_up_by_keyed() {
+    // All-or-nothing per key: two iTunes artists keep exactly their two values.
+    let udta = bx(
+        b"udta",
+        &itunes_meta(&bx(b"\xa9ART", &[text("A"), text("B")].concat())),
+    );
+    let meta = keyed_meta(&[("ARTIST", text("Keyed"))]);
+    let buf = mp4_with_keyed(&[meta, udta].concat(), &[], &[], b"AUDIO");
+    assert_eq!(
+        read_tags(&buf),
+        vec![
+            ("artist".to_string(), "A".to_string()),
+            ("artist".to_string(), "B".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn read_tags_first_keyed_item_wins_per_key() {
+    // Movie level beats udta beats track beats media; within one `meta`, the first
+    // item that yields a value for a canonical key wins, compared case-insensitively.
+    let movie = keyed_meta(&[
+        ("com.apple.quicktime.artist", text("Movie")),
+        ("artist", text("Movie bare")),
+    ]);
+    let udta = bx(
+        b"udta",
+        &ffmpeg_keyed_udta_meta(&[
+            ("ARTIST", text("Udta")),
+            ("com.apple.quicktime.album", text("Udta Album")),
+        ]),
+    );
+    let trak = keyed_meta(&[
+        ("com.apple.quicktime.album", text("Track Album")),
+        ("com.apple.quicktime.genre", text("Track Genre")),
+    ]);
+    let mdia = keyed_meta(&[("com.apple.quicktime.genre", text("Media Genre"))]);
+    // `udta` placed before the movie-level meta: precedence is by level, not order.
+    let buf = mp4_with_keyed(&[udta, movie].concat(), &trak, &mdia, b"AUDIO");
+    assert_eq!(
+        read_tags(&buf),
+        vec![
+            ("artist".to_string(), "Movie".to_string()),
+            ("album".to_string(), "Udta Album".to_string()),
+            ("genre".to_string(), "Track Genre".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn read_tags_unmapped_key_matching_is_case_insensitive_across_sources() {
+    // An unknown key keeps its first spelling; a later differently-cased spelling
+    // of the same key is the same key and is not added again.
+    let movie = keyed_meta(&[("com.example.Mood", text("calm"))]);
+    let trak = keyed_meta(&[("COM.EXAMPLE.MOOD", text("loud"))]);
+    let buf = mp4_with_keyed(&movie, &trak, &[], b"AUDIO");
+    assert_eq!(
+        read_tags(&buf),
+        vec![("com.example.Mood".to_string(), "calm".to_string())]
+    );
+}
+
+#[test]
+fn read_tags_decodes_keyed_value_types() {
+    let utf16 = |s: &str, bom: bool| -> Vec<u8> {
+        let mut v = Vec::new();
+        if bom {
+            v.extend_from_slice(&0xFEFFu16.to_be_bytes());
+        }
+        for u in s.encode_utf16() {
+            v.extend_from_slice(&u.to_be_bytes());
+        }
+        v
+    };
+    let meta = keyed_meta(&[
+        ("utf8", data_atom(1, "héllo".as_bytes())),
+        ("utf16", data_atom(2, &utf16("wörld", false))),
+        ("utf16bom", data_atom(2, &utf16("bom", true))),
+        ("be_signed_1", data_atom(21, &[0xFF])),
+        ("be_signed_3", data_atom(21, &[0xFF, 0xFF, 0xFE])),
+        ("be_signed_4_pos", data_atom(21, &[0x00, 0x01, 0x00, 0x00])),
+        ("be_signed_8", data_atom(21, &i64::MIN.to_be_bytes())),
+        ("be_unsigned_2", data_atom(22, &[0xFF, 0xFE])),
+        ("be_unsigned_8", data_atom(22, &u64::MAX.to_be_bytes())),
+        ("i8", data_atom(65, &[0x80])),
+        ("i16", data_atom(66, &(-300i16).to_be_bytes())),
+        ("i32", data_atom(67, &(-70_000i32).to_be_bytes())),
+        ("i64", data_atom(74, &(-5i64).to_be_bytes())),
+        ("u8", data_atom(75, &[200])),
+        ("u16", data_atom(76, &65_000u16.to_be_bytes())),
+        ("u32", data_atom(77, &4_000_000_000u32.to_be_bytes())),
+        ("u64", data_atom(78, &(1u64 << 40).to_be_bytes())),
+        ("f32", data_atom(23, &4.5f32.to_be_bytes())),
+        ("f64", data_atom(24, &0.1f64.to_be_bytes())),
+    ]);
+    let buf = mp4_with_keyed(&meta, &[], &[], b"AUDIO");
+    let want: Vec<(String, String)> = [
+        ("utf8", "héllo"),
+        ("utf16", "wörld"),
+        ("utf16bom", "bom"),
+        ("be_signed_1", "-1"),
+        ("be_signed_3", "-2"),
+        ("be_signed_4_pos", "65536"),
+        ("be_signed_8", "-9223372036854775808"),
+        ("be_unsigned_2", "65534"),
+        ("be_unsigned_8", "18446744073709551615"),
+        ("i8", "-128"),
+        ("i16", "-300"),
+        ("i32", "-70000"),
+        ("i64", "-5"),
+        ("u8", "200"),
+        ("u16", "65000"),
+        ("u32", "4000000000"),
+        ("u64", "1099511627776"),
+        ("f32", "4.5"),
+        ("f64", "0.1"),
+    ]
+    .iter()
+    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+    .collect();
+    assert_eq!(read_tags(&buf), want);
+}
+
+#[test]
+fn read_tags_skips_keyed_values_it_cannot_represent() {
+    // Every one of these is dropped, leaving only the sentinel.
+    let meta = keyed_meta(&[
+        ("reserved", data_atom(0, b"raw")),
+        ("sjis", data_atom(3, b"\x82\xa0")),
+        ("utf8_sort", data_atom(4, b"sort")),
+        ("utf16_sort", data_atom(5, &[0, b's'])),
+        ("jpeg_on_text_key", data_atom(13, &[0xFF, 0xD8])),
+        ("bmp", data_atom(27, b"BM")),
+        ("nested_meta", data_atom(28, &[0; 8])),
+        ("point", data_atom(70, &[0; 8])),
+        ("bad_utf8", data_atom(1, &[0xC3])),
+        ("utf16_odd", data_atom(2, &[0, b'a', 0])),
+        ("utf16_lone_surrogate", data_atom(2, &[0xD8, 0x00])),
+        ("be_signed_empty", data_atom(21, &[])),
+        ("be_signed_9", data_atom(21, &[0; 9])),
+        ("be_unsigned_empty", data_atom(22, &[])),
+        ("be_unsigned_9", data_atom(22, &[0; 9])),
+        ("i8_wide", data_atom(65, &[0, 0])),
+        ("i16_short", data_atom(66, &[0])),
+        ("i32_short", data_atom(67, &[0; 3])),
+        ("i64_short", data_atom(74, &[0; 7])),
+        ("u8_wide", data_atom(75, &[0, 0])),
+        ("u16_wide", data_atom(76, &[0; 3])),
+        ("u32_wide", data_atom(77, &[0; 5])),
+        ("u64_wide", data_atom(78, &[0; 9])),
+        ("f32_short", data_atom(23, &[0; 3])),
+        ("f64_short", data_atom(24, &[0; 4])),
+        ("f32_nan", data_atom(23, &f32::NAN.to_be_bytes())),
+        ("f64_inf", data_atom(24, &f64::INFINITY.to_be_bytes())),
+        ("short_data", bx(b"data", &[0, 0, 0, 1, 0, 0, 0])),
+        ("no_data", bx(b"free", b"")),
+        ("sentinel", text("kept")),
+    ]);
+    let buf = mp4_with_keyed(&meta, &[], &[], b"AUDIO");
+    assert_eq!(
+        read_tags(&buf),
+        vec![("sentinel".to_string(), "kept".to_string())]
+    );
+}
+
+#[test]
+fn read_tags_picks_one_keyed_value_preferring_the_default_locale() {
+    // Several `data` boxes in one item are alternative representations (QTFF "Data
+    // ordering"), not multiple values: one is chosen. The first default-locale (0)
+    // value wins; with none, the last decodable one — the most general, since data
+    // is ordered most-specific first.
+    let us_eng = u32::from_be_bytes([b'U', b'S', 0x15, 0xC7]);
+    let meta = keyed_meta(&[
+        (
+            "default_later",
+            [
+                data_atom_locale(1, us_eng, b"localized"),
+                data_atom_locale(1, 0, b"default"),
+                data_atom_locale(1, 0, b"second default"),
+            ]
+            .concat(),
+        ),
+        (
+            "all_localized",
+            [
+                data_atom_locale(1, us_eng, b"first"),
+                data_atom_locale(1, us_eng + 1, b"last"),
+                data_atom_locale(13, us_eng, &[0xFF, 0xD8]),
+            ]
+            .concat(),
+        ),
+        (
+            "default_image_then_text",
+            [
+                data_atom_locale(13, 0, &[0xFF, 0xD8]),
+                data_atom_locale(1, us_eng, b"text"),
+            ]
+            .concat(),
+        ),
+    ]);
+    let buf = mp4_with_keyed(&meta, &[], &[], b"AUDIO");
+    assert_eq!(
+        read_tags(&buf),
+        vec![
+            ("default_later".to_string(), "default".to_string()),
+            ("all_localized".to_string(), "last".to_string()),
+            ("default_image_then_text".to_string(), "text".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn read_tags_keyed_index_resolution_is_lenient() {
+    // keys: [1] mdta "one", [2] 'udta'-namespace "@cpy" (not a string key), [3]
+    // invalid UTF-8, [4] mdta "four". Items: index 0 (reserved), 1, 2, 3, 4, and 9
+    // (out of range). Only indices 1 and 4 resolve; a skipped slot does not shift
+    // the later indices.
+    let keys = keys_box(&[
+        (b"mdta", b"one"),
+        (b"udta", b"@cpy"),
+        (b"mdta", &[0xFF, 0xFE]),
+        (b"mdta", b"four"),
+    ]);
+    let ilst = [
+        keyed_item(0, &text("zero")),
+        keyed_item(1, &text("1")),
+        keyed_item(2, &text("2")),
+        keyed_item(3, &text("3")),
+        keyed_item(4, &text("4")),
+        keyed_item(9, &text("9")),
+    ]
+    .concat();
+    let meta = bx(b"meta", &[mdta_hdlr(), keys, bx(b"ilst", &ilst)].concat());
+    let buf = mp4_with_keyed(&meta, &[], &[], b"AUDIO");
+    assert_eq!(
+        read_tags(&buf),
+        vec![
+            ("one".to_string(), "1".to_string()),
+            ("four".to_string(), "4".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn read_tags_keys_table_that_lies_keeps_its_readable_prefix() {
+    // entry_count claims u32::MAX (never allocated for), and the third entry's size
+    // is below the 8-byte minimum: the two entries before it resolve, nothing after.
+    let mut keys_p = vec![0u8; 4];
+    keys_p.extend_from_slice(&u32::MAX.to_be_bytes());
+    for name in [b"aa", b"bb"] {
+        keys_p.extend_from_slice(&10u32.to_be_bytes());
+        keys_p.extend_from_slice(b"mdta");
+        keys_p.extend_from_slice(name);
+    }
+    keys_p.extend_from_slice(&7u32.to_be_bytes()); // size < 8: malformed
+    keys_p.extend_from_slice(b"mdta");
+    keys_p.extend_from_slice(&10u32.to_be_bytes()); // would be a 4th entry
+    keys_p.extend_from_slice(b"mdtacc");
+    let ilst = [
+        keyed_item(1, &text("a")),
+        keyed_item(2, &text("b")),
+        keyed_item(3, &text("c")),
+        keyed_item(4, &text("d")),
+    ]
+    .concat();
+    let meta = bx(
+        b"meta",
+        &[mdta_hdlr(), bx(b"keys", &keys_p), bx(b"ilst", &ilst)].concat(),
+    );
+    let buf = mp4_with_keyed(&meta, &[], &[], b"AUDIO");
+    assert_eq!(
+        read_tags(&buf),
+        vec![
+            ("aa".to_string(), "a".to_string()),
+            ("bb".to_string(), "b".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn read_tags_keys_entry_count_bounds_the_table() {
+    // entry_count 1 with a second well-formed entry present: only index 1 exists.
+    let mut keys_p = vec![0u8; 4];
+    keys_p.extend_from_slice(&1u32.to_be_bytes());
+    for name in [b"aa", b"bb"] {
+        keys_p.extend_from_slice(&10u32.to_be_bytes());
+        keys_p.extend_from_slice(b"mdta");
+        keys_p.extend_from_slice(name);
+    }
+    let ilst = [keyed_item(1, &text("a")), keyed_item(2, &text("b"))].concat();
+    let meta = bx(
+        b"meta",
+        &[mdta_hdlr(), bx(b"keys", &keys_p), bx(b"ilst", &ilst)].concat(),
+    );
+    let buf = mp4_with_keyed(&meta, &[], &[], b"AUDIO");
+    assert_eq!(read_tags(&buf), vec![("aa".to_string(), "a".to_string())]);
+}
+
+#[test]
+fn read_tags_keys_entry_exactly_filling_the_table_resolves() {
+    // An entry whose key_size reaches exactly the end of the `keys` payload is
+    // well-formed; one byte more overruns and is dropped.
+    let exact = keys_box(&[(b"mdta", b"exact")]);
+    let ilst = bx(b"ilst", &keyed_item(1, &text("v")));
+    let meta = bx(b"meta", &[mdta_hdlr(), exact, ilst.clone()].concat());
+    let buf = mp4_with_keyed(&meta, &[], &[], b"A");
+    assert_eq!(
+        read_tags(&buf),
+        vec![("exact".to_string(), "v".to_string())]
+    );
+
+    let mut over_p = vec![0u8; 4];
+    over_p.extend_from_slice(&1u32.to_be_bytes());
+    over_p.extend_from_slice(&14u32.to_be_bytes()); // claims 14, 13 present
+    over_p.extend_from_slice(b"mdta");
+    over_p.extend_from_slice(b"exact");
+    let meta = bx(b"meta", &[mdta_hdlr(), bx(b"keys", &over_p), ilst].concat());
+    let buf = mp4_with_keyed(&meta, &[], &[], b"A");
+    assert!(read_tags(&buf).is_empty());
+}
+
+#[test]
+fn read_tags_keyed_meta_survives_garbled_siblings() {
+    // A malformed box trailing `ilst` inside the keyed `meta`, and a malformed item
+    // after a good one: the good values are still read (#524/#542 contract).
+    let ilst = {
+        let mut v = keyed_item(1, &text("Good"));
+        v.extend_from_slice(&[0, 0, 0, 99, 0, 0, 0, 2]); // item claims 99 bytes
+        bx(b"ilst", &v)
+    };
+    let mut children = [
+        mdta_hdlr(),
+        keys_box(&[(b"mdta", b"artist"), (b"mdta", b"album")]),
+        ilst,
+    ]
+    .concat();
+    children.extend_from_slice(&[0, 0, 0, 50, b'j', b'u', b'n', b'k']);
+    let buf = mp4_with_keyed(&bx(b"meta", &children), &[], &[], b"AUDIO");
+    assert_eq!(
+        read_tags(&buf),
+        vec![("artist".to_string(), "Good".to_string())]
+    );
+}
+
+#[test]
+fn read_tags_ignores_index_items_without_an_mdta_handler() {
+    // Keys and index items are only meaningful under an `mdta` handler (ffmpeg's
+    // `found_hdlr_mdta` gate): a `meta` with another handler, or none, is not
+    // keyed metadata.
+    let items = [("com.apple.quicktime.artist", text("X"))];
+    let mut no_hdlr = keyed_meta_children(&items);
+    no_hdlr.drain(..mdta_hdlr().len());
+    let mut mdir = keyed_meta_children(&items);
+    let at = mdir.windows(4).position(|w| w == b"mdta").unwrap();
+    mdir[at..at + 4].copy_from_slice(b"mdir");
+    for children in [no_hdlr, mdir] {
+        let buf = mp4_with_keyed(&bx(b"meta", &children), &[], &[], b"AUDIO");
+        assert!(read_tags(&buf).is_empty());
+    }
+}
+
+#[test]
+fn read_tags_reads_itunes_ilst_beside_an_ffmpeg_keyed_meta_in_udta() {
+    // A `udta` holding both an `mdta` meta and an iTunes meta, in either order:
+    // the iTunes `ilst` is found (it used to be "the first meta", which lost it
+    // when the keyed one came first), and each system's values are read once.
+    let keyed =
+        ffmpeg_keyed_udta_meta(&[("artist", text("Keyed")), ("album", text("Keyed Album"))]);
+    let itunes = itunes_meta(&bx(b"\xa9ART", &text("iTunes")));
+    for udta in [
+        bx(b"udta", &[keyed.clone(), itunes.clone()].concat()),
+        bx(b"udta", &[itunes.clone(), keyed.clone()].concat()),
+    ] {
+        let buf = mp4_with_keyed(&udta, &[], &[], b"AUDIO");
+        assert_eq!(
+            read_tags(&buf),
+            vec![
+                ("artist".to_string(), "iTunes".to_string()),
+                ("album".to_string(), "Keyed Album".to_string()),
+            ]
+        );
+    }
+}
+
+#[test]
+fn read_tags_reads_keyed_metadata_from_a_moov_only_buffer() {
+    // The bounded probe hands the readers `scan.moov` alone, not the whole file.
+    let buf = mp4_with_keyed(
+        &keyed_meta(&[("com.apple.quicktime.title", text("T"))]),
+        &[],
+        &[],
+        b"AUDIO",
+    );
+    let scan = read_structure(&buf).unwrap();
+    assert_eq!(
+        read_tags(&scan.moov),
+        vec![("title".to_string(), "T".to_string())]
+    );
+}
+
+#[test]
+fn read_pictures_ingests_keyed_artwork() {
+    let png = [0x89, b'P', b'N', b'G', 1, 2];
+    let jpeg = [0xFF, 0xD8, 0xFF, 0xE0, 3];
+    for (type_code, bytes, mime) in [
+        (14u32, &png[..], "image/png"),
+        (13, &jpeg[..], "image/jpeg"),
+    ] {
+        let meta = keyed_meta(&[("com.apple.quicktime.artwork", data_atom(type_code, bytes))]);
+        let buf = mp4_with_keyed(&meta, &[], &[], b"AUDIO");
+        let (pics, dropped) = read_pictures_reporting(&buf, usize::MAX);
+        assert!(dropped.is_empty());
+        assert_eq!(pics.len(), 1, "{mime}");
+        assert_eq!(pics[0].mime, mime);
+        assert_eq!(pics[0].data, bytes);
+        assert_eq!(pics[0].picture_type, PictureType::new(3).unwrap());
+        assert!(pics[0].description.is_empty());
+        // Artwork is art, never a text tag.
+        assert!(read_tags(&buf).is_empty());
+    }
+}
+
+#[test]
+fn read_pictures_keyed_artwork_is_one_picture_from_the_first_source() {
+    // Two representations in one item (large, thumbnail) are one artwork; a second
+    // artwork at the track level is a lower-precedence source and is not used. BMP
+    // is skipped like a non-JPEG/PNG `covr`, so the PNG after it is chosen.
+    let movie = keyed_meta(&[(
+        "com.apple.quicktime.artwork",
+        [
+            data_atom(27, b"BMbmp"),
+            data_atom(13, b"large"),
+            data_atom(13, b"thumb"),
+        ]
+        .concat(),
+    )]);
+    let trak = keyed_meta(&[("com.apple.quicktime.artwork", data_atom(14, b"track"))]);
+    let buf = mp4_with_keyed(&movie, &trak, &[], b"AUDIO");
+    let pics = read_pictures(&buf, usize::MAX);
+    assert_eq!(pics.len(), 1);
+    assert_eq!(pics[0].data, b"large");
+}
+
+#[test]
+fn read_pictures_falls_through_an_artwork_item_with_no_image() {
+    // A movie-level artwork item holding no usable image does not claim the slot:
+    // the track-level artwork is used.
+    let movie = keyed_meta(&[("com.apple.quicktime.artwork", data_atom(27, b"BM"))]);
+    let trak = keyed_meta(&[("com.apple.quicktime.artwork", data_atom(14, b"track"))]);
+    let buf = mp4_with_keyed(&movie, &trak, &[], b"AUDIO");
+    let pics = read_pictures(&buf, usize::MAX);
+    assert_eq!(pics.len(), 1);
+    assert_eq!(pics[0].data, b"track");
+}
+
+#[test]
+fn read_pictures_covr_wins_over_keyed_artwork() {
+    let udta = bx(b"udta", &itunes_meta(&bx(b"covr", &data_atom(13, b"covr"))));
+    let meta = keyed_meta(&[("com.apple.quicktime.artwork", data_atom(14, b"keyed"))]);
+    let buf = mp4_with_keyed(&[meta.clone(), udta].concat(), &[], &[], b"AUDIO");
+    let pics = read_pictures(&buf, usize::MAX);
+    assert_eq!(pics.len(), 1);
+    assert_eq!(pics[0].data, b"covr");
+
+    // A `covr` whose only image is an unsupported type yields nothing, so the keyed
+    // artwork fills in.
+    let udta = bx(b"udta", &itunes_meta(&bx(b"covr", &data_atom(27, b"BM"))));
+    let buf = mp4_with_keyed(&[meta, udta].concat(), &[], &[], b"AUDIO");
+    let pics = read_pictures(&buf, usize::MAX);
+    assert_eq!(pics.len(), 1);
+    assert_eq!(pics[0].data, b"keyed");
+}
+
+#[test]
+fn read_pictures_an_oversize_covr_still_claims_the_art_slot() {
+    // An oversize `covr` is reported (and fails the file upstream, #644); the keyed
+    // artwork is not silently substituted for it.
+    let udta = bx(b"udta", &itunes_meta(&bx(b"covr", &data_atom(13, &[0; 5]))));
+    let meta = keyed_meta(&[("com.apple.quicktime.artwork", data_atom(14, b"k"))]);
+    let buf = mp4_with_keyed(&[meta, udta].concat(), &[], &[], b"AUDIO");
+    let (pics, dropped) = read_pictures_reporting(&buf, 4);
+    assert!(pics.is_empty());
+    assert_eq!(dropped.len(), 1);
+    assert_eq!(dropped[0].descriptor, "image/jpeg");
+}
+
+#[test]
+fn read_pictures_reporting_caps_keyed_artwork() {
+    let meta = keyed_meta(&[("com.apple.quicktime.artwork", data_atom(14, &[7; 5]))]);
+    let buf = mp4_with_keyed(&meta, &[], &[], b"AUDIO");
+    let (pics, dropped) = read_pictures_reporting(&buf, 4);
+    assert!(pics.is_empty());
+    assert_eq!(
+        dropped,
+        vec![OversizeDrop {
+            descriptor: "image/png".to_string(),
+            bytes: 5
+        }]
+    );
+    let (pics, dropped) = read_pictures_reporting(&buf, 5);
+    assert_eq!(pics.len(), 1);
+    assert!(dropped.is_empty());
+}
+
+/// A FullBox `meta` with a `hdlr` naming `handler`, then `body` verbatim.
+fn handler_meta(handler: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut hdlr = vec![0u8; 8];
+    hdlr.extend_from_slice(handler);
+    hdlr.extend_from_slice(&[0u8; 12]);
+    let mut p = vec![0u8; 4];
+    p.extend(bx(b"hdlr", &hdlr));
+    p.extend_from_slice(body);
+    bx(b"meta", &p)
+}
+
+/// A `soun` `mdia` with one `stco` entry of 0 (patched by [`mp4_around_traks`])
+/// followed by `extra` children.
+fn soun_mdia(extra: &[u8]) -> Vec<u8> {
+    let mut hdlr_p = vec![0u8; 8];
+    hdlr_p.extend_from_slice(b"soun");
+    hdlr_p.extend_from_slice(&[0u8; 12]);
+    let mut stco = vec![0u8; 4];
+    stco.extend_from_slice(&1u32.to_be_bytes());
+    stco.extend_from_slice(&0u32.to_be_bytes());
+    let minf = bx(b"minf", &bx(b"stbl", &bx(b"stco", &stco)));
+    bx(
+        b"mdia",
+        &[bx(b"hdlr", &hdlr_p), minf, extra.to_vec()].concat(),
+    )
+}
+
+/// `ftyp`, then `moov` = `mvhd` + `moov_children`, then `mdat` holding `audio`.
+/// The `n`th `stco` in the file gets the payload offset plus `chunk_offsets[n]`.
+fn mp4_around(moov_children: &[u8], audio: &[u8], chunk_offsets: &[u32]) -> Vec<u8> {
+    let moov = bx(
+        b"moov",
+        &[bx(b"mvhd", &[0u8; 8]), moov_children.to_vec()].concat(),
+    );
+    let mut out = [bx(b"ftyp", b"M4A isom"), moov, bx(b"mdat", audio)].concat();
+    let payload_at = u32::try_from(out.len() - audio.len()).unwrap();
+    let tables: Vec<usize> = out
+        .windows(4)
+        .enumerate()
+        .filter_map(|(i, w)| (w == b"stco").then_some(i))
+        .collect();
+    assert_eq!(tables.len(), chunk_offsets.len(), "one offset per stco");
+    for (at, add) in tables.into_iter().zip(chunk_offsets) {
+        let entry = at + 12;
+        out[entry..entry + 4].copy_from_slice(&(payload_at + add).to_be_bytes());
+    }
+    out
+}
+
+/// Materialize a layout with no streamed segments: inline bytes, and backing
+/// audio read from `backing`.
+fn serve_unstreamed(layout: &RegionLayout, backing: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for seg in layout.segments() {
+        match seg {
+            Segment::Inline(b) => out.extend_from_slice(b),
+            Segment::BackingAudio { offset, len } => {
+                let s = usize_from(*offset);
+                out.extend_from_slice(&backing[s..s + usize_from(*len)]);
+            }
+            other => panic!("unexpected streamed segment: {other:?}"),
+        }
+    }
+    out
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// The whole-box bytes of every child of `buf` of type `kind`.
+fn child_box_bytes(buf: &[u8], kind: &[u8; 4]) -> Vec<Vec<u8>> {
+    child_boxes(buf)
+        .unwrap()
+        .into_iter()
+        .filter(|b| &b.kind == kind)
+        .map(|b| buf[b.start..b.end()].to_vec())
+        .collect()
+}
+
+fn kinds(buf: &[u8]) -> Vec<[u8; 4]> {
+    child_boxes(buf).unwrap().iter().map(|b| b.kind).collect()
+}
+
+/// Synthesize `buf` with `tags` only, serve it, and check the invariants every
+/// keyed-metadata synthesis must hold: the served file re-parses strictly, its
+/// audio is byte-identical, it carries no keyed metadata anywhere, and its tags
+/// are exactly the store's. Returns the served file and its structure.
+fn synthesize_single_system(buf: &[u8], tags: &[TagInput]) -> (Vec<u8>, Mp4Scan) {
+    let scan = read_structure(buf).unwrap();
+    let layout = synthesize_layout(&scan, tags, &[], &[]).unwrap();
+    let served = serve_unstreamed(&layout, buf);
+    let served_scan = read_structure(&served).expect("served file re-parses strictly");
+    let old_audio = &buf[usize_from(scan.mdat_payload_offset)..];
+    assert_eq!(
+        &served[usize_from(served_scan.mdat_payload_offset)..],
+        old_audio
+    );
+    assert!(keyed_items(&served).is_empty(), "keyed metadata survived");
+    let want: Vec<(String, String)> = tags
+        .iter()
+        .map(|t| (t.key.clone(), t.value.clone()))
+        .collect();
+    assert_eq!(read_tags(&served), want);
+    (served, served_scan)
+}
+
+#[test]
+fn synthesize_drops_movie_level_keyed_meta_but_keeps_other_meta_handlers() {
+    // After an `artist` edit the served file must not also carry the original
+    // keyed `artist` (#771); a `meta` under another handler (here ID3-in-MP4's
+    // `ID32`) is not a system the store models and passes through untouched.
+    let keyed = keyed_meta(&[("com.apple.quicktime.artist", text("Old Keyed Artist"))]);
+    let id32 = handler_meta(b"ID32", &bx(b"ID32", b"\x00\x00ID3-opaque"));
+    let ffmpeg_udta = bx(
+        b"udta",
+        &ffmpeg_keyed_udta_meta(&[("artist", text("Old ffmpeg Artist"))]),
+    );
+    let trak = bx(b"trak", &soun_mdia(&[]));
+    let buf = mp4_around(
+        &[keyed, trak, id32.clone(), ffmpeg_udta].concat(),
+        b"AUDIODATA",
+        &[0],
+    );
+
+    let (served, s) = synthesize_single_system(&buf, &[TagInput::new("artist", "New Artist")]);
+    assert!(!contains(&served, b"Old Keyed Artist"));
+    assert!(!contains(&served, b"Old ffmpeg Artist"));
+    let mp = &s.moov[8..];
+    assert_eq!(kinds(mp), vec![*b"mvhd", *b"trak", *b"meta", *b"udta"]);
+    assert_eq!(child_box_bytes(mp, b"meta"), vec![id32]);
+    // The chunk offset follows the audio to its new position.
+    assert_eq!(
+        all_stco(&served),
+        vec![vec![u32::try_from(s.mdat_payload_offset).unwrap()]]
+    );
+}
+
+#[test]
+fn synthesize_drops_a_bare_and_a_fullbox_keyed_meta_alike() {
+    let bare = keyed_meta(&[("com.apple.quicktime.title", text("Old Bare"))]);
+    let full = ffmpeg_keyed_udta_meta(&[("com.apple.quicktime.album", text("Old Full"))]);
+    let trak = bx(b"trak", &soun_mdia(&[]));
+    let buf = mp4_around(&[bare, full, trak].concat(), b"AUDIO", &[0]);
+    let (served, s) = synthesize_single_system(&buf, &[TagInput::new("title", "T")]);
+    assert!(!contains(&served, b"Old Bare") && !contains(&served, b"Old Full"));
+    assert_eq!(kinds(&s.moov[8..]), vec![*b"mvhd", *b"trak", *b"udta"]);
+}
+
+#[test]
+fn synthesize_strips_keyed_meta_from_track_and_media_and_resizes_both() {
+    // Removing a nested box shrinks `mdia`, `trak` and `moov`. The stco value is
+    // then relocated by the delta the shrunken moov implies: both have to agree
+    // for the served file to parse strictly and point at the right audio.
+    let trak_meta = keyed_meta(&[(
+        "player.movie.audio.gain",
+        data_atom(23, &0.5f32.to_be_bytes()),
+    )]);
+    let mdia_meta = keyed_meta(&[("com.apple.quicktime.comment", text("Old comment"))]);
+    let trak_udta = bx(b"udta", &bx(b"tsrp", b"{\"transcript\":true}"));
+    let mdia_other = handler_meta(b"mdir", &bx(b"ilst", b""));
+    let mdia = soun_mdia(&[mdia_meta.clone(), mdia_other.clone()].concat());
+    let trak = bx(
+        b"trak",
+        &[trak_meta.clone(), mdia.clone(), trak_udta.clone()].concat(),
+    );
+    let buf = mp4_around(&trak, b"AUDIODATA", &[0]);
+
+    let (served, s) = synthesize_single_system(&buf, &[TagInput::new("title", "New")]);
+    assert!(!contains(&served, b"Old comment"));
+    assert!(!contains(&served, b"player.movie.audio.gain"));
+    let mp = &s.moov[8..];
+    let new_trak = child_boxes(mp).unwrap()[1];
+    assert_eq!(&new_trak.kind, b"trak");
+    assert_eq!(
+        new_trak.total_len,
+        trak.len() - trak_meta.len() - mdia_meta.len()
+    );
+    let trak_payload = new_trak.payload(mp);
+    assert_eq!(kinds(trak_payload), vec![*b"mdia", *b"udta"]);
+    assert_eq!(child_box_bytes(trak_payload, b"udta"), vec![trak_udta]);
+    let new_mdia = child_boxes(trak_payload).unwrap()[0];
+    assert_eq!(new_mdia.total_len, mdia.len() - mdia_meta.len());
+    let mdia_payload = new_mdia.payload(trak_payload);
+    assert_eq!(kinds(mdia_payload), vec![*b"hdlr", *b"minf", *b"meta"]);
+    assert_eq!(child_box_bytes(mdia_payload, b"meta"), vec![mdia_other]);
+    assert_eq!(
+        all_stco(&served),
+        vec![vec![u32::try_from(s.mdat_payload_offset).unwrap()]]
+    );
+}
+
+#[test]
+fn synthesize_strips_keyed_meta_under_a_largesize_trak_header() {
+    // A 64-bit largesize header keeps its form, with the shrunken size.
+    let meta = keyed_meta(&[("com.apple.quicktime.title", text("Old"))]);
+    let body = [soun_mdia(&[]), meta.clone()].concat();
+    let mut trak = 1u32.to_be_bytes().to_vec();
+    trak.extend_from_slice(b"trak");
+    trak.extend_from_slice(&(16 + body.len() as u64).to_be_bytes());
+    trak.extend_from_slice(&body);
+    let buf = mp4_around(&trak, b"AUDIODATA", &[0]);
+
+    let (served, s) = synthesize_single_system(&buf, &[TagInput::new("title", "New")]);
+    let mp = &s.moov[8..];
+    let new_trak = child_boxes(mp).unwrap()[1];
+    assert_eq!((new_trak.kind, new_trak.header_len), (*b"trak", 16));
+    assert_eq!(new_trak.total_len, trak.len() - meta.len());
+    assert_eq!(&mp[new_trak.start..new_trak.start + 4], &1u32.to_be_bytes());
+    assert_eq!(
+        all_stco(&served),
+        vec![vec![u32::try_from(s.mdat_payload_offset).unwrap()]]
+    );
+}
+
+#[test]
+fn synthesize_strip_keeps_bytes_trailing_the_last_track_child() {
+    // Up to 7 bytes after a `trak`'s last child are not a box; they are copied
+    // through rather than lost when a keyed meta before them is removed.
+    let meta = keyed_meta(&[("com.apple.quicktime.title", text("Old"))]);
+    let trak = bx(
+        b"trak",
+        &[soun_mdia(&[]), meta.clone(), b"tail".to_vec()].concat(),
+    );
+    let buf = mp4_around(&trak, b"AUDIODATA", &[0]);
+    let (_, s) = synthesize_single_system(&buf, &[TagInput::new("title", "New")]);
+    let mp = &s.moov[8..];
+    let new_trak = child_boxes(mp).unwrap()[1];
+    assert_eq!(new_trak.total_len, trak.len() - meta.len());
+    assert!(new_trak.payload(mp).ends_with(b"tail"));
+}
+
+#[test]
+fn synthesize_does_not_strip_meta_nested_below_mdia() {
+    // Keyed metadata is defined at the movie, track and media levels only; a
+    // `meta` deeper down (here inside `minf`) is an unmodelled box, left as is.
+    let meta = keyed_meta(&[("com.apple.quicktime.title", text("Deep"))]);
+    let mut hdlr_p = vec![0u8; 8];
+    hdlr_p.extend_from_slice(b"soun");
+    hdlr_p.extend_from_slice(&[0u8; 12]);
+    let mut stco = vec![0u8; 4];
+    stco.extend_from_slice(&1u32.to_be_bytes());
+    stco.extend_from_slice(&0u32.to_be_bytes());
+    let minf = bx(
+        b"minf",
+        &[bx(b"stbl", &bx(b"stco", &stco)), meta.clone()].concat(),
+    );
+    let trak = bx(
+        b"trak",
+        &bx(b"mdia", &[bx(b"hdlr", &hdlr_p), minf].concat()),
+    );
+    let buf = mp4_around(&trak, b"AUDIODATA", &[0]);
+    let scan = read_structure(&buf).unwrap();
+    let layout = synthesize_layout(&scan, &[], &[], &[]).unwrap();
+    let served = serve_unstreamed(&layout, &buf);
+    let s = read_structure(&served).unwrap();
+    assert_eq!(child_boxes(&s.moov[8..]).unwrap()[1].total_len, trak.len());
+    assert!(contains(&served, &meta));
+}
+
+#[test]
+fn synthesize_strips_keyed_meta_from_a_chaptered_m4b_keeping_chapters() {
+    // #672 still holds with keyed metadata in both tracks: the chapter track's
+    // chunk offset relocates with the audio's, and the Nero `chpl` survives.
+    let audio_meta = keyed_meta(&[("com.apple.quicktime.title", text("Old Title"))]);
+    let chapter_meta = keyed_meta(&[("com.apple.quicktime.comment", text("Old Chapter Meta"))]);
+    let movie_meta = keyed_meta(&[("com.apple.quicktime.artist", text("Old Artist"))]);
+    let soun = bx(b"trak", &[soun_mdia(&[]), audio_meta].concat());
+    let text_trak = {
+        let mut hdlr_p = vec![0u8; 8];
+        hdlr_p.extend_from_slice(b"text");
+        hdlr_p.extend_from_slice(&[0u8; 12]);
+        let mut stco = vec![0u8; 4];
+        stco.extend_from_slice(&1u32.to_be_bytes());
+        stco.extend_from_slice(&0u32.to_be_bytes());
+        let minf = bx(b"minf", &bx(b"stbl", &bx(b"stco", &stco)));
+        let mdia = bx(b"mdia", &[bx(b"hdlr", &hdlr_p), minf].concat());
+        bx(b"trak", &[mdia, chapter_meta].concat())
+    };
+    let chpl = chpl_box(&["One", "Two"]);
+    let udta = bx(
+        b"udta",
+        &[
+            itunes_meta(&bx(b"\xa9nam", &text("Old iTunes"))),
+            chpl.clone(),
+        ]
+        .concat(),
+    );
+    let buf = mp4_around(
+        &[movie_meta, soun, text_trak, udta].concat(),
+        b"AUDIODATACHAPTERS",
+        &[0, 9],
+    );
+
+    let (served, s) = synthesize_single_system(&buf, &[TagInput::new("title", "New")]);
+    for old in [
+        &b"Old Title"[..],
+        b"Old Chapter Meta",
+        b"Old Artist",
+        b"Old iTunes",
+    ] {
+        assert!(!contains(&served, old));
+    }
+    let p = u32::try_from(s.mdat_payload_offset).unwrap();
+    assert_eq!(all_stco(&served), vec![vec![p], vec![p + 9]]);
+    let mp = &s.moov[8..];
+    let udta = child_box_bytes(mp, b"udta").remove(0);
+    assert!(udta.ends_with(&chpl));
+}
+
+#[test]
+fn synthesize_strips_the_readable_prefix_of_a_garbled_second_mdia() {
+    // `validate_moov` parses only a track's first `mdia`, so a second one can be
+    // garbled inside. The reader still ingests the keyed `meta` in its readable
+    // prefix; synthesis must drop that same box, copying the unreadable rest
+    // through, rather than failing the file or serving the stale value.
+    let keyed = keyed_meta(&[("com.apple.quicktime.title", text("Old"))]);
+    let junk = [0, 0, 0, 99, b'j', b'u', b'n', b'k'];
+    let garbled = bx(b"mdia", &[keyed.clone(), junk.to_vec()].concat());
+    let trak = bx(b"trak", &[soun_mdia(&[]), garbled].concat());
+    let buf = mp4_around(&trak, b"AUDIODATA", &[0]);
+    assert_eq!(
+        read_tags(&buf),
+        vec![("title".to_string(), "Old".to_string())]
+    );
+
+    let (_, s) = synthesize_single_system(&buf, &[TagInput::new("title", "New")]);
+    let mp = &s.moov[8..];
+    let new_trak = child_boxes(mp).unwrap()[1];
+    assert_eq!(new_trak.total_len, trak.len() - keyed.len());
+    let trak_payload = new_trak.payload(mp);
+    let second = child_boxes(trak_payload).unwrap()[1];
+    assert_eq!(second.payload(trak_payload), junk);
+}
+
+#[test]
+fn synthesize_keeps_a_keyed_meta_nested_in_track_udta() {
+    // The reader takes keyed metadata from `trak/meta` and `trak/mdia/meta` only,
+    // so a keyed `meta` inside `trak/udta` is not ingested — and must not be
+    // dropped either. Only `mdia` is descended into; every other track child is
+    // copied through byte for byte.
+    let nested = keyed_meta(&[("com.apple.quicktime.title", text("Nested"))]);
+    let trak_udta = bx(b"udta", &nested);
+    let trak = bx(b"trak", &[soun_mdia(&[]), trak_udta.clone()].concat());
+    let buf = mp4_around(&trak, b"AUDIODATA", &[0]);
+    assert!(
+        read_tags(&buf).is_empty(),
+        "trak/udta is not a keyed location"
+    );
+
+    let scan = read_structure(&buf).unwrap();
+    let layout = synthesize_layout(&scan, &[], &[], &[]).unwrap();
+    let served = serve_unstreamed(&layout, &buf);
+    let s = read_structure(&served).unwrap();
+    let mp = &s.moov[8..];
+    let new_trak = child_boxes(mp).unwrap()[1];
+    assert_eq!(new_trak.total_len, trak.len());
+    assert_eq!(
+        child_box_bytes(new_trak.payload(mp), b"udta"),
+        vec![trak_udta]
+    );
+}
+
+#[test]
+fn chunk_offsets_reads_every_tracks_stco_or_co64_table() {
+    // Several entries, so an entry's position depends on its index and width.
+    let stco = mk_mp4(true, b"AUDIODATA", &[42, 100, 7]);
+    assert_eq!(
+        chunk_offsets(&read_structure(&stco).unwrap().moov).unwrap(),
+        vec![vec![42, 100, 7]]
+    );
+    let co64 = mk_mp4_co64(b"AUDIODATA", &[1 << 40, 5, 9]);
+    assert_eq!(
+        chunk_offsets(&read_structure(&co64).unwrap().moov).unwrap(),
+        vec![vec![1 << 40, 5, 9]]
+    );
+    let chaptered = mk_mp4_chaptered(b"text", 3, 9);
+    assert_eq!(
+        chunk_offsets(&read_structure(&chaptered).unwrap().moov).unwrap(),
+        vec![vec![3], vec![9]]
+    );
+}
+
+#[test]
+fn read_binary_tags_never_reads_keyed_items() {
+    let meta = keyed_meta(&[
+        ("com.example.blob", data_atom(0, &[1, 2, 3])),
+        ("com.apple.quicktime.artwork", data_atom(13, b"img")),
+    ]);
+    let buf = mp4_with_keyed(&meta, &[], &[], b"AUDIO");
+    let (tags, dropped) = read_binary_tags_reporting(&buf, 0);
+    assert!(tags.is_empty());
+    assert!(dropped.is_empty());
+}

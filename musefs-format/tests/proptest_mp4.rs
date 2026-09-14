@@ -3,9 +3,12 @@
 mod common;
 
 use common::resolve_layout;
-use musefs_format::fuzz_check::{assert_backing_covers_audio, fixtures};
+use musefs_format::fuzz_check::{
+    assert_backing_covers_audio, assert_mp4_single_metadata_system, fixtures,
+};
 use musefs_format::{ArtInput, BinaryTagInput, BlobLen, PictureType, TagInput, mp4};
 use proptest::prelude::*;
+use std::collections::HashMap;
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(128))]
@@ -38,6 +41,37 @@ proptest! {
             .collect();
         if let Ok(layout) = mp4::synthesize_layout(&scan, &taginputs, &[], &arts) {
             assert_backing_covers_audio(scan.mdat_payload_offset, scan.mdat_payload_len, &layout);
+        }
+    }
+
+    /// #771: a source carrying QuickTime keyed metadata at the movie, track and
+    /// media levels, in either box order, synthesizes for any tags to a file that
+    /// re-parses, keeps its audio byte for byte, holds no keyed `meta`, and has
+    /// every chunk offset moved by exactly the relocation delta — and whose tags
+    /// are the store's alone.
+    #[test]
+    fn mp4_keyed_metadata_never_survives_synthesis(
+        payload in proptest::collection::vec(any::<u8>(), 1..256),
+        tags in proptest::collection::vec(("[a-z]{1,12}", "[ -~]{0,40}"), 0..8),
+        moov_first in any::<bool>(),
+    ) {
+        let file = if moov_first {
+            fixtures::m4a_keyed(&payload)
+        } else {
+            fixtures::m4a_keyed_moov_last(&payload)
+        };
+        let scan = mp4::read_structure(&file).unwrap();
+        let taginputs: Vec<TagInput> = tags.iter().map(|(k, v)| TagInput::new(k, v)).collect();
+        let layout = mp4::synthesize_layout(&scan, &taginputs, &[], &[]).unwrap();
+        assert_mp4_single_metadata_system(&file, &scan, &layout);
+
+        let served = resolve_layout(&layout, &file, &HashMap::new(), &HashMap::new());
+        let keys: Vec<String> = mp4::read_tags(&served).into_iter().map(|(k, _)| k).collect();
+        for key in &keys {
+            prop_assert!(
+                tags.iter().any(|(k, _)| k == key),
+                "served tag {key:?} is not the store's"
+            );
         }
     }
 

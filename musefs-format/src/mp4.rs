@@ -1,8 +1,8 @@
-//! Hand-rolled MP4/M4A box layer: parse the structure, read iTunes metadata, and
-//! regenerate `moov` (with patched chunk offsets) to synthesize a re-tagged file
-//! whose `mdat` audio payload is served verbatim. Strict: anything outside the
-//! supported shape (one audio track plus optional chapter tracks, one `mdat`,
-//! non-fragmented) is rejected.
+//! Hand-rolled MP4/M4A box layer: parse the structure, read iTunes and QuickTime
+//! keyed metadata, and regenerate `moov` (with patched chunk offsets) to
+//! synthesize a re-tagged file whose `mdat` audio payload is served verbatim.
+//! Strict: anything outside the supported shape (one audio track plus optional
+//! chapter tracks, one `mdat`, non-fragmented) is rejected.
 
 use crate::bytes::{read_u32_be, read_u64_be};
 use crate::convert::usize_from;
@@ -12,6 +12,7 @@ use crate::input::{
 };
 use crate::layout::{RegionLayout, Segment};
 use crate::size;
+use std::collections::HashSet;
 use std::io::{self, Read, Seek, SeekFrom};
 
 const MAX_MP4_METADATA_BYTES: u64 = 256 * 1024 * 1024;
@@ -386,11 +387,7 @@ pub fn read_structure_from<R: Read + Seek>(
     })
 }
 
-/// Locate `moov/udta/meta/ilst` and return the ilst payload range absolute within
-/// `buf`. The walk is lenient ([`find_box_lenient`]) at every level: a single
-/// malformed sibling box anywhere on the path must not suppress an otherwise
-/// well-formed `ilst`, matching the metadata extractors' "seed what you can"
-/// contract (#542). Strictness is reserved for the audio/structure path.
+/// The children of a `meta` box, given its payload.
 ///
 /// `meta` is normally an ISO FullBox — 4 version/flags bytes precede its children —
 /// but QuickTime also uses a bare `meta` with no such prefix. Per ISO 14496-12 the
@@ -398,24 +395,270 @@ pub fn read_structure_from<R: Read + Seek>(
 /// (skip 4) and any other value marks the bare variant (skip 0) (#543). A bare
 /// first child declaring `size == 0` ("extends to end") is the one ambiguous case
 /// and is misread as a FullBox, mirroring the wider tooling's heuristic.
-fn ilst_region(buf: &[u8]) -> Option<(usize, usize)> {
+fn meta_children(meta_payload: &[u8]) -> &[u8] {
+    match meta_payload.split_first_chunk::<4>() {
+        Some(([0, 0, 0, 0], children)) => children,
+        _ => meta_payload,
+    }
+}
+
+/// The handler type of QuickTime keyed metadata: a `keys` table plus an `ilst`
+/// whose item atom types are 1-based indexes into it, instead of FourCCs.
+const KEYED_HANDLER: [u8; 4] = *b"mdta";
+
+/// Whether a `meta` box (given its payload) holds QuickTime keyed metadata: its
+/// `hdlr` declares the `mdta` handler (`[version/flags][pre_defined][handler_type]`).
+/// The handler, not the presence of `keys`, is what ffmpeg's reader also gates on
+/// (`found_hdlr_mdta`). A `meta` with no readable `hdlr` is not keyed.
+fn is_keyed_meta(meta_payload: &[u8]) -> bool {
+    let children = meta_children(meta_payload);
+    find_box_lenient(children, b"hdlr")
+        .and_then(|h| h.payload(children).get(8..12))
+        .is_some_and(|handler| handler == KEYED_HANDLER)
+}
+
+/// The payloads of `buf`'s well-formed child boxes of type `kind`, in order.
+fn child_payloads<'a>(buf: &'a [u8], kind: &[u8; 4]) -> Vec<&'a [u8]> {
+    child_boxes_lenient(buf)
+        .into_iter()
+        .filter(|b| &b.kind == kind)
+        .map(|b| b.payload(buf))
+        .collect()
+}
+
+/// Locate the iTunes `moov/udta/meta/ilst` and return its payload. The walk is
+/// lenient ([`find_box_lenient`]) at every level: a single malformed sibling box
+/// anywhere on the path must not suppress an otherwise well-formed `ilst`,
+/// matching the metadata extractors' "seed what you can" contract (#542).
+/// Strictness is reserved for the audio/structure path.
+///
+/// The iTunes `meta` is the first one in `udta` that is not keyed metadata:
+/// ffmpeg's `-movflags use_metadata_tags` puts an `mdta` `meta` in `udta` too,
+/// and its index-typed `ilst` is read by [`keyed_items`] instead (#771).
+fn itunes_ilst(buf: &[u8]) -> Option<&[u8]> {
     let moov = find_box_lenient(buf, b"moov")?;
     let mp = moov.payload(buf);
-    let base = moov.payload_start();
     let udta = find_box_lenient(mp, b"udta")?;
-    let up = udta.payload_start();
-    let udta_payload = udta.payload(mp);
-    let meta = find_box_lenient(udta_payload, b"meta")?;
-    let meta_payload = meta.payload(udta_payload);
-    let prefix = if meta_payload.get(..4) == Some(&[0, 0, 0, 0][..]) {
-        4
-    } else {
-        0
+    let meta = child_payloads(udta.payload(mp), b"meta")
+        .into_iter()
+        .find(|meta| !is_keyed_meta(meta))?;
+    let children = meta_children(meta);
+    Some(find_box_lenient(children, b"ilst")?.payload(children))
+}
+
+/// One QuickTime keyed-metadata item: the key its index resolved to, and its
+/// `data` box payloads (`[type][locale][value]`, each at least 8 bytes) in file
+/// order.
+struct KeyedItem<'a> {
+    name: &'a str,
+    datas: Vec<&'a [u8]>,
+}
+
+/// Every keyed-metadata `meta` in the file, as its children, in precedence
+/// order: the movie-level `moov/meta`, then `moov/udta/meta` (where ffmpeg
+/// writes it), then each track's `trak/meta` and `trak/mdia/meta` — the three
+/// locations the QuickTime File Format allows, plus ffmpeg's. Lenient
+/// throughout: a malformed box ends only its own sibling list. These are exactly
+/// the boxes synthesis drops, which the fuzz oracle checks against.
+pub(crate) fn keyed_metas(buf: &[u8]) -> Vec<&[u8]> {
+    let Some(moov) = find_box_lenient(buf, b"moov") else {
+        return Vec::new();
     };
-    let meta_children = meta_payload.get(prefix..)?;
-    let il = find_box_lenient(meta_children, b"ilst")?;
-    let start = base + up + meta.payload_start() + prefix + il.payload_start();
-    Some((start, il.total_len - il.header_len))
+    let mp = moov.payload(buf);
+    let mut containers = vec![mp];
+    containers.extend(child_payloads(mp, b"udta"));
+    for trak in child_payloads(mp, b"trak") {
+        containers.push(trak);
+        containers.extend(child_payloads(trak, b"mdia"));
+    }
+    containers
+        .into_iter()
+        .flat_map(|container| child_payloads(container, b"meta"))
+        .filter(|meta| is_keyed_meta(meta))
+        .map(meta_children)
+        .collect()
+}
+
+/// Every track's chunk offsets, in track order, from a whole `moov` box: the
+/// `stco` entries widened, or the `co64` ones. The relocation oracle in
+/// `fuzz_check` compares a served file's against its source's.
+#[cfg(any(test, feature = "fuzzing"))]
+pub(crate) fn chunk_offsets(moov: &[u8]) -> Result<Vec<Vec<u64>>> {
+    let payload = read_box(moov, 0)?.payload(moov);
+    child_boxes(payload)?
+        .into_iter()
+        .filter(|b| &b.kind == b"trak")
+        .map(|t| {
+            let trak = t.payload(payload);
+            let (range, width) = match find_path(trak, &[b"mdia", b"minf", b"stbl", b"stco"])? {
+                Some(r) => (r, 4),
+                None => (
+                    find_path(trak, &[b"mdia", b"minf", b"stbl", b"co64"])?
+                        .ok_or(FormatError::Malformed)?,
+                    8,
+                ),
+            };
+            let table = &trak[range.0..range.0 + range.1];
+            let count = usize_from(u64::from(read_u32_be(table, 4)?));
+            (0..count)
+                .map(|i| {
+                    let pos = 8 + i * width;
+                    if width == 4 {
+                        read_u32_be(table, pos).map(u64::from)
+                    } else {
+                        read_u64_be(table, pos)
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Every keyed-metadata item in the file: [`keyed_metas`] order, and `ilst`
+/// order within one `meta`.
+fn keyed_items(buf: &[u8]) -> Vec<KeyedItem<'_>> {
+    keyed_metas(buf)
+        .into_iter()
+        .flat_map(read_keyed_meta)
+        .collect()
+}
+
+/// The items of one keyed `meta` (given its children): each `ilst` item's box
+/// type is a big-endian 1-based index into `keys`. An item whose index is 0
+/// (reserved), past the table, or names an unusable key slot is skipped.
+fn read_keyed_meta(children: &[u8]) -> Vec<KeyedItem<'_>> {
+    let keys = find_box_lenient(children, b"keys")
+        .map_or_else(Vec::new, |k| parse_keys(k.payload(children)));
+    let Some(ilst) = find_box_lenient(children, b"ilst") else {
+        return Vec::new();
+    };
+    let ilst = ilst.payload(children);
+    child_boxes_lenient(ilst)
+        .into_iter()
+        .filter_map(|item| {
+            let index = usize_from(u64::from(u32::from_be_bytes(item.kind)));
+            let name = (*keys.get(index.checked_sub(1)?)?)?;
+            let datas = child_payloads(item.payload(ilst), b"data")
+                .into_iter()
+                .filter(|dp| dp.len() >= 8)
+                .collect();
+            Some(KeyedItem { name, datas })
+        })
+        .collect()
+}
+
+/// The key names of a `keys` table payload (`[version/flags][entry_count]`, then
+/// per entry `[key_size][key_namespace][key_value]`); slot `i` is index `i + 1`.
+/// An entry outside the `mdta` namespace, or whose name is not UTF-8, is a `None`
+/// slot, so the indexes after it stay aligned. Lenient: the table ends at
+/// `entry_count` or at the first entry that does not fit, and grows only with
+/// entries actually present — never allocated from the declared count.
+fn parse_keys(payload: &[u8]) -> Vec<Option<&str>> {
+    let Ok(count) = read_u32_be(payload, 4) else {
+        return Vec::new();
+    };
+    let mut keys = Vec::new();
+    let mut pos = 8;
+    while keys.len() < usize_from(u64::from(count)) {
+        let Ok(size) = read_u32_be(payload, pos) else {
+            break;
+        };
+        let size = usize_from(u64::from(size));
+        let Some(entry) = pos.checked_add(size).and_then(|end| payload.get(pos..end)) else {
+            break;
+        };
+        let Some((header, name)) = entry.split_at_checked(8) else {
+            break;
+        };
+        keys.push(if header[4..] == KEYED_HANDLER {
+            std::str::from_utf8(name).ok()
+        } else {
+            None
+        });
+        pos += size;
+    }
+    keys
+}
+
+/// Choose one value from a keyed item's `data` boxes. Several `data` boxes are
+/// alternative representations of one datum — by locale or storage type — ordered
+/// most-specific first (QTFF "Data ordering"), not multiple values. So: the first
+/// default-locale (locale 0) value `decode` accepts, else the last one it accepts,
+/// the most general.
+fn pick_value<'a, T>(datas: &[&'a [u8]], decode: impl Fn(u32, &'a [u8]) -> Option<T>) -> Option<T> {
+    let mut fallback = None;
+    for dp in datas {
+        let type_code = u32::from_be_bytes([dp[0], dp[1], dp[2], dp[3]]);
+        let Some(value) = decode(type_code, &dp[8..]) else {
+            continue;
+        };
+        if dp[4..8] == [0, 0, 0, 0] {
+            return Some(value);
+        }
+        fallback = Some(value);
+    }
+    fallback
+}
+
+/// Render a keyed `data` value as tag text, by its QTFF well-known type: UTF-8
+/// (1) and UTF-16BE (2, a leading byte-order mark dropped); the big-endian
+/// integers — variable-width signed (21) and unsigned (22), and the fixed-width
+/// 8/16/32/64-bit signed (65/66/67/74) and unsigned (75/76/77/78) — as decimal;
+/// and finite float32 (23) / float64 (24) as their shortest decimal form. Every
+/// other type (sort-only strings, S/JIS, images, structured types) and every value
+/// whose length does not fit its type is not text: `None`.
+fn keyed_text(type_code: u32, value: &[u8]) -> Option<String> {
+    match (type_code, value.len()) {
+        (1, _) => std::str::from_utf8(value).ok().map(str::to_string),
+        (2, _) => utf16_be(value),
+        (21, 1..=8) | (65, 1) | (66, 2) | (67, 4) | (74, 8) => Some(be_signed(value).to_string()),
+        (22, 1..=8) | (75, 1) | (76, 2) | (77, 4) | (78, 8) => Some(be_unsigned(value).to_string()),
+        (23, 4) => {
+            let f = f32::from_be_bytes(value.try_into().ok()?);
+            f.is_finite().then(|| f.to_string())
+        }
+        (24, 8) => {
+            let f = f64::from_be_bytes(value.try_into().ok()?);
+            f.is_finite().then(|| f.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// A big-endian unsigned integer of up to 8 bytes.
+fn be_unsigned(value: &[u8]) -> u64 {
+    debug_assert!(value.len() <= 8, "at most 8 bytes");
+    value.iter().fold(0, |n, &b| (n << 8) | u64::from(b))
+}
+
+/// A big-endian two's-complement integer of 1 to 8 bytes, sign-extended.
+fn be_signed(value: &[u8]) -> i64 {
+    debug_assert!((1..=8).contains(&value.len()), "1 to 8 bytes");
+    let unused = 64 - 8 * u32::try_from(value.len()).expect("1 to 8 bytes");
+    (be_unsigned(value) << unused).cast_signed() >> unused
+}
+
+/// Decode UTF-16BE text, dropping a leading byte-order mark. An odd byte count
+/// or an unpaired surrogate is not text.
+fn utf16_be(value: &[u8]) -> Option<String> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+    let units: Vec<u16> = value
+        .chunks_exact(2)
+        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        .collect();
+    String::from_utf16(units.strip_prefix(&[0xFEFF]).unwrap_or(&units)).ok()
+}
+
+/// The image MIME type for a `covr`/artwork `data` type code: JPEG (13) and PNG
+/// (14) only.
+fn image_mime(type_code: u32) -> Option<&'static str> {
+    match type_code {
+        13 => Some("image/jpeg"),
+        14 => Some("image/png"),
+        _ => None,
+    }
 }
 
 /// Parse a `----` freeform atom payload into `(key, value)` pairs. Folds
@@ -491,15 +734,45 @@ fn number_total(value: &[u8]) -> String {
 
 /// Lenient: returns empty / skips any malformed atom and never errors — this only
 /// seeds metadata from existing files, so a missing or garbled tag must simply be
-/// absent. Text atoms map via the vocabulary; `trkn`/`disk` yield track/disc
-/// numbers as `"N"`/`"N/M"`; `----` freeform atoms key on their name (folded when
-/// known). Every `data` sub-box of an atom is read, so multi-value atoms recover
-/// all their values. Other atoms are skipped.
+/// absent.
+///
+/// The iTunes `ilst` is read first: text atoms map via the vocabulary;
+/// `trkn`/`disk` yield track/disc numbers as `"N"`/`"N/M"`; `----` freeform atoms
+/// key on their name (folded when known). Every `data` sub-box of an atom is
+/// read, so multi-value atoms recover all their values. Other atoms are skipped.
+///
+/// QuickTime keyed metadata ([`keyed_items`], #771) then fills in keys the `ilst`
+/// does not define. A key name folds onto the vocabulary when it has a mapping
+/// (`com.apple.quicktime.artist` → `artist`), and is otherwise kept verbatim, as
+/// an unknown `----` name is. Precedence is all-or-nothing per key, compared
+/// case-insensitively: a key the `ilst` carries takes nothing from keyed
+/// metadata, and among keyed items the first (in [`keyed_items`] order) that
+/// yields a value supplies the key. Each item yields at most one value
+/// ([`pick_value`], [`keyed_text`]); the artwork key is art, not text.
 pub fn read_tags(buf: &[u8]) -> Vec<(String, String)> {
-    let Some((start, len)) = ilst_region(buf) else {
-        return Vec::new();
-    };
-    let ilst = &buf[start..start + len];
+    let mut out = itunes_ilst(buf).map_or_else(Vec::new, read_ilst_tags);
+    let mut present: HashSet<String> = out.iter().map(|(k, _)| k.to_ascii_lowercase()).collect();
+    for item in keyed_items(buf) {
+        if item
+            .name
+            .eq_ignore_ascii_case(crate::tagmap::MP4_KEYED_ARTWORK)
+        {
+            continue;
+        }
+        let key = crate::tagmap::mp4_keyed_to_key(item.name).unwrap_or(item.name);
+        if present.contains(&key.to_ascii_lowercase()) {
+            continue;
+        }
+        if let Some(value) = pick_value(&item.datas, keyed_text) {
+            present.insert(key.to_ascii_lowercase());
+            out.push((key.to_string(), value));
+        }
+    }
+    out
+}
+
+/// The text tags of an iTunes `ilst` payload (see [`read_tags`]).
+fn read_ilst_tags(ilst: &[u8]) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for atom in child_boxes_lenient(ilst) {
         let inner = atom.payload(ilst);
@@ -527,10 +800,7 @@ pub fn read_tags(buf: &[u8]) -> Vec<(String, String)> {
                 out.push(("discnumber".into(), number_total(value)));
             } else if let Some(key) = crate::tagmap::mp4_integer_atom_to_key(&atom.kind) {
                 // tmpo/cpil/pgap: a big-endian unsigned integer in the value bytes.
-                let mut n: u64 = 0;
-                for &b in value.iter().take(8) {
-                    n = (n << 8) | u64::from(b);
-                }
+                let n = be_unsigned(&value[..value.len().min(8)]);
                 out.push((key.to_string(), n.to_string()));
             }
         }
@@ -552,66 +822,87 @@ pub struct OversizeDrop {
     pub bytes: usize,
 }
 
-/// Like [`read_pictures`], but also returns the oversized `covr` images skipped
-/// over `max_art_bytes`, so the caller can log each lossy drop. The size check
-/// still happens before any copy — an oversized image is described, never
+/// Like [`read_pictures`], but also returns the oversized images skipped over
+/// `max_art_bytes`, so the caller can log each lossy drop. The size check still
+/// happens before any copy — an oversized image is described, never
 /// materialized. See [`OversizeDrop`].
 pub fn read_pictures_reporting(
     buf: &[u8],
     max_art_bytes: usize,
 ) -> (Vec<EmbeddedPicture>, Vec<OversizeDrop>) {
-    let Some((start, len)) = ilst_region(buf) else {
-        return (Vec::new(), Vec::new());
-    };
-    let ilst = &buf[start..start + len];
     let mut out = Vec::new();
     let mut dropped = Vec::new();
-    for atom in child_boxes_lenient(ilst) {
-        if &atom.kind != b"covr" {
-            continue;
-        }
-        let inner = atom.payload(ilst);
-        for data in child_boxes_lenient(inner) {
-            if &data.kind != b"data" {
-                continue;
-            }
-            let dp = data.payload(inner);
+    let covr_atoms = itunes_ilst(buf).map_or_else(Vec::new, |ilst| child_payloads(ilst, b"covr"));
+    for covr in covr_atoms {
+        for dp in child_payloads(covr, b"data") {
             if dp.len() < 8 {
                 continue;
             }
-            let mime = match u32::from_be_bytes([dp[0], dp[1], dp[2], dp[3]]) {
-                13 => "image/jpeg",
-                14 => "image/png",
-                _ => continue,
-            };
-            if dp.len() - 8 > max_art_bytes {
-                dropped.push(OversizeDrop {
-                    descriptor: mime.to_string(),
-                    bytes: dp.len() - 8,
-                });
+            let Some(mime) = image_mime(u32::from_be_bytes([dp[0], dp[1], dp[2], dp[3]])) else {
                 continue;
-            }
-            out.push(EmbeddedPicture {
-                mime: mime.to_string(),
-                picture_type: PictureType::new(3).expect("3 is in range"),
-                description: String::new(),
-                // `covr` is the image bytes and a type flag; it declares no
-                // geometry, so these are all "not stated" as with `APIC`.
-                width: 0,
-                height: 0,
-                depth: 0,
-                colors: 0,
-                data: dp[8..].to_vec(),
+            };
+            push_picture(mime, &dp[8..], max_art_bytes, &mut out, &mut dropped);
+        }
+    }
+    // The `covr` art wins outright, as the `ilst` does for text; an oversize
+    // `covr` still claims the slot, since it fails the file rather than
+    // quietly giving way to a different image.
+    if out.is_empty() && dropped.is_empty() {
+        let artwork = keyed_items(buf)
+            .iter()
+            .filter(|item| {
+                item.name
+                    .eq_ignore_ascii_case(crate::tagmap::MP4_KEYED_ARTWORK)
+            })
+            .find_map(|item| {
+                pick_value(&item.datas, |type_code, value| {
+                    image_mime(type_code).map(|mime| (mime, value))
+                })
             });
+        if let Some((mime, image)) = artwork {
+            push_picture(mime, image, max_art_bytes, &mut out, &mut dropped);
         }
     }
     (out, dropped)
 }
 
+/// Record one embedded image: a front-cover picture, or an [`OversizeDrop`] when
+/// `image` exceeds `max_art_bytes` (checked before the copy).
+fn push_picture(
+    mime: &str,
+    image: &[u8],
+    max_art_bytes: usize,
+    out: &mut Vec<EmbeddedPicture>,
+    dropped: &mut Vec<OversizeDrop>,
+) {
+    if image.len() > max_art_bytes {
+        dropped.push(OversizeDrop {
+            descriptor: mime.to_string(),
+            bytes: image.len(),
+        });
+        return;
+    }
+    out.push(EmbeddedPicture {
+        mime: mime.to_string(),
+        picture_type: PictureType::new(3).expect("3 is in range"),
+        description: String::new(),
+        // `covr` and keyed artwork are image bytes and a type flag; neither
+        // declares geometry, so these are all "not stated" as with `APIC`.
+        width: 0,
+        height: 0,
+        depth: 0,
+        colors: 0,
+        data: image.to_vec(),
+    });
+}
+
 /// Lenient: returns empty / skips any malformed atom and never errors — this only
 /// seeds cover art from existing files, so a missing or garbled picture must simply be absent.
 /// Every `data` child of every `covr` atom yields one picture (the iTunes
-/// multiple-artwork convention); non-`data` children are skipped.
+/// multiple-artwork convention); non-`data` children are skipped. Only when the
+/// `covr` atoms yield nothing (not even an oversize drop) is QuickTime keyed
+/// metadata's `com.apple.quicktime.artwork` consulted: the first artwork item, in
+/// [`keyed_items`] order, holding a JPEG/PNG value gives one picture.
 ///
 /// `max_art_bytes` caps each image body: a `data` payload whose image bytes
 /// (after the 8-byte `[type][locale]` header) exceed it is skipped before any
@@ -629,10 +920,11 @@ pub fn read_binary_tags_reporting(
     buf: &[u8],
     max_binary_tag_bytes: usize,
 ) -> (Vec<EmbeddedBinaryTag>, Vec<OversizeDrop>) {
-    let Some((start, len)) = ilst_region(buf) else {
+    // Keyed metadata has no binary passthrough: its non-text values are either
+    // artwork or dropped (see `keyed_text`), so only the iTunes `ilst` is read.
+    let Some(ilst) = itunes_ilst(buf) else {
         return (Vec::new(), Vec::new());
     };
-    let ilst = &buf[start..start + len];
     let mut out = Vec::new();
     let mut dropped = Vec::new();
     for atom in child_boxes_lenient(ilst) {
