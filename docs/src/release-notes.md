@@ -170,12 +170,17 @@ A few files need more than that:
 content version in the nanoseconds, so a tag edit is visible to a tool that
 compares size and mtime. 1.3.0 served whole seconds, so on the first mount
 nearly every synthesized file's mtime changes. The first revalidate then moves
-it again, seconds included, because it rewrites every row. Where it restores
-picture metadata or an Ogg FLAC's bounds, the size changes too. To have rsync
-without `--checksum`, Syncthing or a backup tool re-copy the library once
-rather than twice, revalidate before the first sync from the new mount. A
-whole-second comparison sees only the second change. `--mode structure-only`
-is unaffected.
+it again, seconds included. The upgrade cleared every fingerprint, so at the
+default checksum tier that revalidate re-probes every file, and each re-probe
+stamps its row's update time, which the whole second follows — on every
+filesystem, FAT32 and exFAT included. The nanoseconds move as well wherever the
+re-probe changes the file's content version: by recording its inode for the
+first time, which happens everywhere except FAT32 and exFAT ([#757]), or by
+restoring its picture metadata or an Ogg FLAC's bounds, where the size changes
+too. To have rsync without `--checksum`, Syncthing or a backup tool re-copy the
+library once rather than twice, revalidate before the first sync from the new
+mount. A whole-second comparison sees only the second change.
+`--mode structure-only` is unaffected.
 
 **`scan` exits `2` when the store rejects a file** ([#662]). A constraint
 violation on one file used to stop the scan with exit `1`. Now that file fails,
