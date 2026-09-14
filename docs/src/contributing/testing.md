@@ -89,8 +89,17 @@ bash scripts/contract-roundtrip.sh
 It scans real ffmpeg-generated audio (so `musefs scan` owns the track geometry),
 writes tags/art through `musefs_common.store`, synthesizes the served bytes via
 `cargo test --test contract_emit`, and asserts with mutagen that the Python tags
-and art survived. Picard's `musefs_bin` tier runs in the `picard` job (it needs
-the system-Picard environment).
+and art survived. Picard's `musefs_bin` tier runs in the same job: its path-gate
+tests import the bundled `musefs._common`, not the system-Picard environment.
+
+The job also runs the beets `e2e` tier (`python -m pytest contrib/beets/tests -m
+e2e`), the only test that drives the whole chain: generated audio, `beet
+import`, a retag, `beet musefs`, a real FUSE mount, and tags plus byte-identical
+audio read back from it. It is deselected by default because it needs `ffmpeg`,
+the built binary, `/dev/fuse` and a `fusermount3`/`fusermount` helper. Under
+`MUSEFS_REQUIRE_BIN=1` a missing one fails the tier rather than skipping it: for
+a while it ran in no job at all, and a guard that skipped hid it
+([#728](https://github.com/Sohex/musefs/issues/728)).
 
 ### Failure-path fault injection
 

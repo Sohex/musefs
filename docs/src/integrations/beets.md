@@ -187,8 +187,10 @@ only tier that sees the real schema rather than a fixture's, so a store-shape
 change breaks it and nothing else. Where the binary is absent it skips cleanly,
 so a Rust toolchain is not required to work on the plugin.
 
-The `e2e` tier stays opt-in: it needs `ffmpeg` and `/dev/fuse` + `fusermount`,
-and it generates audio, imports it with beets, retags, syncs, mounts via FUSE,
-and verifies the mount's tags and byte-identical audio (including a
-move-reconcile case) — not what a default `pytest` should do. It also skips
-cleanly if its tools are absent.
+The `e2e` tier stays opt-in locally: it needs `ffmpeg` and `/dev/fuse` +
+`fusermount3`/`fusermount`, and it generates audio, imports it with beets,
+retags, syncs, mounts via FUSE, and verifies the mount's tags and byte-identical
+audio (including a move-reconcile case) — not what a default `pytest` should
+do. Run it with `-m e2e`; it skips cleanly if its tools are absent. CI's
+`contract` job runs it on every change with `MUSEFS_REQUIRE_BIN=1`, which turns
+that skip into a failure ([#728](https://github.com/Sohex/musefs/issues/728)).

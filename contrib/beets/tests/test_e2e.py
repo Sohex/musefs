@@ -103,17 +103,30 @@ PLAYBACK_FORMATS = [
 ]
 
 
+def _missing_tool():
+    """Why this tier cannot run here, or None when everything it needs is present."""
+    if not (_DEBUG.exists() or _RELEASE.exists()):
+        return f"musefs binary not built (looked in {_DEBUG}, {_RELEASE})"
+    if not (os.path.exists("/dev/fuse") and _fusermount()):
+        return "no /dev/fuse, or no fusermount3/fusermount helper"
+    if not shutil.which("ffmpeg"):
+        return "ffmpeg not available"
+    if not os.path.exists(BEET):
+        return f"beet not found at {BEET}"
+    return None
+
+
 @pytest.fixture(autouse=True)
 def _require_tools():
-    """Skip the test when required external tools are missing."""
-    if not (_DEBUG.exists() or _RELEASE.exists()):
-        pytest.skip(f"musefs binary not built (looked in {_DEBUG}, {_RELEASE})")
-    if not (os.path.exists("/dev/fuse") and _fusermount()):
-        pytest.skip("no /dev/fuse, or no fusermount3/fusermount helper")
-    if not shutil.which("ffmpeg"):
-        pytest.skip("ffmpeg not available")
-    if not os.path.exists(BEET):
-        pytest.skip(f"beet not found at {BEET}")
+    """Skip the test when required external tools are missing — or, in CI's
+    contract tier, fail it. A guard that skips is how this tier went dark once
+    already (#728): an unmet requirement there must be loud."""
+    missing = _missing_tool()
+    if missing is None:
+        return
+    if os.environ.get("MUSEFS_REQUIRE_BIN"):
+        pytest.fail(missing)
+    pytest.skip(missing)
 
 
 # --- helpers ---------------------------------------------------------------

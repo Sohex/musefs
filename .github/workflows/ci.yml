@@ -181,6 +181,9 @@ jobs:
     # mutagen reads back). All three plugins' musefs_bin tiers run here,
     # including Picard's (it imports the bundled `musefs._common`, not the
     # system-Picard env). The separate `picard` job runs the full Picard suite.
+    # So does the beets `e2e` tier — import, retag, sync, a real FUSE mount —
+    # which ran in no job before #728; MUSEFS_REQUIRE_BIN makes its tool guard
+    # fail rather than skip, so it cannot go dark again unnoticed.
     needs: changes
     if: needs.changes.outputs.src == 'true'
     runs-on: ubuntu-latest
@@ -229,6 +232,10 @@ jobs:
         run: python -m pytest contrib/picard/tests/test_vendor_sync.py -v
       - name: Python -> Rust synthesis round trip
         run: bash scripts/contract-roundtrip.sh
+      - name: beets e2e tier (non-skipping)
+        # Deselected by beets' default addopts; `-m e2e` selects it. Needs the
+        # fuse3/ffmpeg installed above and the binary built above.
+        run: python -m pytest contrib/beets/tests -m e2e -v
 
   python-musefs:
     needs: changes
