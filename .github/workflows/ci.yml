@@ -97,8 +97,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: Install libfuse3
-        run: ./scripts/apt-install.sh fuse3 libfuse3-dev pkg-config
+      - name: Install fuse3
+        run: ./scripts/apt-install.sh fuse3
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           components: rustfmt, clippy
@@ -201,7 +201,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install FUSE + ffmpeg
-        run: ./scripts/apt-install.sh fuse3 libfuse3-dev pkg-config ffmpeg
+        run: ./scripts/apt-install.sh fuse3 ffmpeg
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
@@ -362,7 +362,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install FUSE and ffmpeg
-        run: ./scripts/apt-install.sh fuse3 libfuse3-dev pkg-config ffmpeg
+        run: ./scripts/apt-install.sh fuse3 ffmpeg
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
       - name: FUSE end-to-end tests
@@ -440,9 +440,11 @@ jobs:
 
   tsan:
     # ThreadSanitizer is BEST-EFFORT and deliberately NOT in ci-ok: it cannot
-    # instrument the system C libs (libfuse, libsqlite3), so it sees races in
-    # our code around the FFI but may miss or false-positive inside the C deps.
-    # continue-on-error keeps a noisy run from showing as a hard failure.
+    # instrument C code — the bundled SQLite that libsqlite3-sys compiles, and
+    # libc — so it sees races in our code around the FFI but may miss or
+    # false-positive inside SQLite. (libfuse is not involved: fuser's pure-Rust
+    # mount links none.) continue-on-error keeps a noisy run from showing as a
+    # hard failure.
     #
     # Unlike AddressSanitizer (which is ABI-compatible with an uninstrumented
     # std), ThreadSanitizer changes the ABI, so nightly rejects linking tsan
@@ -456,8 +458,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: Install libfuse3
-        run: ./scripts/apt-install.sh fuse3 libfuse3-dev pkg-config
+      - name: Install fuse3
+        run: ./scripts/apt-install.sh fuse3
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           toolchain: nightly
@@ -524,8 +526,6 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - name: Install libfuse3
-        run: ./scripts/apt-install.sh libfuse3-dev
       - name: Install critcmp
         run: cargo install critcmp --locked --version 0.1.8
       - name: Run A/B
