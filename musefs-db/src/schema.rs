@@ -378,10 +378,12 @@ const MIGRATION_V4: &str = r"
 -- every file. Rows carrying the old value would claim a fingerprint under an
 -- algorithm that no longer produces it -- a stale content identity of exactly
 -- the kind #689 is about -- so they are nulled here rather than silently
--- reinterpreted. The next `scan` or `revalidate` recomputes them: revalidate
--- already re-probes a row missing the checksum its tier asks for, so no new
--- backfill machinery is needed. `content_hash` is untouched: it is a full-file
--- SHA-256 and its meaning has not changed.
+-- reinterpreted. The next `revalidate` recomputes them: it already re-probes a
+-- row missing the checksum its tier asks for, so no new backfill machinery is
+-- needed. `content_hash` is nulled too, although its meaning did not change:
+-- before #689 a fingerprint-tier rescan of a rewritten file kept the old bytes'
+-- hash, so no stored value can be trusted to describe the file beside it.
+-- `revalidate --checksum=full` recomputes those.
 --
 -- The cost of nulling is bounded and one-way: a file that moves between this
 -- upgrade and the next scan is not move-recovered (it inserts fresh, as an
@@ -568,11 +570,11 @@ CREATE TABLE tracks (
 --
 -- `fingerprint` is dropped on the floor here -- that is #691's reset, folded in.
 --
--- `content_hash` is sanitized rather than carried blindly. It is a
--- scanner-owned derived column that the next scan recomputes, which is exactly
--- the case the sanitize-only-under-a-flag policy carves out: nulling one costs
--- a rescan, while carrying a value the new CHECK rejects would abort the whole
--- upgrade over a column that rebuilds itself. The other tightened columns are
+-- `content_hash` is dropped on the floor as well (see the #691 note above for
+-- why none is trusted). It is a scanner-owned derived column a revalidate
+-- recomputes, which is the case the sanitize-only-under-a-flag policy carves
+-- out, and it also means no stored hash can abort the upgrade by failing the
+-- tightened CHECK. The other tightened columns are
 -- NOT sanitized here -- they are either structural or NOT NULL, so a row that
 -- violates them fails the migration. That failure is atomic: every step runs in
 -- one transaction, so nothing is half-applied and the store is exactly as it
@@ -586,10 +588,7 @@ INSERT INTO tracks (id, backing_path, format, audio_offset, audio_length,
            backing_size, backing_mtime_ns, content_version, updated_at,
            backing_ctime_ns,
            NULL,
-           CASE WHEN typeof(content_hash) = 'text'
-                     AND length(content_hash) = 64
-                     AND instr(content_hash, char(0)) = 0
-                THEN content_hash END,
+           NULL,
            0
     FROM tracks_hold_v4;
 
@@ -1076,7 +1075,7 @@ const MIGRATIONS: &[Migration] = &[
         MIGRATION_V4,
         Gate::Gated,
         "2.0.0",
-        "clears every stored fingerprint; a revalidate recomputes them",
+        "clears every stored fingerprint and content hash; a revalidate recomputes them",
     ),
 ];
 
@@ -2301,10 +2300,8 @@ mod v4_tracks_rebuild_tests {
         }
     }
 
-    /// The one column the refill sanitizes rather than aborting on. A
-    /// scanner-owned derived column that a rescan recomputes is outside the
-    /// sanitize-only-under-a-flag policy, and carrying a value the new CHECK
-    /// rejects would fail the whole upgrade over something that rebuilds itself.
+    /// A `content_hash` the new CHECK would reject cannot abort the upgrade:
+    /// the refill carries no hash at all (#689), so it is nulled with the rest.
     #[test]
     fn the_refill_nulls_a_content_hash_the_new_check_would_reject() {
         let mut conn = populated_store_at(3);
@@ -2330,10 +2327,11 @@ mod v4_tracks_rebuild_tests {
         assert_eq!(kept, None, "id 2 never had one");
     }
 
-    /// #691, folded into the refill: the fingerprint is retired for every row,
-    /// while `content_hash` -- whose meaning did not change -- is kept.
+    /// #691 and #689, folded into the refill: the fingerprint is retired for
+    /// every row, and so is `content_hash`, even a well-formed one, because an
+    /// older rescan could leave it describing bytes the file no longer holds.
     #[test]
-    fn the_refill_retires_the_fingerprint_and_keeps_a_good_content_hash() {
+    fn the_refill_retires_the_fingerprint_and_the_content_hash() {
         let mut conn = populated_store_at(3);
         super::migrate_all(&mut conn).unwrap();
         let (fp, ch): (Option<String>, Option<String>) = conn
@@ -2344,7 +2342,7 @@ mod v4_tracks_rebuild_tests {
             )
             .unwrap();
         assert_eq!(fp, None);
-        assert_eq!(ch.as_deref(), Some(&"c".repeat(64)[..]));
+        assert_eq!(ch, None, "a well-formed hash is not proof it is current");
     }
 
     /// The upgrade rehearsal: a populated store from every released shape
@@ -3112,10 +3110,12 @@ mod baseline_tests {
 
     /// V4 retires every fingerprint written under the pre-audio-sampling
     /// algorithm (#691): an upgraded store must not carry values that claim to
-    /// be fingerprints the current code no longer produces. `content_hash` is
-    /// a full-file SHA-256 whose meaning did not change, so it must survive.
+    /// be fingerprints the current code no longer produces. It retires every
+    /// `content_hash` too: the SHA-256 means what it always did, but a pre-#689
+    /// rescan could leave a row's hash describing some earlier bytes, and
+    /// nothing in the row tells that apart from a current one.
     #[test]
-    fn migration_v4_clears_stale_fingerprints_and_keeps_content_hashes() {
+    fn migration_v4_clears_stale_fingerprints_and_content_hashes() {
         let mut conn = Connection::open_in_memory().unwrap();
         // Stop at V3 and seed a row the way a V3-era scanner would have.
         for (target, migration) in (1i64..).zip(super::MIGRATIONS).take(3) {
@@ -3146,9 +3146,8 @@ mod baseline_tests {
             .unwrap();
         assert_eq!(fp, None, "a pre-V4 fingerprint must not be carried forward");
         assert_eq!(
-            ch.as_deref(),
-            Some(&"d".repeat(64)[..]),
-            "content_hash means what it always meant"
+            ch, None,
+            "a pre-V4 content_hash must not be carried forward either"
         );
     }
 

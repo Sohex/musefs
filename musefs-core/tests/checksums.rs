@@ -537,3 +537,51 @@ fn fingerprint_tier_move_confirms_against_the_stored_hash() {
         "the confirm's hash is persisted, so the next scan need not re-read"
     );
 }
+
+/// The state a pre-#689 musefs could leave behind, as a V4 upgrade hands it on:
+/// a row whose stamp and geometry describe the file on disk, but whose
+/// `content_hash` is some other bytes' hash, and whose inode is unrecorded. A
+/// default (fingerprint-tier) revalidate re-probes it to record the inode. It
+/// must not keep that hash on the strength of a stamp whose inode wildcard proves
+/// nothing about the bytes the hash was computed over.
+#[test]
+fn revalidate_does_not_keep_a_content_hash_an_unrecorded_inode_cannot_vouch_for() {
+    let dir = tempfile::tempdir().unwrap();
+    write_a_flac(dir.path(), "a.flac", &[0xAB; 64]);
+    let db = Db::open_in_memory().unwrap();
+    scan_directory_with(&db, dir.path(), &opts(ChecksumTier::Fingerprint)).unwrap();
+    let track = db.list_tracks().unwrap().remove(0);
+
+    db.upsert_track(&musefs_db::NewTrack {
+        backing_path: track.backing_path.clone(),
+        format: track.format,
+        audio_offset: track.bounds.audio_offset(),
+        audio_length: track.bounds.audio_length(),
+        backing_size: track.backing_size,
+        backing_mtime_ns: track.backing_mtime_ns,
+        backing_ctime_ns: track.backing_ctime_ns,
+        backing_ino: None,
+    })
+    .unwrap();
+    let stale = "e".repeat(64);
+    db.set_track_checksums(
+        track.id,
+        musefs_db::ChecksumWrite::Keep,
+        musefs_db::ChecksumWrite::Set(&stale),
+    )
+    .unwrap();
+    let planted = db.get_track(track.id).unwrap().unwrap();
+    assert_eq!(planted.content_hash.as_deref(), Some(stale.as_str()));
+    assert_eq!(planted.backing_ino, None);
+
+    let stats =
+        musefs_core::revalidate_with(&db, dir.path(), &opts(ChecksumTier::Fingerprint)).unwrap();
+    assert_eq!(stats.updated, 1, "an unrecorded inode forces the re-probe");
+
+    let after = db.get_track(track.id).unwrap().unwrap();
+    assert!(after.backing_ino.is_some(), "the inode is recorded now");
+    assert_eq!(
+        after.content_hash, None,
+        "a hash the stamp cannot vouch for is cleared, not carried"
+    );
+}

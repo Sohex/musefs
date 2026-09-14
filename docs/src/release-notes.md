@@ -127,6 +127,12 @@ upgrade leaves several things only a revalidate puts right, and it is the
   is not recognised: `scan` ingests it as a new track and leaves its curated
   row behind. A plain `scan` does not recompute them for files already in the
   store; `revalidate` does.
+- **Full-file hashes are cleared too** ([#689]). A 1.x rescan could leave a
+  row's `content_hash` describing bytes its file no longer holds, so none is
+  carried across. If you scan with `--checksum=full`, run
+  `musefs revalidate --checksum=full` to recompute them. Until then
+  `--match=auto` confirms a move by fingerprint alone, and `--match=strict`
+  refuses to retarget.
 - **Stored inodes start unknown** ([#674]). The check that catches a backing
   file replaced in place cannot use the inode until a revalidate records it.
 - **Picture metadata is copied, not per file** ([#716], [#746]). 1.3.0 kept one

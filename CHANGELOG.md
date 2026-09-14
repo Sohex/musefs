@@ -385,6 +385,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A revalidate no longer keeps a `content_hash` its row cannot vouch for.**
+  Deciding whether an uncomputed checksum may be kept compared the stored stamp
+  with the live file the way serving does, where an unrecorded inode matches
+  any. That is too weak to prove the bytes are unchanged. Every row an upgraded
+  store starts with has no inode, and a hash a pre-#689 rescan left stale would
+  have survived the first revalidate and been treated as current from then on.
+  Such a row's uncomputed checksums are now cleared rather than kept
+  ([#689](https://github.com/Sohex/musefs/issues/689)).
 - **`musefs migrate` exits `2` when the revalidate it ran counted failures**
   ([#750](https://github.com/Sohex/musefs/issues/750)), as `musefs revalidate`
   itself does; it used to exit `0`. The store upgrade has succeeded either way,

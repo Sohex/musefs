@@ -133,7 +133,7 @@ itself:
 ```text
 store library.db is at schema version 2; this build needs 4.
   v3 (musefs 2.0.0) — widens the tags.value and track_art.description caps
-  v4 (musefs 2.0.0) — clears every stored fingerprint; a revalidate recomputes them  [needs this command]
+  v4 (musefs 2.0.0) — clears every stored fingerprint and content hash; a revalidate recomputes them  [needs this command]
 This rewrites the store in place. Once it is done, musefs builds older than this one will no longer open it.
 store is 412.7 MiB; the upgrade needs about 825.4 MiB free and has 27.7 GiB.
 a snapshot will be written to library.db.v2.bak first.

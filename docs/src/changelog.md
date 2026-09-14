@@ -524,8 +524,10 @@ see the [Release notes](release-notes.md).
   checksum its tier asks for, which a plain `scan` of a tracked file does not —
   and until then those
   rows cannot be move-recovered, exactly as an unfingerprinted row never could.
-  `content_hash` is untouched; it is a full-file SHA-256 and its meaning has not
-  changed. Like every migration this is one-way: the store will no longer open
+  `content_hash` is nulled with it. Its meaning did not change, but before #689 a
+  fingerprint-tier rescan of a rewritten file kept the old bytes' hash, so no
+  stored value can be trusted to describe its file; `musefs revalidate
+  --checksum=full` recomputes them. Like every migration this is one-way: the store will no longer open
   with an older musefs
   ([#691](https://github.com/Sohex/musefs/issues/691)).
 
@@ -610,6 +612,14 @@ see the [Release notes](release-notes.md).
 
 ### Fixed
 
+- **A revalidate no longer keeps a `content_hash` its row cannot vouch for.**
+  Deciding whether an uncomputed checksum may be kept compared the stored stamp
+  with the live file the way serving does, where an unrecorded inode matches
+  any. That is too weak to prove the bytes are unchanged. Every row an upgraded
+  store starts with has no inode, and a hash a pre-#689 rescan left stale would
+  have survived the first revalidate and been treated as current from then on.
+  Such a row's uncomputed checksums are now cleared rather than kept
+  ([#689](https://github.com/Sohex/musefs/issues/689)).
 - **`musefs migrate` exits `2` when the revalidate it ran counted failures**
   ([#750](https://github.com/Sohex/musefs/issues/750)). It discarded the count
   and exited `0`, so `musefs migrate --yes --revalidate && …` treated a partial

@@ -513,7 +513,8 @@ fn audio_sample_reads_three_bounded_windows() {
 /// for a fourth that does not.
 #[test]
 fn records_same_bytes_needs_every_field_to_agree() {
-    let unit = unit_with("/m/a.flac", Some("a".repeat(64)));
+    let mut unit = unit_with("/m/a.flac", Some("a".repeat(64)));
+    unit.stamp.ino = Some(7);
     // A real row to vary: `Track` is `#[non_exhaustive]`, so outside musefs-db
     // one comes from the store rather than a literal.
     let db = Db::open_in_memory().unwrap();
@@ -560,6 +561,20 @@ fn records_same_bytes_needs_every_field_to_agree() {
         ("format", row(unit.stamp, Format::Mp3, 0, 0)),
         ("audio_offset", row(unit.stamp, Format::Flac, 4, 0)),
         ("audio_length", row(unit.stamp, Format::Flac, 0, 4)),
+        // A stored row with no recorded inode, everything else agreeing: the
+        // wildcard that serving allows cannot vouch for a checksum (#689).
+        (
+            "unrecorded inode",
+            row(
+                BackingStamp {
+                    ino: None,
+                    ..unit.stamp
+                },
+                Format::Flac,
+                0,
+                0,
+            ),
+        ),
     ] {
         assert!(
             !records_same_bytes(&unit, Some(&t)),
@@ -1013,7 +1028,9 @@ fn a_checksum_that_cannot_be_produced_fails_the_file() {
 
 /// The `&Db` sink's known-path arm: a unit whose path already has a row must be
 /// upserted through `ingest_into`, and a pass that computed no full hash over
-/// unchanged bytes must leave the stored one alone (#689).
+/// unchanged bytes must leave the stored one alone (#689). "Unchanged" needs the
+/// row's inode recorded: an unrecorded one cannot vouch for the hash, which
+/// `tests/checksums.rs` covers from the other side.
 ///
 /// Also the only coverage of `<&Db>::existing_track` returning a row — the
 /// other `&Db` ingest tests all use paths the store has never seen, so a sink
@@ -1023,7 +1040,8 @@ fn ingest_unit_db_path_keeps_the_hash_of_unchanged_bytes() {
     let db = Db::open_in_memory().unwrap();
     let fp = "a".repeat(64);
     let hash = "d".repeat(64);
-    let unit = unit_with("/exists.flac", Some(fp.clone()));
+    let mut unit = unit_with("/exists.flac", Some(fp.clone()));
+    unit.stamp.ino = Some(7);
     let id = db
         .upsert_track(&NewTrack {
             backing_path: unit.abs_path.clone(),
@@ -1033,7 +1051,7 @@ fn ingest_unit_db_path_keeps_the_hash_of_unchanged_bytes() {
             backing_size: unit.stamp.size,
             backing_mtime_ns: unit.stamp.mtime_ns,
             backing_ctime_ns: unit.stamp.ctime_ns,
-            backing_ino: None,
+            backing_ino: unit.stamp.ino,
         })
         .unwrap();
     db.set_track_checksums(id, ChecksumWrite::Keep, ChecksumWrite::Set(&hash))

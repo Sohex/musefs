@@ -2075,9 +2075,18 @@ fn is_store_rejection(e: &crate::error::CoreError) -> bool {
 /// A `false` here is what turns an uncomputed checksum into `Clear` rather than
 /// `Keep`: a pass below the `full` tier must not leave the previous bytes'
 /// `content_hash` sitting beside the new ones (#689).
+///
+/// The stored row must have recorded an inode. `matches_live` lets an
+/// unrecorded one match any live inode, which is right for "is this row still
+/// safe to serve" and too weak for "have these bytes been proved the same":
+/// every row an upgraded store starts with has none, and a stamp that agrees
+/// on the other three fields cannot vouch for a hash an older musefs may already
+/// have left stale. Such a row's uncomputed checksums are cleared instead.
 fn records_same_bytes(unit: &Unit, existing: Option<&musefs_db::Track>) -> bool {
     existing.is_some_and(|t| {
-        BackingStamp::from_track(t).matches_live(&unit.stamp)
+        let stored = BackingStamp::from_track(t);
+        stored.ino.is_some()
+            && stored.matches_live(&unit.stamp)
             && t.format == unit.probed.format
             && t.bounds.audio_offset() == unit.probed.audio_offset
             && t.bounds.audio_length() == unit.probed.audio_length

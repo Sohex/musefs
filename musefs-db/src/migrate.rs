@@ -161,31 +161,20 @@ impl PendingMigration {
     /// it with no `ON DELETE` clause, so deleting a refused `art` row while a
     /// link to it survives fails outright.
     ///
-    /// `tracks` is the one whose source shape depends on the version being
-    /// upgraded from: the checksum columns arrived in V2, so a V1 store has no
-    /// such columns to select.
-    fn probe_projections(&self) -> [(&'static str, String); 5] {
-        let checksums = self.current >= 2;
-        let content_hash = if checksums {
-            "CASE WHEN typeof(content_hash) = 'text' \
-                       AND length(content_hash) = 64 \
-                       AND instr(content_hash, char(0)) = 0 \
-                  THEN content_hash END"
-        } else {
-            "NULL"
-        };
+    /// `tracks` selects no checksum column: the refill nulls both (#691,
+    /// #689), so a V1 store, which has no such columns, needs no special case.
+    fn probe_projections() -> [(&'static str, String); 5] {
         [
             (
                 "tracks",
-                format!(
-                    "(rowid, id, backing_path, format, audio_offset, audio_length, \
-                      backing_size, backing_mtime_ns, content_version, updated_at, \
-                      backing_ctime_ns, fingerprint, content_hash, backing_ino) \
-                     SELECT rowid, id, CAST(backing_path AS BLOB), format, audio_offset, \
-                      audio_length, backing_size, backing_mtime_ns, content_version, \
-                      updated_at, backing_ctime_ns, NULL, {content_hash}, 0 \
-                     FROM main.tracks"
-                ),
+                "(rowid, id, backing_path, format, audio_offset, audio_length, \
+                  backing_size, backing_mtime_ns, content_version, updated_at, \
+                  backing_ctime_ns, fingerprint, content_hash, backing_ino) \
+                 SELECT rowid, id, CAST(backing_path AS BLOB), format, audio_offset, \
+                  audio_length, backing_size, backing_mtime_ns, content_version, \
+                  updated_at, backing_ctime_ns, NULL, NULL, 0 \
+                 FROM main.tracks"
+                    .to_string(),
             ),
             (
                 "tags",
@@ -331,7 +320,7 @@ impl PendingMigration {
                     })?;
             }
             let mut out: Vec<(&'static str, Vec<i64>)> = Vec::new();
-            for (table, projection) in self.probe_projections() {
+            for (table, projection) in Self::probe_projections() {
                 self.conn
                     .execute_batch(&format!("INSERT OR IGNORE INTO probe.{table} {projection}"))?;
                 let mut stmt = self.conn.prepare(&format!(

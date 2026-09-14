@@ -383,10 +383,12 @@ PRAGMA user_version = 3;
 -- every file. Rows carrying the old value would claim a fingerprint under an
 -- algorithm that no longer produces it -- a stale content identity of exactly
 -- the kind #689 is about -- so they are nulled here rather than silently
--- reinterpreted. The next `scan` or `revalidate` recomputes them: revalidate
--- already re-probes a row missing the checksum its tier asks for, so no new
--- backfill machinery is needed. `content_hash` is untouched: it is a full-file
--- SHA-256 and its meaning has not changed.
+-- reinterpreted. The next `revalidate` recomputes them: it already re-probes a
+-- row missing the checksum its tier asks for, so no new backfill machinery is
+-- needed. `content_hash` is nulled too, although its meaning did not change:
+-- before #689 a fingerprint-tier rescan of a rewritten file kept the old bytes'
+-- hash, so no stored value can be trusted to describe the file beside it.
+-- `revalidate --checksum=full` recomputes those.
 --
 -- The cost of nulling is bounded and one-way: a file that moves between this
 -- upgrade and the next scan is not move-recovered (it inserts fresh, as an
@@ -573,11 +575,11 @@ CREATE TABLE tracks (
 --
 -- `fingerprint` is dropped on the floor here -- that is #691's reset, folded in.
 --
--- `content_hash` is sanitized rather than carried blindly. It is a
--- scanner-owned derived column that the next scan recomputes, which is exactly
--- the case the sanitize-only-under-a-flag policy carves out: nulling one costs
--- a rescan, while carrying a value the new CHECK rejects would abort the whole
--- upgrade over a column that rebuilds itself. The other tightened columns are
+-- `content_hash` is dropped on the floor as well (see the #691 note above for
+-- why none is trusted). It is a scanner-owned derived column a revalidate
+-- recomputes, which is the case the sanitize-only-under-a-flag policy carves
+-- out, and it also means no stored hash can abort the upgrade by failing the
+-- tightened CHECK. The other tightened columns are
 -- NOT sanitized here -- they are either structural or NOT NULL, so a row that
 -- violates them fails the migration. That failure is atomic: every step runs in
 -- one transaction, so nothing is half-applied and the store is exactly as it
@@ -591,10 +593,7 @@ INSERT INTO tracks (id, backing_path, format, audio_offset, audio_length,
            backing_size, backing_mtime_ns, content_version, updated_at,
            backing_ctime_ns,
            NULL,
-           CASE WHEN typeof(content_hash) = 'text'
-                     AND length(content_hash) = 64
-                     AND instr(content_hash, char(0)) = 0
-                THEN content_hash END,
+           NULL,
            0
     FROM tracks_hold_v4;
 

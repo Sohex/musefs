@@ -123,7 +123,11 @@ ones were computed without it. The next `revalidate` recomputes them with no
 flag needed, since it re-probes a row missing the checksum its tier asks for; a
 plain `scan` does not, because it leaves already-tracked rows alone. Until then those rows cannot be move-recovered, exactly as
 an unfingerprinted row never could, so run one pass before moving files around.
-`content_hash` is untouched by the upgrade.
+The upgrade clears every stored `content_hash` too. Before #689 was fixed, a
+fingerprint-tier rescan of a rewritten file could keep the old bytes' hash, so
+none is carried across. Run `musefs revalidate --checksum=full` to recompute
+them; until then `--match=auto` confirms a move by fingerprint alone, and
+`--match=strict` refuses to retarget.
 
 **Move re-identification workflow.** After moving or reorganizing your backing
 library, run a normal `musefs scan` on the new locations. For each file not
