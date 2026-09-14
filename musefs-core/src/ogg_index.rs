@@ -260,6 +260,15 @@ pub fn serve_ogg_window(
         {
             return Err(musefs_format::FormatError::Malformed.into());
         }
+        // A beginning-of-stream page starts a logical bitstream, and this one
+        // began in the header region, so one here starts another — under the
+        // same serial, in a chain whose links all share one (concatenated
+        // `ffmpeg -fflags +bitexact` output, out of spec but real). The check
+        // above cannot see it, and nor can the scan's final-page check, while
+        // `seq_delta` is just as wrong for it.
+        if hdr_buf[5] & musefs_format::ogg::FLAG_BOS != 0 {
+            return Err(musefs_format::FormatError::Malformed.into());
+        }
 
         // Reuse the snapshotted patched header for the one page it was memoized
         // against (the boundary-straddling page sequential reads re-touch); every
@@ -1090,6 +1099,49 @@ mod tests {
         assert!(r.is_err(), "a foreign serial must not be renumbered");
 
         // The first stream's own pages still serve.
+        let mut ok = Vec::new();
+        serve_ogg_window(&br, 0, alen, 0, 0xABCD, 0, first_len, &mut ok, None).unwrap();
+        assert_eq!(ok, data[..usize_from(first_len)]);
+    }
+
+    #[test]
+    fn serve_ogg_window_refuses_a_second_stream_under_the_same_serial() {
+        // A chain whose links share one serial — concatenated `ffmpeg -fflags
+        // +bitexact` output — passes the serial check above and the scan's
+        // final-page check. RFC 7845 forbids it, but it exists, and the second
+        // link restarts its page sequence at a beginning-of-stream page, which
+        // no single logical bitstream carries past its first page. Renumbering
+        // that link by the first one's delta is the same corruption #722 was.
+        let (mut data, _) = lace_packet_pub(0xABCD, 5, false, 100, &[9u8; 200]);
+        let first_len = data.len() as u64;
+        let (restart, _) = lace_packet_pub(0xABCD, 0, true, 0, &[7u8; 50]);
+        data.extend_from_slice(&restart);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("same-serial-chain.ogg");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&data)
+            .unwrap();
+        let backing = std::fs::File::open(&path).unwrap();
+        let test_br = TestBr::new();
+        let br = test_br.reader(&backing, u64::MAX);
+        let alen = data.len() as u64;
+
+        let mut out = Vec::new();
+        let r = serve_ogg_window(&br, 0, alen, 1, 0xABCD, 0, alen, &mut out, None);
+        assert!(
+            r.is_err(),
+            "a second stream's BOS page must not be renumbered"
+        );
+
+        // A read that starts on the restart page is refused too, not only one
+        // that walks into it.
+        let mut out = Vec::new();
+        let r = serve_ogg_window(&br, 0, alen, 1, 0xABCD, first_len, alen, &mut out, None);
+        assert!(r.is_err(), "reading the BOS page directly is refused");
+
+        // The first link's own pages still serve.
         let mut ok = Vec::new();
         serve_ogg_window(&br, 0, alen, 0, 0xABCD, 0, first_len, &mut ok, None).unwrap();
         assert_eq!(ok, data[..usize_from(first_len)]);

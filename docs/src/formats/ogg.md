@@ -221,6 +221,17 @@ and only while the file still carries the stamp the refusing probe saw. A file
 that merely fails to parse or to read keeps its row, since a download still in
 progress looks the same.
 
+A chain whose links all share one serial number — concatenated
+`ffmpeg -fflags +bitexact` output, which RFC 7845 forbids but which exists —
+gets past both scan-time checks, because every page carries the header's serial,
+the final page included. What gives it away is the beginning-of-stream page that
+each later link opens with, which a single logical bitstream carries only on its
+first page. Finding that page at scan time would mean walking the whole audio
+region, so the scanner does not look for it. The serve path refuses any page
+past the header region that carries the flag (`EIO`), rather than renumbering
+the second link by the first link's delta. Reads that stay inside the first link
+still serve.
+
 ## Quirks & invariants
 
 - Page and header sizes are bounded at parse and serve time
