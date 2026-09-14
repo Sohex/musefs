@@ -1,5 +1,4 @@
-use clap::Parser;
-use musefs_cli::{Cli, run};
+use musefs_cli::run;
 
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
@@ -34,7 +33,9 @@ fn jemalloc_stats() -> Option<musefs_fuse::AllocatorStats> {
 }
 
 fn main() -> std::process::ExitCode {
-    let cli = Cli::parse();
+    // Not `Cli::parse()`: `musefs_cli::parse` reads a boolean flag's variable set
+    // to the empty string as unset, the way a unit file blanks one.
+    let cli = musefs_cli::parse();
     // The library crates report serve-path failures through the `log` facade;
     // without a sink they vanish. Default to `warn` so they surface on stderr;
     // `-v`/`-vv`/`-vvv` raise the floor, and an explicit RUST_LOG overrides both.

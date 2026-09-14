@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use indicatif::{HumanBytes, HumanDuration};
 use musefs_core::{MountConfig, Musefs};
 use musefs_db::{Db, PendingMigration};
@@ -495,7 +495,7 @@ const RETIRED_SCAN_ENV: &[(&str, &str)] = &[
 ];
 
 /// Refuse to run while any of `retired` is set. An empty value counts as unset,
-/// which is how clap treats a declared variable too.
+/// as it does for every boolean flag's variable (see [`parse`]).
 fn refuse_retired_env(retired: &[(&str, &str)]) -> Result<()> {
     for (var, instead) in retired {
         if std::env::var_os(var).is_some_and(|v| !v.is_empty()) {
@@ -1348,6 +1348,56 @@ fn walk_preview(
         }
     }
     Ok(())
+}
+
+/// Parse the process's command line, as the `musefs` binary does.
+///
+/// clap hands a flag's environment variable to the flag's parser even when it
+/// is set to the empty string, and the boolean parser refuses that. An empty
+/// value is how a systemd unit (`Environment=MUSEFS_QUIET=`) or an env file
+/// blanks a variable, so for a boolean flag it is read as unset and the flag
+/// keeps its default. A value that is not empty is parsed as before: one that is
+/// not a boolean is still a usage error. Other flags are left alone, since an
+/// empty value can be a real one there, such as `--default-fallback`.
+pub fn parse() -> Cli {
+    let mut matches = command().get_matches();
+    Cli::from_arg_matches_mut(&mut matches)
+        .map_err(|e| e.format(&mut command()))
+        .unwrap_or_else(|e| e.exit())
+}
+
+/// [`Cli`]'s command line as [`parse`] reads it.
+pub fn command() -> clap::Command {
+    unset_empty_boolean_env(Cli::command(), &|name| {
+        std::env::var_os(name).is_some_and(|value| value.is_empty())
+    })
+}
+
+/// Drop the environment source of every boolean flag in `cmd` and its
+/// subcommands whose variable `is_empty` says is set to the empty string.
+fn unset_empty_boolean_env(
+    cmd: clap::Command,
+    is_empty: &dyn Fn(&std::ffi::OsStr) -> bool,
+) -> clap::Command {
+    let boolean = clap::builder::ValueParser::bool().type_id();
+    let blanked: Vec<String> = cmd
+        .get_arguments()
+        .filter(|arg| {
+            arg.get_value_parser().type_id() == boolean && arg.get_env().is_some_and(is_empty)
+        })
+        .map(|arg| arg.get_id().as_str().to_owned())
+        .collect();
+    let mut cmd = blanked.into_iter().fold(cmd, |cmd, id| {
+        cmd.mut_arg(id, |arg| arg.env(None::<&'static str>))
+    });
+    let subcommands: Vec<String> = cmd
+        .get_subcommands()
+        .map(|sub| sub.get_name().to_owned())
+        .collect();
+    for name in subcommands {
+        cmd = cmd.mut_subcommand(name, |sub| unset_empty_boolean_env(sub, is_empty));
+    }
+    cmd
 }
 
 pub fn run(cli: Cli) -> Result<ExitCode> {
@@ -2349,6 +2399,35 @@ mod tests {
             panic!("expected Vacuum");
         };
         assert_eq!(db, PathBuf::from("/tmp/x.db"));
+    }
+
+    /// An empty variable drops only a boolean flag's environment source, in every
+    /// subcommand, and leaves a string flag reading the same variable name alone.
+    #[test]
+    fn only_boolean_flags_read_an_empty_variable_as_unset() {
+        let blank = [
+            "MUSEFS_QUIET",
+            "MUSEFS_KEEP_CACHE",
+            "MUSEFS_YES",
+            "MUSEFS_DB",
+        ];
+        let cmd = unset_empty_boolean_env(Cli::command(), &|name| {
+            blank.iter().any(|b| name == std::ffi::OsStr::new(b))
+        });
+        let env_of = |sub: &str, id: &str| {
+            cmd.find_subcommand(sub)
+                .and_then(|s| s.get_arguments().find(|a| a.get_id() == id))
+                .unwrap_or_else(|| panic!("{sub} --{id}"))
+                .get_env()
+                .map(std::ffi::OsStr::to_owned)
+        };
+        assert_eq!(env_of("scan", "quiet"), None);
+        assert_eq!(env_of("revalidate", "quiet"), None);
+        assert_eq!(env_of("mount", "keep_cache"), None);
+        assert_eq!(env_of("migrate", "yes"), None);
+        // Not blanked, or not a boolean: untouched.
+        assert_eq!(env_of("scan", "force"), Some("MUSEFS_FORCE".into()));
+        assert_eq!(env_of("scan", "db"), Some("MUSEFS_DB".into()));
     }
 
     #[test]

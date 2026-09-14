@@ -710,51 +710,162 @@ fn boolish_boolean_env_values_are_accepted() {
     }
 }
 
-// #370: a boolish MUSEFS_QUIET (1/0) is honoured — `1` suppresses the summary,
-// `0` keeps it. The bare-`bool` parser would reject `0` outright, so this only
-// passes once BoolishValueParser is attached.
+// #370: a boolish MUSEFS_QUIET is honoured in every spelling — a true one
+// suppresses the summary, a false one keeps it, and the empty value is unset, so
+// the default (the summary) applies. The bare-`bool` parser would reject `0`
+// outright, so this only passes once BoolishValueParser is attached. A value that
+// is not a boolean is still a usage error.
 #[test]
 fn boolish_quiet_env_toggles_the_summary() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("library");
     std::fs::create_dir(&target).unwrap();
     let db = dir.path().join("quiet.db");
+    let scan = |value: &str| {
+        musefs()
+            .arg("scan")
+            .arg(&target)
+            .env("MUSEFS_DB", &db)
+            .env("MUSEFS_QUIET", value)
+            .output()
+            .unwrap()
+    };
 
-    let out = musefs()
-        .arg("scan")
-        .arg(&target)
-        .env("MUSEFS_DB", &db)
-        .env("MUSEFS_QUIET", "1")
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "stderr: {}",
+    for (value, quiet) in [
+        ("1", true),
+        ("true", true),
+        ("yes", true),
+        ("on", true),
+        ("0", false),
+        ("false", false),
+        ("no", false),
+        ("off", false),
+        ("", false),
+    ] {
+        let out = scan(value);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "MUSEFS_QUIET={value:?}, stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            stdout.trim().is_empty(),
+            quiet,
+            "MUSEFS_QUIET={value:?} should {} the summary, stdout: {stdout}",
+            if quiet { "suppress" } else { "keep" }
+        );
+    }
+
+    let out = scan("enabled");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a non-boolean MUSEFS_QUIET is a usage error; stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(
-        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
-        "MUSEFS_QUIET=1 should suppress the summary, stdout: {}",
-        String::from_utf8_lossy(&out.stdout)
+}
+
+/// Every boolean flag's variable, with the subcommand that reads it.
+const BOOLEAN_ENV: &[(&str, &str)] = &[
+    ("mount", "MUSEFS_SKIP_ON_MISSING"),
+    ("mount", "MUSEFS_READ_AHEAD_PREFETCH"),
+    ("mount", "MUSEFS_KEEP_CACHE"),
+    ("mount", "MUSEFS_TRUST_BACKING_MTIME"),
+    ("mount", "MUSEFS_CASE_INSENSITIVE"),
+    ("mount", "MUSEFS_ALLOW_OTHER"),
+    ("mount", "MUSEFS_EXPOSE_METRICS"),
+    ("scan", "MUSEFS_FORCE"),
+    ("scan", "MUSEFS_FOLLOW_SYMLINKS"),
+    ("scan", "MUSEFS_QUIET"),
+    ("revalidate", "MUSEFS_PRUNE"),
+    ("revalidate", "MUSEFS_FOLLOW_SYMLINKS"),
+    ("revalidate", "MUSEFS_QUIET"),
+    ("migrate", "MUSEFS_YES"),
+];
+
+/// A boolean flag's variable set to the empty string — how a systemd unit or an
+/// env file blanks one — is unset: the command runs with the flag's default
+/// instead of stopping on a usage error. Each is checked on the subcommand that
+/// reads it, where the default is observable: the dry-run still lists the track
+/// `--skip-on-missing` would drop, the summaries are still printed, nothing is
+/// pruned, and `migrate` still asks for its confirmation.
+#[test]
+fn an_empty_boolean_variable_leaves_the_flag_at_its_default() {
+    // Every boolean flag with a variable is covered, so a new one cannot be
+    // added without this test naming it.
+    let mut declared: Vec<(String, String)> = Vec::new();
+    let boolean = clap::builder::ValueParser::bool().type_id();
+    for sub in musefs_cli::command().get_subcommands() {
+        for arg in sub.get_arguments() {
+            if let Some(env) = arg.get_env()
+                && arg.get_value_parser().type_id() == boolean
+            {
+                declared.push((
+                    sub.get_name().to_owned(),
+                    env.to_string_lossy().into_owned(),
+                ));
+            }
+        }
+    }
+    let mut listed: Vec<(String, String)> = BOOLEAN_ENV
+        .iter()
+        .map(|(sub, var)| ((*sub).to_owned(), (*var).to_owned()))
+        .collect();
+    declared.sort();
+    listed.sort();
+    assert_eq!(
+        declared, listed,
+        "BOOLEAN_ENV must list every boolean variable"
     );
 
-    let out = musefs()
+    let (dir, library, db) = library_with_one_flac();
+    let scanned = musefs()
         .arg("scan")
-        .arg(&target)
-        .env("MUSEFS_DB", &db)
-        .env("MUSEFS_QUIET", "0")
+        .arg(&library)
+        .arg("--db")
+        .arg(&db)
         .output()
         .unwrap();
-    assert!(
-        out.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&out.stdout).contains("scanned"),
-        "MUSEFS_QUIET=0 should keep the summary, stdout: {}",
-        String::from_utf8_lossy(&out.stdout)
-    );
+    assert!(scanned.status.success());
+    let gated = dir.path().join("gated.db");
+    musefs_db::seed_store_at_version(&gated, musefs_db::LATEST_VERSION - 1).unwrap();
+
+    for (sub, var) in BOOLEAN_ENV {
+        let mut cmd = musefs();
+        cmd.env(var, "");
+        match *sub {
+            "mount" => cmd.args(["mount", "--dry-run", "--db"]).arg(&db),
+            "scan" | "revalidate" => cmd.arg(sub).arg(&library).arg("--db").arg(&db),
+            "migrate" => cmd.args(["migrate", "--db"]).arg(&gated),
+            other => panic!("no invocation for {other}"),
+        };
+        let out = cmd.output().unwrap();
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        let context = format!("{var}= on {sub}; stdout: {stdout} stderr: {stderr}");
+        assert_ne!(out.status.code(), Some(2), "not a usage error: {context}");
+        match *sub {
+            "mount" => {
+                assert!(out.status.success(), "{context}");
+                assert!(stdout.contains("dry run: 1 files"), "{context}");
+            }
+            "scan" => {
+                assert!(out.status.success(), "{context}");
+                assert!(stdout.contains("scanned"), "{context}");
+            }
+            "revalidate" => {
+                assert!(out.status.success(), "{context}");
+                assert!(stdout.contains(" 0 pruned"), "{context}");
+            }
+            _ => {
+                assert_eq!(out.status.code(), Some(1), "{context}");
+                assert!(stderr.contains("pass --yes"), "{context}");
+            }
+        }
+    }
 }
 
 /// #709: `--match` is the one way to ask, and it reaches the scan.
