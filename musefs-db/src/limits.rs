@@ -34,6 +34,17 @@ pub const MAX_TAG_KEY_LEN: i64 = 256;
 pub const MAX_TAG_VALUE_LEN: i64 = 0x00FF_FFFF;
 /// Max `art.mime` length.
 pub const MAX_ART_MIME_LEN: i64 = 255;
+/// Max `tracks.backing_path` length in bytes — 64 KiB (#758). The column is a
+/// BLOB, so the schema `CHECK` and the reader guard in [`crate::tracks`] both
+/// count bytes.
+///
+/// A generous portable ceiling rather than `PATH_MAX`, which is 4096 on Linux and
+/// 1024 on macOS: the store needs one shape wherever it is opened. musefs opens a
+/// backing file by absolute path, so nothing past the OS limit could be served
+/// anyway, and the cap refuses no servable file. What it buys is the bound: every
+/// reader materializes the path, `getattr` included, and before this a crafted
+/// store could make that allocation as large as SQLite allows a value.
+pub const MAX_BACKING_PATH_BYTES: i64 = 64 * 1024;
 /// Exact `art.sha256` length: a hex-encoded SHA-256 digest. The schema `CHECK`
 /// pins it to equality; the reader guard in [`crate::art`] bounds only the
 /// upper side, since a short digest is a correctness problem for the caller
@@ -103,5 +114,6 @@ mod tests {
         );
         assert_eq!(MAX_ART_ROWS_PER_TRACK, 4096);
         assert_eq!(ART_SHA256_LEN, 64);
+        assert_eq!(MAX_BACKING_PATH_BYTES, 65_536);
     }
 }

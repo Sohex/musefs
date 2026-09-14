@@ -525,8 +525,14 @@ CREATE TABLE tracks (
     -- `tracks_geometry_au`, and the Rust freshness stamp), never ordered or
     -- summed, so the encoding costs nothing it is used for.
     backing_ino      INTEGER NOT NULL DEFAULT 0,
+    -- The upper bound is 64 KiB (#758), a portable ceiling rather than any
+    -- platform's PATH_MAX: no path past the OS limit can be opened to serve, and
+    -- without a bound a crafted row chose the size of the allocation every reader
+    -- makes, getattr included. The readers re-check it from length() before
+    -- loading the path, for a store written with its constraints off.
     CHECK (typeof(backing_path) = 'blob'
            AND length(backing_path) > 0
+           AND length(backing_path) <= 65536
            AND instr(backing_path, x'00') = 0),
     -- The IN list is strictly stronger than a typeof CHECK would be: no
     -- non-TEXT value compares equal to any of these, so the storage class is
@@ -555,14 +561,21 @@ CREATE TABLE tracks (
     -- anything satisfied a bare length() = 64 while storing something else
     -- entirely. Banning NUL keeps the documented `64 characters` meaning rather
     -- than quietly converting the field to a byte cap.
+    --
+    -- And the characters are lowercase hex (#761), the one spelling every
+    -- writer produces and the only one an equality match finds. GLOB is
+    -- case-sensitive, so the one clause refuses uppercase and non-hex alike; the
+    -- NUL test stays beside it because GLOB, like length(), stops at a NUL.
     CHECK (fingerprint IS NULL
            OR (typeof(fingerprint) = 'text'
                AND length(fingerprint) = 64
-               AND instr(fingerprint, char(0)) = 0)),
+               AND instr(fingerprint, char(0)) = 0
+               AND fingerprint NOT GLOB '*[^0-9a-f]*')),
     CHECK (content_hash IS NULL
            OR (typeof(content_hash) = 'text'
                AND length(content_hash) = 64
-               AND instr(content_hash, char(0)) = 0))
+               AND instr(content_hash, char(0)) = 0
+               AND content_hash NOT GLOB '*[^0-9a-f]*'))
 );
 
 -- 4. Refill. CAST(backing_path AS BLOB) is what preserves identity across the
@@ -714,9 +727,16 @@ CREATE TABLE art (
     -- `track_art` now (#716). What is left is the content and its identity.
     byte_len INTEGER NOT NULL,
     data     BLOB NOT NULL,
+    -- Lowercase hex, as on the two track checksums (#761). Dedup is
+    -- `ON CONFLICT(sha256)`, a text match, so the same bytes filed under another
+    -- spelling of their digest were stored twice and never reached #724's byte
+    -- comparison. A refill row that fails is not lowercased: a lowercase row for
+    -- the same bytes may already exist, which is the collision this prevents.
+    -- It fails the migration, and `migrate`'s pre-flight reports it first.
     CHECK (typeof(sha256) = 'text'
            AND length(sha256) = 64
-           AND instr(sha256, char(0)) = 0),
+           AND instr(sha256, char(0)) = 0
+           AND sha256 NOT GLOB '*[^0-9a-f]*'),
     CHECK (typeof(byte_len) = 'integer'
            AND byte_len >= 0
            AND byte_len <= 16711680),
@@ -776,10 +796,30 @@ DROP TABLE track_art_hold_v4;
 DROP TABLE structural_blocks_hold_v4;
 DROP TABLE art_hold_v4;
 
+-- The changelog ring is the one internal table whose payload never gained a
+-- storage class: V1's `track_id INTEGER NOT NULL` accepts text, a real or a
+-- blob, and the refresh reads the column straight into an i64 (#760). It is
+-- recreated rather than migrated, because nothing in it is worth keeping: it is
+-- derived state, this step is gated so no mount holds a watermark into it, and
+-- a mount takes its watermark from whatever is there when it opens. Here, after
+-- every refill and before the changelog triggers come back, nothing inserts
+-- into it while it is gone. `track_changes_prune` is on the table, so it goes
+-- with it and comes back with it; `seq` restarts at 1, which nothing depends on.
+DROP TABLE track_changes;
+CREATE TABLE track_changes (
+    seq      INTEGER PRIMARY KEY AUTOINCREMENT,
+    track_id INTEGER NOT NULL,
+    CHECK (typeof(track_id) = 'integer')
+);
+CREATE TRIGGER track_changes_prune AFTER INSERT ON track_changes BEGIN
+    DELETE FROM track_changes WHERE seq <= NEW.seq - 8192;
+END;
+
 -- 6. Recreate the indexes and the thirteen triggers the drops took with them,
 -- plus what the new shapes add. Verbatim except where noted: `tracks_geometry_au`
--- gains `backing_ino`, the two `_au` bumps widen to both owners, and two
--- reparent-refusal triggers are new.
+-- gains `backing_ino`, `tracks_changelog_au` logs the old id too, the two `_au`
+-- bumps widen to both owners, and two reparent-refusal triggers and a rekey
+-- refusal are new.
 CREATE INDEX tracks_fingerprint_idx ON tracks(fingerprint);
 
 -- The reverse art -> track_art edge, which went with the DROP TABLE above. Bulk
@@ -806,8 +846,14 @@ CREATE UNIQUE INDEX tags_ordinal_idx
 CREATE TRIGGER tracks_changelog_ai AFTER INSERT ON tracks BEGIN
     INSERT INTO track_changes (track_id) VALUES (NEW.id);
 END;
+-- The old id first, and the new one only when it differs (#762). A rekey is
+-- refused below, but the refresh only removes an id the log names, so logging
+-- `NEW.id` alone left a ghost for the old id in the live tree against any
+-- writer that got past the refusal. The second insert is conditional so an
+-- ordinary update still spends one ring slot rather than two.
 CREATE TRIGGER tracks_changelog_au AFTER UPDATE ON tracks BEGIN
-    INSERT INTO track_changes (track_id) VALUES (NEW.id);
+    INSERT INTO track_changes (track_id) VALUES (OLD.id);
+    INSERT INTO track_changes (track_id) SELECT NEW.id WHERE NEW.id <> OLD.id;
 END;
 CREATE TRIGGER tracks_changelog_ad AFTER DELETE ON tracks BEGIN
     INSERT INTO track_changes (track_id) VALUES (OLD.id);
@@ -877,6 +923,31 @@ END;
 CREATE TRIGGER structural_blocks_ad AFTER DELETE ON structural_blocks BEGIN
     UPDATE tracks SET content_version = content_version + 1 WHERE id = OLD.track_id;
 END;
+-- V1 shipped only the two triggers above, reasoning that the owned writer
+-- replaces by DELETE-then-INSERT so no UPDATE path exists, and that the
+-- resulting over-bump on a byte-identical re-probe is harmless churn. Neither
+-- holds any more. SQL has an UPDATE path whatever musefs does: rewriting `body`
+-- changed a served FLAC-header input without bumping `content_version`, and
+-- changing `track_id` moved one between tracks without bumping either owner, so
+-- a cached layout kept serving the old header (#759). And a bump is no longer
+-- invisible churn: the served mtime derives from `content_version` (#725),
+-- which is why the owned writer now leaves an identical set alone (#757).
+--
+-- So an in-place update is refused outright -- no WHEN guard, since there is no
+-- legitimate one to let through -- the way art content (#719) and row ownership
+-- (#717) already are. The AFTER UPDATE bump covers both owners anyway, so the
+-- invalidation stays correct against a writer that drops the refusal through
+-- `writable_schema`.
+CREATE TRIGGER structural_blocks_au AFTER UPDATE ON structural_blocks BEGIN
+    UPDATE tracks SET content_version = content_version + 1
+    WHERE id IN (OLD.track_id, NEW.track_id);
+END;
+CREATE TRIGGER structural_blocks_reject_update
+BEFORE UPDATE ON structural_blocks
+BEGIN
+    SELECT RAISE(ABORT,
+        'structural_blocks rows are immutable; delete the row and insert its replacement');
+END;
 
 CREATE TRIGGER art_ad AFTER DELETE ON art BEGIN
     UPDATE tracks SET content_version = content_version + 1,
@@ -927,6 +998,18 @@ WHEN NEW.track_id <> OLD.track_id
 BEGIN
     SELECT RAISE(ABORT,
         'art link ownership is immutable; delete the row and insert it under the new track');
+END;
+
+-- A track's id is immutable for the same reason (#762). The incremental refresh
+-- keys on it -- which is why it is AUTOINCREMENT and never handed back out
+-- (#678) -- and foreign keys do not protect it: a childless track has nothing
+-- referencing its old id, so it could be rekeyed freely, onto a deleted id
+-- included. The WHEN guard is load-bearing, as it is for the reparent refusals.
+CREATE TRIGGER tracks_reject_rekey
+BEFORE UPDATE OF id ON tracks
+WHEN NEW.id <> OLD.id
+BEGIN
+    SELECT RAISE(ABORT, 'track ids are immutable; delete the row and insert a new one');
 END;
 
 PRAGMA user_version = 4;

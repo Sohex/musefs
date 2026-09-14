@@ -523,8 +523,14 @@ CREATE TABLE tracks (
     -- `tracks_geometry_au`, and the Rust freshness stamp), never ordered or
     -- summed, so the encoding costs nothing it is used for.
     backing_ino      INTEGER NOT NULL DEFAULT 0,
+    -- The upper bound is 64 KiB (#758), a portable ceiling rather than any
+    -- platform's PATH_MAX: no path past the OS limit can be opened to serve, and
+    -- without a bound a crafted row chose the size of the allocation every reader
+    -- makes, getattr included. The readers re-check it from length() before
+    -- loading the path, for a store written with its constraints off.
     CHECK (typeof(backing_path) = 'blob'
            AND length(backing_path) > 0
+           AND length(backing_path) <= 65536
            AND instr(backing_path, x'00') = 0),
     -- The IN list is strictly stronger than a typeof CHECK would be: no
     -- non-TEXT value compares equal to any of these, so the storage class is
@@ -553,14 +559,21 @@ CREATE TABLE tracks (
     -- anything satisfied a bare length() = 64 while storing something else
     -- entirely. Banning NUL keeps the documented `64 characters` meaning rather
     -- than quietly converting the field to a byte cap.
+    --
+    -- And the characters are lowercase hex (#761), the one spelling every
+    -- writer produces and the only one an equality match finds. GLOB is
+    -- case-sensitive, so the one clause refuses uppercase and non-hex alike; the
+    -- NUL test stays beside it because GLOB, like length(), stops at a NUL.
     CHECK (fingerprint IS NULL
            OR (typeof(fingerprint) = 'text'
                AND length(fingerprint) = 64
-               AND instr(fingerprint, char(0)) = 0)),
+               AND instr(fingerprint, char(0)) = 0
+               AND fingerprint NOT GLOB '*[^0-9a-f]*')),
     CHECK (content_hash IS NULL
            OR (typeof(content_hash) = 'text'
                AND length(content_hash) = 64
-               AND instr(content_hash, char(0)) = 0))
+               AND instr(content_hash, char(0)) = 0
+               AND content_hash NOT GLOB '*[^0-9a-f]*'))
 );
 
 -- 4. Refill. CAST(backing_path AS BLOB) is what preserves identity across the
@@ -712,9 +725,16 @@ CREATE TABLE art (
     -- `track_art` now (#716). What is left is the content and its identity.
     byte_len INTEGER NOT NULL,
     data     BLOB NOT NULL,
+    -- Lowercase hex, as on the two track checksums (#761). Dedup is
+    -- `ON CONFLICT(sha256)`, a text match, so the same bytes filed under another
+    -- spelling of their digest were stored twice and never reached #724's byte
+    -- comparison. A refill row that fails is not lowercased: a lowercase row for
+    -- the same bytes may already exist, which is the collision this prevents.
+    -- It fails the migration, and `migrate`'s pre-flight reports it first.
     CHECK (typeof(sha256) = 'text'
            AND length(sha256) = 64
-           AND instr(sha256, char(0)) = 0),
+           AND instr(sha256, char(0)) = 0
+           AND sha256 NOT GLOB '*[^0-9a-f]*'),
     CHECK (typeof(byte_len) = 'integer'
            AND byte_len >= 0
            AND byte_len <= 16711680),
@@ -774,10 +794,30 @@ DROP TABLE track_art_hold_v4;
 DROP TABLE structural_blocks_hold_v4;
 DROP TABLE art_hold_v4;
 
+-- The changelog ring is the one internal table whose payload never gained a
+-- storage class: V1's `track_id INTEGER NOT NULL` accepts text, a real or a
+-- blob, and the refresh reads the column straight into an i64 (#760). It is
+-- recreated rather than migrated, because nothing in it is worth keeping: it is
+-- derived state, this step is gated so no mount holds a watermark into it, and
+-- a mount takes its watermark from whatever is there when it opens. Here, after
+-- every refill and before the changelog triggers come back, nothing inserts
+-- into it while it is gone. `track_changes_prune` is on the table, so it goes
+-- with it and comes back with it; `seq` restarts at 1, which nothing depends on.
+DROP TABLE track_changes;
+CREATE TABLE track_changes (
+    seq      INTEGER PRIMARY KEY AUTOINCREMENT,
+    track_id INTEGER NOT NULL,
+    CHECK (typeof(track_id) = 'integer')
+);
+CREATE TRIGGER track_changes_prune AFTER INSERT ON track_changes BEGIN
+    DELETE FROM track_changes WHERE seq <= NEW.seq - 8192;
+END;
+
 -- 6. Recreate the indexes and the thirteen triggers the drops took with them,
 -- plus what the new shapes add. Verbatim except where noted: `tracks_geometry_au`
--- gains `backing_ino`, the two `_au` bumps widen to both owners, and two
--- reparent-refusal triggers are new.
+-- gains `backing_ino`, `tracks_changelog_au` logs the old id too, the two `_au`
+-- bumps widen to both owners, and two reparent-refusal triggers and a rekey
+-- refusal are new.
 CREATE INDEX tracks_fingerprint_idx ON tracks(fingerprint);
 
 -- The reverse art -> track_art edge, which went with the DROP TABLE above. Bulk
@@ -804,8 +844,14 @@ CREATE UNIQUE INDEX tags_ordinal_idx
 CREATE TRIGGER tracks_changelog_ai AFTER INSERT ON tracks BEGIN
     INSERT INTO track_changes (track_id) VALUES (NEW.id);
 END;
+-- The old id first, and the new one only when it differs (#762). A rekey is
+-- refused below, but the refresh only removes an id the log names, so logging
+-- `NEW.id` alone left a ghost for the old id in the live tree against any
+-- writer that got past the refusal. The second insert is conditional so an
+-- ordinary update still spends one ring slot rather than two.
 CREATE TRIGGER tracks_changelog_au AFTER UPDATE ON tracks BEGIN
-    INSERT INTO track_changes (track_id) VALUES (NEW.id);
+    INSERT INTO track_changes (track_id) VALUES (OLD.id);
+    INSERT INTO track_changes (track_id) SELECT NEW.id WHERE NEW.id <> OLD.id;
 END;
 CREATE TRIGGER tracks_changelog_ad AFTER DELETE ON tracks BEGIN
     INSERT INTO track_changes (track_id) VALUES (OLD.id);
@@ -875,6 +921,31 @@ END;
 CREATE TRIGGER structural_blocks_ad AFTER DELETE ON structural_blocks BEGIN
     UPDATE tracks SET content_version = content_version + 1 WHERE id = OLD.track_id;
 END;
+-- V1 shipped only the two triggers above, reasoning that the owned writer
+-- replaces by DELETE-then-INSERT so no UPDATE path exists, and that the
+-- resulting over-bump on a byte-identical re-probe is harmless churn. Neither
+-- holds any more. SQL has an UPDATE path whatever musefs does: rewriting `body`
+-- changed a served FLAC-header input without bumping `content_version`, and
+-- changing `track_id` moved one between tracks without bumping either owner, so
+-- a cached layout kept serving the old header (#759). And a bump is no longer
+-- invisible churn: the served mtime derives from `content_version` (#725),
+-- which is why the owned writer now leaves an identical set alone (#757).
+--
+-- So an in-place update is refused outright -- no WHEN guard, since there is no
+-- legitimate one to let through -- the way art content (#719) and row ownership
+-- (#717) already are. The AFTER UPDATE bump covers both owners anyway, so the
+-- invalidation stays correct against a writer that drops the refusal through
+-- `writable_schema`.
+CREATE TRIGGER structural_blocks_au AFTER UPDATE ON structural_blocks BEGIN
+    UPDATE tracks SET content_version = content_version + 1
+    WHERE id IN (OLD.track_id, NEW.track_id);
+END;
+CREATE TRIGGER structural_blocks_reject_update
+BEFORE UPDATE ON structural_blocks
+BEGIN
+    SELECT RAISE(ABORT,
+        'structural_blocks rows are immutable; delete the row and insert its replacement');
+END;
 
 CREATE TRIGGER art_ad AFTER DELETE ON art BEGIN
     UPDATE tracks SET content_version = content_version + 1,
@@ -927,10 +998,23 @@ BEGIN
         'art link ownership is immutable; delete the row and insert it under the new track');
 END;
 
+-- A track's id is immutable for the same reason (#762). The incremental refresh
+-- keys on it -- which is why it is AUTOINCREMENT and never handed back out
+-- (#678) -- and foreign keys do not protect it: a childless track has nothing
+-- referencing its old id, so it could be rekeyed freely, onto a deleted id
+-- included. The WHEN guard is load-bearing, as it is for the reparent refusals.
+CREATE TRIGGER tracks_reject_rekey
+BEFORE UPDATE OF id ON tracks
+WHEN NEW.id <> OLD.id
+BEGIN
+    SELECT RAISE(ABORT, 'track ids are immutable; delete the row and insert a new one');
+END;
+
 ";
 
 /// Ring capacity of the `track_changes` changelog. Must match the literal in
-/// MIGRATION_V1 (guarded by `changelog_cap_constant_matches_migration_sql`).
+/// MIGRATION_V4, which recreates the ring (guarded by
+/// `changelog_cap_constant_matches_migration_sql`).
 #[allow(dead_code)]
 pub const CHANGELOG_CAP: i64 = 8192;
 
@@ -3151,10 +3235,11 @@ mod baseline_tests {
         );
     }
 
-    /// The SQL literal and the exported constant must not drift.
+    /// The SQL literal and the exported constant must not drift. V4 recreates
+    /// the ring and its prune trigger (#760), so the live literal is V4's.
     #[test]
     fn changelog_cap_constant_matches_migration_sql() {
-        assert!(super::MIGRATION_V1.contains(&format!("NEW.seq - {}", super::CHANGELOG_CAP)));
+        assert!(super::MIGRATION_V4.contains(&format!("NEW.seq - {}", super::CHANGELOG_CAP)));
     }
 
     /// The caps a later migration has since widened live in V1/V2 as *frozen
@@ -3262,6 +3347,8 @@ mod baseline_tests {
         );
         // V4 rebuilds `art` too (#718, #719), so its literals moved with it.
         assert!(v4.contains(&format!("length(sha256) = {ART_SHA256_LEN}")));
+        // `tracks` is rebuilt by V4 as well, and its path cap lives there (#758).
+        assert!(v4.contains(&format!("length(backing_path) <= {MAX_BACKING_PATH_BYTES}")));
         assert!(v4.contains(&format!("byte_len <= {MAX_ART_BYTES}")));
         // V4 rebuilds `structural_blocks` too (#732), so the last two assertions
         // that were still reading V1 move with it -- nothing here reads a
@@ -3822,6 +3909,51 @@ mod constraint_tests {
         );
     }
 
+    /// A stored digest is lowercase hex (#761). Dedup matches it as text, so
+    /// any other spelling of the same bytes' digest files them a second time.
+    #[test]
+    fn v4_digests_must_be_lowercase_hex() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        insert_track(&conn, "/a.flac");
+        let canonical = "0123456789abcdef".repeat(4);
+        conn.execute(
+            "INSERT INTO art (sha256, byte_len, data) VALUES (?1, 1, X'00')",
+            [&canonical],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tracks SET fingerprint = ?1, content_hash = ?1 WHERE id = 1",
+            [&canonical],
+        )
+        .unwrap();
+
+        for bad in [
+            canonical.to_uppercase(),
+            "g".repeat(64),
+            format!("{}Z", &canonical[..63]),
+        ] {
+            assert!(
+                conn.execute(
+                    "INSERT INTO art (sha256, byte_len, data) VALUES (?1, 1, X'01')",
+                    [&bad],
+                )
+                .is_err(),
+                "art.sha256 {bad} must be refused"
+            );
+            for column in ["fingerprint", "content_hash"] {
+                assert!(
+                    conn.execute(
+                        &format!("UPDATE tracks SET {column} = ?1 WHERE id = 1"),
+                        [&bad],
+                    )
+                    .is_err(),
+                    "tracks.{column} {bad} must be refused"
+                );
+            }
+        }
+    }
+
     #[test]
     fn v4_tracks_accepts_every_pinned_format() {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -4274,16 +4406,19 @@ mod constraint_tests {
             "art_ad",
             "tracks_geometry_au",
             "structural_blocks_ai",
+            "structural_blocks_au",
             "structural_blocks_ad",
+            "structural_blocks_reject_update",
             "tags_reject_reparent",
             "track_art_reject_reparent",
+            "tracks_reject_rekey",
         ] {
             assert!(
                 names.iter().any(|n| n == expected),
                 "missing trigger on fresh DB: {expected}"
             );
         }
-        assert_eq!(names.len(), 17, "unexpected trigger count: {names:?}");
+        assert_eq!(names.len(), 20, "unexpected trigger count: {names:?}");
     }
 
     #[test]
@@ -4613,5 +4748,250 @@ mod art_immutability_tests {
             })
             .unwrap();
         assert_eq!(cv1, cv0, "deleting an unreferenced art row must not bump");
+    }
+}
+
+/// `tracks.id` is the identity the incremental refresh keys on (#678), so it
+/// cannot be rewritten in place (#762).
+#[cfg(test)]
+mod track_id_immutability_tests {
+    use rusqlite::Connection;
+
+    /// Foreign keys ON, as `Db::configure` opens the real connection. A
+    /// childless track is the shape enforcement does not protect: with no
+    /// child to reference the old id, nothing but the trigger stands in the way.
+    fn migrated_with_track() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        super::migrate(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime_ns, updated_at) \
+             VALUES (CAST('/a.flac' AS BLOB),'flac',0,1,1,0,0)",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM track_changes", []).unwrap();
+        conn
+    }
+
+    fn logged(conn: &Connection) -> Vec<i64> {
+        conn.prepare("SELECT track_id FROM track_changes ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_rekey_is_refused() {
+        let conn = migrated_with_track();
+        let err = conn
+            .execute("UPDATE tracks SET id = 99 WHERE id = 1", [])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("track ids are immutable"), "{err}");
+    }
+
+    /// The `WHEN` guard: `BEFORE UPDATE OF id` fires whenever the column is
+    /// named in a `SET` list, so a writer rewriting a row wholesale without
+    /// moving it must still get through.
+    #[test]
+    fn naming_id_without_changing_it_is_allowed() {
+        let conn = migrated_with_track();
+        conn.execute("UPDATE tracks SET id = id, updated_at = 5 WHERE id = 1", [])
+            .unwrap();
+        assert_eq!(
+            logged(&conn),
+            vec![1],
+            "an ordinary update spends one ring slot, not two"
+        );
+    }
+
+    /// The changelog is correct on its own terms: against a writer that has
+    /// dropped the refusal, a rekey still names the id that went away, which
+    /// is the one the incremental refresh has to remove.
+    #[test]
+    fn with_the_refusal_dropped_a_rekey_logs_both_ids() {
+        let conn = migrated_with_track();
+        conn.execute_batch("DROP TRIGGER tracks_reject_rekey")
+            .unwrap();
+        conn.execute("UPDATE tracks SET id = 99 WHERE id = 1", [])
+            .unwrap();
+        assert_eq!(logged(&conn), vec![1, 99]);
+    }
+}
+
+/// `structural_blocks` rows are replaced, never updated (#759).
+#[cfg(test)]
+mod structural_blocks_immutability_tests {
+    use rusqlite::Connection;
+
+    /// Two tracks, the first holding one STREAMINFO block.
+    fn migrated_with_a_block() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        super::migrate(&mut conn).unwrap();
+        for path in ["/a.flac", "/b.flac"] {
+            conn.execute(
+                "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+                 backing_size, backing_mtime_ns, updated_at) \
+                 VALUES (?1,'flac',0,1,1,0,0)",
+                [path.as_bytes()],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
+             VALUES (1, 'STREAMINFO', 0, X'0102')",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn versions(conn: &Connection) -> (i64, i64) {
+        conn.query_row(
+            "SELECT (SELECT content_version FROM tracks WHERE id = 1), \
+                    (SELECT content_version FROM tracks WHERE id = 2)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn an_in_place_update_is_refused() {
+        let conn = migrated_with_a_block();
+        for sql in [
+            "UPDATE structural_blocks SET body = X'FFFF'",
+            "UPDATE structural_blocks SET track_id = 2",
+        ] {
+            let err = conn.execute(sql, []).unwrap_err().to_string();
+            assert!(
+                err.contains("structural_blocks rows are immutable"),
+                "{sql}: {err}"
+            );
+        }
+    }
+
+    /// Delete-then-insert is the owned writer's path, and stays open.
+    #[test]
+    fn delete_then_insert_still_replaces_a_block() {
+        let conn = migrated_with_a_block();
+        conn.execute("DELETE FROM structural_blocks WHERE track_id = 1", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
+             VALUES (1, 'STREAMINFO', 0, X'FFFF')",
+            [],
+        )
+        .unwrap();
+    }
+
+    /// The bump is correct on its own terms: against a writer that dropped the
+    /// refusal, a rewritten body invalidates its owner and a reparented block
+    /// invalidates both tracks.
+    #[test]
+    fn with_the_refusal_dropped_an_update_bumps_every_owner() {
+        let conn = migrated_with_a_block();
+        conn.execute_batch("DROP TRIGGER structural_blocks_reject_update")
+            .unwrap();
+
+        let (a, b) = versions(&conn);
+        conn.execute("UPDATE structural_blocks SET body = X'FFFF'", [])
+            .unwrap();
+        assert_eq!(
+            versions(&conn),
+            (a + 1, b),
+            "a body rewrite bumps its owner"
+        );
+
+        let (a, b) = versions(&conn);
+        conn.execute("UPDATE structural_blocks SET track_id = 2", [])
+            .unwrap();
+        assert_eq!(
+            versions(&conn),
+            (a + 1, b + 1),
+            "a reparent bumps both owners"
+        );
+    }
+}
+
+/// `track_changes` is recreated by V4 with its storage class pinned (#760).
+#[cfg(test)]
+mod v4_changelog_ring_tests {
+    use rusqlite::Connection;
+
+    /// A V3 store whose ring holds a real change and a row the V1 definition
+    /// accepted but the refresh cannot read.
+    fn migrated_from_a_v3_ring() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        for (target, migration) in (1i64..).zip(super::MIGRATIONS).take(3) {
+            conn.execute_batch(migration.sql).unwrap();
+            conn.pragma_update(None, "user_version", target).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime_ns, backing_ctime_ns, updated_at) \
+             VALUES ('/lib/a.flac', 'flac', 0, 0, 0, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO track_changes (track_id) VALUES ('not an id')",
+            [],
+        )
+        .unwrap();
+        super::migrate_all(&mut conn).unwrap();
+        conn
+    }
+
+    fn ring(conn: &Connection) -> (i64, i64, i64) {
+        conn.query_row(
+            "SELECT COUNT(*), COALESCE(MIN(seq), 0), COALESCE(MAX(seq), 0) FROM track_changes",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    /// Nothing is carried over: the ring is disposable, and the migration is
+    /// gated, so no mount holds a watermark into it.
+    #[test]
+    fn the_ring_starts_empty_and_refuses_a_non_integer_id() {
+        let conn = migrated_from_a_v3_ring();
+        assert_eq!(ring(&conn), (0, 0, 0));
+        // Non-integral on purpose: INTEGER affinity stores an exactly-integral
+        // REAL, or an integer-looking TEXT, as the integer it spells.
+        for bad in ["'not an id'", "1.5", "X'01'"] {
+            assert!(
+                conn.execute(
+                    &format!("INSERT INTO track_changes (track_id) VALUES ({bad})"),
+                    [],
+                )
+                .is_err(),
+                "track_id {bad} must be refused"
+            );
+        }
+    }
+
+    /// The prune trigger goes with the table and has to come back with it.
+    #[test]
+    fn the_recreated_ring_still_logs_and_prunes() {
+        let conn = migrated_from_a_v3_ring();
+        for i in 0..(super::CHANGELOG_CAP + 10) {
+            conn.execute("UPDATE tracks SET backing_mtime_ns = ?1 WHERE id = 1", [i])
+                .unwrap();
+        }
+        let (rows, min_seq, max_seq) = ring(&conn);
+        assert_eq!(
+            rows,
+            super::CHANGELOG_CAP,
+            "ring must hold exactly CAP rows"
+        );
+        assert_eq!(min_seq, max_seq - super::CHANGELOG_CAP + 1, "contiguous");
     }
 }

@@ -218,6 +218,44 @@ fn changelog_since_empty_table_reports_zero_bounds() {
     let log = db.changelog_since(0).unwrap();
     assert!(log.changed_ids.is_empty());
     assert_eq!((log.min_seq, log.max_seq), (0, 0));
+    assert!(!log.malformed);
+}
+
+/// A row whose `track_id` is not an integer, in a store written with its
+/// constraints off (#760). The read must not fail on it: an error advances no
+/// watermark, so the refresh would hit the same row on every poll. It is
+/// skipped and reported instead, and only while it is past the watermark.
+#[test]
+fn changelog_since_skips_a_malformed_row_and_reports_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.db");
+    let db = Db::open(&path).unwrap();
+    let id = db.upsert_track(&new_track("/a.flac")).unwrap();
+
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.pragma_update(None, "ignore_check_constraints", true)
+        .unwrap();
+    for bad in ["'not an id'", "1.5", "X'01'"] {
+        raw.execute(
+            &format!("INSERT INTO track_changes (track_id) VALUES ({bad})"),
+            [],
+        )
+        .unwrap();
+    }
+
+    let log = db.changelog_since(0).unwrap();
+    assert_eq!(
+        log.changed_ids,
+        vec![id],
+        "only the readable id is returned"
+    );
+    assert!(log.malformed, "the unreadable rows are reported");
+
+    let later = db.changelog_since(log.max_seq).unwrap();
+    assert!(
+        !later.malformed,
+        "a malformed row behind the watermark is none of the caller's business"
+    );
 }
 
 #[test]
@@ -246,6 +284,84 @@ fn delete_changelog_through_for_test_prunes_the_prefix() {
         (log.max_seq, log.max_seq),
         "rows through max_seq - 1 must actually be deleted"
     );
+}
+
+/// An over-cap `backing_path` is refused by every reader from its length alone
+/// (#758). The row is smuggled past the V4 `CHECK`, as a store written with its
+/// constraints off would hold it; each reader has to reject it from
+/// `length(backing_path)` before loading the value, or a crafted store picks the
+/// size of the allocation.
+#[test]
+fn every_backing_path_reader_refuses_an_over_cap_path() {
+    use musefs_db::DbError;
+    use musefs_db::limits::MAX_BACKING_PATH_BYTES;
+    use std::os::unix::ffi::OsStrExt;
+
+    // Never formats the value: on failure that would print the 64 KiB path.
+    fn refused<T>(reader: &str, got: musefs_db::Result<T>) {
+        match got {
+            Err(DbError::FieldTooLarge {
+                table: "tracks",
+                field: "backing_path",
+                ..
+            }) => {}
+            Err(other) => panic!("{reader} refused with the wrong error: {other}"),
+            Ok(_) => panic!("{reader} loaded the over-cap path"),
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("s.db");
+    let db = Db::open(&store).unwrap();
+    let mut long = vec![b'/'];
+    long.resize(usize::try_from(MAX_BACKING_PATH_BYTES).unwrap() + 1, b'a');
+    let fingerprint = "a".repeat(64);
+
+    let raw = rusqlite::Connection::open(&store).unwrap();
+    raw.pragma_update(None, "ignore_check_constraints", true)
+        .unwrap();
+    raw.execute(
+        "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+         backing_size, backing_mtime_ns, updated_at, fingerprint) \
+         VALUES (?1, 'flac', 0, 0, 0, 0, 0, ?2)",
+        rusqlite::params![long, fingerprint],
+    )
+    .unwrap();
+    let id = raw.last_insert_rowid();
+
+    refused("get_track", db.get_track(id));
+    refused(
+        "get_track_by_path",
+        db.get_track_by_path(Path::new(std::ffi::OsStr::from_bytes(&long))),
+    );
+    refused("list_tracks", db.list_tracks());
+    refused(
+        "tracks_by_fingerprint",
+        db.tracks_by_fingerprint(&fingerprint),
+    );
+    refused("track_identity", db.track_identity(id));
+    refused("list_backing_paths", db.list_backing_paths());
+}
+
+/// The cap is inclusive: a path exactly at it stores and reads back, and one
+/// byte more is refused at the write.
+#[test]
+fn a_backing_path_at_the_cap_round_trips_and_one_byte_more_is_refused() {
+    use musefs_db::limits::MAX_BACKING_PATH_BYTES;
+    let cap = usize::try_from(MAX_BACKING_PATH_BYTES).unwrap();
+    let db = Db::open_in_memory().unwrap();
+
+    let at_cap = format!("/{}", "a".repeat(cap - 1));
+    let id = db.upsert_track(&new_track(&at_cap)).unwrap();
+    let track = db
+        .get_track(id)
+        .unwrap()
+        .expect("the at-cap track reads back");
+    assert_eq!(track.backing_path, Path::new(&at_cap));
+
+    let over = format!("/{}", "b".repeat(cap));
+    let err = db.upsert_track(&new_track(&over)).unwrap_err().to_string();
+    assert!(err.contains("CHECK constraint failed"), "{err}");
 }
 
 #[test]

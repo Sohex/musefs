@@ -29,16 +29,20 @@ plugins under `contrib/` write tags and art here out-of-band.
   rows. Triggers bump the owning track's `content_version`/`updated_at` on any
   `tags`/`track_art` edit; `CHECK` constraints enforce the contract invariants
   below at commit time. A bounded, self-pruning `track_changes` ring (capacity
-  8192, `CHANGELOG_CAP`) fed by triggers on `tracks` gives O(changed) refresh —
+  8192, `CHANGELOG_CAP`; its `track_id` pinned to an integer from v4, and a row
+  without one read by the refresh as a gap rather than an error) fed by
+  triggers on `tracks` gives O(changed) refresh —
   every metadata edit funnels through an `UPDATE` on the tracks row, relying on
   SQLite's nested trigger activation (on by default). Freshness-superset
   triggers make `content_version` cover every DB-knowable input to synthesized
   bytes: `art_reject_content_update` (art is content-addressed and immutable),
   `art_ad` (a deleted art row bumps referencing tracks so an orphan rebuilds to
   a clean serve-time error), `tracks_geometry_au` (scanner-owned geometry
-  changes), and `structural_blocks_ai`/`_ad`. `tags_reject_reparent` and
-  `track_art_reject_reparent` make row ownership immutable, for the same reason
-  art content is.
+  changes), and `structural_blocks_ai`/`_au`/`_ad`. `tags_reject_reparent` and
+  `track_art_reject_reparent` make row ownership immutable,
+  `tracks_reject_rekey` makes a track's id immutable, and
+  `structural_blocks_reject_update` makes a structural block immutable, for the
+  same reason art content is.
 
 ### Transparent and gated migrations
 
@@ -160,8 +164,11 @@ malformed *shapes* at commit, so an external writer cannot persist them:
 - an unknown `format` string, or a negative length/offset/size/version;
 - an `audio_offset + audio_length` running past the stored `backing_size`;
 - a binary tag row whose `value` is non-empty;
-- an `art.byte_len` that disagrees with its blob, or a `sha256` of the wrong
-  length;
+- an `art.byte_len` that disagrees with its blob, or an `art.sha256` that is not
+  64 lowercase hexadecimal characters — the form every musefs writer produces,
+  and the only one dedup can match (see **A digest has to name its bytes**
+  below). `tracks.fingerprint` and `tracks.content_hash` follow the same
+  grammar;
 - a `picture_type` outside `0..=20`;
 - a `tags.key` over 256 chars or `tags.value` over 16 MiB − 1 bytes (FLAC's
   24-bit metadata-block ceiling — the largest tag synthesis could serve, so the
@@ -178,7 +185,12 @@ malformed *shapes* at commit, so an external writer cannot persist them:
 - an `art.byte_len` over `MAX_ART_BYTES`;
 - a `track_art.mime` over 255 chars or `description` over 8 KiB, or either one,
   or an `art.sha256`, containing NUL;
-- a `backing_path` that is not a non-empty `BLOB`, or that contains a NUL byte;
+- a `backing_path` that is not a non-empty `BLOB`, that contains a NUL byte, or
+  that is over 64 KiB (`MAX_BACKING_PATH_BYTES`,
+  [#758](https://github.com/Sohex/musefs/issues/758)) — a portable ceiling past
+  any platform's `PATH_MAX`, so it refuses no path that could be opened. Every
+  reader of the column also re-checks the cap from `length(backing_path)` before
+  loading the path, for a store written with its constraints off;
 - a `structural_blocks` row with an unknown `kind`, negative `ordinal`, or `body`
   over the FLAC 24-bit block limit.
 
@@ -310,6 +322,17 @@ What this does not do is audit the table: a poisoned row nothing ever dedups
 onto is never compared, and the readers serve whatever a link points at. Filing
 every row under the digest of its own bytes remains the external writer's job.
 
+The digest also has one spelling: **lowercase hex**, 64 characters, which is
+what `upsert_art` in `musefs_common` produces and the reference for any
+third-party writer. It matters because dedup matches the digest as text —
+`ON CONFLICT(sha256)` — so the same bytes filed under `ABCD…` and under `abcd…`
+are two rows: the image is stored twice, and the byte comparison above never
+runs, since nothing matched for it to check. From schema v4 a `CHECK` refuses
+any other spelling ([#761](https://github.com/Sohex/musefs/issues/761)), so a
+writer that honours the schema cannot produce one. A writer that turns
+constraint enforcement off is outside the contract, as it is for every other
+constraint here.
+
 **Row ownership is immutable too.** A `tags` or `track_art` row may not move
 between tracks: `tags_reject_reparent` and `track_art_reject_reparent` abort a
 `track_id` change with the same shape of message. Replace by delete-then-insert,
@@ -321,6 +344,25 @@ bump both the old and the new owner regardless, so the accounting is correct on
 its own terms rather than only because the refusal forbids the case.) Naming
 `track_id` in a `SET` list without changing its value is not a reparent and is
 allowed.
+
+**So is a track's id.** `tracks.id` is the identity the incremental refresh
+keys on — the reason it is `AUTOINCREMENT` and never handed back out
+([#678](https://github.com/Sohex/musefs/issues/678)) — and `tracks_reject_rekey`
+aborts any `UPDATE` that changes it
+([#762](https://github.com/Sohex/musefs/issues/762)). Foreign keys alone did not
+stop a rekey: a childless track has nothing referencing its old id. The
+changelog trigger records the old id as well as a changed new one regardless,
+so a writer that drops the refusal still leaves the mount's refresh able to see
+the old id go.
+
+**And a structural block is replaced, never updated.** `structural_blocks` is
+scanner-owned, so no external writer should touch it at all, but SQL permits an
+`UPDATE` whatever the contract says, and an in-place rewrite of `body` or
+`track_id` changed what a FLAC header is synthesized from without invalidating
+either track ([#759](https://github.com/Sohex/musefs/issues/759)).
+`structural_blocks_reject_update` aborts every `UPDATE` on the table; the
+scanner already replaces a track's blocks by delete-then-insert. The update
+trigger bumps both the old and the new owner regardless.
 
 **Text and binary tag rows have independent ordinal spaces.** `tags` has no
 primary key; a unique index on `(track_id, key, ordinal, (value_blob IS NULL))`

@@ -1,3 +1,5 @@
+use crate::error::check_field_bytes;
+use crate::limits::MAX_BACKING_PATH_BYTES;
 use crate::models::{ChecksumWrite, Format, NewTrack, Track, TrackBounds};
 use crate::{Db, ReadWrite, Result};
 use rusqlite::{Row, params};
@@ -13,10 +15,13 @@ use rusqlite::{Row, params};
 /// sound only while every stored path had come from a Rust `String`; a path is
 /// an arbitrary byte string on Unix, and the whole point of the byte-typed
 /// model is that such a path round-trips instead of being mangled.
+///
+/// `backing_path_len` rides beside it so `row_to_track` can refuse an over-cap
+/// path before loading it (#758).
 macro_rules! track_select {
     ($tail:literal) => {
         concat!(
-            "SELECT id, backing_path, format, \
+            "SELECT id, length(backing_path) AS backing_path_len, backing_path, format, \
              audio_offset, audio_length, \
              backing_size, backing_mtime_ns, backing_ctime_ns, backing_ino, \
              content_version, updated_at, \
@@ -39,7 +44,26 @@ fn parse_format_col(fmt: &str) -> rusqlite::Result<Format> {
     })
 }
 
-fn row_to_track(r: &Row) -> rusqlite::Result<Track> {
+/// Refuse a `backing_path` over the cap from its projected `length()`, before the
+/// value is read (#758). Every reader of the column materializes it — into a
+/// `PathBuf`, on `getattr` among others — so without this a crafted store chose
+/// the size of that allocation; the V4 `CHECK` cannot protect a store written
+/// with its constraints off. The column is a BLOB, so `length()` counts bytes.
+fn check_backing_path_len(len: i64) -> Result<()> {
+    check_field_bytes("tracks", "backing_path", len, MAX_BACKING_PATH_BYTES)
+}
+
+/// Drain a `track_select!` result, guarding each row as `row_to_track` does.
+fn collect_tracks(mut rows: rusqlite::Rows) -> Result<Vec<Track>> {
+    let mut out = Vec::new();
+    while let Some(r) = rows.next()? {
+        out.push(row_to_track(r)?);
+    }
+    Ok(out)
+}
+
+fn row_to_track(r: &Row) -> Result<Track> {
+    check_backing_path_len(r.get("backing_path_len")?)?;
     let fmt: String = r.get("format")?;
     let format = parse_format_col(&fmt)?;
     let audio_offset: u64 = r.get("audio_offset")?;
@@ -121,7 +145,7 @@ pub(crate) fn get_track_by_path_in(
         conn,
         track_select!("WHERE backing_path = ?1"),
         params![crate::models::path_to_col(path)],
-        |r| Ok(row_to_track(r)?),
+        row_to_track,
     )
 }
 
@@ -130,8 +154,7 @@ pub(crate) fn tracks_by_fingerprint_in(
     fp: &str,
 ) -> Result<Vec<Track>> {
     let mut stmt = conn.prepare_cached(track_select!("WHERE fingerprint = ?1 ORDER BY id"))?;
-    let rows = stmt.query_map(params![fp], row_to_track)?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    collect_tracks(stmt.query(params![fp])?)
 }
 
 /// Both checksum writers below take each column as a `(overwrite?, value)`
@@ -213,6 +236,13 @@ pub struct ChangelogRead {
     pub changed_ids: Vec<i64>,
     pub min_seq: i64,
     pub max_seq: i64,
+    /// A row past `last_seq` whose `track_id` is not an integer (#760). V4's
+    /// `CHECK` refuses one, so only a store written with its constraints off
+    /// holds it. It names no track the caller can act on, so it is left out of
+    /// `changed_ids` rather than failing the read, and the caller treats the
+    /// window as a gap: an error would advance no watermark, and every later
+    /// read would meet the same row.
+    pub malformed: bool,
 }
 
 impl<M> Db<M> {
@@ -226,8 +256,7 @@ impl<M> Db<M> {
 
     pub fn list_tracks(&self) -> Result<Vec<Track>> {
         let mut stmt = self.conn.prepare_cached(track_select!("ORDER BY id"))?;
-        let rows = stmt.query_map([], row_to_track)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        collect_tracks(stmt.query([])?)
     }
 
     /// Just the `backing_path` column for every track: the projection a scan's
@@ -238,9 +267,14 @@ impl<M> Db<M> {
     pub fn list_backing_paths(&self) -> Result<Vec<std::path::PathBuf>> {
         let mut stmt = self
             .conn
-            .prepare_cached("SELECT backing_path FROM tracks")?;
-        let rows = stmt.query_map([], |r| Ok(crate::models::path_from_col(r.get(0)?)))?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+            .prepare_cached("SELECT length(backing_path), backing_path FROM tracks")?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            check_backing_path_len(r.get(0)?)?;
+            out.push(crate::models::path_from_col(r.get(1)?));
+        }
+        Ok(out)
     }
 
     /// How many tracks carry no `fingerprint`.
@@ -273,17 +307,18 @@ impl<M> Db<M> {
     pub fn track_identity(&self, id: i64) -> Result<Option<crate::TrackIdentity>> {
         crate::query_optional(
             &self.conn,
-            "SELECT content_version, backing_path, backing_size, \
+            "SELECT length(backing_path), content_version, backing_path, backing_size, \
              backing_mtime_ns, backing_ctime_ns, backing_ino FROM tracks WHERE id = ?1",
             params![id],
             |r| {
+                check_backing_path_len(r.get(0)?)?;
                 Ok(crate::TrackIdentity {
-                    content_version: r.get(0)?,
-                    backing_path: crate::models::path_from_col(r.get(1)?),
-                    backing_size: r.get(2)?,
-                    backing_mtime_ns: r.get(3)?,
-                    backing_ctime_ns: r.get(4)?,
-                    backing_ino: crate::models::ino_from_col(r.get(5)?),
+                    content_version: r.get(1)?,
+                    backing_path: crate::models::path_from_col(r.get(2)?),
+                    backing_size: r.get(3)?,
+                    backing_mtime_ns: r.get(4)?,
+                    backing_ctime_ns: r.get(5)?,
+                    backing_ino: crate::models::ino_from_col(r.get(6)?),
                 })
             },
         )
@@ -318,7 +353,7 @@ impl<M> Db<M> {
     }
 
     fn query_optional_track(&self, sql: &str, p: impl rusqlite::Params) -> Result<Option<Track>> {
-        crate::query_optional(&self.conn, sql, p, |r| Ok(row_to_track(r)?))
+        crate::query_optional(&self.conn, sql, p, row_to_track)
     }
 
     /// Cheap render-key identity scan for incremental refresh: `(id, content_version,
@@ -355,16 +390,24 @@ impl<M> Db<M> {
         )?;
         let changed_ids = {
             let mut stmt = tx.prepare(
-                "SELECT DISTINCT track_id FROM track_changes WHERE seq > ?1 ORDER BY track_id",
+                "SELECT DISTINCT track_id FROM track_changes \
+                 WHERE seq > ?1 AND typeof(track_id) = 'integer' ORDER BY track_id",
             )?;
             stmt.query_map([last_seq], |r| r.get(0))?
                 .collect::<rusqlite::Result<Vec<i64>>>()?
         };
+        let malformed: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM track_changes \
+             WHERE seq > ?1 AND typeof(track_id) <> 'integer')",
+            [last_seq],
+            |r| r.get(0),
+        )?;
         tx.commit()?;
         Ok(ChangelogRead {
             changed_ids,
             min_seq,
             max_seq,
+            malformed,
         })
     }
 

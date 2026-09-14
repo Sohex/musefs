@@ -274,6 +274,20 @@ see the [Release notes](release-notes.md).
     mount kept listing the pruned track and never showed the new one until it
     was remounted. Reading the ghost returned `EIO` rather than the wrong audio,
     because the backing stamp guard still failed closed.
+
+    An id that is an identity must also not change, and nothing refused
+    `UPDATE tracks SET id = …`
+    ([#762](https://github.com/Sohex/musefs/issues/762)). Foreign keys stop it
+    for a track with children, but a childless track — a file with no tags, art
+    or structural blocks — rekeyed freely, including onto an id that had been
+    deleted, which is #678's reuse through a different door. And
+    `tracks_changelog_au` logged only `NEW.id`, so the refresh classified the
+    new id as an addition and never saw the old one leave: the mount listed a
+    ghost for the old id beside the rekeyed track. `tracks_reject_rekey` now
+    refuses a changed id, in the shape of #717's reparent refusals, and the
+    changelog trigger logs `OLD.id` and, only when it differs, `NEW.id` — so
+    the refresh is correct on its own terms against a writer that drops the
+    refusal, while an ordinary update still spends one ring slot rather than two.
   - `tracks.backing_path` becomes a `BLOB`
     ([#680](https://github.com/Sohex/musefs/issues/680)), and so does the Rust
     model — see the Fixed entry below for the half that stops the mangling. The
@@ -285,6 +299,18 @@ see the [Release notes](release-notes.md).
     declaring the column `BLOB` is an affinity and would still accept `TEXT`
     through the same door
     ([#718](https://github.com/Sohex/musefs/issues/718)).
+
+    The column gains an upper bound as well, 64 KiB
+    ([#758](https://github.com/Sohex/musefs/issues/758)). It had none, and every
+    reader loads the whole path — `get_track` on every resolve, `track_identity`
+    on `getattr`, `list_backing_paths` for every row at once during a scan — so
+    a crafted but schema-valid store chose the size of that allocation, before
+    the OS could refuse a path no one can open. The ceiling is portable rather
+    than a platform's `PATH_MAX`, which the store's one shape cannot encode, and
+    nothing past the OS limit could be served anyway. Every reader checks
+    `length(backing_path)` before reading the value, which is the half that
+    protects a store written with its constraints off; a scanned path over the
+    cap fails that one file.
   - `tracks.backing_ino` is added
     ([#674](https://github.com/Sohex/musefs/issues/674)). On filesystems that
     truncate sub-second timestamps — ext3, HFS+, some SMB and NFS mounts — a
@@ -444,6 +470,52 @@ see the [Release notes](release-notes.md).
   exist and this cost a drop and a create. Left for a future major it would have
   cost a gated migration of its own, for a robustness fix nobody would schedule
   one for.
+
+  **Its rows become immutable too**
+  ([#759](https://github.com/Sohex/musefs/issues/759)). The table had insert and
+  delete triggers only, on V1's reasoning that the owned writer replaces by
+  delete-then-insert and no `UPDATE` path exists. That is true of musefs and not
+  of SQL: rewriting a row's `body` changed a served FLAC-header input without
+  bumping `content_version`, and changing its `track_id` moved one between
+  tracks without bumping either owner, so a cached layout kept serving the old
+  header. `structural_blocks_reject_update` now refuses every update — there is
+  no legitimate one to let through — the way art content and tag and link
+  ownership already are, and a new `structural_blocks_au` bumps both the old and
+  the new owner for a writer that drops the refusal. V1's other claim, that the
+  over-bump from a byte-identical re-probe is harmless churn, stopped holding
+  once the served mtime derived from `content_version` (#725); V1's text is
+  frozen, so the correction lives in V4's comments.
+
+- **The `track_changes` ring is recreated with its storage class pinned**
+  ([#760](https://github.com/Sohex/musefs/issues/760)). It kept V1's
+  `track_id INTEGER NOT NULL` with no `typeof`, the one internal table the
+  storage-class work left out, and the refresh reads the column straight into an
+  `i64`. A text, real or blob row past a mount's watermark was therefore a
+  conversion error, and an error — unlike a gap — advances no watermark: every
+  later poll re-read the same window and failed on the same row, so the mount
+  stopped picking up external edits until 8192 further changes pruned it or the
+  mount restarted. The migration drops and recreates the ring with
+  `CHECK (typeof(track_id) = 'integer')` instead of carrying its contents: it is
+  derived state, the step is gated so no mount holds a watermark into it, and a
+  mount takes its watermark from whatever is there. The reader does not rely on
+  the `CHECK` either. `changelog_since` skips such a row and reports it in
+  `ChangelogRead::malformed`, and the refresh treats that as a gap and falls back
+  to a full rebuild.
+
+- **A stored digest must be lowercase hex**
+  ([#761](https://github.com/Sohex/musefs/issues/761)). `art.sha256`,
+  `tracks.fingerprint` and `tracks.content_hash` were constrained to 64 NUL-free
+  characters, not to the form every musefs writer produces. Dedup matches the
+  digest as text, so an external writer filing identical bytes under an
+  uppercase digest stored the image a second time: `ON CONFLICT(sha256)` never
+  fired, #724's byte comparison never ran, and #746's per-embedding restore
+  missed the link. Each `CHECK` gains `NOT GLOB '*[^0-9a-f]*'` — `GLOB` is
+  case-sensitive, so one clause refuses uppercase and non-hex alike — beside the
+  NUL test it keeps, since `GLOB` stops at an embedded NUL. The two track columns
+  cost nothing, as the refill nulls both. An `art` row that fails is not
+  lowercased, because a lowercase row for the same bytes may already exist: it
+  goes through the pre-flight like any other refused row, reported with the links
+  that point at it, and `--repair` deletes both after the snapshot.
 
 - **`art` is rebuilt by the same migration** — the third of the four, and the
   one with an ordering constraint the others did not have. `track_art.art_id`

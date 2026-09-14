@@ -415,6 +415,112 @@ fn pruned_ring_prefix_is_a_gap_and_full_rebuild_recovers_lost_change() {
     );
 }
 
+/// A track id rewritten in place must leave the live tree the way a fresh open
+/// would see it (#762). The schema refuses the rekey, so this drops the refusal
+/// for the one statement — the shape a `writable_schema` writer produces — and
+/// checks that the changelog alone still carries the refresh to the right tree.
+/// Before it logged `OLD.id`, the incremental path saw the new id as an addition
+/// and never saw the old one leave, so the mount listed both.
+#[test]
+fn a_rekeyed_track_leaves_no_ghost_in_the_live_tree() {
+    let target = small_corpus(2);
+    let db_path = target.db_path.clone();
+    let corpus = target.corpus_dir.clone();
+    let db = Db::open(&db_path).unwrap();
+    scan_directory(&db, &corpus).unwrap();
+    let fs = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+    let ids: Vec<i64> = db.list_tracks().unwrap().iter().map(|t| t.id).collect();
+
+    // Childless first: with foreign keys enforced, a track that still has
+    // children cannot be rekeyed at all.
+    let raw = rusqlite::Connection::open(&db_path).unwrap();
+    raw.pragma_update(None, "foreign_keys", true).unwrap();
+    for table in ["tags", "track_art", "structural_blocks"] {
+        raw.execute(
+            &format!("DELETE FROM {table} WHERE track_id = ?1"),
+            [ids[0]],
+        )
+        .unwrap();
+    }
+    assert!(fs.poll_refresh().unwrap());
+
+    let refusal: Vec<String> = raw
+        .prepare("SELECT sql FROM sqlite_master WHERE name = 'tracks_reject_rekey'")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    raw.execute_batch("DROP TRIGGER IF EXISTS tracks_reject_rekey")
+        .unwrap();
+    raw.execute(
+        "UPDATE tracks SET id = (SELECT max(id) FROM tracks) + 100 WHERE id = ?1",
+        [ids[0]],
+    )
+    .unwrap();
+    // Restored verbatim, so the reference open below passes schema identity.
+    for sql in &refusal {
+        raw.execute_batch(sql).unwrap();
+    }
+
+    assert!(fs.poll_refresh().unwrap());
+    let reference = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+    assert_eq!(
+        tree_fingerprint(&fs).into_keys().collect::<Vec<_>>(),
+        tree_fingerprint(&reference).into_keys().collect::<Vec<_>>(),
+        "the old id must leave the tree when the row is rekeyed"
+    );
+}
+
+/// A changelog row whose `track_id` is not an integer (#760), from a store
+/// written with its constraints off. It used to be a conversion error, and an
+/// error moves no watermark, so every later poll re-read the same window and
+/// failed on the same row: the mount stopped picking up external edits. The
+/// refresh cannot tell which track the row named, so it treats it as a gap.
+#[test]
+fn a_malformed_changelog_row_falls_back_instead_of_stalling() {
+    let target = small_corpus(2);
+    let db_path = target.db_path.clone();
+    let corpus = target.corpus_dir.clone();
+    let db = Db::open(&db_path).unwrap();
+    scan_directory(&db, &corpus).unwrap();
+    let fs = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+    let writer = Db::open(&db_path).unwrap();
+    let ids: Vec<i64> = writer.list_tracks().unwrap().iter().map(|t| t.id).collect();
+
+    let raw = rusqlite::Connection::open(&db_path).unwrap();
+    raw.pragma_update(None, "ignore_check_constraints", true)
+        .unwrap();
+    raw.execute(
+        "INSERT INTO track_changes (track_id) VALUES ('not an id')",
+        [],
+    )
+    .unwrap();
+    writer
+        .replace_tags(ids[0], &[Tag::new("TITLE", "past-the-bad-row", 0)])
+        .unwrap();
+
+    assert!(
+        fs.poll_refresh().unwrap(),
+        "the poll must refresh, not fail"
+    );
+    assert_eq!(fs.gap_fallbacks_for_test(), 1, "an unreadable row is a gap");
+
+    // Not stuck: the watermark moved past the bad row, so the next edit is an
+    // ordinary incremental refresh.
+    writer
+        .replace_tags(ids[1], &[Tag::new("TITLE", "after-the-gap", 0)])
+        .unwrap();
+    assert!(fs.poll_refresh().unwrap());
+    assert_eq!(fs.gap_fallbacks_for_test(), 1);
+
+    let reference = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+    assert_eq!(
+        tree_fingerprint(&fs).into_keys().collect::<Vec<_>>(),
+        tree_fingerprint(&reference).into_keys().collect::<Vec<_>>(),
+    );
+}
+
 #[test]
 fn empty_ring_with_zero_watermark_polls_incremental() {
     // A data_version bump with no changelog rows and no watermark (the ring was

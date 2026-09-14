@@ -123,7 +123,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     allocator let a pruned track and a freshly ingested replacement collide on
     id, format *and* `content_version` — a substitution the refresh then blessed
     as a no-op, leaving the mount listing a track that was gone and hiding one
-    that was there until it was remounted.
+    that was there until it was remounted. The id is also immutable now
+    ([#762](https://github.com/Sohex/musefs/issues/762)): `UPDATE tracks SET id`
+    is refused. A track with no tags, art or structural blocks could otherwise
+    be rekeyed — onto a deleted id included — and the mount kept listing it
+    under the old id as well; the changelog now records both ids regardless.
   - `tracks.backing_path` is a `BLOB`
     ([#680](https://github.com/Sohex/musefs/issues/680)). A filesystem path is
     bytes; the lossy text round-trip could collapse two distinct files onto one
@@ -131,7 +135,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     SQLite never compares a `TEXT` value equal to a `BLOB`, so a lookup binding
     a string now matches nothing rather than failing. The plugins encode and
     decode at the boundary (`path_param`/`path_value`); third-party writers must
-    do the same.
+    do the same. The column is also capped at 64 KiB
+    ([#758](https://github.com/Sohex/musefs/issues/758)), a portable ceiling
+    past any platform's path limit, and every reader checks the length before
+    loading the path, so a crafted store can no longer choose how much the mount
+    allocates for it.
   - `tracks.backing_ino` is added
     ([#674](https://github.com/Sohex/musefs/issues/674)), for backing
     filesystems that store no sub-second timestamps and where a same-size
@@ -195,7 +203,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the one table the migration would otherwise have left alone, which is what
   made it the last one where a schema-valid row could still reach the Rust side
   as a conversion failure. The migration already held its rows while `tracks`
-  was rebuilt, so this cost a drop and a create rather than another copy.
+  was rebuilt, so this cost a drop and a create rather than another copy. Its
+  rows now refuse `UPDATE` too
+  ([#759](https://github.com/Sohex/musefs/issues/759)): the scanner replaces
+  them by delete-then-insert, and an in-place rewrite changed what a FLAC header
+  is built from without invalidating the cached layout.
 
 - **`art` is rebuilt by the same migration.**
 
@@ -209,6 +221,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     ([#718](https://github.com/Sohex/musefs/issues/718),
     [#693](https://github.com/Sohex/musefs/issues/693)), including an upper
     bound on the geometry that the range check never had.
+  - An `art.sha256` must be 64 lowercase hex characters
+    ([#761](https://github.com/Sohex/musefs/issues/761)), and `fingerprint` and
+    `content_hash` follow the same rule. Deduplication matches the digest as
+    text, so the same image filed under an uppercase digest was stored twice.
+    musefs and the plugins have always written lowercase, so only a store
+    another tool wrote is affected — and there **`musefs migrate` refuses such
+    a row, and `--repair` deletes it along with every picture link to it**, so
+    each track using it loses that picture; it survives only in the snapshot.
+    The digest is not lowercased for you, because a correctly filed row for the
+    same image may already exist.
 
 - **The public enums a downstream crate matches on are `#[non_exhaustive]`**
   ([#708](https://github.com/Sohex/musefs/issues/708)): the error enums,
@@ -455,6 +477,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   image: `musefs scan` fails only the file that would link a mismatched row,
   counted under `rejected`, and the `contrib` helper `upsert_art` raises
   `ArtDigestMismatch`.
+
+- **A malformed changelog row no longer stalls the mount's refresh**
+  ([#760](https://github.com/Sohex/musefs/issues/760)). A `track_changes` row
+  whose track id was not an integer made every poll fail on the same row, so
+  external edits stopped appearing until the row aged out or the mount
+  restarted. The migration recreates the ring with the column's type enforced,
+  and a row like that from a store written with constraints off now forces a
+  full rebuild instead.
 
 - **A backing file rewritten mid-read fails that read, not the next one**
   ([#682](https://github.com/Sohex/musefs/issues/682)). The stamp check now runs
