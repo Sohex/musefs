@@ -129,3 +129,16 @@ def test_build_records_uses_real_beets_destination(tmp_path):
     records, _ = _core.build_records([item], fields=None, stats=stats)
     # beets sanitizes "AC/DC" -> "AC_DC" and zero-pads $track; we strip ".flac".
     assert ("beets_path", "AC_DC/Back in Black/01 Hells Bells") in records[0].pairs
+
+
+def test_opening_a_real_library_writes_nothing_to_the_working_directory(tmp_path, monkeypatch):
+    # beets backs a database up before each migration, next to its path, and an
+    # in-memory library's path is the literal ":memory:" — so the copies landed in
+    # whatever directory the suite ran from. conftest turns the backups off.
+    from beets.library import Library
+
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    Library(":memory:", directory=str(tmp_path / "library"))
+    assert sorted(os.listdir(cwd)) == []

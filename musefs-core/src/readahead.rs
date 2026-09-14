@@ -454,6 +454,14 @@ fn lock_buf_or_clear<'a>(
     }
 }
 
+/// Drop every window `buf` holds and uncharge them from `pool`, so the
+/// `charged == Σ(registered buffers' bytes.len())` invariant holds whether or
+/// not the buffer is registered (an unregistered one holds nothing to free).
+pub fn discard_windows(pool: &ReadAheadPool, buf: &Mutex<ReadAhead>) {
+    let freed = lock_buf_or_clear(buf, pool).clear();
+    pool.reconcile(freed, 0);
+}
+
 /// Store a prefetched window into `buf` iff the handle's epoch is unchanged, and
 /// charge the global budget by the resulting size delta so the
 /// `charged == Σ(registered buffers' bytes.len())` invariant is preserved. A
@@ -610,7 +618,6 @@ impl PrefetchWorkers {
 
     #[expect(clippy::needless_pass_by_value)]
     pub fn run_job(job: PrefetchJob) {
-        use std::os::unix::fs::FileExt;
         let ctx = &job.ctx;
         if ctx.epoch.load(std::sync::atomic::Ordering::Acquire) != ctx.dispatched_epoch {
             return;
@@ -624,9 +631,13 @@ impl PrefetchWorkers {
         if !ctx.pool.has_room_for(want) {
             return;
         }
+        // Into a fresh buffer's spare capacity rather than over zeroes (#670),
+        // as the foreground fill does: the window is moved into the cache, so
+        // it cannot be a reused scratch buffer.
         #[expect(clippy::cast_possible_truncation)]
-        let mut bytes = vec![0u8; want as usize];
-        if ctx.file.read_exact_at(&mut bytes, job.start).is_err() {
+        let window = want as usize;
+        let mut bytes = Vec::with_capacity(window);
+        if pread_append(&ctx.file, &mut bytes, window, job.start).is_err() {
             return;
         }
         crate::metrics::on_prefetch_read(want);
@@ -674,10 +685,12 @@ pub(crate) fn pread_append(
 }
 
 // Caps each `pread` below, so a test can make a regular file return the short
-// reads a network filesystem can; nothing else reaches the resume path.
+// reads a network filesystem can; nothing else reaches the resume path. A cap
+// of zero makes every read come back empty, as one past a truncation does.
 #[cfg(test)]
 thread_local! {
-    static PREAD_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+    pub(crate) static PREAD_CAP: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(usize::MAX) };
 }
 
 fn pread_append_unwound(
@@ -1650,6 +1663,70 @@ mod prefetch_worker_tests {
         .unwrap();
         assert_eq!(fills, 0, "prefetched window should serve without a pread");
         assert_eq!(out, data[1024 * 1024..1024 * 1024 + 4096]);
+    }
+
+    /// #670 reaches the worker too: its window, like the foreground's, is
+    /// moved into the cache and so cannot be a reused scratch buffer, and it
+    /// reads into a fresh one's spare capacity through `pread_append` rather
+    /// than over zeroes. `PREAD_CAP` reaches only that read, so short reads
+    /// must still assemble the right window, and reads that come back empty
+    /// must store none.
+    #[test]
+    fn prefetch_job_reads_its_window_into_spare_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.bin");
+        let data: Vec<u8> = (0u64..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&data)
+            .unwrap();
+        let file = Arc::new(std::fs::File::open(&path).unwrap());
+        let job = |pool: &Arc<ReadAheadPool>, buf: &Arc<Mutex<ReadAhead>>| PrefetchJob {
+            ctx: Arc::new(PrefetchContext {
+                file: Arc::clone(&file),
+                buf: Arc::clone(buf),
+                pool: Arc::clone(pool),
+                epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                dispatched_epoch: 0,
+                len: 1024 * 1024,
+                backing_len: data.len() as u64,
+            }),
+            start: 1024 * 1024,
+        };
+        let fresh = || {
+            let pool = Arc::new(ReadAheadPool::new(64 * 1024 * 1024));
+            let buf = Arc::new(Mutex::new(ReadAhead::new(pool.per_stream_cap())));
+            pool.register(1, Arc::clone(&buf));
+            (pool, buf)
+        };
+
+        let (pool, buf) = fresh();
+        super::PREAD_CAP.with(|cap| cap.set(0));
+        PrefetchWorkers::run_job(job(&pool, &buf));
+        super::PREAD_CAP.with(|cap| cap.set(usize::MAX));
+        assert_eq!(pool.charged(), 0, "an empty read stores no window");
+        assert_eq!(buf.lock().unwrap().len(), 0);
+
+        let (pool, buf) = fresh();
+        super::PREAD_CAP.with(|cap| cap.set(4096 - 7));
+        PrefetchWorkers::run_job(job(&pool, &buf));
+        super::PREAD_CAP.with(|cap| cap.set(usize::MAX));
+        assert_eq!(
+            pool.charged(),
+            1024 * 1024,
+            "short reads resume into one window"
+        );
+        let mut out = vec![0u8; 1024 * 1024];
+        let mut fills = 0;
+        buf.lock()
+            .unwrap()
+            .read_into(&mut out, 1024 * 1024, data.len() as u64, |_, _| {
+                fills += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(fills, 0, "the window serves without a pread");
+        assert_eq!(out, data[1024 * 1024..2 * 1024 * 1024]);
     }
 
     /// A job whose target buffer lock is already poisoned must not panic the

@@ -199,6 +199,206 @@ fn a_rewrite_during_a_stateless_read_fails_that_read() {
     );
 }
 
+/// Run `read` with every backing `pread` coming back empty, as one past a
+/// truncation would, so the read fails on its own.
+fn with_empty_preads<T>(read: impl FnOnce() -> T) -> T {
+    crate::readahead::PREAD_CAP.with(|cap| cap.set(0));
+    let out = read();
+    crate::readahead::PREAD_CAP.with(|cap| cap.set(usize::MAX));
+    out
+}
+
+/// #682: a handle read that fails on its own while a rewrite lands reports the
+/// rewrite. A rewrite can surface as a short read before anything else, and
+/// `BackingChanged` is what retires the cached attrs (#668), so the detected
+/// drift outranks the read's own error. Checking the read's result first
+/// returned the I/O error instead.
+#[test]
+fn a_rewrite_outranks_a_failing_handle_read() {
+    let (_dir, fs, file_inode, backing) = mount_over_one_mp3();
+    let fh = fs.open_handle(file_inode).unwrap();
+
+    let alone = with_empty_preads(|| fs.read(file_inode, Some(fh), 0, 1 << 20));
+    assert!(
+        matches!(alone, Err(CoreError::Io(_))),
+        "without a rewrite the read reports its own failure: {:?}",
+        alone.map(|b| b.len())
+    );
+
+    set_after_backing_read_hook(rewrite_in_place(backing));
+    let read = with_empty_preads(|| fs.read(file_inode, Some(fh), 0, 1 << 20));
+    clear_after_backing_read_hook();
+    assert!(
+        matches!(read, Err(CoreError::BackingChanged(_))),
+        "{:?}",
+        read.map(|b| b.len())
+    );
+    fs.release_handle(fh);
+}
+
+/// #682, the stateless path: the same ordering, in `read_at_into`.
+#[test]
+fn a_rewrite_outranks_a_failing_stateless_read() {
+    let (_dir, fs, file_inode, backing) = mount_over_one_mp3();
+
+    let alone = with_empty_preads(|| fs.read(file_inode, None, 0, 1 << 20));
+    assert!(
+        matches!(alone, Err(CoreError::Io(_))),
+        "without a rewrite the read reports its own failure: {:?}",
+        alone.map(|b| b.len())
+    );
+
+    set_after_backing_read_hook(rewrite_in_place(backing));
+    let read = with_empty_preads(|| fs.read(file_inode, None, 0, 1 << 20));
+    clear_after_backing_read_hook();
+    assert!(
+        matches!(read, Err(CoreError::BackingChanged(_))),
+        "{:?}",
+        read.map(|b| b.len())
+    );
+}
+
+/// Rewrite `path` in place — same inode, same size — ending in `audio` instead
+/// of what it ended in, with an mtime an hour ahead so the stamp moves even
+/// where timestamps are coarse.
+fn rewrite_audio_in_place(path: &std::path::Path, audio: &[u8]) {
+    use std::os::unix::fs::FileExt;
+    let len = std::fs::metadata(path).unwrap().len();
+    let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    f.write_all_at(audio, len - audio.len() as u64).unwrap();
+    f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_hours(1))
+        .unwrap();
+}
+
+/// Record the backing file as it now stands, as `musefs revalidate` does after
+/// an out-of-band rewrite.
+fn restamp(dir: &tempfile::TempDir) {
+    let db = musefs_db::Db::open(dir.path().join("m.db")).unwrap();
+    crate::scan::revalidate(&db, dir.path()).unwrap();
+}
+
+/// A handle's read-ahead windows are keyed by backing offset alone, and hold
+/// bytes read under whatever stamp was current. Once a rewritten backing file
+/// is restamped, the held fd matches the row again and the post-read check
+/// passes, so a window cached before the rewrite would be served behind the
+/// new header. The re-resolve that picks up the new stamp has to drop it.
+#[test]
+fn a_restamped_backing_drops_the_handles_read_ahead() {
+    let (dir, fs, file_inode, backing) = mount_over_one_mp3();
+    let fh = fs.open_handle(file_inode).unwrap();
+    let before = fs.read(file_inode, Some(fh), 0, 1 << 20).unwrap();
+    assert!(before.ends_with(&[1, 2, 3, 4]), "{before:?}");
+
+    rewrite_audio_in_place(&backing, &[9, 9, 9, 9]);
+    let caught = fs.read(file_inode, Some(fh), 0, 1 << 20);
+    assert!(
+        matches!(caught, Err(CoreError::BackingChanged(_))),
+        "the rewrite is caught while the store still describes the old file: {:?}",
+        caught.map(|b| b.len())
+    );
+
+    restamp(&dir);
+    assert!(fs.poll_refresh().unwrap(), "the restamp is a store change");
+    let fresh = fs.read(file_inode, None, 0, 1 << 20).unwrap();
+    assert!(fresh.ends_with(&[9, 9, 9, 9]), "{fresh:?}");
+    assert_eq!(
+        fs.read(file_inode, Some(fh), 0, 1 << 20).unwrap(),
+        fresh,
+        "the handle must serve the rewritten file, not a window cached before it"
+    );
+
+    fs.release_handle(fh);
+    assert_eq!(
+        fs.pool_charged(),
+        0,
+        "the dropped windows must be uncharged"
+    );
+}
+
+/// The same restamp, racing a prefetch that read the old file before it and
+/// lands after the handle re-resolved. The re-resolve happens on a read of the
+/// synthesized header alone, which touches no backing byte and so cannot move
+/// the epoch by seeking; only the re-resolve itself can refuse the window.
+#[test]
+fn a_prefetch_landing_after_a_restamp_is_refused() {
+    let (dir, fs, file_inode, backing) = mount_over_one_mp3();
+    let fh = fs.open_handle(file_inode).unwrap();
+    fs.read(file_inode, Some(fh), 0, 1 << 20).unwrap();
+    let h = fs
+        .handles
+        .get(fh.slab_key())
+        .map(|g| Arc::clone(&g))
+        .unwrap();
+
+    // A job dispatched now, over the file as it now stands.
+    let dispatched = h.epoch.load(Ordering::Acquire);
+    let old = std::fs::read(&backing).unwrap();
+    h.prefetched_upto.store(old.len() as u64, Ordering::Relaxed);
+
+    rewrite_audio_in_place(&backing, &[9, 9, 9, 9]);
+    restamp(&dir);
+    assert!(fs.poll_refresh().unwrap(), "the restamp is a store change");
+    fs.read(file_inode, Some(fh), 0, 1)
+        .expect("the header reads against the new stamp");
+
+    assert_eq!(
+        h.prefetched_upto.load(Ordering::Relaxed),
+        0,
+        "the dispatch watermark describes windows that were dropped"
+    );
+    assert!(
+        !crate::readahead::try_store_prefetch(
+            &fs.readahead_pool,
+            &h.readahead,
+            &h.epoch,
+            dispatched,
+            0,
+            old,
+        ),
+        "a window read before the restamp must not be cached after it"
+    );
+    let fresh = fs.read(file_inode, None, 0, 1 << 20).unwrap();
+    assert!(fresh.ends_with(&[9, 9, 9, 9]), "{fresh:?}");
+    assert_eq!(fs.read(file_inode, Some(fh), 0, 1 << 20).unwrap(), fresh);
+
+    drop(h);
+    fs.release_handle(fh);
+    assert_eq!(fs.pool_charged(), 0);
+}
+
+/// Most re-resolves are not restamps. A retag moves the generation and leaves
+/// the backing file alone, and the windows a handle holds are still the file's
+/// bytes, so they survive — as does the epoch an in-flight prefetch carries.
+#[test]
+fn a_retag_keeps_the_handles_read_ahead() {
+    let (dir, fs, file_inode, _backing) = mount_over_one_mp3();
+    let fh = fs.open_handle(file_inode).unwrap();
+    fs.read(file_inode, Some(fh), 0, 1 << 20).unwrap();
+    let h = fs
+        .handles
+        .get(fh.slab_key())
+        .map(|g| Arc::clone(&g))
+        .unwrap();
+    let cached = h.readahead.lock().unwrap().len();
+    assert!(cached > 0, "the read cached a window");
+    let epoch = h.epoch.load(Ordering::Acquire);
+
+    {
+        let db = musefs_db::Db::open(dir.path().join("m.db")).unwrap();
+        let track_id = db.list_tracks().unwrap()[0].id;
+        db.replace_tags(track_id, &[musefs_db::Tag::new("comment", "retagged", 0)])
+            .unwrap();
+    }
+    assert!(fs.poll_refresh().unwrap(), "the retag is a store change");
+    fs.read(file_inode, Some(fh), 0, 1)
+        .expect("the header reads against the new layout");
+
+    assert_eq!(h.readahead.lock().unwrap().len(), cached);
+    assert_eq!(h.epoch.load(Ordering::Acquire), epoch);
+    drop(h);
+    fs.release_handle(fh);
+}
+
 #[test]
 fn prefetch_workers_created_only_with_budget_and_flag() {
     use std::collections::BTreeMap;

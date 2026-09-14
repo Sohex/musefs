@@ -85,13 +85,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fire-and-forget there — but sampling the prefetch counters without it misses
   reads still in flight, and a caller that owns the backing filesystem itself
   (the latency-injecting mount the read benches use) can otherwise tear it down
-  under a worker mid-read and park that thread in uninterruptible sleep (#671).
+  under a worker mid-read and park that thread in uninterruptible sleep
+  ([#671](https://github.com/Sohex/musefs/issues/671)).
 
 - `musefs_readahead_prefetch_reads_total` and
   `musefs_readahead_prefetch_bytes_total` count the backing reads the Phase-2
   prefetch workers issue. The serve-path `musefs_backing_pread_*` counters never
   saw those threads, so a runaway prefetcher was invisible to the daemon's own
-  telemetry (#671).
+  telemetry ([#671](https://github.com/Sohex/musefs/issues/671)).
 
 - `musefs_dir_handle_rejections_total` counts `opendir` calls that could not be
   given a cached directory snapshot, so directory-handle pressure stays visible
@@ -107,12 +108,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   The default stays auto (2× the CPU count, oversized for I/O-bound work), but
   each worker lazily opens its own read-only SQLite connection, so steady-state
   memory scales with the pool — many-core hosts serving few concurrent readers
-  can now cap that component (#631).
+  can now cap that component
+  ([#631](https://github.com/Sohex/musefs/issues/631)).
 - `musefs_process_resident_bytes` (Linux) reports the whole-process RSS, and
   `musefs_sqlite_memory_bytes` reports what SQLite holds across all connections.
   SQLite allocates through libc, so the jemalloc `musefs_alloc_*` gauges never
   saw it — a full-library walk grew the process by hundreds of MB while the
-  allocator gauges barely moved (#631). The metrics surface now answers "how
+  allocator gauges barely moved
+  ([#631](https://github.com/Sohex/musefs/issues/631)). The metrics surface now answers "how
   much memory is this using" honestly.
 
 ### Changed
@@ -275,7 +278,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The serve path no longer zero-fills buffers a read is about to overwrite
   ([#670](https://github.com/Sohex/musefs/issues/670)). Backing-audio segments,
-  Ogg audio pages and read-ahead windows were zero-filled and then overwritten
+  Ogg audio pages and read-ahead windows, whether a read or the background
+  prefetch filled them, were zero-filled and then overwritten
   by the positioned read; the bytes now land in the buffer's uninitialized
   capacity, committed only as far as `pread` reports. Against high-latency
   backing nothing visible changes; against page-cached or NVMe reads it is one
@@ -305,7 +309,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   NFS modes also disable NFS LOCALIO for the run: on Linux 6.12+ a loopback mount
   negotiates local I/O and bypasses the RPC transport, so `tc netem` on `lo` had
   no effect on the data path and every "NFS" row measured local disk at GB/s
-  (#671).
+  ([#671](https://github.com/Sohex/musefs/issues/671)).
 
 - **Behavior change.** A scan that hits a DB constraint violation on one file
   now runs to completion instead of stopping there
@@ -339,7 +343,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   same limiter, since a saturated client retries in a tight loop. The limiter is
   now process-wide rather than FUSE-local, so the warns emitted from inside
   synthesis — a dropped Vorbis tag key, over-cap art, a failed art-blob read —
-  are bounded by the same budget instead of bypassing it (#650). Log targets are
+  are bounded by the same budget instead of bypassing it
+  ([#650](https://github.com/Sohex/musefs/issues/650)). Log targets are
   unchanged: each warning is still attributed to the module that raised it, so
   per-crate `RUST_LOG` filters keep working.
 - Scan failures are broken down by reason, and the per-file warnings capped
@@ -360,7 +365,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   default is ~2 MiB). The serve path opens one connection per worker thread
   (2× CPUs), so the default multiplied into hundreds of MB of steady-state RSS
   after a full-library enumeration; the cap saved ~110 MB on a 200,000-track
-  walk with 64 workers and no measured latency change (#631). The tuning guide
+  walk with 64 workers and no measured latency change
+  ([#631](https://github.com/Sohex/musefs/issues/631)). The tuning guide
   now documents the post-enumeration steady state as the number to size a host
   against, and the transparent-hugepage inflation some distros' `THP=always`
   default adds on top.
@@ -435,6 +441,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   outside the test suites called them.
 
 ### Fixed
+
+- **An open file no longer serves read-ahead cached before a backing rewrite**
+  once the row is restamped. A handle's read-ahead windows are keyed by backing
+  offset alone. After an in-place rewrite of the backing file, reads correctly
+  failed with `BackingChanged`; but once `musefs revalidate` or `scan --force`
+  restamped the row, the held descriptor matched the new stamp again, and a read
+  landing in a window cached before the rewrite served those old bytes behind the
+  new header, a file matching neither version. A handle that re-resolves onto a
+  new stamp now drops its cached windows and refuses in-flight prefetches first.
+  The bug predates 2.0.0.
+
+- **`--follow-symlinks` judges a link by the file it points at**
+  ([#766](https://github.com/Sohex/musefs/issues/766)). The walk checked the
+  extension of the link's own name but probed its target, so a recursive scan
+  skipped `track -> song.flac` and `notes.txt -> song.flac` (though the same
+  link passed as the scan root was ingested), and accepted `song.flac -> notes`
+  only to fail it at probe. The walk now resolves each link it follows once and
+  uses that path throughout: the target decides eligibility and the skip bucket,
+  and the resolved path is what dedup, the already-present check, `revalidate`
+  and the probe use, and what is stored. A link that cannot be resolved counts
+  as a `symlink` walk error.
 
 - **Re-probing an unchanged file no longer moves its served mtime**
   ([#757](https://github.com/Sohex/musefs/issues/757)). Every re-probe stamped
@@ -552,7 +579,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   musefs ([#683](https://github.com/Sohex/musefs/issues/683)). With
   `--keep-cache`, a page-cache hit never does, so an in-place backing rewrite
   behind an open, cached file is caught at the next open, and only if the
-  rewrite changed the file's size, mtime, ctime or inode.
+  rewrite changed the file's size, mtime, ctime or inode. The `--keep-cache`
+  and `--trust-backing-mtime` help now say the same instead of claiming no stale
+  byte is ever served.
 
 - **A synthesized file's mtime now moves whenever its bytes do, and a pre-epoch
   backing file is stored and served.** Two fixes in the same type, because both are
@@ -1109,3 +1138,12 @@ First public release.
 - Initial MVP (FLAC and MP3 synthesis, virtual tree with beets-style templates,
   `synthesis` / `structure-only` mount modes, auto-refresh, `scan` /
   `scan --revalidate`). Never published publicly; superseded by 0.2.0.
+
+[Unreleased]: https://github.com/Sohex/musefs/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/Sohex/musefs/releases/tag/v2.0.0
+[1.3.0]: https://github.com/Sohex/musefs/releases/tag/v1.3.0
+[1.2.0]: https://github.com/Sohex/musefs/releases/tag/v1.2.0
+[1.1.0]: https://github.com/Sohex/musefs/releases/tag/v1.1.0
+[1.0.0]: https://github.com/Sohex/musefs/releases/tag/v1.0.0
+[0.2.0]: https://github.com/Sohex/musefs/releases/tag/v0.2.0
+[0.1.0]: https://github.com/Sohex/musefs/releases/tag/v0.1.0

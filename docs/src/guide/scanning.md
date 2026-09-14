@@ -18,6 +18,10 @@ ones is the job of `musefs revalidate` — see
 [Maintenance](maintenance.md#refreshing-the-store-musefs-revalidate).) It takes
 one or more files or directories, and `--jobs N` controls probe parallelism. `--follow-symlinks` walks symlinked
 files and directories (off by default, so symlinks are logged and skipped).
+A followed link is judged by the file it points at, not by its own name: a link
+named `track` or `notes.txt` that points at a FLAC is scanned as that FLAC, and
+one named `song.flac` that points at a text file counts as skipped. It is stored
+under the path it resolves to.
 `--quiet` (`-q`) suppresses the per-target summary for scripting; scan
 failures still surface on stderr (raise detail with `-v`/`-vv`, or
 `RUST_LOG=info`).
@@ -31,7 +35,9 @@ elapsed time. Anything logged during the scan (skip warnings, per-file
 failures) is printed above the bar, which is lifted out of the way and redrawn
 underneath, so warnings stay readable and scroll back intact.
 
-The per-target summary reads `scanned N: … already present Z, skipped X, failed Y`.
+The per-target summary reads
+`scanned <target>: N file(s), Z already present, skipped X, failed Y in <elapsed>`,
+where `N` counts the files stored or refreshed.
 `already present` counts files bare `scan` skipped because they were already
 tracked. `skipped`
 counts every file that isn't a supported audio format — cover art, `.cue` /
@@ -125,8 +131,8 @@ before a moved file is retargeted:
 - **`strict`** — require a full-hash match; if the matched candidate has no
   stored `content_hash`, refuse the retarget and insert a fresh row instead.
 
-**Upgrading from musefs 1.3.0 or earlier.** Every command refuses a 1.3.0
-store until `musefs migrate --db library.db` upgrades it (see
+**Upgrading from musefs 1.3.0 or earlier.** Every command other than
+`migrate` refuses a 1.3.0 store until `musefs migrate --db library.db` upgrades it (see
 [Maintenance](maintenance.md#upgrading-the-store-musefs-migrate)). That upgrade
 clears every stored fingerprint, because the value now includes sampled audio
 and the old ones were computed without it. The next `revalidate` recomputes

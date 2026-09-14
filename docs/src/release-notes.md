@@ -11,8 +11,8 @@ The first major release. At its centre is the store: one schema migration, to
 version 4, that makes a track's identity, its backing path and its picture
 metadata mean what they say. It is applied by an explicit `musefs migrate`
 rather than silently on open. Around it ride the breaking cleanups a major
-version allows, and everything merged since v1.3.0, so the highlights below
-include features built during 1.x. Read
+version allows, and everything merged since v1.3.0. There is no 1.4.0: the
+features built during 1.x ship here, so the highlights below include them. Read
 [Upgrading from v1.3.0](#upgrading-from-v130) before installing it, because the
 store upgrade is one-way without the snapshot `migrate` takes.
 
@@ -23,7 +23,8 @@ store upgrade is one-way without the snapshot `migrate` takes.
   disk, or locks older builds out — now happens only when you ask. `migrate`
   reports what it will do, checks every row against the new schema, snapshots
   the store, then upgrades it. Until it has run, every other command refuses
-  the store and leaves it untouched.
+  the store without changing its data or schema version, so the previous
+  release still opens it.
 - **A store that means what it says** ([#674], [#678], [#680], [#693], [#716],
   [#717], [#718]):
   - track ids are never reused, so a deleted track's id cannot bless another;
@@ -46,12 +47,26 @@ store upgrade is one-way without the snapshot `migrate` takes.
 - **A scan survives a rejected file** ([#662]). A row the store refuses fails
   that one file, and the scan runs to completion and exits `2`.
 - **Hardening across the serve path and the store**:
-  - backing changes are validated after the read, not before ([#682]);
+  - backing changes are validated after the read, not before ([#682]), and an
+    open file drops the read-ahead it cached before a backing rewrite once the
+    row is restamped to match;
   - an over-cap directory listing stays stable across a refresh ([#695]);
   - metadata work on the worker pool is admission-controlled ([#694]);
   - content-addressed art is verified ([#724]);
+  - under `--follow-symlinks`, a link is scanned by its target's format, not
+    its own name, whether the walk reaches it or it is the scan root ([#766]);
   - chained Ogg is refused, and an old row for one is removable ([#722],
     [#747]).
+- **Directory handles share one listing** ([#675]). Handles open on the same
+  directory at the same tree generation share a listing instead of each copying
+  it, so a client holding many handles on a wide directory no longer pins memory
+  in proportion to the handle count. `musefs_dir_listings` reports how many
+  distinct listings are held.
+- **Wider tag and description caps.** A `tags.value` may hold up to
+  16 MiB − 1 bytes (was 256 KiB) and a `track_art.description` up to 8,192
+  characters (was 1,024). This is schema version 3, which only widens
+  constraints and carries every row across; `musefs migrate` applies it together
+  with version 4.
 
 See the [Changelog](changelog.md#200---2026-09-14) for the full list.
 
@@ -70,16 +85,25 @@ musefs migrate --db library.db
 ```
 
 Stop the old mount and any scheduled scan first. The commands that refuse the
-store leave it exactly as it was, so 1.3.0 still opens it until `migrate` has
-run ([#749]).
+store change neither its data nor its schema version, so 1.3.0 still opens it
+until `migrate` has run ([#749]). Its file bytes can still change: closing the
+store checkpoints any write-ahead-log frames left pending into the database.
 
 `migrate` refuses a store anything else has open — a mount, even an idle one, a
 running scan, another `migrate`. In a script it needs `--yes`, since there is no
 terminal to confirm on, and its two follow-up offers (step 4) decline unless
-`--vacuum` / `--revalidate` ask for them. Once the store is upgraded, no musefs
-older than 2.0.0 opens it. The
+`--vacuum` / `--revalidate` ask for them. Once the store is upgraded, musefs
+1.1.0 to 1.3.0 refuse to open it. 1.0.x has no such check and does not refuse a
+newer store, so never run a 1.0.x binary against an upgraded one. The
 [maintenance guide](guide/maintenance.md#upgrading-the-store-musefs-migrate) has
 the full walkthrough and flag table.
+
+**Containers.** The floating `:latest` and `:musl` image tags move to 2.0.0
+with this release. A container that pulls them automatically refuses its 1.x
+store, and will not start until `musefs migrate` has run against the store
+volume. Pin `:1.3.0` (or `:1.3.0-musl`) until you are ready to upgrade.
+[Running in containers](guide/containers.md) shows how to run `migrate` from
+the image.
 
 **2. Disk space, and the way back** ([#705]). Before asking anything, `migrate`
 checks for free space next to the store: the store's on-disk size (the database
@@ -134,7 +158,11 @@ through the catches.
 **4. Revalidate afterwards.** Accept `migrate`'s offer to revalidate your
 library, or run `musefs revalidate /path/to/music --db library.db` yourself. The
 upgrade leaves several things only a revalidate puts right, and it is the
-**first** revalidate that does it.
+**first** revalidate that does it, as long as it runs at the default checksum
+tier or above, as the offer does. A `--checksum=none` revalidate skips an
+unchanged file on a filesystem whose inode numbers musefs does not record (see
+[Freshness](architecture/tree-scanning.md#freshness-two-version-counters)), so
+there it restores neither picture metadata nor an Ogg FLAC's bounds.
 
 The offer revalidates the deepest directory every stored track shares. Stored
 paths are already resolved, symlinks included, so that walk reaches every track
@@ -177,10 +205,11 @@ A few files need more than that:
   where their audio starts. Tags and art that 1.3.0 never read from those files
   arrive only through `musefs scan --force <file>`, which replaces that file's
   curated tags and art with what it embeds.
-- **Chained Ogg** stored by 1.3.0 ([#722], [#747]). 2.0.0 refuses to serve these,
+- **Chained Ogg** stored by 1.3.0 ([#722], [#747]). 2.0.0's scan refuses these,
   so they cannot be refreshed. Each counts as `failed` (reason `unsupported`),
-  and `revalidate` exits `2` while any remain. Until they are removed, reads
-  into a chain's second stream fail with `EIO`. `musefs revalidate --prune`
+  and `revalidate` exits `2` while any remain. Until they are removed, the mount
+  still plays a chain's first stream, but reads into its second stream fail with
+  `EIO`. `musefs revalidate --prune`
   removes them. The run that does so still exits `2`, and the next one does not.
   `migrate`'s offer never prunes; if its revalidate counts failures,
   `migrate` exits `2` ([#750]).
@@ -386,6 +415,7 @@ directly.
 [#668]: https://github.com/Sohex/musefs/issues/668
 [#672]: https://github.com/Sohex/musefs/issues/672
 [#674]: https://github.com/Sohex/musefs/issues/674
+[#675]: https://github.com/Sohex/musefs/issues/675
 [#678]: https://github.com/Sohex/musefs/issues/678
 [#680]: https://github.com/Sohex/musefs/issues/680
 [#682]: https://github.com/Sohex/musefs/issues/682
@@ -414,15 +444,16 @@ directly.
 [#743]: https://github.com/Sohex/musefs/issues/743
 [#746]: https://github.com/Sohex/musefs/issues/746
 [#747]: https://github.com/Sohex/musefs/issues/747
-[#757]: https://github.com/Sohex/musefs/issues/757
 [#749]: https://github.com/Sohex/musefs/issues/749
 [#750]: https://github.com/Sohex/musefs/issues/750
 [#751]: https://github.com/Sohex/musefs/issues/751
+[#757]: https://github.com/Sohex/musefs/issues/757
 [#758]: https://github.com/Sohex/musefs/issues/758
 [#759]: https://github.com/Sohex/musefs/issues/759
 [#760]: https://github.com/Sohex/musefs/issues/760
 [#761]: https://github.com/Sohex/musefs/issues/761
 [#762]: https://github.com/Sohex/musefs/issues/762
+[#766]: https://github.com/Sohex/musefs/issues/766
 
 ## v1.3.0
 

@@ -143,7 +143,8 @@ see the [Release notes](release-notes.md).
   fire-and-forget there — but sampling the prefetch counters without it misses
   reads still in flight, and a caller that owns the backing filesystem itself
   (the latency-injecting mount the read benches use) can otherwise tear it down
-  under a worker mid-read and park that thread in uninterruptible sleep (#671).
+  under a worker mid-read and park that thread in uninterruptible sleep
+  ([#671](https://github.com/Sohex/musefs/issues/671)).
 
 - `musefs_readahead_prefetch_reads_total` and
   `musefs_readahead_prefetch_bytes_total`
@@ -198,8 +199,8 @@ see the [Release notes](release-notes.md).
 - **The serve path no longer zero-fills buffers a read is about to overwrite**
   ([#670](https://github.com/Sohex/musefs/issues/670)). Each backing-audio
   segment and Ogg audio page a read touched was zero-filled and then overwritten
-  by the positioned read, and each read-ahead window was allocated zeroed and then
-  filled — about 1.7 µs per 128 KiB segment and 69 µs per 8 MiB window as
+  by the positioned read, and each read-ahead window, whether a read or the
+  background prefetch filled it, was allocated zeroed and then filled — about 1.7 µs per 128 KiB segment and 69 µs per 8 MiB window as
   measured in the issue, roughly 18% of a page-cached fill. Those reads now land
   in the buffer's uninitialized spare capacity instead, committed by one audited
   `unsafe` `set_len` covering only the bytes `pread` reports initialized, and a
@@ -527,7 +528,8 @@ see the [Release notes](release-notes.md).
   ownership already are, and a new `structural_blocks_au` bumps both the old and
   the new owner for a writer that drops the refusal. V1's other claim, that the
   over-bump from a byte-identical re-probe is harmless churn, stopped holding
-  once the served mtime derived from `content_version` (#725); V1's text is
+  once the served mtime derived from `content_version`
+  ([#725](https://github.com/Sohex/musefs/issues/725)); V1's text is
   frozen, so the correction lives in V4's comments.
 
 - **The `track_changes` ring is recreated with its storage class pinned**
@@ -624,7 +626,7 @@ see the [Release notes](release-notes.md).
   NFS modes also disable NFS LOCALIO for the run: on Linux 6.12+ a loopback mount
   negotiates local I/O and bypasses the RPC transport, so `tc netem` on `lo` had
   no effect on the data path and every "NFS" row measured local disk at GB/s
-  (#671).
+  ([#671](https://github.com/Sohex/musefs/issues/671)).
 
 - **Behavior change.** A scan that hits a DB constraint violation on one file
   now runs to completion instead of stopping there
@@ -816,12 +818,46 @@ see the [Release notes](release-notes.md).
 
 ### Fixed
 
+- **An open file no longer serves read-ahead cached before a backing rewrite**
+  once the row is restamped. A handle's read-ahead windows are keyed by backing
+  offset alone, and a read's post-read check validates the held descriptor
+  against the stamp its layout names. After an in-place rewrite of the backing
+  file (same inode), reads correctly failed with `BackingChanged`; but once
+  `musefs revalidate` or `scan --force` restamped the row, the handle re-resolved,
+  its descriptor matched the new stamp, and a read landing in a window cached
+  before the rewrite served those old bytes behind the new header — a file that
+  matched neither version, and with `--keep-cache` the `content_version` bump sent
+  the kernel straight to it. A handle publishing a layout resolved against a
+  different stamp now bumps its epoch (refusing a prefetch dispatched before the
+  rewrite), drops and uncharges its cached windows, and resets its prefetch
+  watermark, in that order, before the new layout is served. A re-tag, which
+  keeps the stamp, keeps the windows. The bug predates 2.0.0. The rule #682
+  settled, that a detected backing change outranks the read's own error, is now
+  pinned on both read paths too.
+
+- **`--follow-symlinks` judges a link by the file it points at**
+  ([#766](https://github.com/Sohex/musefs/issues/766)). The walk checked the
+  extension of the link's own name, but the worker canonicalized the path and
+  the probe dispatched on the target's: two namespaces for one decision. A
+  recursive scan therefore skipped `track -> song.flac` and
+  `notes.txt -> song.flac`, while the same link passed as the scan root was
+  ingested because the root is canonicalized before its extension is checked;
+  `song.flac -> notes` passed discovery only to fail at probe. The walk now
+  resolves each link it follows once, to its canonical path, and carries that
+  path onward: the target decides eligibility and the skip bucket, a followed
+  directory is descended by its resolved path, and dedup, the already-present
+  check, `revalidate` and the probe all use the resolved path, which is what is
+  stored. Nothing downstream resolves it again, so #684's single resolution
+  still holds. A link that cannot be resolved (dangling, looping, or retargeted
+  away mid-walk) counts as a `symlink` walk error.
+
 - **Re-probing an unchanged file no longer moves its served mtime**
   ([#757](https://github.com/Sohex/musefs/issues/757)). A synthesized file's
   modification time follows two values a re-probe wrote whether or not anything
   had changed. Its whole second follows the row's `updated_at`, which every
   re-probe stamped with the current time. Its nanoseconds follow
-  `content_version` (#725), which every FLAC re-probe bumped by deleting and
+  `content_version` ([#725](https://github.com/Sohex/musefs/issues/725)), which
+  every FLAC re-probe bumped by deleting and
   re-inserting the track's `STREAMINFO`/`SEEKTABLE` rows. A revalidate over
   unchanged files, to raise the checksum tier say, made every file look modified
   to rsync, Syncthing and backup tools. A re-probe now stamps `updated_at` only
@@ -942,7 +978,9 @@ see the [Release notes](release-notes.md).
   rather than on those cached reads, provided the rewrite moved the file's size,
   mtime, ctime or inode; a same-size rewrite in place on a filesystem with
   coarse timestamps can move none of them, and then no open catches it. The behaviour is unchanged and deliberate;
-  the architecture page and the tuning table now say so.
+  the architecture page and the tuning table now say so, and so do the
+  `--keep-cache` and `--trust-backing-mtime` help, which had claimed no stale
+  byte is ever served.
 
 - **`musefs vacuum` refuses a store a mount has open, as it always said it did**
   ([#721](https://github.com/Sohex/musefs/issues/721)). It relied on `VACUUM`
@@ -1033,20 +1071,20 @@ see the [Release notes](release-notes.md).
   `BackingStamp` was `(size, mtime_ns, ctime_ns)`. #276 had already strengthened
   it past size plus whole-second mtime, with `ctime` as the adversarial backstop
   a writer cannot set backward. The residual hole was filesystems that store no
-  sub-second times at all — FAT32's two-second granularity and no ctime, ext3,
-  HFS+, some SMB and NFS mounts truncating the nanosecond fields — where a
-  same-size replacement inside the granularity window leaves all three fields
-  identical to what was scanned. The guard passed, and the reader was served a
-  mix of new audio bytes and a metadata region synthesized for the old content.
+  sub-second times at all — ext3, HFS+, some SMB and NFS mounts truncating the
+  nanosecond fields — where a same-size replacement inside the granularity
+  window leaves all three fields identical to what was scanned. The guard
+  passed, and the reader was served a mix of new audio bytes and a metadata
+  region synthesized for the old content.
 
   The inode closes the *replacement* shape: a new file moved over the old one
   gets a fresh one. It does not close a true in-place rewrite, which is a POSIX
   timestamp limitation rather than something musefs can fix — but the
   replacement shape is what almost every tagger actually does, writing a
-  temporary file and renaming over the original. The false-positive cost is
-  nil: an inode changes when a file is copied, restored from backup or moved
-  across devices, and all three already invalidate the stamp today, because
-  `ctime` cannot be preserved by `cp -a` or rsync either.
+  temporary file and renaming over the original. It does not help on FAT or
+  exFAT under Linux either: those filesystems keep no stable inode numbers, so
+  none is recorded for them and their stamp stays size plus a coarse mtime
+  ([#757](https://github.com/Sohex/musefs/issues/757)).
 
   **A stored inode of zero means "not recorded", not "inode zero"** — the state
   every row in an upgraded store starts in — and such a row is compared on the
@@ -1535,6 +1573,14 @@ see the [Release notes](release-notes.md).
 
 ### Added
 
+- **`-v`/`--verbose` flag:** a global verbosity flag (`-v` = info, `-vv` =
+  debug, `-vvv` = trace; default `warn`) on `scan` and `mount`, so diagnosing a
+  run no longer requires knowing the `RUST_LOG` env var. An explicit `RUST_LOG`
+  still takes precedence.
+- **`mount --dry-run`:** validate the `--template` and configuration and print a
+  sample of the paths the mount would expose (with total file and directory
+  counts), then exit without mounting — a way to check a template before
+  committing to a mount.
 - **Runtime telemetry (`.musefs-metrics`):** an opt-in `--expose-metrics` flag
   (env `MUSEFS_EXPOSE_METRICS`) surfaces a synthetic `.musefs-metrics` file at
   the mount root rendering Prometheus-format counters — getattr/read/open
@@ -1574,6 +1620,20 @@ see the [Release notes](release-notes.md).
 - **`musefs vacuum` command:** compact the SQLite store, reclaiming free pages
   left by prunes, orphan-art GC, and the schema migration. Runs `VACUUM` + a WAL
   checkpoint and reports the space reclaimed; run it while unmounted (#566).
+
+### Changed
+
+- **Declared MSRV (`rust-version = "1.95"`):** the workspace now states a
+  minimum supported Rust version so a too-old toolchain fails with a clear cargo
+  message instead of mid-compile. It is best-effort and tracks recent stable
+  (the bundled-SQLite dependency requires it); not CI-gated.
+- **Supply-chain license gate:** a `deny.toml` + `cargo deny` CI job enforces a
+  permissive-license allow-list (and bans/sources), closing the gap left by the
+  advisory-only `cargo audit` check.
+- **Strict template validation:** an unclosed `[ … ]` section or an unterminated
+  `${` / `$!{` field is now rejected at mount time with an error naming the
+  problem, instead of silently folding the rest of the template into the open
+  construct — which turned a typo'd bracket into a surprising directory tree.
 
 ### Fixed
 

@@ -77,14 +77,18 @@ and XFS, get the full check; see
 ## Building from source
 
 `cargo install musefs` compiles the latest release; building needs Rust 1.95
-or newer (2024 edition) plus the FUSE headers (`libfuse3-dev`) and
-`pkg-config`. To install the latest development version instead:
+or newer (2024 edition) plus a C compiler, for the bundled SQLite, and `make`,
+for jemalloc. No FUSE headers or `pkg-config` are needed: musefs does not link
+libfuse (on Linux it mounts through `fusermount3`). To install the latest
+development version instead:
 
 ```bash
 cargo install --git https://github.com/Sohex/musefs musefs
 ```
 
-The same `fuse3` runtime requirement as the prebuilt binaries applies.
+On Linux the same `fuse3` runtime requirement as the prebuilt binaries applies;
+FreeBSD and macOS use their own FUSE implementations, listed under
+[Platform support](#platform-support).
 
 The binary uses **jemalloc** as its global allocator by default (it bounds
 resident memory for the long-lived mount daemon under heavy concurrent reads).

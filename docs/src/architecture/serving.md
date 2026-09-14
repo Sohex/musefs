@@ -52,9 +52,16 @@ one large `pread` (geometric growth up to a per-stream cap) instead of the
 the RPCs behind one syscall; a seek resets the window to the floor. All handles
 draw from one process-wide RAM budget (`--read-ahead-budget-mib`, default 64) with
 deadlock-free `try_lock` LRU eviction. Keying on the absolute backing offset (not
-the synthesized output) makes the cache retag-immune, and serving still flows
-through the post-read `validate_opened_backing` re-stat, so the cardinal
-audio-bytes invariant and freshness semantics are untouched. An optional Phase-2
+the synthesized output) makes the cache retag-immune. The windows carry no stamp
+of their own, though, and serving validates the held descriptor, not the window:
+a backing file rewritten in place and then restamped (`musefs revalidate`,
+`scan --force`) matches that descriptor again, so a window cached before the
+rewrite would pass the post-read `validate_opened_backing` re-stat. A handle
+that re-resolves onto a different stamp therefore drops its windows, and moves
+its prefetch epoch so an in-flight prefetch of the old bytes is refused, before
+it serves the new layout. Every backing byte a read serves was then read under
+the stamp that read validates against, so the cardinal audio-bytes invariant and
+freshness semantics are untouched. An optional Phase-2
 background-prefetch layer (`--read-ahead-prefetch`) exists and is off by default:
 amplification alone carries the win on local and low-latency backing, while the
 threads add a measured ~30 % on top of it only once per-read latency is high
@@ -239,7 +246,7 @@ Nothing in the store holds nanoseconds. `updated_at` is still whole seconds, and
 the sub-second part is derived where the timestamp is built, so no column claims
 a precision nobody wrote.
 
-**A pre-epoch backing file is served as one.** An archival rip or a restored
+**A pre-epoch backing file is stored as one.** An archival rip or a restored
 backup can carry an mtime before 1970, and the store accepts it from v4 on
 ([#696](https://github.com/Sohex/musefs/issues/696)). A synthetic directory has
 no row and therefore no timestamp; it reports the mount time. Those two cases

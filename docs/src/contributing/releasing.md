@@ -129,9 +129,15 @@ human side.
    lockfile fails them. `fuzz/` is outside the workspace and keeps its own
    `fuzz/Cargo.lock`, which still pins the old musefs versions until
    `cargo +nightly fuzz build` rebuilds it; commit that too.
-5. Promote the `## [Unreleased]` section of `CHANGELOG.md` to
-   `## [X.Y.Z] - <date>`, and confirm `docs/src/release-notes.md` has a
-   `## vX.Y.Z` section, with upgrade steps where the release needs any.
+5. Promote the changelogs. In both `CHANGELOG.md` and `docs/src/changelog.md`,
+   rename `## [Unreleased]` to `## [X.Y.Z] - <date>` and open a fresh, empty
+   `## [Unreleased]` above it. Then update each file's footer link definitions:
+   point `[Unreleased]` at `compare/vX.Y.Z...HEAD` and add
+   `[X.Y.Z]: https://github.com/Sohex/musefs/releases/tag/vX.Y.Z`. Without the
+   definition, GitHub renders the new heading with literal brackets. Finally,
+   confirm `docs/src/release-notes.md` has a `## vX.Y.Z` section, with upgrade
+   steps where the release needs any, and that its issue link definitions cover
+   every `[#N]` it cites.
 6. Dry-run package every published crate in **one** invocation, which packages
    and verifies them in dependency order:
 
