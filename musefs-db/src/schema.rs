@@ -1012,6 +1012,13 @@ impl Migration {
     }
 }
 
+/// Every migration's SQL, for the few tests that need one step's text rather
+/// than a store built out of them.
+#[cfg(test)]
+pub(crate) fn migration_sql() -> Vec<&'static str> {
+    MIGRATIONS.iter().map(|m| m.sql).collect()
+}
+
 /// Build a store at a released schema version — what an older musefs build
 /// would have left behind — by running that version's migrations for real.
 ///
@@ -1025,17 +1032,11 @@ impl Migration {
 /// way, and the exclusive-claim check `musefs migrate` runs reads other
 /// connections' shared marks, which exist only in that mode.
 ///
-/// Exported rather than `#[cfg(test)]` so the integration tests and the CLI's
-/// own tests share this one definition; `#[doc(hidden)]` because it is not part
-/// of the crate's interface.
-/// Every migration's SQL, for the few tests that need one step's text rather
-/// than a store built out of them.
-#[cfg(test)]
-pub(crate) fn migration_sql() -> Vec<&'static str> {
-    MIGRATIONS.iter().map(|m| m.sql).collect()
-}
-
-#[doc(hidden)]
+/// Test scaffolding, so it is compiled only for this crate's own tests and
+/// under the `test-support` feature, which the integration tests here and in
+/// `musefs-cli` switch on through a dev-dependency (#751). One definition serves
+/// them all.
+#[cfg(any(test, feature = "test-support"))]
 pub fn seed_store_at_version(path: &std::path::Path, version: i64) -> rusqlite::Result<()> {
     let conn = Connection::open(path)?;
     let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;

@@ -29,6 +29,9 @@ fs4 = { version = "1", default-features = false }
 # against a store an older musefs build would have left behind.
 rusqlite = { version = "0.40", features = ["bundled"] }
 tempfile = "3"
+# `musefs-db`'s test scaffolding (`seed_store_at_version`), for building a store
+# an older musefs left behind; compiled for tests only (#751).
+musefs-db = { path = "../musefs-db", features = ["test-support"] }
 
 [features]
 metrics = ["musefs-fuse/metrics"]

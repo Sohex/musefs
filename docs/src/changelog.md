@@ -645,7 +645,9 @@ see the [Release notes](release-notes.md).
   their own test builds switch on, `page_test_support` joins `fuzz_check`
   behind `musefs-format`'s `fuzzing`, and the five helpers only a crate's own
   unit tests call are `pub(crate)`. Nothing outside the test suites called any
-  of them.
+  of them. `musefs_db::seed_store_at_version`, which builds a store at an old
+  schema version, was missed at first and followed under `musefs-db`'s
+  `test-support` ([#751](https://github.com/Sohex/musefs/issues/751)).
 
 ### Fixed
 
