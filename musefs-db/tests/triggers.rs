@@ -1,6 +1,78 @@
 mod common;
 use common::new_track;
-use musefs_db::{Db, StructuralBlock, Tag};
+use musefs_db::{Db, Format, NewTrack, StructuralBlock, Tag};
+
+/// A second well in the past, so a stamp of the current time cannot land on it.
+const AGED: i64 = 1_000_000_000;
+
+/// A file-backed store plus a raw connection to it, to plant an old `updated_at`
+/// that the public API has no reason to write.
+fn aged_store() -> (tempfile::TempDir, Db, rusqlite::Connection) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("musefs.db");
+    let db = Db::open(&path).unwrap();
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    (dir, db, raw)
+}
+
+/// One way a re-upsert can differ from the stored row.
+type Change = fn(&mut NewTrack);
+
+fn age(raw: &rusqlite::Connection, id: i64) {
+    raw.execute(
+        "UPDATE tracks SET updated_at = ?1 WHERE id = ?2",
+        rusqlite::params![AGED, id],
+    )
+    .unwrap();
+}
+
+/// #757: a synthesized file's served second follows `updated_at`, so a
+/// re-upsert finding the file exactly as recorded, which is what re-probing an
+/// unchanged file does, must leave it and `content_version` alone.
+#[test]
+fn an_identical_reupsert_leaves_updated_at_and_content_version_alone() {
+    let (_dir, db, raw) = aged_store();
+    let id = db.upsert_track(&new_track("/m/a.flac")).unwrap();
+    age(&raw, id);
+    let before = db.track_content_version(id).unwrap();
+
+    db.upsert_track(&new_track("/m/a.flac")).unwrap();
+
+    let t = db.get_track(id).unwrap().unwrap();
+    assert_eq!(t.updated_at, AGED);
+    assert_eq!(t.content_version, before);
+}
+
+/// Each column the upsert writes is a real change when it differs, and moves
+/// `updated_at` on its own: an `AND` slipped into the guard would let the other
+/// six agreeing hide it.
+#[test]
+fn every_column_the_upsert_writes_moves_updated_at_when_it_changes() {
+    let (_dir, db, raw) = aged_store();
+    let changes: [(&str, Change); 7] = [
+        ("format", |t| t.format = Format::Mp3),
+        ("audio_offset", |t| t.audio_offset = 99),
+        ("audio_length", |t| t.audio_length = 999),
+        ("backing_size", |t| t.backing_size = 1101),
+        ("backing_mtime_ns", |t| t.backing_mtime_ns += 1),
+        ("backing_ctime_ns", |t| t.backing_ctime_ns += 1),
+        ("backing_ino", |t| t.backing_ino = Some(7)),
+    ];
+    for (column, change) in changes {
+        let path = format!("/m/{column}.flac");
+        let id = db.upsert_track(&new_track(&path)).unwrap();
+        age(&raw, id);
+        let mut changed = new_track(&path);
+        change(&mut changed);
+
+        db.upsert_track(&changed).unwrap();
+
+        assert!(
+            db.get_track(id).unwrap().unwrap().updated_at > AGED,
+            "a changed {column} is a change, so updated_at must move"
+        );
+    }
+}
 
 #[test]
 fn tag_changes_bump_content_version() {

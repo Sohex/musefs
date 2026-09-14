@@ -3,9 +3,11 @@
 //! no database write covers. Strengthened past size + whole-second mtime to
 //! nanosecond mtime + ctime (#276) so a same-size in-place rewrite — including
 //! an adversarial one that resets mtime — cannot evade the guard, and then with
-//! the inode (#674) for backing filesystems that store no sub-second timestamps
-//! at all, where those three can agree across a replacement.
+//! the inode (#674) for backing filesystems with coarse timestamps, where those
+//! three can agree across a replacement — wherever the filesystem keeps an inode
+//! number to record (#757).
 use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 
@@ -14,17 +16,38 @@ const NANOS_PER_SEC: i64 = 1_000_000_000;
 /// ~2262). `ctime` is the adversarial backstop: a writer can reset mtime with
 /// `utimensat`, but ctime is bumped by any write and cannot be set backward.
 ///
-/// `ino` closes the one case the other three cannot see (#674): a backing
-/// filesystem with no sub-second timestamps — FAT32's two-second mtime and no
-/// ctime at all, or ext3/HFS+/some SMB and NFS mounts truncating the nanosecond
-/// fields — where a same-size replacement inside the granularity window leaves
-/// all three identical. It does not help against a true in-place rewrite, which
-/// is a POSIX timestamp limitation rather than something musefs can fix; it
-/// catches the *replacement* shape, where a tagger writes a temporary file and
-/// renames over the original, which is what almost every tagger does.
+/// `ino` closes a case the other three cannot see (#674): a backing filesystem
+/// with coarse timestamps — ext3 and HFS+ keep whole seconds, and some SMB and
+/// NFS mounts truncate the nanosecond fields — where a same-size replacement
+/// inside the granularity window leaves all three identical. It does not help
+/// against a true in-place rewrite, which is a POSIX timestamp limitation rather
+/// than something musefs can fix; it catches the *replacement* shape, where a
+/// tagger writes a temporary file and renames over the original, which is what
+/// almost every tagger does.
 ///
-/// `None` means "not recorded", not "no inode": a row written before #674, or
-/// one V4 migrated. [`BackingStamp::matches_live`] is what knows that an
+/// It is recorded only where the filesystem keeps one (#757). FAT and exFAT
+/// store no inode numbers: Linux hands one out each time a file enters the inode
+/// cache, so an untouched file reports a different number after a remount, or
+/// after eviction. Recording it there would fail every serve after a replug, so
+/// `BackingStamp::recordable` drops it, and on those filesystems the stamp is
+/// effectively size plus a coarse mtime — two-second steps on FAT, 10 ms on
+/// exFAT, and both report ctime as mtime. That is why neither is recommended as
+/// backing storage.
+///
+/// The device number is absent on purpose (#757). An inode is unique only within
+/// one filesystem, so a different filesystem appearing at the backing path — a
+/// swapped drive, a replaced network mount — could hold a file agreeing on all
+/// four fields. But `st_dev` is assigned at mount or detection time rather than
+/// stored by the filesystem: network mounts, FUSE, btrfs subvolumes and
+/// renumbered disks come back with a different one after a reboot, which would
+/// fail every row at once, while a swapped drive at the same mount point often
+/// gets the same one. The coincidence it would catch also needs ctime, which the
+/// kernel sets when a file is written and nothing can set backward, to agree, so
+/// on filesystems with real timestamps a copy onto new storage never matches.
+///
+/// `None` means "not recorded", not "no inode": a row written before #674, one
+/// V4 migrated, or one on a filesystem that keeps none.
+/// [`BackingStamp::matches_live`] is what knows that an
 /// unrecorded inode cannot discriminate — which is why `PartialEq` is *not* the
 /// freshness question. Equality here is ordinary structural equality, and stays
 /// transitive.
@@ -100,8 +123,8 @@ impl BackingStamp {
     /// not an equivalence relation — a stored stamp with no inode matches two
     /// live stamps that do not match each other — and an `==` that is not
     /// transitive is a trap for the next reader. Fill a missing inode by
-    /// running `musefs scan --revalidate`, which re-probes exactly the rows
-    /// whose inode is missing.
+    /// running `musefs revalidate`, which re-probes the rows whose inode is
+    /// missing — except on a filesystem that keeps none (#757).
     pub fn matches_live(&self, live: &BackingStamp) -> bool {
         self.size == live.size
             && self.mtime_ns == live.mtime_ns
@@ -127,6 +150,116 @@ impl BackingStamp {
     /// backing file reports and the round trip through this method is lossless.
     pub fn display_secs(&self) -> i64 {
         self.mtime_ns.div_euclid(NANOS_PER_SEC)
+    }
+
+    /// The stamp to *store* for a file, from a live one: the inode survives only
+    /// where the filesystem keeps inode numbers at all (#757), as [`keeps_inodes`]
+    /// or [`keeps_inodes_at`] answered for the file this stamp was read from.
+    ///
+    /// Only a stamp being recorded, or compared against one that was, goes
+    /// through this. A live stamp checked on the serve path keeps whatever inode
+    /// it read: a stored `None` is already the wildcard
+    /// [`matches_live`](Self::matches_live) needs.
+    #[must_use]
+    pub(crate) fn recordable(self, keeps_inodes: bool) -> BackingStamp {
+        BackingStamp {
+            ino: self.ino.filter(|_| keeps_inodes),
+            ..self
+        }
+    }
+}
+
+/// `f_type` values from `linux/magic.h` for the filesystems that keep no inode
+/// numbers (#757).
+#[cfg(target_os = "linux")]
+const MSDOS_SUPER_MAGIC: u64 = 0x4d44;
+#[cfg(target_os = "linux")]
+const EXFAT_SUPER_MAGIC: u64 = 0x2011_BAB0;
+
+/// Whether the filesystem holding `file` keeps inode numbers, and so whether a
+/// stamp recorded for it may carry one (#757).
+///
+/// FAT and exFAT do not. Both Linux drivers assign a number with `iunique()`
+/// each time a file enters the inode cache, so an untouched file reports a
+/// different one after a remount, and within a mount after eviction. Recording
+/// it would fail the stamp of a file that never changed.
+///
+/// A question `fstatfs` cannot answer is answered yes. That records the inode,
+/// as the stamp always did, so a failed query keeps the stronger stamp rather
+/// than quietly weakening it.
+///
+/// Off Linux nothing is asked and the answer is always yes: `f_type` holds a
+/// Linux magic number only on Linux, so elsewhere no value in it could name FAT.
+pub(crate) fn keeps_inodes(file: &std::fs::File) -> bool {
+    #[cfg(test)]
+    if NO_INODES.with(std::cell::Cell::get) {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        f_type_keeps_inodes(fs_type(rustix::fs::fstatfs(file)))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = file;
+        true
+    }
+}
+
+/// [`keeps_inodes`] for a pathname, at the call sites that stat a path rather
+/// than hold a descriptor. Follows symlinks, as `std::fs::metadata` does.
+pub(crate) fn keeps_inodes_at(path: &Path) -> bool {
+    #[cfg(test)]
+    if NO_INODES.with(std::cell::Cell::get) {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        f_type_keeps_inodes(fs_type(rustix::fs::statfs(path)))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        true
+    }
+}
+
+/// The filesystem type a `statfs` reported, or `None` when it could not say.
+#[cfg(target_os = "linux")]
+fn fs_type(stat: rustix::io::Result<rustix::fs::StatFs>) -> Option<u64> {
+    stat.ok().and_then(|s| u64::try_from(s.f_type).ok())
+}
+
+/// The decision itself, on a bare `f_type`, so it is testable without a FAT
+/// mount. An unknown type keeps inodes, for the reason [`keeps_inodes`] gives.
+#[cfg(target_os = "linux")]
+fn f_type_keeps_inodes(f_type: Option<u64>) -> bool {
+    !matches!(f_type, Some(MSDOS_SUPER_MAGIC | EXFAT_SUPER_MAGIC))
+}
+
+#[cfg(test)]
+thread_local! {
+    static NO_INODES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test seam standing in for a FAT or exFAT mount, which the suite cannot make:
+/// while the returned guard lives, this thread's [`keeps_inodes`] and
+/// [`keeps_inodes_at`] answer no. Thread-local, so it reaches the calling
+/// thread's checks — a direct probe, revalidate's skip pass — and not a scan's
+/// worker pool.
+#[cfg(test)]
+pub(crate) fn pretend_no_inodes() -> NoInodes {
+    NO_INODES.with(|c| c.set(true));
+    NoInodes(())
+}
+
+#[cfg(test)]
+pub(crate) struct NoInodes(());
+
+#[cfg(test)]
+impl Drop for NoInodes {
+    fn drop(&mut self) {
+        NO_INODES.with(|c| c.set(false));
     }
 }
 
@@ -323,5 +456,99 @@ mod tests {
         );
         // Structural equality, meanwhile, stays honest about all four fields.
         assert_ne!(unrecorded, one);
+    }
+
+    /// #757's two filesystems by their `linux/magic.h` values, against a spread
+    /// of ones that do keep inode numbers — local, network and FUSE alike.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fat_and_exfat_are_the_filesystems_that_keep_no_inodes() {
+        let keeps = |f_type: u64| f_type_keeps_inodes(Some(f_type));
+        assert!(!keeps(0x4d44), "FAT");
+        assert!(!keeps(0x2011_BAB0), "exFAT");
+        for (name, magic) in [
+            ("ext4", 0xEF53),
+            ("btrfs", 0x9123_683E),
+            ("xfs", 0x5846_5342),
+            ("tmpfs", 0x0102_1994),
+            ("nfs", 0x6969),
+            ("smb2", 0xFE53_4D42),
+            ("fuse", 0x6573_5546),
+        ] {
+            assert!(keeps(magic), "{name}");
+        }
+        assert!(
+            f_type_keeps_inodes(None),
+            "a filesystem that cannot say keeps the stronger stamp"
+        );
+    }
+
+    /// The one assertion that pins `fs_type`'s decoding. Every other test sees
+    /// an ordinary filesystem, where any value but FAT's or exFAT's reads the
+    /// same, so a `fs_type` answering the wrong number would pass them all.
+    /// `/proc` is procfs on every Linux system and container, so its magic is
+    /// a value known in advance.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fs_type_decodes_the_magic_statfs_reports() {
+        /// `PROC_SUPER_MAGIC` from `linux/magic.h`.
+        const PROC_SUPER_MAGIC: u64 = 0x9fa0;
+        assert_eq!(fs_type(rustix::fs::statfs("/proc")), Some(PROC_SUPER_MAGIC));
+    }
+
+    /// Answered yes on every platform for an ordinary filesystem: on Linux by
+    /// asking it, and elsewhere without asking at all.
+    #[test]
+    fn a_real_filesystem_is_asked_by_descriptor_and_by_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("f");
+        std::fs::write(&p, b"x").unwrap();
+        #[cfg(target_os = "linux")]
+        assert!(
+            fs_type(rustix::fs::statfs(dir.path())).is_some(),
+            "statfs reports a type"
+        );
+        assert!(keeps_inodes(&std::fs::File::open(&p).unwrap()));
+        assert!(keeps_inodes_at(&p));
+        assert!(
+            keeps_inodes_at(&dir.path().join("missing")),
+            "a query that fails keeps the stronger stamp"
+        );
+    }
+
+    #[test]
+    fn the_test_seam_answers_no_while_held_and_yes_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("f");
+        std::fs::write(&p, b"x").unwrap();
+        {
+            let _fat = pretend_no_inodes();
+            assert!(!keeps_inodes(&std::fs::File::open(&p).unwrap()));
+            assert!(!keeps_inodes_at(&p));
+        }
+        assert!(keeps_inodes_at(&p));
+    }
+
+    #[test]
+    fn recordable_drops_the_inode_and_nothing_else() {
+        let live = BackingStamp {
+            size: 1,
+            mtime_ns: 2,
+            ctime_ns: 3,
+            ino: Some(4),
+        };
+        assert_eq!(live.recordable(true), live);
+        assert_eq!(live.recordable(false), BackingStamp { ino: None, ..live });
+    }
+
+    /// The failure #757 fixes. FAT hands an untouched file a new inode after a
+    /// remount: recorded with its inode, the file failed every serve until a
+    /// revalidate, while recorded without one it still matches.
+    #[test]
+    fn a_stamp_recorded_without_the_inode_survives_a_renumbering() {
+        let before = stamp(10, Some(111));
+        let after_remount = stamp(10, Some(222));
+        assert!(!before.matches_live(&after_remount));
+        assert!(before.recordable(false).matches_live(&after_remount));
     }
 }

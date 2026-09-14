@@ -287,8 +287,8 @@ see the [Release notes](release-notes.md).
     ([#718](https://github.com/Sohex/musefs/issues/718)).
   - `tracks.backing_ino` is added
     ([#674](https://github.com/Sohex/musefs/issues/674)). On filesystems that
-    truncate sub-second timestamps — FAT32, ext3, HFS+, some SMB and NFS mounts
-    — a same-size in-place rewrite inside the granularity window left all three
+    truncate sub-second timestamps — ext3, HFS+, some SMB and NFS mounts — a
+    same-size in-place rewrite inside the granularity window left all three
     stamp fields identical and the freshness guard passed on changed bytes. The
     inode catches the *replacement* shape, which is what almost every tagger
     actually does (write a temporary file, rename over the original). Zero is
@@ -296,6 +296,17 @@ see the [Release notes](release-notes.md).
     precedent, so an upgraded store is not taken dark and the guard arms per row
     as scans happen. It joins `tracks_geometry_au`'s bump set, since a changed
     inode means the backing file was replaced.
+
+    It is recorded only where the filesystem keeps inode numbers
+    ([#757](https://github.com/Sohex/musefs/issues/757)). FAT and exFAT assign
+    one each time a file enters the inode cache, so every remount renumbers an
+    untouched file, and recording it there would have failed every serve after
+    a replug until a revalidate. The scanner checks the probed file's filesystem
+    type and records no inode on those two, and `revalidate` asks the same
+    question live rather than re-probing such a row on every pass. No device
+    number is recorded beside the inode: the kernel reassigns device numbers
+    across reboots, which would fail a whole library at once. FAT and exFAT
+    are now documented as not recommended for backing storage.
   - The lower bounds on `backing_mtime_ns` and `backing_ctime_ns` are dropped
     ([#696](https://github.com/Sohex/musefs/issues/696)), so a file dated before
     1970 — an archival rip, a restored backup, anything whose mtime came from
@@ -612,6 +623,19 @@ see the [Release notes](release-notes.md).
   `test-support` ([#751](https://github.com/Sohex/musefs/issues/751)).
 
 ### Fixed
+
+- **Re-probing an unchanged file no longer moves its served mtime**
+  ([#757](https://github.com/Sohex/musefs/issues/757)). A synthesized file's
+  modification time follows two values a re-probe wrote whether or not anything
+  had changed. Its whole second follows the row's `updated_at`, which every
+  re-probe stamped with the current time. Its nanoseconds follow
+  `content_version` (#725), which every FLAC re-probe bumped by deleting and
+  re-inserting the track's `STREAMINFO`/`SEEKTABLE` rows. A revalidate over
+  unchanged files, to raise the checksum tier say, made every file look modified
+  to rsync, Syncthing and backup tools. A re-probe now stamps `updated_at` only
+  when a column it writes differs from what is stored, and leaves a
+  byte-identical block set alone. Any real difference, down to one byte or a
+  swapped ordinal, still records a change.
 
 - **A revalidate no longer keeps a `content_hash` its row cannot vouch for.**
   Deciding whether an uncomputed checksum may be kept compared the stored stamp

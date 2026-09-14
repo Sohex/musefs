@@ -985,7 +985,11 @@ fn read_tail_128(file: &std::fs::File, file_len: u64) -> std::io::Result<Option<
 fn probe_file(path: &Path, window: usize, tier: ChecksumTier) -> std::io::Result<ProbeOutcome> {
     let file = std::fs::File::open(path)?;
     crate::metrics::on_scan_open();
-    let s1 = BackingStamp::from_metadata(&file.metadata()?);
+    // Asked once: both stats below read this descriptor, so the filesystem
+    // cannot change between them, and on FAT neither may record an inode the
+    // next remount renumbers (#757).
+    let keeps_inodes = crate::freshness::keeps_inodes(&file);
+    let s1 = BackingStamp::from_metadata(&file.metadata()?).recordable(keeps_inodes);
     #[cfg(test)]
     fire_after_s1();
 
@@ -999,7 +1003,7 @@ fn probe_file(path: &Path, window: usize, tier: ChecksumTier) -> std::io::Result
         },
     };
 
-    let s2 = BackingStamp::from_metadata(&file.metadata()?);
+    let s2 = BackingStamp::from_metadata(&file.metadata()?).recordable(keeps_inodes);
     if s1 != s2 {
         return Ok(ProbeOutcome::Raced);
     }
@@ -2895,12 +2899,16 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
             // store migrated into V4, alongside the structural and checksum
             // backfills it already covered.
             //
-            // A backing filesystem that can supply no inode at all leaves such
-            // a row re-probed on every pass rather than converging. That is
-            // slower, never wrong, and only reachable on a filesystem whose
-            // stat is already malformed — not worth a third state in the model
-            // to distinguish "not yet known" from "cannot be known".
-            let needs_ino = stamp.ino.is_none();
+            // Not on a filesystem that keeps no inode numbers (#757): on FAT or
+            // exFAT a re-probe records none either, so re-probing would never
+            // converge, and would rewrite the row — moving its served mtime —
+            // on every pass. The filesystem is asked live rather than the
+            // answer stored, so the model needs no third state for "cannot be
+            // known": the answer belongs to the filesystem and cannot go stale.
+            // A stat that supplies no inode at all still re-probes each pass;
+            // that is slower, never wrong, and only reachable on a filesystem
+            // whose stat is malformed.
+            let needs_ino = stamp.ino.is_none() && crate::freshness::keeps_inodes_at(&path);
             if stamp.matches_live(&crate::freshness::BackingStamp::from_metadata(&meta))
                 && !needs_backfill
                 && !needs_checksum
@@ -2943,8 +2951,12 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
         // not be read, and only while the file still carries the stamp the
         // refusing probe saw: one rewritten since deserves the next pass.
         for (path, stamp) in refused {
-            let as_refused = std::fs::metadata(&path)
-                .is_ok_and(|meta| BackingStamp::from_metadata(&meta) == stamp);
+            // The probe recorded `stamp`, so compare the way it records (#757).
+            let as_refused = std::fs::metadata(&path).is_ok_and(|meta| {
+                BackingStamp::from_metadata(&meta)
+                    .recordable(crate::freshness::keeps_inodes_at(&path))
+                    == stamp
+            });
             if as_refused && let Some(track) = db.get_track_by_path(&path)? {
                 db.delete_track(track.id)?;
                 pruned += 1;
@@ -3132,11 +3144,14 @@ pub(crate) fn full_file_hash(file: &std::fs::File) -> std::io::Result<String> {
 fn hash_confirm(path: &Path, expect: BackingStamp) -> std::io::Result<Option<String>> {
     let file = std::fs::File::open(path)?;
     crate::metrics::on_scan_open();
-    if BackingStamp::from_metadata(&file.metadata()?) != expect {
+    // `expect` is a stamp the probe recorded, so this side records the same way
+    // (#757): on FAT it holds no inode, and a live one would never equal it.
+    let keeps_inodes = crate::freshness::keeps_inodes(&file);
+    if BackingStamp::from_metadata(&file.metadata()?).recordable(keeps_inodes) != expect {
         return Ok(None);
     }
     let hash = full_file_hash(&file)?;
-    if BackingStamp::from_metadata(&file.metadata()?) != expect {
+    if BackingStamp::from_metadata(&file.metadata()?).recordable(keeps_inodes) != expect {
         return Ok(None);
     }
     Ok(Some(hash))

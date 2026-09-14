@@ -29,7 +29,7 @@ store upgrade is one-way without the snapshot `migrate` takes.
   - track ids are never reused, so a deleted track's id cannot bless another;
   - backing paths are the filesystem's bytes, so two non-UTF-8 names no longer
     collapse into one track;
-  - the freshness stamp carries the inode;
+  - the freshness stamp carries the inode, wherever the filesystem keeps one;
   - picture metadata belongs to each file rather than the shared image;
   - tag and art rows cannot move between tracks;
   - every column's storage class is enforced.
@@ -135,6 +135,10 @@ upgrade leaves several things only a revalidate puts right, and it is the
   refuses to retarget.
 - **Stored inodes start unknown** ([#674]). The check that catches a backing
   file replaced in place cannot use the inode until a revalidate records it.
+  On FAT and exFAT none is ever recorded ([#757]): those filesystems renumber
+  files on every mount, so an inode there would fail every file after a replug.
+  The check is weaker on them as a result, and they are
+  [not recommended](guide/installation.md) for the backing library.
 - **Picture metadata is copied, not per file** ([#716], [#746]). 1.3.0 kept one
   MIME type and one set of dimensions per image, so the upgrade copies those
   onto every file that embeds it, with FLAC's bit depth and colour count at 0.
@@ -166,12 +170,18 @@ A few files need more than that:
 content version in the nanoseconds, so a tag edit is visible to a tool that
 compares size and mtime. 1.3.0 served whole seconds, so on the first mount
 nearly every synthesized file's mtime changes. The first revalidate then moves
-it again, seconds included, because it rewrites every row. Where it restores
-picture metadata or an Ogg FLAC's bounds, the size changes too. To have rsync
-without `--checksum`, Syncthing or a backup tool re-copy the library once
-rather than twice, revalidate before the first sync from the new mount. A
-whole-second comparison sees only the second change. `--mode structure-only`
-is unaffected.
+it again. The upgrade cleared every fingerprint, so at the default checksum tier
+that revalidate re-probes every file, and a re-probe moves a file's mtime only
+where it records something the store did not hold ([#757]). Everywhere except
+FAT and exFAT that includes the file's inode, recorded for the first time, so
+nearly every file's mtime moves again, seconds included. FAT and exFAT keep no
+inode numbers, so there the mtime moves only where the revalidate corrects what
+the store holds for the file: its picture metadata, an Ogg FLAC's bounds, or
+FLAC structural data an older scan never recorded. A restored picture or Ogg
+FLAC bound can change the size too. To have rsync without `--checksum`,
+Syncthing or a backup tool re-copy the library once rather than twice,
+revalidate before the first sync from the new mount. A whole-second comparison
+sees only the second change. `--mode structure-only` is unaffected.
 
 **`scan` exits `2` when the store rejects a file** ([#662]). A constraint
 violation on one file used to stop the scan with exit `1`. Now that file fails,
@@ -312,6 +322,7 @@ directly.
 [#743]: https://github.com/Sohex/musefs/issues/743
 [#746]: https://github.com/Sohex/musefs/issues/746
 [#747]: https://github.com/Sohex/musefs/issues/747
+[#757]: https://github.com/Sohex/musefs/issues/757
 [#749]: https://github.com/Sohex/musefs/issues/749
 [#750]: https://github.com/Sohex/musefs/issues/750
 [#751]: https://github.com/Sohex/musefs/issues/751

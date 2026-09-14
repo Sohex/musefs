@@ -980,6 +980,49 @@ fn hash_confirm_refuses_a_file_that_no_longer_matches_the_stamp() {
     );
 }
 
+/// #757: the retarget confirm compares against the stamp the probe recorded, so
+/// it has to record the same way. Otherwise every confirm on FAT would compare a
+/// stamp without an inode against one with, and refuse.
+#[test]
+fn hash_confirm_accepts_a_stamp_recorded_without_the_inode() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("f.bin");
+    std::fs::write(&path, b"abc").unwrap();
+    let _fat = crate::freshness::pretend_no_inodes();
+    let stamp = BackingStamp::from_metadata(&std::fs::metadata(&path).unwrap()).recordable(false);
+    assert_eq!(
+        hash_confirm(&path, stamp).unwrap().as_deref(),
+        Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+        "a file stamped where no inode is kept still confirms"
+    );
+}
+
+/// #757: a probe records the inode it read, except on a filesystem that keeps
+/// none, where it records nothing — and does not read the file as raced for it.
+#[test]
+fn probe_records_the_inode_only_where_the_filesystem_keeps_one() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.m4a");
+    std::fs::write(&path, mp4_with_covr(13, &[0xFF; 8])).unwrap();
+    let recorded_ino = || match probe_file(&path, 0, ChecksumTier::Fingerprint).unwrap() {
+        ProbeOutcome::Probed(_, stamp, _) => stamp.ino,
+        other => panic!("expected Probed, got {other:?}"),
+    };
+
+    assert_eq!(
+        recorded_ino(),
+        Some(std::fs::metadata(&path).unwrap().ino()),
+        "a filesystem that keeps inode numbers gets its inode recorded"
+    );
+    let _fat = crate::freshness::pretend_no_inodes();
+    assert_eq!(
+        recorded_ino(),
+        None,
+        "a filesystem that renumbers files on every mount gets none"
+    );
+}
+
 /// A checksum the tier asked for and could not produce fails that file under
 /// its own reason, instead of committing a row one tier below what the flag
 /// promised behind a warn nothing counted (#690). Being in `SkipReason::FAILED`
