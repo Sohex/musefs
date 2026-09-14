@@ -969,7 +969,7 @@ dependencies = [
 
 [[package]]
 name = "musefs"
-version = "1.3.0"
+version = "2.0.0"
 dependencies = [
  "clap",
  "env_logger",
@@ -984,7 +984,7 @@ dependencies = [
 
 [[package]]
 name = "musefs-cli"
-version = "1.3.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1003,7 +1003,7 @@ dependencies = [
 
 [[package]]
 name = "musefs-core"
-version = "1.3.0"
+version = "2.0.0"
 dependencies = [
  "arc-swap",
  "base16ct",
@@ -1037,7 +1037,7 @@ dependencies = [
 
 [[package]]
 name = "musefs-db"
-version = "1.3.0"
+version = "2.0.0"
 dependencies = [
  "base16ct",
  "log",
@@ -1051,7 +1051,7 @@ dependencies = [
 
 [[package]]
 name = "musefs-format"
-version = "1.3.0"
+version = "2.0.0"
 dependencies = [
  "base64",
  "crc",
@@ -1067,7 +1067,7 @@ dependencies = [
 
 [[package]]
 name = "musefs-fuse"
-version = "1.3.0"
+version = "2.0.0"
 dependencies = [
  "base64",
  "fuser",
@@ -1087,7 +1087,7 @@ dependencies = [
 
 [[package]]
 name = "musefs-latencyfs"
-version = "1.3.0"
+version = "2.0.0"
 dependencies = [
  "fuser",
  "libc",
