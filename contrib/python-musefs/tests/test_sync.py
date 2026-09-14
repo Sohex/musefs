@@ -1,6 +1,7 @@
 import hashlib
 
 from conftest import JPEG, PNG, insert_track, text_tags
+from test_image_dimensions import APP0, jpeg, png, sof
 
 from musefs_common import ArtImage, Record, SyncStats, connect, sync_files, sync_one
 from musefs_common.constants import MAX_ART_BYTES
@@ -21,6 +22,27 @@ def test_sync_one_skips_unmatched_path(db_path):
         sync_one(conn, Record(key="/nope.flac", pairs=[("title", "T")], art=None), stats)
         assert stats.skipped == 1
         assert stats.synced == 0
+    finally:
+        conn.close()
+
+
+def test_sync_one_states_the_dimensions_each_image_header_gives(db_path):
+    """Each picture's width and height come from its own header (musefs #737);
+    one whose header gives none links with them unset."""
+    conn, _ = _seed(db_path)
+    try:
+        art = [
+            ArtImage(png(640, 480), "image/png"),
+            ArtImage(jpeg(APP0, sof(0xC0, 300, 200)), "image/jpeg", 4),
+            ArtImage(JPEG, "image/jpeg", 5),
+        ]
+        stats = SyncStats()
+        sync_one(conn, Record(key="/m/a.flac", pairs=[("title", "T")], art=art), stats)
+        conn.commit()
+        rows = conn.execute(
+            "SELECT picture_type, width, height FROM track_art ORDER BY ordinal"
+        ).fetchall()
+        assert rows == [(3, 640, 480), (4, 300, 200), (5, None, None)]
     finally:
         conn.close()
 

@@ -102,8 +102,8 @@ A few files need more than that:
   and `revalidate` exits `2` while any remain. Until they are removed, reads
   into a chain's second stream fail with `EIO`. `musefs revalidate --prune`
   removes them. The run that does so still exits `2`, and the next one does not.
-  `migrate`'s offer never prunes, and it exits `0` whatever its revalidate
-  counted.
+  `migrate`'s offer never prunes; if its revalidate counts failures,
+  `migrate` exits `2` ([#750]).
 - **Two files whose names differed only in non-UTF-8 bytes** ([#680]). 1.3.0
   merged them into one track under a mangled path and served neither. A `scan`
   adds both as new tracks; `revalidate --prune` removes the merged row, along
@@ -210,8 +210,9 @@ directly.
   left exhaustive.
 - Test scaffolding is no longer public ([#710]):
   `musefs_core::scan_directory_full_oracle`, the `*_for_test` methods on `Musefs`
-  and `Db`, and `musefs_format::ogg::page_test_support`. No production code
-  called any of them.
+  and `Db`, `musefs_db::seed_store_at_version` ([#751]), and
+  `musefs_format::ogg::page_test_support`. No production code called any of
+  them.
 - The configuration and result structs follow the enums ([#743]):
   `ScanOptions`, `MountConfig`, `FuseConfig`, `musefs-cli`'s argument structs and
   the crates' result types are `#[non_exhaustive]`, so outside their crate they
@@ -246,6 +247,8 @@ directly.
 [#746]: https://github.com/Sohex/musefs/issues/746
 [#747]: https://github.com/Sohex/musefs/issues/747
 [#749]: https://github.com/Sohex/musefs/issues/749
+[#750]: https://github.com/Sohex/musefs/issues/750
+[#751]: https://github.com/Sohex/musefs/issues/751
 
 ## v1.3.0
 

@@ -41,5 +41,6 @@ markers = [
 # rather than a fixture's, so a store-shape change breaks it and nothing else,
 # and it skips cleanly where the binary is absent. `e2e` stays opt-in -- it
 # mounts a filesystem and drives a full beets import, which is not what a
-# default `pytest` should do. Run it with `-m e2e`.
+# default `pytest` should do. Run it with `-m e2e`. CI's contract job does, with
+# MUSEFS_REQUIRE_BIN=1 so a missing tool fails the tier instead of skipping it.
 addopts = "-m 'not e2e'"
