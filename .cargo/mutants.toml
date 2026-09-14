@@ -501,7 +501,7 @@ exclude_re = [
     # and read_append share; the fn's other two `+` are the observable fills
     # counters and stay killable, so this one is pinned by coordinate, not by fn.
     # guard: op="+" fn="BackingReader<'a>::serve" rows=2
-    'musefs-core/src/readahead\.rs:879:68:',
+    'musefs-core/src/readahead\.rs:882:68:',
     #
     # More hang-class (TIMEOUT-only, CANCEL the in-diff job): `len() -> 1` /
     # `clear() -> 1` force a constant resident size, so `evict_one_coldest` keeps
