@@ -120,6 +120,28 @@ fn clear_after_resolve_hook() {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
+/// A checksum I/O error injected into one probed path's checksum reads (#690),
+/// standing in for a read that fails partway through a file that parsed — which
+/// the suite cannot provoke on a real filesystem. Process-wide and keyed by path
+/// for the same reason as the resolve hook above.
+#[cfg(test)]
+static CHECKSUM_FAULT: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+fn checksum_fault(probed: &Path) -> Option<std::io::Error> {
+    CHECKSUM_FAULT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_deref()
+        .is_some_and(|p| p == probed)
+        .then(|| std::io::Error::other("injected checksum read failure"))
+}
+#[cfg(test)]
+fn set_checksum_fault(path: Option<PathBuf>) {
+    *CHECKSUM_FAULT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = path;
+}
+
 /// A progress event emitted during a scan or revalidate. Borrows the current
 /// path to avoid a per-file allocation in the writer; the saved allocation is
 /// negligible next to the existing per-file `to_string_lossy` + DB write, so do
@@ -997,10 +1019,15 @@ fn probe_file(path: &Path, window: usize, tier: ChecksumTier) -> std::io::Result
     // Inside the sandwich: the s2 check below covers the checksum reads too.
     let settled = match probed {
         ProbeBody::Failed(f) => Err(f),
-        ProbeBody::Parsed(p) => match checksums_of(&file, &p, tier) {
-            Ok(c) => Ok((p, c)),
-            Err(e) => Err(checksum_failure(path, &e)),
-        },
+        ProbeBody::Parsed(p) => {
+            let checksums = checksums_of(&file, &p, tier);
+            #[cfg(test)]
+            let checksums = checksum_fault(path).map_or(checksums, Err);
+            match checksums {
+                Ok(c) => Ok((p, c)),
+                Err(e) => Err(checksum_failure(path, &e)),
+            }
+        }
     };
 
     let s2 = BackingStamp::from_metadata(&file.metadata()?).recordable(keeps_inodes);

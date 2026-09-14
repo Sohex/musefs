@@ -1069,6 +1069,57 @@ fn a_checksum_that_cannot_be_produced_fails_the_file() {
     );
 }
 
+/// #690's routing end to end, which the test above checks only in pieces: a
+/// file that parses and then cannot be hashed leaves `probe_file` as a
+/// `Checksum` failure carrying its stamp, and a scan counts it in
+/// `ScanStats::failed` — the number the CLI turns into exit status 2 — with no
+/// row written for it.
+#[test]
+fn a_file_that_parses_and_cannot_be_hashed_fails_the_scan_for_that_file() {
+    crate::warn_limit::log_capture::install();
+    let dir = tempfile::tempdir().unwrap();
+    let path = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .join("checksum-fault.m4a");
+    std::fs::write(&path, mp4_with_covr(13, &[0xFF; 8])).unwrap();
+
+    struct FaultGuard;
+    impl Drop for FaultGuard {
+        fn drop(&mut self) {
+            set_checksum_fault(None);
+        }
+    }
+    set_checksum_fault(Some(path.clone()));
+    let _guard = FaultGuard;
+
+    match probe_file(&path, WINDOW, ChecksumTier::Full).unwrap() {
+        ProbeOutcome::Failed(f) => {
+            assert_eq!(f.reason, SkipReason::Checksum);
+            assert!(f.message.contains("checksum failed"), "{}", f.message);
+            assert!(f.stamp.is_some(), "the verdict came from a held file");
+        }
+        other => panic!("expected a checksum failure, got {other:?}"),
+    }
+
+    let db = Db::open_in_memory().unwrap();
+    let stats = scan_directory_with(
+        &db,
+        dir.path(),
+        &ScanOptions {
+            checksum: ChecksumTier::Full,
+            ..ScanOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!((stats.scanned, stats.failed), (0, 1), "{stats:?}");
+    assert!(db.list_tracks().unwrap().is_empty(), "nothing is stored");
+    let logged = crate::warn_limit::log_capture::messages_containing("checksum-fault.m4a");
+    assert!(
+        logged.iter().any(|m| m.contains("checksum failed")),
+        "{logged:?}"
+    );
+}
+
 /// The `&Db` sink's known-path arm: a unit whose path already has a row must be
 /// upserted through `ingest_into`, and a pass that computed no full hash over
 /// unchanged bytes must leave the stored one alone (#689). "Unchanged" needs the
