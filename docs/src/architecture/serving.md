@@ -235,6 +235,12 @@ no row and therefore no timestamp; it reports the mount time. Those two cases
 used to be the same value — zero — so a file whose mtime really was the Unix
 epoch reported the mount time instead.
 
+What a pre-epoch file reports depends on the mode. `--mode structure-only`
+serves the backing file's own mtime, pre-1970 seconds included. Synthesis mode
+reports the later of that and the row's `updated_at`, the second the store last
+changed the file, which is never before 1970. So there a pre-epoch file reports
+a second after 1970.
+
 ## Synthetic telemetry namespace
 
 When `--expose-metrics` is on, the root directory gains a synthetic

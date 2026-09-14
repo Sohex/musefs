@@ -724,7 +724,7 @@ see the [Release notes](release-notes.md).
   guard, at a cap pinned by a test to the longest allowlisted kind.
 
 - **A synthesized file's mtime now moves whenever its bytes do, and a pre-epoch
-  backing file is served as one.** Two fixes in the same type, because both are
+  backing file is stored and served.** Two fixes in the same type, because both are
   about what the mount reports as a timestamp
   ([#696](https://github.com/Sohex/musefs/issues/696),
   [#725](https://github.com/Sohex/musefs/issues/725)).
@@ -748,7 +748,9 @@ see the [Release notes](release-notes.md).
   mount time for anything at or below zero. A file whose mtime really was the
   epoch therefore reported the wrong time, and every pre-epoch file would have
   once v4 stopped refusing one. The field is an `Option` now, so the fallback
-  fires for the synthetic case and nothing else.
+  fires for the synthetic case and nothing else. A pre-epoch second is what
+  `--mode structure-only` reports; synthesis mode reports the later of it and
+  the row's `updated_at`, which is never before 1970.
 
   What the virtual mtime promises is written down for the first time, in
   [the serving model](architecture/serving.md).

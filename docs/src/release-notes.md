@@ -35,7 +35,7 @@ store upgrade is one-way without the snapshot `migrate` takes.
   - every column's storage class is enforced.
 - **Modification times that move with the bytes** ([#725], [#696]). A tag edit
   is visible to anything comparing size and mtime, and a pre-1970 backing file
-  is served as one.
+  is stored instead of refused.
 - **`readdirplus`** ([#667]). A client that stats what it lists — `ls -l`, every
   media scanner — spends one round trip on the directory instead of one per
   entry.
