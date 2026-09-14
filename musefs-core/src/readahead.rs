@@ -454,6 +454,14 @@ fn lock_buf_or_clear<'a>(
     }
 }
 
+/// Drop every window `buf` holds and uncharge them from `pool`, so the
+/// `charged == Σ(registered buffers' bytes.len())` invariant holds whether or
+/// not the buffer is registered (an unregistered one holds nothing to free).
+pub fn discard_windows(pool: &ReadAheadPool, buf: &Mutex<ReadAhead>) {
+    let freed = lock_buf_or_clear(buf, pool).clear();
+    pool.reconcile(freed, 0);
+}
+
 /// Store a prefetched window into `buf` iff the handle's epoch is unchanged, and
 /// charge the global budget by the resulting size delta so the
 /// `charged == Σ(registered buffers' bytes.len())` invariant is preserved. A
