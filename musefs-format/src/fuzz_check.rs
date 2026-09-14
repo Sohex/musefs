@@ -417,6 +417,10 @@ pub mod fixtures {
     /// magic. `tag` must carry no header flags, as [`id3v24_text_tag`]'s do not.
     pub fn with_id3v24_footer(tag: &[u8]) -> Vec<u8> {
         let mut out = tag.to_vec();
+        debug_assert_eq!(
+            out[5], 0,
+            "with_id3v24_footer expects a tag with no header flags"
+        );
         out[5] = 0x10; // footer present, and nothing else
         let mut footer = b"3DI".to_vec();
         footer.extend_from_slice(&out[3..10]);

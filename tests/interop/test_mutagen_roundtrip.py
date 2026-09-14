@@ -35,11 +35,13 @@ RIFX_SAMPLES = [0x0102, -2, 300, -32768, 32767, 5, 6, 7]
 
 
 def _is_rifx(path):
+    """Whether the file at `path` is RIFX (big-endian WAVE) by its magic."""
     with open(path, "rb") as fh:
         return fh.read(4) == b"RIFX"
 
 
 def _synchsafe(b):
+    """Decode the 28-bit synchsafe integer in the four bytes `b` (ID3v2.4 §6.2)."""
     return (b[0] << 21) | (b[1] << 14) | (b[2] << 7) | b[3]
 
 

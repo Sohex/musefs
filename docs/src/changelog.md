@@ -953,10 +953,11 @@ see the [Release notes](release-notes.md).
   the 64 MiB probe ceiling, and never the MPEG payload. Every tag at either end is
   parsed within its own extent and merged in file order as ID3v2.4 §5 and §3.2
   specify: a later tag replaces what came before unless its extended header sets
-  the update flag, in which case only the frames the frames document calls unique
-  override (text, `TXXX`, `COMM` and `USLT` by store key; `POPM` by rating and play
-  count together; `APIC` by description; binary frames by their own rules). A tag
-  the allocation guard will not parse contributes nothing and discards nothing.
+  the update flag, in which case only the frames the ID3v2.4 frames document
+  calls unique override (text, `TXXX`, `COMM` and `USLT` by store key; `POPM` by
+  rating and play count together; `APIC` by description; binary frames by their
+  own rules). A tag the allocation guard will not parse contributes nothing and
+  discards nothing.
   ID3v2.3 has no update flag, but its §4.19 makes every later tag an update of
   the one before, so a later v2.2 or v2.3 tag now overrides only the frames it
   carries and keeps everything else, where the scan used to read only the first
