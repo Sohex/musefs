@@ -13,9 +13,30 @@ therefore a superset key — the one input it cannot cover is an on-disk backing
 change with no DB write, which `resolve` (and, since #279, a size-cache
 `getattr` hit) catches by re-statting the backing file and degrading to
 `BackingChanged`. The scanner stamps the backing file's `(size, mtime_ns,
-ctime_ns)` tuple from the **probed file descriptor** using a pre/post `fstat`
-sandwich: if the file's metadata changes between the two stats, the entry is
-dropped. `ctime` defeats an mtime-forging writer (e.g. `touch -m`). The
+ctime_ns, ino)` tuple from the **probed file descriptor** using a pre/post
+`fstat` sandwich: if the file's metadata changes between the two stats, the
+entry is dropped. `ctime` defeats an mtime-forging writer (e.g. `touch -m`),
+and `ino` covers the one case the timestamps cannot: a backing filesystem that
+stores no sub-second times — FAT32's two-second granularity and no ctime at
+all, or ext3/HFS+/some SMB and NFS mounts truncating the nanosecond fields —
+where a same-size *replacement* inside the granularity window leaves all three
+identical. It does not help against a true in-place rewrite, which is a POSIX
+timestamp limit rather than something musefs can fix; it catches the shape
+almost every tagger actually produces, writing a temporary file and renaming
+over the original.
+
+A stored inode of zero means "not recorded" — every row a store migrated into
+v4 carries, until `musefs revalidate` (or a `scan --force` of the file) fills it
+in, since a plain `scan` leaves tracked rows alone — and such a
+row is compared on the other three fields alone rather than failing closed on a
+field the store has nothing to say about. `revalidate` re-probes exactly those
+rows, which is what makes it the repopulation path for an upgraded store. The
+wildcard is one-directional: it belongs to the *stored* side only, and a live
+stat that cannot produce an inode fails closed against a row that has one,
+rather than being excused in turn. This comparison is therefore deliberately
+*not* equality — a stamp with no recorded inode matches two live files that do
+not match each other — so it is a named, asymmetric check rather than an `==`
+that would not be transitive. The
 `HeaderCache` (`reader.rs`) — a byte-budgeted concurrent cache (64 MiB
 default) of resolved layouts — keys each entry on it *and* on the
 **backing-source identity** the entry was built from: the row's
@@ -30,10 +51,22 @@ it re-stats the live path and holds no locator anything opens
 ([#679](https://github.com/Sohex/musefs/issues/679)).
 Independently of the cache, **every**
 resolve re-stats the backing file and errors with `BackingChanged` if its
-size, mtime, or ctime drifted from the scanned values, so a silently replaced
+size, mtime, ctime, or inode drifted from the scanned values, so a silently replaced
 backing file is never spliced at stale offsets. The per-handle read path
-re-stats the held descriptor on every read too, so this guarantee holds on the
-hot path and not only through `resolve()`.
+re-stats the held descriptor on every read it serves too — after acquiring the
+bytes, so a rewrite that lands mid-read fails that read — and this guarantee
+holds on the hot path and not only through `resolve()`.
+
+It covers the reads that reach musefs, which is not every read. With
+`--keep-cache`, on by default, a read the kernel can satisfy from its page cache
+never becomes a FUSE request, so no re-stat runs for it. An in-place rewrite of a
+backing file behind a file that is already open and cached is therefore not seen
+by those cached reads. The next open resolves the file again, and fails with `EIO`
+if the rewrite moved the freshness stamp — size, mtime, ctime or inode. A
+same-size rewrite in place on a filesystem with coarse timestamps can leave all
+four unchanged, and then no open catches it either (see above). That is deliberate rather than an oversight: bypassing the
+page cache would give up the one measured storage win in the benchmarks, and an
+in-place rewrite of a backing file is outside the contract to begin with.
 
 **`--trust-backing-mtime`** opts out of the `getattr` half of that, and of
 nothing else ([#668](https://github.com/Sohex/musefs/issues/668)). On a
@@ -70,7 +103,9 @@ Polling is debounced (`--poll-interval-ms`) and rebuilds are single-flighted:
 a metadata-op storm costs at most one rebuild per interval. When mounted with
 `--keep-cache`, the changed-inode notifications drive kernel page-cache
 invalidation (`inval_inode`), so a re-tagged file never serves stale cached
-bytes.
+bytes. That covers changes recorded in the store; a backing file rewritten in
+place writes nothing to the store and raises no notification (see
+[above](#freshness-two-version-counters)).
 
 ## Virtual tree
 
@@ -130,7 +165,7 @@ offset/length, tags, pictures, structural blocks) on a parallel probe
 pipeline feeding a single DB writer, committing in batches. Probing reads
 are bounded — the scanner never slurps whole files — and ingestion caps
 per-item sizes (`MAX_ART_BYTES`, `MAX_BINARY_TAG_BYTES`, and the store's
-`tags.key`/`tags.value`/`art.mime`/`track_art.description` limits) so a crafted
+`tags.key`/`tags.value`/`track_art.mime`/`track_art.description` limits) so a crafted
 file cannot balloon the store.
 
 `check_storable` applies every one of those caps in a single place, before
@@ -186,12 +221,18 @@ aborting the scan. The `root` argument is always followed regardless of the
 flag; only links encountered during recursion are gated.
 
 `revalidate` is the maintenance pass: it re-probes only files whose
-`(size, mtime_ns, ctime_ns)` freshness stamp changed — a ctime-only move (e.g.
-a forged-mtime in-place rewrite) is still re-probed — and it preserves any
-external tag edits in the DB by refreshing only Layer A. New files are
+`(size, mtime_ns, ctime_ns, ino)` freshness stamp changed — a ctime-only move
+(e.g. a forged-mtime in-place rewrite) is still re-probed — and it preserves any
+external tag edits in the DB by refreshing only Layer A. It also re-probes rows
+the stamp *cannot* fully decide: a FLAC missing its structural blocks, a row
+below the requested checksum tier, and a row with no recorded inode. That last
+one is what makes it the repopulation path for a store upgraded to v4, where
+every row starts without one. New files are
 ignored: `revalidate` only touches rows that already exist in the store.
 Deletion is opt-in via `--prune`, which removes tracks under the scanned root
-whose backing file is gone and garbage-collects now-unreferenced art. Pruning
+whose backing file is gone, or is present but refused as unsupported (a chained
+Ogg an older binary stored, [#747](https://github.com/Sohex/musefs/issues/747)),
+and garbage-collects now-unreferenced art. Pruning
 is scoped to the scanned root, so revalidating one library root never removes
 tracks belonging to another. Because a track is keyed by its *canonical*
 backing path, a file scanned via `--follow-symlinks` whose real target lives

@@ -267,7 +267,7 @@ def test_sync_cli_album_deleted_prunes_without_api(tmp_path, capsys):
     try:
         tid = conn.execute(
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, "
-            "backing_size, backing_mtime_ns, updated_at) VALUES ('/m/a.flac', 'flac', 0, 0, 0, 0, 0)"
+            "backing_size, backing_mtime_ns, updated_at) VALUES (CAST('/m/a.flac' AS BLOB), 'flac', 0, 0, 0, 0, 0)"
         ).lastrowid
         replace_tags(conn, tid, [("musicbrainz_albumid", "rg-1"), (MANAGED_KEY, MANAGED_VALUE)])
         conn.commit()

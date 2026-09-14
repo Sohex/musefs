@@ -3,6 +3,7 @@ import time
 
 import pytest
 from musefs_common import connect as musefs_connect
+from musefs_common import path_param
 from musefs_common.schema import SCHEMA_SQL
 
 
@@ -31,7 +32,15 @@ def insert_track(
     cur = conn.execute(
         "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, "
         "backing_size, backing_mtime_ns, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (backing_path, fmt, audio_offset, audio_length, backing_size, backing_mtime_ns, now),
+        (
+            path_param(backing_path),
+            fmt,
+            audio_offset,
+            audio_length,
+            backing_size,
+            backing_mtime_ns,
+            now,
+        ),
     )
     return cur.lastrowid
 

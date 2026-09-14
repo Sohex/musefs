@@ -4,6 +4,7 @@ import time
 import pytest
 
 from musefs_common import connect as musefs_connect
+from musefs_common import path_param
 from musefs_common.schema import SCHEMA_SQL
 
 # Minimal valid JPEG/PNG headers + padding; used as fake cover-art bytes in tests.
@@ -41,7 +42,7 @@ def insert_track(conn, backing_path, fmt="flac"):
     cur = conn.execute(
         "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, "
         "backing_size, backing_mtime_ns, updated_at) VALUES (?, ?, 0, 0, 0, 0, ?)",
-        (backing_path, fmt, now),
+        (path_param(backing_path), fmt, now),
     )
     return cur.lastrowid
 

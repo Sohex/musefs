@@ -55,14 +55,24 @@ and is the source of truth; this checklist is the human side.
    builds or publishes — a red tree blocks the release automatically.
 3. `CARGO_REGISTRY_TOKEN` is present in repo secrets.
 4. Smoke-build every cross target so `jemalloc-sys` is known to compile under
-   zig before tagging (the release matrix builds with the `jemalloc` feature on):
+   zig before tagging (the release matrix builds with the `jemalloc` feature on).
+   These are the six `build` targets in `release.yml`; `rustup target add` each
+   triple first:
 
    ```bash
    for t in x86_64-unknown-linux-gnu.2.17 aarch64-unknown-linux-gnu.2.17 \
-            x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
+            riscv64gc-unknown-linux-gnu.2.27 riscv64gc-unknown-linux-musl; do
      cargo zigbuild --release -p musefs --target "$t"
    done
    ```
+
+   `scripts/smoke-binary.sh <binary>` is the smoke `release.yml` runs on each
+   build (scan, mount, read back, byte-identical audio, clean unmount). A
+   native binary runs it directly; a musl one inside `alpine` with `/dev/fuse`;
+   another architecture needs user-mode QEMU (`qemu-user`, or
+   `qemu-user-static` with binfmt registered for a `--platform` container).
+   The riscv64 smoke legs are emulated in CI and do not block the release.
 
    If a target cannot build `jemalloc-sys`, add `--no-default-features` to that
    matrix entry's `cargo zigbuild` in `release.yml`, rather than blocking the
@@ -78,11 +88,19 @@ and is the source of truth; this checklist is the human side.
    internal floor fails the publish.
 4. Promote the `## [Unreleased]` section of `CHANGELOG.md` to
    `## [X.Y.Z] - <date>`.
-5. Dry-run package each crate: `cargo package -p <crate> --locked` for each of
-   `musefs-db musefs-format musefs-core musefs-fuse musefs-cli musefs`. This
-   catches packaging errors but **not** the cross-crate index-propagation
-   problem (it resolves siblings via path deps); that is handled in-workflow
-   (next section).
+5. Dry-run package every published crate in **one** invocation, which packages
+   and verifies them in dependency order:
+
+   ```bash
+   cargo package --locked -p musefs-db -p musefs-format -p musefs-core \
+     -p musefs-fuse -p musefs-cli -p musefs
+   ```
+
+   Packaged one at a time, every crate after `musefs-db` fails while the new
+   version is not yet on crates.io: a lone `cargo package` resolves its
+   siblings from the registry, not the workspace. The dry run catches packaging
+   errors but **not** the cross-crate index-propagation problem at publish
+   time; that is handled in-workflow (next section).
 6. Commit, e.g. `git commit -am "release: vX.Y.Z"`.
 
 **Tag and push.**

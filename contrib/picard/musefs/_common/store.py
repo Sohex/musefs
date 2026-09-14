@@ -5,10 +5,11 @@ import contextlib
 import hashlib
 import os
 import sqlite3
+import struct
 from dataclasses import dataclass
 
 from .constants import EXPECTED_USER_VERSION
-from .errors import SchemaMismatch
+from .errors import ArtDigestMismatch, SchemaMismatch
 
 # SQLite caps a statement's host parameters (SQLITE_MAX_VARIABLE_NUMBER: 999 on
 # the <3.32 floor). Chunk bulk IN-lists below it so large lookups never trip it.
@@ -102,9 +103,35 @@ def check_schema_version(conn):
         raise SchemaMismatch(found)
 
 
+def path_param(key):
+    """Encode a ``backing_path`` key for binding.
+
+    The column is a ``BLOB`` from schema v4 on: a filesystem path is bytes, and
+    the lossy ``str`` round-trip collapsed two distinct files onto one row.
+    SQLite never compares a ``TEXT`` value equal to a ``BLOB``, so a ``str``
+    bound as-is matches nothing at all rather than failing — which is why this
+    is a helper and not four inline ``.encode()`` calls.
+
+    The library's own type is ``str``, carrying undecodable bytes as surrogates
+    the way Python spells an OS path everywhere else. ``os.fsencode`` and
+    ``os.fsdecode`` are exact inverses, so the round trip is lossless and — the
+    part that matters — injective: two distinct files cannot become one key.
+    Using them rather than a hardcoded ``utf-8`` keeps both directions on the
+    same codec, so a filesystem encoding that is not UTF-8 cannot split them.
+    """
+    return os.fsencode(key)
+
+
+def path_value(raw):
+    """Decode a ``backing_path`` read back out. The inverse of `path_param`."""
+    return os.fsdecode(bytes(raw) if isinstance(raw, (bytes, bytearray)) else raw)
+
+
 def track_id_for_path(conn, key):
     """Return the track id whose backing_path equals ``key``, or None."""
-    row = conn.execute("SELECT id FROM tracks WHERE backing_path = ?", (key,)).fetchone()
+    row = conn.execute(
+        "SELECT id FROM tracks WHERE backing_path = ?", (path_param(key),)
+    ).fetchone()
     return row[0] if row else None
 
 
@@ -123,9 +150,10 @@ def track_ids_for_paths(conn, keys):
         placeholders = ",".join("?" for _ in chunk)
         rows = conn.execute(
             f"SELECT backing_path, id FROM tracks WHERE backing_path IN ({placeholders})",
-            chunk,
+            [path_param(k) for k in chunk],
         )
-        for backing_path, track_id in rows:
+        for raw_path, track_id in rows:
+            backing_path = path_value(raw_path)
             if backing_path in out:
                 # backing_path is UNIQUE in the schema, so a duplicate means a
                 # non-conformant DB; collapsing it would silently hide a track
@@ -185,12 +213,13 @@ def _rows_to_prune(conn, track_ids):
     id is considered once, in first-seen order, so a caller that passes
     duplicates neither over-counts the prune nor reports one path twice."""
     if track_ids is None:
-        yield from conn.execute("SELECT id, backing_path FROM tracks")
+        for track_id, raw_path in conn.execute("SELECT id, backing_path FROM tracks"):
+            yield track_id, path_value(raw_path)
         return
     for track_id in dict.fromkeys(track_ids):
         row = conn.execute("SELECT backing_path FROM tracks WHERE id=?", (track_id,)).fetchone()
         if row is not None:
-            yield track_id, row[0]
+            yield track_id, path_value(row[0])
 
 
 def _backing_is_gone(track_id, path, unreadable):
@@ -318,34 +347,171 @@ def sniff_mime(data, path):
     return _EXT_MIME.get(ext, "application/octet-stream")
 
 
-def upsert_art(conn, data, mime):
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+# The start-of-frame markers, which carry the frame's dimensions: every C0-CF
+# except DHT (C4), JPG (C8) and DAC (CC), which share the range and do not.
+_JPEG_SOF = frozenset((
+    0xC0,
+    0xC1,
+    0xC2,
+    0xC3,
+    0xC5,
+    0xC6,
+    0xC7,
+    0xC9,
+    0xCA,
+    0xCB,
+    0xCD,
+    0xCE,
+    0xCF,
+))
+# Markers that stand alone, with no length field: RST0-RST7 and TEM.
+_JPEG_STANDALONE = frozenset(range(0xD0, 0xD8)) | {0x01}
+# PNG caps a dimension at 2**31 - 1; the same bound keeps a JPEG's inside the
+# column's range.
+_MAX_DIMENSION = 2**31 - 1
+
+
+def image_dimensions(data):
+    """``(width, height)`` from a PNG or JPEG header, or ``None``.
+
+    Reads header bytes only, with no decoder and no dependency: PNG's ``IHDR``
+    chunk, which the format requires to come first, and a JPEG's start-of-frame
+    segment, found by walking the marker segments ahead of the image data.
+    Anything else — WebP, an unrecognised format, a truncated or malformed
+    header, a zero dimension — is ``None``, which is how ``track_art`` spells
+    "not stated" (musefs #737). Bit depth and colour count are not read."""
+    if data[:8] == _PNG_SIGNATURE:
+        return _png_dimensions(data)
+    if data[:2] == b"\xff\xd8":
+        return _jpeg_dimensions(data)
+    return None
+
+
+def _checked_dimensions(width, height):
+    if 0 < width <= _MAX_DIMENSION and 0 < height <= _MAX_DIMENSION:
+        return (width, height)
+    return None
+
+
+def _png_dimensions(data):
+    # Signature (8), then the IHDR chunk: length (4) = 13, type (4), width (4),
+    # height (4), five more data bytes and the CRC (4), big-endian. Only a
+    # complete chunk is read, so 33 bytes.
+    if len(data) < 33 or data[8:12] != struct.pack(">I", 13) or data[12:16] != b"IHDR":
+        return None
+    width, height = struct.unpack(">II", data[16:24])
+    return _checked_dimensions(width, height)
+
+
+def _jpeg_dimensions(data):
+    i = 2  # past SOI
+    end = len(data)
+    while i < end:
+        if data[i] != 0xFF:
+            return None
+        # Any number of 0xFF fill bytes may precede a marker.
+        while i < end and data[i] == 0xFF:
+            i += 1
+        if i >= end:
+            return None
+        marker = data[i]
+        i += 1
+        if marker in (0xD9, 0xDA):
+            # End of image, or the image data itself: no frame header came first.
+            return None
+        if marker in _JPEG_STANDALONE:
+            continue
+        if i + 2 > end:
+            return None
+        (length,) = struct.unpack(">H", data[i : i + 2])
+        if length < 2 or i + length > end:
+            return None
+        if marker in _JPEG_SOF:
+            # Length (2), precision (1), height (2), width (2), component count
+            # (1), then three bytes per component. A frame header that is not
+            # exactly that long, or has no components, is malformed.
+            if length < 8:
+                return None
+            components = data[i + 7]
+            if components == 0 or length != 8 + 3 * components:
+                return None
+            height, width = struct.unpack(">HH", data[i + 3 : i + 7])
+            return _checked_dimensions(width, height)
+        i += length
+    return None
+
+
+def upsert_art(conn, data):
     """Content-address ``data`` by sha256 and return its art id, inserting only
-    if new (mirrors musefs Db::upsert_art). If the sha256 already exists, the
-    stored row (and its mime) is kept and the ``mime`` argument is ignored."""
+    if new (mirrors musefs Db::upsert_art).
+
+    The row is the bytes and nothing else. It used to carry the mime and the
+    dimensions, which made the first writer of a given image choose them for
+    every track that shared it — so they moved to ``track_art``, and this
+    function lost the argument it could not honour: on a sha256 conflict the
+    stored row was kept and the passed mime silently ignored.
+
+    A conflict returns the row already filed under the digest, and a store is
+    only content-addressed if that row holds these bytes. Nothing in the schema
+    ties ``sha256`` to ``data``, so the conflicting row is compared with ``data``
+    — in SQL, nothing re-hashed — and :class:`ArtDigestMismatch` is raised
+    instead of returning an id that points at another image (musefs #724). A
+    fresh insert needs no comparison: it just stored these bytes."""
     sha = hashlib.sha256(data).hexdigest()
-    conn.execute(
-        "INSERT INTO art (sha256, mime, width, height, byte_len, data) "
-        "VALUES (?, ?, NULL, NULL, ?, ?) ON CONFLICT(sha256) DO NOTHING",
-        (sha, mime, len(data), data),
-    )
-    return conn.execute("SELECT id FROM art WHERE sha256 = ?", (sha,)).fetchone()[0]
+    inserted = conn.execute(
+        "INSERT INTO art (sha256, byte_len, data) VALUES (?, ?, ?) ON CONFLICT(sha256) DO NOTHING",
+        (sha, len(data), data),
+    ).rowcount
+    art_id = conn.execute("SELECT id FROM art WHERE sha256 = ?", (sha,)).fetchone()[0]
+    if inserted == 0:
+        (holds_these_bytes,) = conn.execute(
+            "SELECT data = ? FROM art WHERE id = ?", (data, art_id)
+        ).fetchone()
+        if not holds_these_bytes:
+            raise ArtDigestMismatch(art_id, sha)
+    return art_id
 
 
 def replace_track_art(conn, track_id, arts):
     """Replace the track's art rows. ``arts`` is an ordered list of
-    ``(art_id, picture_type, description)``; each row's ``ordinal`` is its
-    list index.
+    ``(art_id, picture_type, description, mime)`` or
+    ``(art_id, picture_type, description, mime, width, height)``; each row's
+    ``ordinal`` is its list index.
+
+    ``mime`` describes *this* link, not the image bytes. From schema v4 it lives
+    on ``track_art`` rather than ``art``, because two files can hold
+    byte-identical art and declare it differently — and while ``art`` owned it,
+    whichever file was ingested first chose it for every track sharing the blob.
+    It is what musefs writes into the synthesized picture block, so a link
+    without one serves an empty MIME type.
+
+    ``width`` and ``height`` describe the embedding too, and a six-field row
+    states them; ``None`` in either, or a four-field row, leaves it unset.
+    :func:`image_dimensions` reads them from a PNG or JPEG header without
+    decoding, which is how :func:`sync_one` fills them (musefs #737). ``depth``
+    and ``colors`` are always left unset: unset is how both the FLAC picture
+    block and musefs spell "not stated".
 
     Atomic via an internal savepoint (see ``_savepoint``): the DELETE and the
     re-insert either both land or neither does, even on an autocommit
     connection."""
+    rows = [_track_art_row(track_id, i, art) for i, art in enumerate(arts)]
     with _savepoint(conn, "musefs_replace_track_art"):
         conn.execute("DELETE FROM track_art WHERE track_id = ?", (track_id,))
         conn.executemany(
             "INSERT INTO track_art (track_id, art_id, picture_type, description, "
-            "ordinal) VALUES (?, ?, ?, ?, ?)",
-            [
-                (track_id, art_id, picture_type, description, i)
-                for i, (art_id, picture_type, description) in enumerate(arts)
-            ],
+            "mime, width, height, ordinal) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
         )
+
+
+def _track_art_row(track_id, ordinal, art):
+    """One ``track_art`` insert from a four- or six-field ``replace_track_art``
+    row."""
+    if len(art) == 4:
+        art_id, picture_type, description, mime = art
+        width = height = None
+    else:
+        art_id, picture_type, description, mime, width, height = art
+    return (track_id, art_id, picture_type, description, mime, width, height, ordinal)

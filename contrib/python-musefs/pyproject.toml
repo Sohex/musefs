@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "python-musefs"
-version = "1.2.0"
+version = "2.0.0"
 description = "Shared musefs SQLite-store contract for the beets and Picard plugins"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -34,6 +34,5 @@ where = ["src"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 markers = [
-    "musefs_bin: tests that shell out to the real `musefs` Rust binary (opt-in)",
+    "musefs_bin: tests that shell out to the real `musefs` Rust binary",
 ]
-addopts = "-m 'not musefs_bin'"

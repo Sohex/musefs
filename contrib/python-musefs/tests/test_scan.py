@@ -162,7 +162,7 @@ def test_run_scan_hard_failure_error_names_count(monkeypatch):
         scan.run_scan("musefs", "/db.sqlite", ["/a.flac", "/b.flac"])
     except ScanError as exc:
         assert exc.kind == "failed"
-        assert "2" in str(exc.target)  # "2 target(s)"
+        assert exc.target == "2 target(s)"
     else:
         raise AssertionError("expected ScanError")
 

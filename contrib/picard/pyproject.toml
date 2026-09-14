@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "musefs-picard"
-version = "1.2.0"
+version = "2.0.0"
 description = "Sync MusicBrainz Picard metadata into the musefs SQLite store"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -35,7 +35,5 @@ testpaths = ["tests"]
 # So `import musefs._core` resolves to contrib/picard/musefs without an install.
 pythonpath = ["."]
 markers = [
-    "musefs_bin: tests that shell out to the real `musefs` Rust binary (opt-in)",
+    "musefs_bin: tests that shell out to the real `musefs` Rust binary",
 ]
-# Skip the opt-in binary gate by default; run it explicitly with `-m musefs_bin`.
-addopts = "-m 'not musefs_bin'"

@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "beets-musefs"
-version = "1.2.0"
+version = "2.0.0"
 description = "Sync beets metadata into the musefs SQLite store"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Conor Futro" }]
-dependencies = ["python-musefs>=1.2.0", "beets>=1.6"]
+dependencies = ["python-musefs>=2.0.0", "beets>=1.6"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -34,8 +34,13 @@ packages = ["beetsplug"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
-    "musefs_bin: tests that shell out to the real `musefs` Rust binary (opt-in)",
+    "musefs_bin: tests that shell out to the real `musefs` Rust binary",
     "e2e: full beets -> musefs -> FUSE-mount end-to-end (opt-in; needs ffmpeg, the musefs binary, and /dev/fuse)",
 ]
-# By default, skip the opt-in tiers; run them explicitly with `-m musefs_bin` / `-m e2e`.
-addopts = "-m 'not musefs_bin and not e2e'"
+# `musefs_bin` runs by default: it is the only tier that sees the real schema
+# rather than a fixture's, so a store-shape change breaks it and nothing else,
+# and it skips cleanly where the binary is absent. `e2e` stays opt-in -- it
+# mounts a filesystem and drives a full beets import, which is not what a
+# default `pytest` should do. Run it with `-m e2e`. CI's contract job does, with
+# MUSEFS_REQUIRE_BIN=1 so a missing tool fails the tier instead of skipping it.
+addopts = "-m 'not e2e'"

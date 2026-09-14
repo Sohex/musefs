@@ -15,7 +15,7 @@ from .constants import (
     MAX_TAG_VALUE_LEN,
     SCAN_TIMEOUT_SECONDS,
 )
-from .errors import ScanError, SchemaMismatch
+from .errors import ArtDigestMismatch, ScanError, SchemaMismatch
 from .paths import realpath_key
 from .scan import ScanResult, run_scan
 from .store import (
@@ -23,7 +23,10 @@ from .store import (
     check_schema_version,
     connect,
     delete_tracks,
+    image_dimensions,
     merge_tags,
+    path_param,
+    path_value,
     prune_missing,
     replace_tags,
     replace_track_art,
@@ -36,7 +39,7 @@ from .store import (
 )
 from .sync import ArtImage, Record, SyncStats, sync_files, sync_one
 
-__version__ = "1.2.0"
+__version__ = "2.0.0"
 
 __all__ = [
     "EXPECTED_USER_VERSION",
@@ -45,11 +48,14 @@ __all__ = [
     "SCAN_TIMEOUT_SECONDS",
     "SchemaMismatch",
     "ScanError",
+    "ArtDigestMismatch",
     "ScanResult",
     "realpath_key",
     "run_scan",
     "connect",
     "check_schema_version",
+    "path_param",
+    "path_value",
     "track_id_for_path",
     "track_ids_for_paths",
     "track_ids_by_tag",
@@ -62,6 +68,7 @@ __all__ = [
     "upsert_art",
     "replace_track_art",
     "sniff_mime",
+    "image_dimensions",
     "ArtImage",
     "Record",
     "SyncStats",

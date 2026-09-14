@@ -12,7 +12,71 @@ see the [Release notes](release-notes.md).
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-09-14
+
 ### Added
+
+- **`musefs migrate --repair`, and the row-rejection pre-flight it exists for.**
+  The 2.0.0 migration tightens constraints an existing store can already
+  violate — an embedded NUL in a tag key or an art mime, a picture dimension
+  past `u32`, a value whose storage class is not what the Rust side reads. Such
+  a row aborts the migration, atomically, which is safe but a poor way to find
+  out: the upgrade can have been copying blobs for a while before it meets one.
+
+  So `migrate` now checks first, before anything is copied or written, and
+  reports what would be refused per table. It does **not** repair on its own —
+  dropping a row an external writer chose is exactly the class of thing that
+  must not happen unasked — so it stops and names `--repair`. With that flag the
+  rows are deleted *after* the snapshot is taken, so they are still in the copy
+  the user can go back to, and the report says plainly that deleting a track
+  takes its tags and art links with it.
+
+  The check does not describe the constraints a second time. It builds the
+  target tables using the migration itself — a scratch store migrated to the
+  target is by definition the shape this one is about to become — attaches them
+  to the store, and offers every row to them with `INSERT OR IGNORE`, which
+  skips exactly what a `CHECK`, `NOT NULL` or `UNIQUE` would refuse. What did
+  not arrive is the answer. A hand-written copy of the rules would have drifted
+  the first time one changed, and there were seven issues' worth of changes to
+  drift from.
+
+  Foreign keys are off for the pass, because `INSERT OR IGNORE` cannot help with
+  them: conflict resolution does not apply to foreign keys, so a violation
+  aborts the statement rather than skipping the row. That leaves one shape the
+  row-by-row pass cannot see — a child pointing at a parent that is not there,
+  which an external tool can leave behind with enforcement turned off, and which
+  fails the refill when the upgrade puts it back. A second pass covers it, and
+  covers the same question for a child whose parent this repair is about to
+  delete, since to a child those are the same thing.
+
+  So the count is what will actually go, children included, rather than only the
+  rows with something wrong of their own. Deletes run in an order the references
+  require: `tracks` first so its cascade takes what it owns, and `art` last,
+  because `track_art.art_id` references it with no `ON DELETE` clause and
+  deleting a refused blob while a link survives fails outright.
+
+  `--repair` refuses alongside `--no-snapshot`. The rows go for good, and the
+  snapshot is the only copy they survive in.
+
+- **`musefs migrate`.** The command the gate above names: an explicit,
+  confirmed store upgrade. It refuses a store anything else has open, reports
+  the current version, the target version and what each pending step does, and
+  reports the free space the upgrade needs against what the filesystem has,
+  refusing up front rather than failing part-way through the transaction.
+  Before touching anything it writes a compacted copy of the store to
+  `<db>.v<version>.bak` with `VACUUM INTO`, which is what turns an irreversible
+  upgrade into a reversible one; `--snapshot PATH` moves it and `--no-snapshot`
+  skips it, and an existing destination is refused rather than overwritten.
+  Afterwards it reports that the store grew and offers a vacuum, and reports
+  how many tracks lost the fingerprint this upgrade retires and offers a
+  `revalidate` over the directory the library shares, which recomputes them.
+  Prompts come from `dialoguer`, the console-rs sibling of the `indicatif`
+  dependency the scan progress bar already uses, so a question is lifted clear
+  of a live progress frame by the same path a log record takes. Off a terminal
+  nothing blocks on stdin: the upgrade needs `--yes` or it refuses and names
+  the flag, and the two offers decline themselves unless `--vacuum` or
+  `--revalidate` asked for them
+  ([#705](https://github.com/Sohex/musefs/issues/705)).
 
 - `readdirplus` is implemented, folding the per-entry `lookup` into the
   directory read: a client that stats what it lists — `ls -l`, every media
@@ -95,7 +159,319 @@ see the [Release notes](release-notes.md).
   ([#650](https://github.com/Sohex/musefs/issues/650)) the counter covers the
   synthesis warns too, not just the FUSE errno path.
 
+- `--workers` (env `MUSEFS_WORKERS`) sizes the FUSE worker pool explicitly
+  ([#631](https://github.com/Sohex/musefs/issues/631)). The default stays auto,
+  twice the CPU count, because the work is I/O-bound, but each worker lazily
+  opens its own read-only SQLite connection, so steady-state memory scales with
+  the pool rather than with the library alone. A many-core host serving few
+  concurrent readers can now cap that component instead of paying for
+  connections it never uses.
+
+- `musefs_process_resident_bytes` (Linux) reports the whole process's resident
+  set, and `musefs_sqlite_memory_bytes` what SQLite holds across all connections
+  ([#631](https://github.com/Sohex/musefs/issues/631)). SQLite allocates through
+  libc rather than the global allocator, so the jemalloc `musefs_alloc_*` gauges
+  never saw it: a full-library walk grew the process by hundreds of megabytes
+  while those gauges barely moved, and the metrics surface could not say how
+  much memory the daemon was using.
+
 ### Changed
+
+- **The serve path no longer zero-fills buffers a read is about to overwrite**
+  ([#670](https://github.com/Sohex/musefs/issues/670)). Each backing-audio
+  segment and Ogg audio page a read touched was zero-filled and then overwritten
+  by the positioned read, and each read-ahead window was allocated zeroed and then
+  filled — about 1.7 µs per 128 KiB segment and 69 µs per 8 MiB window as
+  measured in the issue, roughly 18% of a page-cached fill. Those reads now land
+  in the buffer's uninitialized spare capacity instead, committed by one audited
+  `unsafe` `set_len` covering only the bytes `pread` reports initialized, and a
+  read served from a cached window is copied straight into the output. Against
+  high-latency backing the I/O dominates and nothing visible changes; against
+  page-cached or NVMe reads it is one of the few costs left on the path.
+  `musefs-core` now depends on `rustix` directly.
+
+- **The public enums a downstream crate matches on are `#[non_exhaustive]`**
+  ([#708](https://github.com/Sohex/musefs/issues/708)). Until now adding a
+  variant to any of them was a breaking change, so the next audio format or
+  error case would have cost a 3.0.0. A `match` on one of these outside its
+  crate now needs a wildcard arm:
+  - errors: `DbError`, `CoreError`, `FormatError`, `LayoutError`,
+    `TemplateError`;
+  - `Format`, so a new audio format is a minor release;
+  - scan and mount inputs: `ChecksumTier`, `MatchStrictness`, `Mode`,
+    `NodeKind`, and the `ScanProgress` events;
+  - `musefs-cli`'s `Command`, `CliMode`, `ChecksumMode` and `MatchMode`.
+
+  Deliberately left exhaustive, because a new variant there should fail to
+  compile rather than reach a wildcard: `Segment`, which `read_at` splices audio
+  bytes from; `Extent`, a two-state probe protocol; `ogg::Codec` and
+  `Mp4ScanError`, which the scanner and reader translate variant by variant; and
+  `WarnDecision`, which `serve_warn!` matches inside other crates. Where the
+  workspace itself lost an exhaustive check across a crate boundary, it has a
+  stand-in: a test fails as soon as `Format` gains a variant, naming the
+  synthesis dispatch to add it to, and `musefs-fuse` maps a `CoreError` it has
+  not placed to
+  `EIO`, the collapse it already documents for structural errors.
+
+- **Public structs that grow are `#[non_exhaustive]` too**
+  ([#743](https://github.com/Sohex/musefs/issues/743)). #708 did it for enums,
+  but adding a field to a public struct with public fields was just as breaking.
+  A non-exhaustive struct cannot be built with a literal outside its crate at
+  all — not even with `..Default::default()` — so the split follows who builds
+  each one. Outside its crate, build a marked configuration struct with
+  `default()` and assign the fields you change.
+  - Configuration a caller fills in from defaults: `ScanOptions`, `MountConfig`
+    (which gains a `Default` matching a bare `musefs mount`, pinned by a test),
+    `FuseConfig`, and `musefs-cli`'s `Cli`, `MountArgs` and `MigrateArgs`.
+  - Results no other crate builds: `ScanStats`, `RevalidateStats`,
+    `CoreTelemetry`, `ProcessStats`, `metrics::Snapshot` and the tree's `Node`;
+    `Track`, `TrackIdentity`, `Tag`, `Art`, `ArtMeta`, `BinaryTagRow`,
+    `ChangelogRead` and `PendingStep`; and the format scanners' results —
+    `FlacScan`, `FlacMeta`, `Mp3Bounds`, `Mp4Bounds`, `Mp4Scan`, `BoxHeader`,
+    `OversizeDrop`, `OggHeader`, `OggScan`, `PageHeader`, `PictureDrop`,
+    `B64Window` and `WavBounds`.
+
+  Deliberately left exhaustive: the structs another crate builds field by field
+  in production — the store's write inputs (`NewTrack`, `NewArt`, `TrackArt`,
+  `BinaryTag`, `StructuralBlock`), the synthesis inputs (`ArtInput`,
+  `BinaryTagInput`, `TagInput`, `MetadataBlock`, `OggArt`), and the telemetry
+  `musefs-fuse` and the binary fill in. A new field on one of those is a value
+  every producer must supply, and the compile error is what makes each one do
+  it — the reason `Segment` stayed exhaustive. So a new store column remains a
+  breaking change for Rust code that writes rows. Also left: the value types
+  tests build directly (`Attr`, `VirtualMtime`, `BackingStamp`, `ResolvedFile`,
+  `WavScan`, `EmbeddedPicture`, `EmbeddedBinaryTag`).
+
+- **`tracks` is rebuilt by the 2.0.0 store migration.** This is the step that
+  makes the upgrade gated: `musefs migrate` runs it, and afterwards the store no
+  longer opens with an older musefs. It is one rebuild because SQLite can add
+  neither `AUTOINCREMENT` nor a column type nor a changed `CHECK` in place, and
+  `tracks` is the only table with children — three tables reference it
+  `ON DELETE CASCADE` and thirteen triggers are on it or name it — so it is the
+  expensive, once-only event every `tracks` schema change in this release rides.
+
+  The rebuild keeps foreign keys enforced throughout. With enforcement on,
+  `DROP TABLE` performs an implicit `DELETE` that cascades into the children and
+  fires their delete triggers, so the migration drops all thirteen triggers up
+  front, copies the parent and the three children into holding tables, recreates
+  `tracks` under its final name (no `ALTER TABLE ... RENAME`, whose schema
+  reparse is what V3's `art_ad` dance existed for), refills, and recreates the
+  index and the triggers. `content_version` is carried across rather than
+  bumped — every cache keys on it, and from this release the served virtual
+  mtime derives from it, so an accidental bump would be visible outside musefs
+  for a migration that changed no audio.
+
+  What rides it:
+
+  - `tracks.id` becomes `INTEGER PRIMARY KEY AUTOINCREMENT`
+    ([#678](https://github.com/Sohex/musefs/issues/678)), which is what forces
+    the rebuild. Without it SQLite's default allocator hands a deleted rowid
+    back out, and the incremental refresh treats a track id as a persistent
+    identity: a pruned track and a freshly ingested replacement collided on the
+    reused id, the format *and* the initial `content_version` (a fresh ingest
+    bumps a fixed number of times for two files of the same shape), so
+    `partition_changelog` classified the whole substitution as unchanged. The
+    mount kept listing the pruned track and never showed the new one until it
+    was remounted. Reading the ghost returned `EIO` rather than the wrong audio,
+    because the backing stamp guard still failed closed.
+  - `tracks.backing_path` becomes a `BLOB`
+    ([#680](https://github.com/Sohex/musefs/issues/680)), and so does the Rust
+    model — see the Fixed entry below for the half that stops the mangling. The
+    refill casts, which is what preserves identity:
+    SQLite never compares a `TEXT` value equal to a `BLOB`, so a refill that
+    copied the column unchanged would leave every existing row unreachable to a
+    byte-binding reader while the unique index failed to fire, silently giving
+    each track a second row. A `typeof` `CHECK` pins the storage class, since
+    declaring the column `BLOB` is an affinity and would still accept `TEXT`
+    through the same door
+    ([#718](https://github.com/Sohex/musefs/issues/718)).
+  - `tracks.backing_ino` is added
+    ([#674](https://github.com/Sohex/musefs/issues/674)). On filesystems that
+    truncate sub-second timestamps — FAT32, ext3, HFS+, some SMB and NFS mounts
+    — a same-size in-place rewrite inside the granularity window left all three
+    stamp fields identical and the freshness guard passed on changed bytes. The
+    inode catches the *replacement* shape, which is what almost every tagger
+    actually does (write a temporary file, rename over the original). Zero is
+    the sentinel for "not yet known", matching the `backing_ctime_ns`
+    precedent, so an upgraded store is not taken dark and the guard arms per row
+    as scans happen. It joins `tracks_geometry_au`'s bump set, since a changed
+    inode means the backing file was replaced.
+  - The lower bounds on `backing_mtime_ns` and `backing_ctime_ns` are dropped
+    ([#696](https://github.com/Sohex/musefs/issues/696)), so a file dated before
+    1970 — an archival rip, a restored backup, anything whose mtime came from
+    the original media's metadata — reaches the mount instead of probing
+    cleanly and then dying at a `CHECK` as a failed file.
+  - Storage-class constraints land on every column
+    ([#718](https://github.com/Sohex/musefs/issues/718)). SQLite's declared
+    types are affinities, so a row satisfying every `CHECK` could still be a
+    Rust conversion failure — which surfaces as a store-wide error rather than
+    as the malformed row it is.
+  - Both checksum columns ban an embedded NUL
+    ([#693](https://github.com/Sohex/musefs/issues/693)). `length()` on `TEXT`
+    counts characters only up to the first NUL, so 64 valid hex characters
+    followed by NUL and any amount of anything satisfied `length() = 64` while
+    storing something that is not a 64-character identity.
+  - Every fingerprint is retired
+    ([#691](https://github.com/Sohex/musefs/issues/691)), folded into the refill
+    rather than run as a statement of its own — the refill rewrites every row
+    anyway. `musefs migrate` reports how many rows are owed a rescan and offers
+    to run one.
+
+  `content_hash` is the one column the refill sanitizes rather than aborting on:
+  it is scanner-owned and a rescan recomputes it, which is the case the
+  sanitize-only-under-a-flag policy carves out. Every other tightened column is
+  structural or `NOT NULL`, so a row violating one fails the migration. The
+  failure is atomic — every step runs in one transaction, so nothing is
+  half-applied and the store is exactly as it was.
+
+  **External writers break here.** The path column changes type under every
+  query, and because SQLite never compares `TEXT` equal to `BLOB` the failure is
+  silent: a lookup binding a string matches nothing instead of erroring. The
+  `contrib` helpers gained `path_param`/`path_value` and encode at the boundary;
+  third-party writers must do the same.
+
+- **`tags` and `track_art` are rebuilt by the same migration**, for four reasons
+  that each needed a `CHECK` or a key SQLite cannot alter in place.
+
+  **The ordinal space splits in two**
+  ([#663](https://github.com/Sohex/musefs/issues/663)). `tags`' primary key was
+  `(track_id, key, ordinal)`, which did not discriminate on `value_blob`, so a
+  track's text rows and its binary rows were numbered in one space per key. The
+  scanner is not affected — it writes both classes together — but an external
+  writer that rewrites the text rows alone is, and that is exactly what both
+  `contrib` helpers do: they scope their `DELETE` to `value_blob IS NULL` so
+  scanner-written binary payloads survive a sync. Such a writer could land a text
+  row on an ordinal a binary row already held and get
+  `UNIQUE constraint failed`. The primary key is replaced by a unique index on
+  `(track_id, key, ordinal, (value_blob IS NULL))`: the expression yields 0 or 1
+  and never NULL, so uniqueness is per class while one row of each may share a
+  triple. The rowid is deliberately untouched: a binary tag payload is addressed
+  by it from the served layout.
+
+  One index rather than the two partial ones the issue sketched, because a
+  partial index can only serve a query whose `WHERE` implies its predicate.
+  Every Rust reader constrains `value_blob`, but `tags_for_track` in the
+  `contrib` helpers deliberately does not — it reads both classes at once — and
+  against two partial indexes that plans as `SCAN tags` plus a temp B-tree for
+  the `ORDER BY`, where the primary key used to serve it. A query-plan test now
+  pins every read shape to an index.
+
+  **Row ownership becomes immutable**
+  ([#717](https://github.com/Sohex/musefs/issues/717)). `tags_au` and
+  `track_art_au` bumped only `NEW.track_id`, so moving a row between tracks left
+  the *old* owner serving a stale synthesized header under a `content_version`
+  that still matched — and for binary tags, a cached layout still holding a rowid
+  that had moved to another track, which is the wrong-row class #502 hardened
+  against. Two `BEFORE UPDATE OF track_id` triggers now refuse the reparent, the
+  way `art_reject_content_update` already refuses art mutation. No writer needs
+  it: both `contrib` helpers replace by delete-then-insert, and moving a tag
+  between tracks is not one edit to one thing — two tracks change, and
+  delete-then-insert says so. The two `_au` bumps widen to
+  `WHERE id IN (OLD.track_id, NEW.track_id)` anyway, so the invalidation is
+  correct on its own terms rather than only because something else forbids the
+  case it mishandled — which matters against a writer that drops triggers
+  through `writable_schema`. Naming `track_id` in a `SET` list without changing
+  it is not a reparent and still works.
+
+  **The picture metadata moves to the link**
+  ([#716](https://github.com/Sohex/musefs/issues/716)).
+  `track_art` gains `mime`, `width`, `height`, `depth` and `colors`, and `art`
+  gives the first three up in the same step. `art` is
+  deduplicated on `sha256(data)` but owned those columns, which is the wrong
+  functional dependency: they describe one file's `PICTURE`/`APIC` block, not the
+  bytes every file shares. Since `upsert_art` is `ON CONFLICT(sha256) DO
+  NOTHING`, whichever occurrence was ingested first permanently chose them for
+  every track referencing the blob — so two files holding byte-identical art
+  served whichever one the scan happened to reach first, *including its declared
+  MIME type*. A library holding the same cover as FLAC and MP3 hits this
+  routinely, because `APIC` carries no dimensions and `PICTURE` does. `depth` and
+  `colors` are new storage for values FLAC's parser already reads and discards.
+
+  The backfill copies the shared `art` values to every link, because the true
+  per-embedding ones were destroyed at ingest; a `revalidate` restores them for every picture a file embeds itself — the pass `musefs migrate` offers once it finishes. Then
+  `art` is rebuilt without them — see the `art` rebuild below, whose ordering
+  constraint is what makes the window for that exist. What is left on the row is
+  the content and its identity: `id`, `sha256`, `byte_len`, `data`.
+
+  External writers using the `contrib` Python library see one change:
+  `upsert_art(conn, data, mime)` is now `upsert_art(conn, data)`. The argument
+  was already ignored whenever the image had been seen before — that is what
+  `ON CONFLICT(sha256) DO NOTHING` means — and there is no longer a column for
+  it to write. `replace_track_art`, which gained the mime in the previous step of
+  this same release, is now where it goes.
+
+  **And both tables gain the constraint work**: storage classes pinned
+  ([#718](https://github.com/Sohex/musefs/issues/718)) — including upper bounds
+  tying the geometry to the Rust model's `Option<u32>` — and an embedded NUL
+  banned in the tag key and the art description
+  ([#693](https://github.com/Sohex/musefs/issues/693)). #693's ban on the art
+  mime arrives with the column at its new home, and there is only the one home.
+
+- **`structural_blocks` is rebuilt as well**
+  ([#732](https://github.com/Sohex/musefs/issues/732)) — the fourth and last of
+  the rebuilds, and what makes "every core table pins its storage classes" true
+  rather than nearly true. It
+  was the one table V4 would otherwise have left alone — its shape does not
+  change — and so the last place a schema-valid row could still reach the reader
+  as a `rusqlite` conversion failure: a non-integral `REAL` `ordinal` or a `TEXT`
+  `body` is what affinity will not convert, and each surfaced as a store-wide
+  error rather than as the malformed row it is. (`kind` needs no such check: its
+  `IN` list is strictly stronger, since no non-`TEXT` value compares equal to
+  either name.) The value checks were always there and still are; what was
+  missing was the storage class that lets them be the thing that fires.
+
+  "Non-integral" is the whole of it, and worth saying: `INTEGER` affinity
+  converts an exactly-integral `REAL` — `1.0` is stored as the integer 1 and is
+  not a violation at all. A storage-class `CHECK` earns its keep only on what
+  affinity cannot convert, which is precisely the set that reaches Rust as a
+  conversion failure rather than as a wrong value.
+
+  Low severity on its own — `structural_blocks` is outside the editable
+  contract, so reaching it needs a writer that ignores that. It is here on
+  timing: the migration **already** holds this table's rows while `tracks` is
+  rebuilt and refills them afterwards, so the empty window and the copy both
+  exist and this cost a drop and a create. Left for a future major it would have
+  cost a gated migration of its own, for a robustness fix nobody would schedule
+  one for.
+
+- **`art` is rebuilt by the same migration** — the third of the four, and the
+  one with an ordering constraint the others did not have. `track_art.art_id`
+  references `art(id)` with **no** `ON DELETE CASCADE`, so with foreign keys
+  enforced `DROP TABLE art` fails outright while any link row exists. The only
+  point in the migration where the table can be replaced at all is after
+  `track_art` has been recreated and before the children are refilled, which is
+  exactly where it sits. It is also the expensive step: every image blob is
+  copied twice and the store transiently holds about its own size again, which
+  is what `musefs migrate`'s free-space pre-flight checks before starting.
+
+  `art_reject_content_update` comes back with the row's **key** in its guard
+  ([#719](https://github.com/Sohex/musefs/issues/719)). `UPDATE art SET id = …`
+  changes none of the content columns, so the `WHEN` clause was false and the
+  trigger never fired. With foreign keys on, the update fails on its own — but
+  this store deliberately defends against writers that turn them off, and under
+  that model the id change orphaned every link while nothing bumped
+  `content_version`: `art_ad` is `AFTER DELETE` only, so the one trigger that
+  fans out to referencing tracks never saw it, and a cached layout kept serving.
+  If the old id were later reused by an unrelated row, that layout would point
+  at the wrong image.
+
+  The same rebuild is where `art` sheds `mime`, `width` and `height`
+  ([#716](https://github.com/Sohex/musefs/issues/716)) — the backfill above has
+  already taken their values to the link, and the holding copy of the old table
+  is what it reads them from, since the real one has stopped having them by then.
+
+  Storage classes are pinned here too
+  ([#718](https://github.com/Sohex/musefs/issues/718)), and `sha256` gains the
+  NUL ban ([#693](https://github.com/Sohex/musefs/issues/693)), because a
+  64-character prefix followed by NUL and anything satisfied a `length() = 64`
+  identity check, which for a content address is the whole meaning of the column.
+
+  The refill is straight rather than sanitizing: `art` carries no scanner-owned
+  column a rescan could recompute, so there is nothing the
+  sanitize-only-under-a-flag policy would let this step null on its own. A row
+  the tightened constraints reject fails the migration, atomically, the way it
+  does for the rebuilds above.
+
 
 - Directory handles on the same directory share one listing instead of copying
   it each. `opendir` took a private snapshot per handle, so the table's memory
@@ -139,76 +515,425 @@ see the [Release notes](release-notes.md).
   exit code and that summary are the signals to key on. The engineering is in
   Fixed below. See [Scanning](guide/scanning.md#scan) and
   [Exit codes](guide/troubleshooting.md#exit-codes).
+- **Schema migration (`user_version` 3 → 4).** `MIGRATION_V4` sets every
+  `tracks.fingerprint` to NULL. The fingerprint's input domain changed (it now
+  includes sampled audio), so a value computed by an earlier musefs claims to be
+  something this build no longer produces. Nulling is honest and costs nothing
+  that leaving them would have saved: an old value cannot match a new one
+  either. The next `revalidate` recomputes them — it re-probes a row missing the
+  checksum its tier asks for, which a plain `scan` of a tracked file does not —
+  and until then those
+  rows cannot be move-recovered, exactly as an unfingerprinted row never could.
+  `content_hash` is untouched; it is a full-file SHA-256 and its meaning has not
+  changed. Like every migration this is one-way: the store will no longer open
+  with an older musefs
+  ([#691](https://github.com/Sohex/musefs/issues/691)).
+
+- **Migrations are classified transparent or gated.** Every schema step up to
+  1.3.0 was applied as a side effect of opening the store. That is right for a
+  step whose cost and consequences nobody notices, and wrong for one that
+  rewrites data the user did not ask to have rewritten, transiently needs the
+  store's size again in free disk, or ends compatibility with the binary they
+  were running yesterday. Each entry in `MIGRATIONS` now declares which it is.
+  An open that finds a gated step pending applies nothing — not even the
+  transparent steps ahead of it, each of which would already lock the previous
+  release out ([#749](https://github.com/Sohex/musefs/issues/749)) — and
+  refuses with `DbError::StoreNeedsMigration`, which names the `musefs migrate`
+  command. That is the opposite direction from `StoreTooNew` and carries the
+  opposite remedy — upgrade the store, not the binary — so the two are separate
+  variants with separate messages. Nothing is stored: the binary owns the
+  classification, so a user jumping from 1.2 straight to 2.1 is still gated on
+  the step that needs it. A store being *created* is exempt, having no data to
+  endanger, or `scan` could never build a new library. The consequence for two
+  callers is visible: `mount` and `vacuum` stop upgrading an older store
+  implicitly, and `vacuum`'s help text, which advertised that it did, no longer
+  says so. `MIGRATION_V4` is the first gated step
+  ([#706](https://github.com/Sohex/musefs/issues/706)).
+
+  Which release a step came from is recorded alongside it, and the contract
+  that follows is enforced by a `const` assertion rather than by review: **a
+  gated step may only be introduced by a major release**, so musefs will not
+  build if one is added to a minor or a patch. That turns the classification
+  into something a user can act on without knowing what a `user_version` is —
+  crossing a major boundary may ask for `musefs migrate`, and a minor or patch
+  upgrade never will. The converse is not asserted: a major release is free to
+  carry only transparent steps, as `MIGRATION_V3` does.
+
 - The `tags.value` cap rises from 256 KiB to 16 MiB − 1, and
   `track_art.description` from 1 KiB to 8 KiB (schema `MIGRATION_V3`). The new
   tag cap is FLAC's 24-bit metadata-block ceiling — the largest tag synthesis
   could ever serve — so the store no longer refuses a tag the format itself can
-  carry. Existing stores upgrade in place, and automatically, on the next
-  `musefs scan` or `musefs mount`: both open the store read-write and run the
-  migration, which only widens the constraints and so carries every existing row
-  across. No rescan of audio is needed and nothing has to be regenerated.
-- A backing file whose metadata exceeds a store limit now fails **that file**
-  instead of being stored with the offending part quietly dropped. Oversize
-  embedded art and binary tags were previously omitted from an otherwise-stored
-  track with only a `warn` to show for it, which is easy to lose in a scan of
-  ten thousand files and leaves a mount silently missing data. Such a file is
-  now logged with its path, what was too big, its size and the limit, counted
-  `failed`, and skipped; the rest of the directory scans normally.
-- The virtual tree interns each node name into one shared `Arc<str>` rather than
-  storing it separately in `Node.name`, `Node.rendered_name`, the `children` key
-  and both `rendered_children` keys ([#617](https://github.com/Sohex/musefs/issues/617)). Measured over 200,000
-  tracks / 222,001 nodes: ~1713 to ~1284 bytes per track (~84 MiB, -25%), with
-  tree build 10-15% faster from the removed allocations. A case-insensitive
-  mount saves more, since `folded_children` held a sixth copy. The tuning guide
-  gained a "Memory footprint" section. The full rendered paths were still stored
-  twice at this point; the next entry shares those as well.
-- Each entry's rendered path is stored once and shared between the inode
-  allocator's map key and `TrackRenderState.path`, rather than allocated
-  independently by each ([#629](https://github.com/Sohex/musefs/issues/629)). Measured over 200,000 tracks with
-  41-byte paths: 1150 to 1078 bytes per track (-6%); with 137-byte paths the
-  saving is -14%. What it removes is exactly one whole path per track, so the
-  gain tracks path length and template depth rather than track count — a flat
-  `--template` gains little. Sharing is conditional: a disambiguated leaf keeps
-  its own allocation, since keying it on the path its bare-named sibling already
-  interned would collapse two nodes onto one inode.
-- Full tree rebuilds and the head of every scan read projected columns instead
-  of materializing a whole `Track` per row ([#621](https://github.com/Sohex/musefs/issues/621)) — roughly 40 MB of
-  transient allocation on a 200,000-track store, on a path already holding a
-  pool connection.
-- The serve-path warn rate limiter is process-wide instead of FUSE-local
-  ([#650](https://github.com/Sohex/musefs/issues/650)). It bounds failure warns
-  to a burst of 10 per 30-second window, but it lived in `musefs-fuse` and was
-  reachable only from the errno-reply path, so the warns synthesis itself emits
-  bypassed it: a dropped Vorbis tag key (once per header-cache miss, and that
-  cache is byte-budgeted, so an evicting library re-warns for the same track
-  indefinitely), art over the byte cap, and a failed art-blob read — the last
-  fires per art *window*, so one bad blob produced many lines for one file. The
-  limiter now lives in `musefs-core` next to `telemetry.rs` and both crates
-  share one budget, which is the right unit: the operator's concern is total
-  serve-path log volume, not per-crate volume. Only the budget is shared, not
-  the attribution: the emit side is the `musefs_core::serve_warn!` macro, so
-  each record still takes its target from the call site's own module and
-  per-crate `RUST_LOG` filtering (`RUST_LOG=warn,musefs_fuse=debug`) reaches
-  exactly what it did before.
-- `readdir`'s unknown-`fh` fallback runs on the worker pool instead of inline on
-  the fuser dispatch thread ([#623](https://github.com/Sohex/musefs/issues/623)), matching the offload every other
-  blocking operation already used. This matters more now that over-cap `opendir`
-  makes that fallback the normal path for large directories.
-- Scan failures are now broken down by reason and their per-file warnings capped
-  ([#651](https://github.com/Sohex/musefs/issues/651)). A scan that ends
-  `failed 37` also logs `failed 37: unparseable=30, io=5, oversize=2` (and
-  `walk errors N: …` for directories the walk could not read), so the number
-  that drives the exit-2 partial-failure signal explains itself instead of
-  having to be reconstructed from N individual lines. The per-file messages
-  themselves are capped at ten per reason per scan, the rest dropping to
-  `debug` — an unreadable subtree or a share that went away mid-scan no longer
-  emits one warning per file. The existing per-extension skip breakdown moves
-  from `warn` to `info` (so it now needs `-v` / `RUST_LOG=info`): cover art and
-  `.cue` sidecars are the normal contents of a music library, and a warning on
-  every healthy scan only teaches operators to tune warnings out. The `skipped`
-  count itself is unchanged and still printed in the per-target summary.
+  carry. The step only widens constraints, so it carries every existing row across
+  and needs no rescan. On its own it would apply on any open, but in 2.0.0 it
+  sits ahead of the gated migration, so `musefs migrate` applies it with the rest
+  ([#749](https://github.com/Sohex/musefs/issues/749)).
+
+### Removed
+
+- **`scan --revalidate`**, deprecated since 1.2.0 in favour of the `revalidate`
+  subcommand, and its `MUSEFS_REVALIDATE` variable
+  ([#707](https://github.com/Sohex/musefs/issues/707)). The flag is now a usage
+  error. The variable is refused rather than ignored: clap never reads an
+  environment variable no flag declares, so a unit file still setting it would
+  have gone on running a full scan where it used to revalidate, and said
+  nothing. `scan` stops with a message naming the subcommand instead.
+  `musefs_cli::run_scan` loses its `revalidate` parameter. The `contrib`
+  packages have called the subcommand since their 1.2.0, so only a copy older
+  than that is affected.
+
+- **`scan --fast` and `--strict`, replaced by `--match=auto|fast|strict`**, and
+  `MUSEFS_FAST`/`MUSEFS_STRICT` by `MUSEFS_MATCH`
+  ([#709](https://github.com/Sohex/musefs/issues/709)). Match strictness has
+  three states, and two booleans spent a fourth on a combination the CLI had to
+  detect and reject; one value has no such combination, and takes the same
+  shape as `--checksum` beside it. `auto` is the default and behaves exactly as
+  passing neither flag did. The old flags are usage errors, and the old
+  variables are refused with the `MUSEFS_MATCH` value to use — ignoring
+  `MUSEFS_STRICT=true` would have quietly weakened how a moved file is
+  confirmed. `musefs_cli::run_scan` takes a `MatchMode` in place of the two
+  booleans.
+
+- **Test scaffolding is no longer published API**
+  ([#710](https://github.com/Sohex/musefs/issues/710)).
+  `musefs_core::scan_directory_full_oracle`, the `*_for_test` methods on
+  `Musefs` and `Db`, and `musefs_format::ogg::page_test_support` were `pub` so
+  the crates' own integration tests could reach them — most of them behind
+  `#[doc(hidden)]`, which keeps a symbol out of rustdoc but not out of semver,
+  and `Musefs::refresh_for_test` not even that. They are compiled for tests
+  only now: `musefs-core` and `musefs-db` each gain a `test-support` feature
+  their own test builds switch on, `page_test_support` joins `fuzz_check`
+  behind `musefs-format`'s `fuzzing`, and the five helpers only a crate's own
+  unit tests call are `pub(crate)`. Nothing outside the test suites called any
+  of them. `musefs_db::seed_store_at_version`, which builds a store at an old
+  schema version, was missed at first and followed under `musefs-db`'s
+  `test-support` ([#751](https://github.com/Sohex/musefs/issues/751)).
 
 ### Fixed
+
+- **`musefs migrate` exits `2` when the revalidate it ran counted failures**
+  ([#750](https://github.com/Sohex/musefs/issues/750)). It discarded the count
+  and exited `0`, so `musefs migrate --yes --revalidate && …` treated a partial
+  revalidate as a clean one, while `musefs revalidate` run on its own exits `2`
+  for the same result. The store upgrade has succeeded either way, and the run
+  says so before exiting. `musefs_cli::run_migrate` returns the failure count.
+- **A chained Ogg file stored by 1.3.0 no longer fails every revalidate for
+  good.** 2.0.0 refuses chained Ogg at scan time, which left the rows an older
+  binary stored with no way out: `revalidate` re-probed each one, was refused,
+  wrote nothing, and counted it in `failed` — exiting `2` — on every run, while
+  neither `scan --force` nor `--prune` (which only removed rows whose file was
+  gone) could remove it. `revalidate --prune` now also deletes a row whose
+  file is present but refused as unsupported, only for that refusal and only
+  while the file is unchanged since; without `--prune` the run says how many
+  there are. The failure breakdown gains an `unsupported` reason
+  ([#747](https://github.com/Sohex/musefs/issues/747)).
+- **A revalidate restores each file's own picture metadata.** The schema v4
+  migration can only copy one blob's MIME type and dimensions onto every link
+  to it, with FLAC's depth and colour count at 0, and said the real values
+  came back on a rescan — but the revalidate `musefs migrate` offers never
+  touched art, so only `scan --force`, which replaces curated tags and art,
+  restored them. A revalidate now restores the MIME type, dimensions, depth
+  and colours of every link whose image, picture type and description are one
+  the file embeds, and leaves every other link alone
+  ([#746](https://github.com/Sohex/musefs/issues/746)).
+- **Metadata work can no longer grow the worker-pool queue without bound.**
+  Reads were capped; `lookup`, `getattr`, `open`, `opendir` and directory
+  listings queued without limit. They now pass an admission gate of 4096 jobs,
+  and over it run on the submitting thread, which throttles the kernel instead
+  of refusing the call; a `readdirplus` entry over the cap is listed with
+  uncached attributes. Store refreshes moved to a thread of their own. The new
+  `musefs_pool_over_cap_total` counter shows when the cap is met.
+  ([#694](https://github.com/Sohex/musefs/issues/694))
+- **A directory listed without a handle can no longer repeat or skip entries
+  when the library changes mid-listing**
+  ([#695](https://github.com/Sohex/musefs/issues/695)). Past the 1,024
+  directory-handle cap, which a parallel walker over a large mount routinely
+  reaches, each `readdir` page was rebuilt from whatever tree was current and
+  resumed at a plain index. A store change landing between two pages shifted
+  the entries under that index, so one enumeration could return an entry twice
+  or miss one. The first page of such an enumeration now pins its listing and
+  tags the cookies it returns with that generation, so every later page reads
+  the same listing. Up to 64 listings stay pinned; one evicted before its
+  enumeration finishes falls back to the old behaviour.
+
+- **A crafted `art` row can no longer hand one image's bytes to a file embedding
+  another** ([#724](https://github.com/Sohex/musefs/issues/724)). `art` is
+  deduplicated by `sha256`, and on a conflict the writers returned the row
+  already filed under the digest without looking at its bytes. Nothing in the
+  schema can tie the digest to the data, so a store holding a row whose `sha256`
+  names bytes it does not hold linked that row to every file embedding the real
+  image. Both writers now compare a conflicting row's bytes with the incoming
+  image before using it. `musefs scan` fails only the file that would link it,
+  counted under `rejected`, and compares each distinct row at most once per
+  scan, so a cover shared across an album costs one comparison; the `contrib`
+  helper `upsert_art` raises `ArtDigestMismatch`, which `sync_one` skips like a
+  constraint violation. A poisoned row nothing dedups onto is not detected, and
+  the readers still serve what a link points at.
+
+- **A backing file rewritten mid-read fails that read, not the next one**
+  ([#682](https://github.com/Sohex/musefs/issues/682)). Both read paths checked
+  the backing file against its stored stamp *before* reading from it, so an
+  in-place rewrite landing between the check and the positioned read returned
+  bytes from the new file spliced into the layout synthesized for the old one;
+  only the following read noticed. The check now runs after the bytes are
+  acquired, replacing the earlier one rather than adding a second stat, and a
+  detected change takes precedence over whatever the read itself reported,
+  since a rewrite can surface as a short read first. Bytes served from the
+  read-ahead window were acquired by an earlier read whose own check covered
+  them.
+
+- **A symlink retargeted during a `--follow-symlinks` scan can no longer store
+  one file's geometry against another file's path**
+  ([#684](https://github.com/Sohex/musefs/issues/684)). The scan probed the
+  walked name and then canonicalized it — two lookups of the same symlink — so a
+  retarget between them ingested a row whose stamp and bounds described one file
+  and whose path named another. It failed closed (every read refused it with
+  `BackingChanged`), but the track was permanently unreadable while the file
+  looked fine. The path is now resolved once and the probe reads what was
+  resolved. A probe failure under `--follow-symlinks` therefore names the
+  resolved target rather than the link.
+
+- **The backing-freshness guarantee is documented for the reads it actually
+  covers** ([#683](https://github.com/Sohex/musefs/issues/683)). The docs said
+  the held descriptor is re-stated on every read, and that re-tags keep cached
+  bytes from going stale. Both are true of what reaches musefs; with
+  `--keep-cache`, on by default, a read the kernel serves from its page cache
+  never does. So an in-place rewrite of a backing file behind a file that is
+  already open and cached is caught at the next open — which fails with `EIO` —
+  rather than on those cached reads, provided the rewrite moved the file's size,
+  mtime, ctime or inode; a same-size rewrite in place on a filesystem with
+  coarse timestamps can move none of them, and then no open catches it. The behaviour is unchanged and deliberate;
+  the architecture page and the tuning table now say so.
+
+- **`musefs vacuum` refuses a store a mount has open, as it always said it did**
+  ([#721](https://github.com/Sohex/musefs/issues/721)). It relied on `VACUUM`
+  failing on a busy lock, and in WAL mode a mount idle between reads holds none,
+  so it compacted the store underneath a live mount. It now claims the store the
+  way `musefs migrate` does — a claim that needs SQLite's shared-memory index to
+  itself, so an idle mount and a read-only connection both count — and holds it
+  until it is done. The one case it cannot see in advance is a process that has
+  opened the store but not yet read from it; that process is kept out from the
+  moment it tries.
+
+- **A crafted `structural_blocks.kind` is refused before it is read**
+  ([#715](https://github.com/Sohex/musefs/issues/715)). The reader checked the
+  value against its two-name allowlist only after materializing it, and a store
+  written under `PRAGMA ignore_check_constraints` can hold any length there, so a
+  hostile row cost its full size twice — once read, once more debug-escaped into
+  the error — before being rejected. The column is now bounded from its
+  character and byte lengths first, like every other text column the readers
+  guard, at a cap pinned by a test to the longest allowlisted kind.
+
+- **A synthesized file's mtime now moves whenever its bytes do, and a pre-epoch
+  backing file is served as one.** Two fixes in the same type, because both are
+  about what the mount reports as a timestamp
+  ([#696](https://github.com/Sohex/musefs/issues/696),
+  [#725](https://github.com/Sohex/musefs/issues/725)).
+
+  The reported second is the later of the backing file's and the row's
+  `updated_at`, which triggers stamp in whole seconds. So two metadata edits
+  inside one wall-clock second left the same second behind, and a same-length
+  tag rewrite looked untouched to anything comparing size and mtime — rsync
+  without `--checksum`, Syncthing, media scanners. A backing mtime in the future
+  was worse: `max` meant it masked *every* metadata edit for as long as the skew
+  lasted. musefs itself was never wrong, because its caches key on
+  `content_version`; the contract presented outward was. The mount now reports
+  that same counter as the timestamp's nanoseconds, so a store change that
+  changes the synthesized bytes always moves the mtime. Nothing in the store
+  holds nanoseconds — the precision is derived where the timestamp is built, and
+  only in synthesis mode: `--mode structure-only` serves the backing file
+  verbatim, where a tag edit changes nothing and must not claim to.
+
+  Separately, `Attr`'s `mtime_secs` was a bare `i64` in which zero meant both
+  "synthetic directory" and "the Unix epoch", and the mount substituted the
+  mount time for anything at or below zero. A file whose mtime really was the
+  epoch therefore reported the wrong time, and every pre-epoch file would have
+  once v4 stopped refusing one. The field is an `Option` now, so the fallback
+  fires for the synthetic case and nothing else.
+
+  What the virtual mtime promises is written down for the first time, in
+  [the serving model](architecture/serving.md).
+
+- Two audio files whose names differ only in bytes that are not valid UTF-8 are
+  no longer silently merged into one track
+  ([#680](https://github.com/Sohex/musefs/issues/680)). A filename on Unix is an
+  arbitrary byte string, and the scanner stored `to_string_lossy()` as the row's
+  identity — every invalid sequence became `U+FFFD`.
+
+  Two things followed, and the second is the serious one. The stored path did
+  not exist on disk, so the track could never be served: every resolve failed
+  its `metadata` call. And two distinct byte paths converged on the same
+  `U+FFFD`-bearing string, where `ON CONFLICT(backing_path) DO UPDATE` merged
+  them into a single row carrying one file's identity and the other's tags. The
+  scan reported success — nothing in the `skipped` or `failed` counts, no
+  warning, one track simply gone.
+
+  The extension filter offered no protection: `is_supported_audio` looks only at
+  the extension, so `bad\x80name.flac` probed fine and reached the insert with
+  its identity already mangled.
+
+  The models, the scanner's in-flight identity, the already-present set, the
+  retarget writer, the backing-path listing and the error variants that name a
+  file are all byte-typed now (`PathBuf`, which *is* bytes on Unix). Lossy
+  conversion survives only where a path is genuinely rendered for a person to
+  read: log lines, the progress bar's label, error messages.
+
+  One knock-on worth naming: `CoreError::BackingChanged` had been carrying a
+  `String` that was sometimes a path and sometimes a sentence. The sentences
+  moved to a new `CoreError::DerivedStateStale`, which travels with it
+  everywhere it matters — same errno, same retry, same attr-cache drop — but
+  says what it actually means.
+
+- The freshness guard no longer passes on changed bytes when the backing
+  filesystem has no sub-second timestamps
+  ([#674](https://github.com/Sohex/musefs/issues/674)). The column landed in
+  the 2.0.0 migration above; this is the half that writes and reads it.
+
+  `BackingStamp` was `(size, mtime_ns, ctime_ns)`. #276 had already strengthened
+  it past size plus whole-second mtime, with `ctime` as the adversarial backstop
+  a writer cannot set backward. The residual hole was filesystems that store no
+  sub-second times at all — FAT32's two-second granularity and no ctime, ext3,
+  HFS+, some SMB and NFS mounts truncating the nanosecond fields — where a
+  same-size replacement inside the granularity window leaves all three fields
+  identical to what was scanned. The guard passed, and the reader was served a
+  mix of new audio bytes and a metadata region synthesized for the old content.
+
+  The inode closes the *replacement* shape: a new file moved over the old one
+  gets a fresh one. It does not close a true in-place rewrite, which is a POSIX
+  timestamp limitation rather than something musefs can fix — but the
+  replacement shape is what almost every tagger actually does, writing a
+  temporary file and renaming over the original. The false-positive cost is
+  nil: an inode changes when a file is copied, restored from backup or moved
+  across devices, and all three already invalidate the stamp today, because
+  `ctime` cannot be preserved by `cp -a` or rsync either.
+
+  **A stored inode of zero means "not recorded", not "inode zero"** — the state
+  every row in an upgraded store starts in — and such a row is compared on the
+  other three fields alone. Failing closed on a field the store has nothing to
+  say about would take an entire library offline on the first serve after an
+  upgrade. `musefs revalidate` re-probes exactly the rows still holding
+  the sentinel and fills it in, which makes it the complete repopulation path
+  for an upgraded store alongside the structural-block and checksum backfills it
+  already covered.
+
+  The column stores the inode's **two's-complement bit pattern**, so a file
+  whose inode is above `i64::MAX` records a negative value. SQLite has no
+  unsigned 64-bit integer and `st_ino` is a full `u64`, so an encoding is
+  forced — and the alternative is not a lost guard but a failed scan: rusqlite
+  refuses the bind, and a bind failure is not a constraint violation, so the
+  scanner classifies it as fatal and the whole run aborts. That range is not
+  theoretical; FUSE and network filesystems synthesize inode numbers freely,
+  and several pooling and cloud-mount filesystems hash to produce them. The
+  encoding is a bijection and the column is only ever compared for equality, so
+  it costs nothing it is used for. The v4 `CHECK` therefore pins the storage
+  class without a lower bound.
+
+  The comparison is a named, asymmetric method rather than `==`: one side is
+  stored and may know nothing, the other is live and always knows, and the
+  sentinel rule is not transitive — a stamp with no recorded inode matches two
+  live files that do not match each other. Spelling that as equality would hand
+  the next reader an `==` that breaks the `Eq` contract.
+
+- Chained Ogg is now detected and skipped at scan time, and refused at serve
+  time ([#722](https://github.com/Sohex/musefs/issues/722)). A chain is complete
+  logical bitstreams concatenated end to end, which RFC 3533 allows and the docs
+  claimed musefs rejected. It did not: `validate_single_bitstream` walks pages
+  only up to `audio_offset`, which proves the *header* region carries one serial
+  and one beginning-of-stream page, and a chain's second stream necessarily
+  begins after the first stream's audio does. Everything from `audio_offset` to
+  EOF was taken as one audio region, and the serve path applied one constant
+  sequence delta across all of it with no serial check. That delta is zero only
+  while the synthesized header happens to occupy as many pages as the original,
+  so a tag edit that changed the page count shifted every page of the second
+  stream — whose own numbering restarts at zero by spec — with the first
+  stream's delta, recomputing each CRC to match. The output was corrupt in a way
+  that passed a page-level integrity check.
+
+  Detection is the file's final page: a chain's last page belongs to its last
+  stream, so a serial other than the header's proves chaining for the whole
+  well-formed-chain class. The scanner reads one page-sized window
+  (`ogg::MAX_PAGE_BYTES`) from the end of the file and classifies it
+  (`ogg::classify_tail`) — one bounded read per Ogg file, rather than the walk
+  over the whole audio region that a page-by-page check would cost. A file whose
+  final page does not end on its last byte, which is what truncation looks like,
+  is reported as indeterminate and still scans and serves as before.
+
+  Independently, `serve_ogg_window` now refuses a page whose serial is not the
+  resolved file's, so a row written by an older binary — or by an external
+  writer — fails closed instead of serving renumbered nonsense. The audio
+  segment carries the serial for that purpose. Existing rows keep their too-wide
+  bounds. No rescan fixes one, since the scanner now refuses the file;
+  `revalidate --prune` removes it ([#747](https://github.com/Sohex/musefs/issues/747)).
+
+- FLAC-in-Ogg files whose mapping header declares a header-packet count of zero
+  now ingest their tags and art, and synthesize correctly
+  ([#723](https://github.com/Sohex/musefs/issues/723)). The 16-bit count in
+  packet 0 is the number of metadata packets that follow, but both RFC 9639 and
+  Xiph's mapping define zero as *unknown* — one or more metadata packets still
+  follow. Reading it as "none" ended the header run at packet 0, so the real
+  `VORBIS_COMMENT`, and any `PICTURE`, `SEEKTABLE` or `CUESHEET`, landed inside
+  what the store then recorded as audio. They were never ingested, so the mount
+  served the file with no tags and no art — and worse, synthesis emitted a
+  mapping packet plus one terminal `VORBIS_COMMENT` followed immediately by
+  those same original metadata packets, replayed verbatim as audio and
+  renumbered, so a decoder met metadata blocks where audio frames must be.
+
+  An unknown count is now resolved by the rule the format itself defines:
+  metadata blocks run until one sets the last-block flag, and a `STREAMINFO`
+  flagged last ends the run at packet 0. A run that reaches the audio packet
+  without ever flagging its last block has no discoverable end and is malformed.
+  A *nonzero* count is still taken at its word: the mapping requires a count it
+  gives to be the true number of following packets, and reserves zero for the
+  unknown case, so a compliant encoder writing zero is exactly the input this
+  fixes rather than an exception to it. Synthesis additionally
+  clears `STREAMINFO`'s last-block flag, since the regenerated comment block
+  always follows it. An existing row keeps its wrong `audio_offset` until a
+  revalidate re-probes it, and the tags and art 1.3.0 never read from such a
+  file arrive only through `scan --force`.
+
+- Both checksums are now derived inside the probe's stability transaction, from
+  the descriptor it already holds, instead of reopening the pathname afterwards.
+  The stamp was always captured first, so the skew was one-directional: a row
+  could record one generation's stamp, geometry and tags alongside a hash of the
+  next generation, or of a torn mid-write state. Serving failed closed on the
+  stamp later, but the value stored as the authoritative content identity was
+  garbage, and the retarget confirm — which decides an identity question and has
+  no such backstop — could compare a torn hash against a stored one. A file that
+  changes during hashing is now discarded as raced like any other, and the
+  retarget confirm refuses to answer unless the file still matches the stamp the
+  probe committed to. Separately, a `--checksum=full` run that cannot hash a
+  file now **fails** that file — counted in `failed` under a `checksum-failed`
+  bucket, and so reaching the exit-`2` signal — rather than committing a row one
+  tier below what the flag promised behind a warning nothing counted
+  ([#690](https://github.com/Sohex/musefs/issues/690)).
+
+- A row no longer claims a `content_hash` its bytes do not have. The checksum
+  write read a `None` argument as "leave the stored value alone", which is
+  right for a pass that computed nothing and wrong for a pass that watched the
+  file change, so a file rewritten in place and then re-probed at the
+  `fingerprint` tier kept the *previous* bytes' hash beside its new stamp,
+  geometry and tags. That broke the documented forensic identity and poisoned
+  move recovery: a later move of the rewritten file was refused on a hash
+  comparison it could never satisfy, orphaning the curated row. Each checksum
+  write now carries an explicit intent — keep, set, or clear — and a pass below
+  the `full` tier clears the column whenever it observes that the recorded bytes
+  changed, while still keeping a higher tier's value for a file that has not
+  changed. A `--match=fast` retarget, which confirms nothing by design, likewise no
+  longer inherits the departed file's hash
+  ([#689](https://github.com/Sohex/musefs/issues/689)).
+
+- A move no longer risks retargeting a curated row onto the wrong file. The
+  cheap `fingerprint` — the default tier — hashed only the probe's *parsed*
+  output, and structural blocks are FLAC-only, so for MP3, M4A, Ogg and WAV it
+  contained no audio bytes at all: two different files with the same tags, the
+  same art and an equal audio-region length shared one fingerprint. The default
+  strictness accepts a fingerprint-only candidate, so scanning such a file
+  where an orphaned row was the unique match moved that row's tags and art onto
+  audio they were never written for, silently. The fingerprint now folds in
+  three bounded windows of audio, sampled at the start, midpoint and end of the
+  audio region — at most 24 KiB of positioned reads per file against a
+  descriptor the probe already holds, so the tier still rides the probe rather
+  than becoming a whole-file pass
+  ([#691](https://github.com/Sohex/musefs/issues/691)).
 
 - A track that renders to `.musefs-metrics` or `.metadata_never_index` at the
   mount root no longer collides with the synthetic entry the FUSE layer injects
@@ -777,7 +1502,8 @@ First public release.
   `synthesis` / `structure-only` mount modes, auto-refresh, `scan` /
   `scan --revalidate`). Never published publicly; superseded by 0.2.0.
 
-[Unreleased]: https://github.com/Sohex/musefs/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/Sohex/musefs/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/Sohex/musefs/releases/tag/v2.0.0
 [1.3.0]: https://github.com/Sohex/musefs/releases/tag/v1.3.0
 [1.2.0]: https://github.com/Sohex/musefs/releases/tag/v1.2.0
 [1.1.0]: https://github.com/Sohex/musefs/releases/tag/v1.1.0

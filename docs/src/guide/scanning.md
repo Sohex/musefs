@@ -90,33 +90,58 @@ failures, are in
 
 - **`none`** — no checksums (legacy behavior).
 - **`fingerprint`** — compute a cheap fingerprint for each file, derived from
-  the probe's parsed output (tags, audio bounds, embedded art). This is the
-  default: it rides the existing probe at essentially no extra I/O cost and
-  is sufficient for routine move detection.
+  the probe's parsed output (tags, audio bounds, embedded art) plus three
+  bounded windows of audio sampled at the start, midpoint and end of the audio
+  region. This is the default: it rides the existing probe, adding at most
+  24 KiB of positioned reads per file and no whole-file pass, and it is
+  sufficient for routine move detection. The audio windows are what make it so
+  for every format — without them, two different MP3, M4A, Ogg or WAV files
+  with the same tags, the same art and an equal audio length share one
+  fingerprint, and a move can retarget the wrong row. It samples the audio
+  rather than hashing all of it, so it remains a heuristic: two files that agree
+  on every sampled window and differ only between them still collide.
 - **`full`** — fingerprint plus an eager full-file SHA-256. Use this when you
   want collision-proof retargeting or a forensic content identity for every
-  file.
+  file. A file this tier cannot hash is **failed**, not ingested one tier
+  lower: it is counted in `failed` (under `checksum-failed` in the end-of-scan
+  breakdown) and so reaches the exit-`2` partial-failure signal.
 
-Two flags govern how a fingerprint match is confirmed before retargeting a
-moved file:
+`--match` (env `MUSEFS_MATCH`) governs how a fingerprint match is confirmed
+before a moved file is retargeted:
 
-- **`--fast`** (env `MUSEFS_FAST`) — fingerprint match is always sufficient;
-  never reads the full file even when a stored `content_hash` exists.
-- **`--strict`** (env `MUSEFS_STRICT`) — require a full-hash match; if the
-  matched candidate has no stored `content_hash`, refuse the retarget and
-  insert a fresh row instead. The default (neither flag) auto-escalates:
-  full-hash the new file when the candidate already has a `content_hash`,
-  and trust the fingerprint alone when it does not.
+- **`auto`** (default) — escalate when there is something to escalate to:
+  full-hash the new file when the matched candidate already has a
+  `content_hash`, and trust the fingerprint alone when it does not.
+- **`fast`** — a fingerprint match is always sufficient; never reads the full
+  file, even when a stored `content_hash` exists.
+- **`strict`** — require a full-hash match; if the matched candidate has no
+  stored `content_hash`, refuse the retarget and insert a fresh row instead.
 
-`--fast` and `--strict` are mutually exclusive.
+**Upgrading from musefs 1.3.0 or earlier.** The schema upgrade clears every
+stored fingerprint, because the value now includes sampled audio and the old
+ones were computed without it. The next `revalidate` recomputes them with no
+flag needed, since it re-probes a row missing the checksum its tier asks for; a
+plain `scan` does not, because it leaves already-tracked rows alone. Until then those rows cannot be move-recovered, exactly as
+an unfingerprinted row never could, so run one pass before moving files around.
+`content_hash` is untouched by the upgrade.
 
 **Move re-identification workflow.** After moving or reorganizing your backing
 library, run a normal `musefs scan` on the new locations. For each file not
 already in the store, the scanner looks up rows whose fingerprint matches and
 whose old path is gone, and retargets the unique match in place — its `id`,
 tags, and art are preserved. Move recovery only applies to rows that were
-fingerprinted before the move (rows scanned under `--checksum=none` have no
-fingerprint and cannot be retargeted until a later fingerprint-tier pass).
+fingerprinted before the move. Rows scanned under `--checksum=none` have no
+fingerprint, and once their files move nothing can give them one: `revalidate`
+ignores files at new paths, and the old ones are gone. Run a fingerprint-tier
+`musefs revalidate` over them *before* moving the files, while each row still
+points at its file.
+
+A `content_hash` only ever describes the file a row currently points at. A pass
+that computes no full hash — a `fingerprint`-tier revalidate of a rewritten file,
+or a `--match=fast` retarget that confirms nothing — clears the column rather than
+leaving the previous bytes' hash standing. A `revalidate --checksum=full`
+restores it. A pass over a file that has not changed keeps the hash it already
+has, so a cheap pass never undoes an expensive one.
 Run `scan` after a move and ideally **before** any `revalidate` — `revalidate`
 only refreshes already tracked rows, so a moved file must be re-seeded before
 the maintenance pass can see it. Use `revalidate --prune` only when you are

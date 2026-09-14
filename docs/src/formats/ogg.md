@@ -1,10 +1,10 @@
 # Ogg (Opus / Vorbis / FLAC-in-Ogg)
 
 How musefs scans and synthesizes Ogg files (`.ogg`, `.oga`, `.opus`) carrying
-an Opus, Vorbis, or FLAC logical bitstream. Multiplexed and chained Ogg is
-detected and skipped at scan time: within the header region every page must
-share the first page's serial, and only the first page may carry
-beginning-of-stream. For the segment model these layouts plug into, see
+an Opus, Vorbis, or FLAC logical bitstream. musefs serves exactly one logical
+bitstream per file; multiplexed and chained Ogg are detected and skipped at scan
+time (see [one bitstream per file](#one-bitstream-per-file)). For the segment
+model these layouts plug into, see
 [the segment model](../architecture/serving.md#the-segment-model). Native FLAC files
 are covered by [FLAC](flac.md).
 
@@ -173,6 +173,35 @@ positioned reads. That is what lets the [Ogg invariant](#the-ogg-invariant)
 ("renumbering patches, never recopies") hold at serve time without a per-page
 in-memory index.
 
+## One bitstream per file
+
+A synthesized file renumbers every audio page by one constant — the difference
+between the regenerated header's page count and the original's. That constant
+belongs to *one* logical bitstream, so a file holding more than one cannot be
+served, and is skipped at scan time instead. Two shapes, caught two ways:
+
+- **Multiplexed** (streams interleaved, all beginning at the front): within the
+  header region every page must share the first page's serial, and only the
+  first page may carry beginning-of-stream (`validate_single_bitstream`).
+- **Chained** (complete bitstreams concatenated end to end, which RFC 3533
+  allows): the second stream necessarily begins *after* the first one's audio, so
+  the header region proves nothing about it. The file's **final page** is the
+  discriminator — a chain's last page belongs to its last stream — so the scanner
+  reads one page-sized window from the end of the file and rejects a final page
+  whose serial is not the header's (`ogg::classify_tail`). One bounded read per
+  file, rather than a walk over the whole audio region.
+
+A file whose final page does not end at its last byte — a truncated download,
+say — proves nothing either way, and still scans and serves as before.
+
+The serve path carries the same check as a belt: a page whose serial is not the
+resolved file's is refused (`EIO`) rather than renumbered. That matters for rows
+written before this check existed, which keep their too-wide audio bounds. A
+rescan cannot fix one: the scanner refuses the file, so nothing is written and
+the row stays, failing every revalidate after it. `musefs revalidate --prune`
+removes such a row, and nothing else it refuses to probe
+([#747](https://github.com/Sohex/musefs/issues/747)).
+
 ## Quirks & invariants
 
 - Page and header sizes are bounded at parse and serve time
@@ -185,3 +214,12 @@ in-memory index.
   raw image bytes (`musefs-format/src/ogg/b64.rs`).
 - The serve path's determinism does not depend on the memo: a content change
   rebuilds the resolved file and starts with a fresh, empty memo.
+- **FLAC-in-Ogg's header-packet count may be unknown.** Packet 0 carries a
+  16-bit count of the metadata packets that follow, but the mapping defines
+  zero as *unknown*, not *none* — blocks still follow. musefs reads a zero
+  count by discovering the run the way the format itself defines it: metadata
+  blocks continue until one sets the last-block flag (and a `STREAMINFO` flagged
+  last ends the run at packet 0). A *nonzero* count is taken at its word — the
+  mapping requires a count it gives to be accurate, and reserves zero for the
+  unknown case. As with chained Ogg, a row scanned before this fix keeps its
+  wrong `audio_offset` until a rescan.

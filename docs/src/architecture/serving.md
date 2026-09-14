@@ -36,14 +36,15 @@ payload from the DB by rowid — binary tags **and** art (`ArtImage` /
 wraps those reads in a single WAL snapshot with a `content_version` recheck.
 A concurrent retag (delete + reinsert reusing a freed rowid) cannot interleave
 bytes from two generations of a tag or splice the wrong image. Both the
-per-handle fast path and the stateless no-fh fallback apply the guard, and the
-fallback re-validates its freshly opened backing fd against the resolved
-stamp.
+per-handle fast path and the stateless no-fh fallback apply the guard, and both
+validate the backing fd against the resolved stamp *after* acquiring its bytes,
+so a rewrite that lands mid-read fails that read rather than the next one
+([#682](https://github.com/Sohex/musefs/issues/682)).
 
 ### Backing read-ahead
 
 Every backing read — `BackingAudio` splices and the `serve_ogg_window` page walk
-alike — flows through a single `BackingReader::read_exact_at`
+alike — flows through a single `BackingReader` (`read_append` on the splice paths)
 (`musefs-core/src/readahead.rs`). It caches *raw backing-file bytes keyed by
 absolute backing offset* in a per-handle adaptive window: a sequential miss reads
 one large `pread` (geometric growth up to a per-stream cap) instead of the
@@ -52,7 +53,7 @@ the RPCs behind one syscall; a seek resets the window to the floor. All handles
 draw from one process-wide RAM budget (`--read-ahead-budget-mib`, default 64) with
 deadlock-free `try_lock` LRU eviction. Keying on the absolute backing offset (not
 the synthesized output) makes the cache retag-immune, and serving still flows
-through the per-read `validate_opened_backing` re-stat, so the cardinal
+through the post-read `validate_opened_backing` re-stat, so the cardinal
 audio-bytes invariant and freshness semantics are untouched. An optional Phase-2
 background-prefetch layer (`--read-ahead-prefetch`) exists and is off by default:
 amplification alone carries the win on local and low-latency backing, while the
@@ -111,11 +112,19 @@ were opened on. `musefs_dir_listings` is the distinct-listing count behind
 every open handle is on a different directory.
 
 Over that cap, `opendir` degrades rather than failing: it returns the stateless
-handle, and `readdir` falls back to rebuilding the listing on each call (on the
-worker pool, like every other blocking operation, not on the single fuser
-dispatch thread). Listings stay complete — parallel walkers routinely exceed
-1024 concurrent directory handles on a large mount — at the cost of that
-rebuild. `musefs_dir_handle_rejections_total` counts the opens that took the
+handle. Listings stay complete — parallel walkers routinely exceed 1024
+concurrent directory handles on a large mount — and they stay stable too. A
+stateless handle cannot tell one enumeration from another, so the first
+`readdir` of an enumeration pins the current generation's listing in a small
+shared cache instead, and tags the cookies it hands out with that generation;
+every later page resolves its cookie back to the same listing. Paging whatever
+generation was current, as it used to, let a refresh landing between two pages
+shift entries under the cursor, so one enumeration could return an entry twice
+or skip one ([#695](https://github.com/Sohex/musefs/issues/695)). The cache
+holds 64 listings; an enumeration whose listing was evicted continues on the
+current generation, which is where every stateless page used to be. The work
+runs on the worker pool, like every other blocking operation, not on the single
+fuser dispatch thread. `musefs_dir_handle_rejections_total` counts the opens that took the
 fallback; the `musefs_dir_handles` gauge cannot show this, because
 saturation is bursty enough to read healthy in every sample while thousands of
 opens are degraded between them.
@@ -145,9 +154,86 @@ An entry whose attributes cannot be resolved is still listed, with placeholder
 attributes and a zero TTL: the kernel caches neither, so the client's next
 access goes back to `lookup` and gets the real error — the same thing it sees
 today, rather than the file silently vanishing from the listing.
+
+### Admission to the worker pool
+
+The pool's queue is unbounded, so nothing reaches it ungated. Reads reserve one
+of 1024 in-flight slots first and are refused with `EAGAIN` over that. Every
+other job — `lookup`, `getattr`, `open`, `opendir`, a stateless listing, a
+`readdirplus` round's resolutions — passes one admission gate capped at 4096
+queued or running ([#694](https://github.com/Sohex/musefs/issues/694)), and none
+of it is refused. A job that finds the gate full runs on the thread that
+submitted it. From the dispatch thread that is the backpressure: fuser reads no
+further request until the job is done, so the backlog waits in the kernel
+rather than in musefs' memory. The one exception is a `readdirplus` entry's
+attributes, which are left unresolved over the cap instead, with the zero-TTL
+placeholder above — running them in place would let a wide directory chain
+round after round on one thread. `musefs_pool_over_cap_total` counts the jobs
+that met the cap; on a healthy mount it stays at zero.
+
+Store refreshes run on a lane of their own, a single thread, so a metadata
+backlog never delays freshness and a refresh never runs in place on the
+dispatch thread, where its kernel invalidations are written.
 `musefs_readdirplus_total` counts the calls; zero means the kernel is not using
 the op, which is otherwise invisible from the daemon since the capability is
 negotiated at mount.
+
+## What a synthesized file's timestamp promises
+
+A served file's bytes come from two places — the backing file, and the tags and
+art in the store — so its mtime has to move when *either* does. The mount
+reports the later of the backing file's second and the row's `updated_at`, which
+covers a backing rewrite and a metadata edit alike.
+
+Whole seconds are not enough on their own. Every trigger stamps `updated_at`
+with `strftime('%s','now')`, so two metadata edits inside one wall-clock second
+leave the same second behind; if they happen to synthesize to the same length —
+which same-length tag rewrites routinely do — the file looks untouched to
+anything comparing size and mtime. And because the reported second is a `max`, a
+backing mtime in the future masks every metadata edit for as long as the skew
+lasts, which a restored archive or a bad clock on a NAS can sustain
+indefinitely.
+
+So the mount reports the row's `content_version` as the timestamp's
+**nanoseconds** ([#725](https://github.com/Sohex/musefs/issues/725)). That
+counter already increments on every change musefs makes to the served bytes — it
+is what every internal cache keys on — so the guarantee it buys is:
+
+> **In synthesis mode, the reported mtime changes whenever a change recorded in
+> the store changes the synthesized bytes.**
+
+Each qualifier in that sentence is load-bearing.
+
+*In synthesis mode*, because `--mode structure-only` serves the backing file
+verbatim. A tag edit does not change those bytes, so it must not move their
+timestamp either — signalling a change there would send every consumer to
+re-copy a byte-identical file, which is the same failure in the opposite
+direction. Passthrough reports no sub-second part at all.
+
+*A change recorded in the store*, because a backing file rewritten behind
+musefs's back bumps no counter. That case is not handled by the timestamp: the
+freshness stamp catches it and the serve fails closed with `BackingChanged`
+rather than quietly reporting stale attributes. The exception is
+`--trust-backing-mtime`, which opts out of the `getattr` re-stat and so accepts
+exactly that staleness until the next `open`
+([Freshness](tree-scanning.md#freshness-two-version-counters)).
+
+Two further limits. The nanosecond field is a change counter, not a duration: it
+does not measure anything, and two versions exactly one billion apart report the
+same one. And a consumer that truncates to whole seconds gets exactly what it
+got before — including the future-backing-mtime masking — because the second is
+unchanged. The precision exists for tools that read a full `timespec`.
+
+Nothing in the store holds nanoseconds. `updated_at` is still whole seconds, and
+the sub-second part is derived where the timestamp is built, so no column claims
+a precision nobody wrote.
+
+**A pre-epoch backing file is served as one.** An archival rip or a restored
+backup can carry an mtime before 1970, and the store accepts it from v4 on
+([#696](https://github.com/Sohex/musefs/issues/696)). A synthetic directory has
+no row and therefore no timestamp; it reports the mount time. Those two cases
+used to be the same value — zero — so a file whose mtime really was the Unix
+epoch reported the mount time instead.
 
 ## Synthetic telemetry namespace
 

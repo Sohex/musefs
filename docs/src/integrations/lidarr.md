@@ -196,8 +196,9 @@ binary are importable/on `PATH`.
   cover, replacing the track's art rows on every sync (an over-cap or
   unreachable cover is skipped, leaving any scanner-ingested art in place).
 - **Schema version:** the sync refuses to run if the DB's `user_version`
-  differs from the version it targets — rebuild the store after upgrading
-  musefs.
+  differs from the version it targets. The message says which side is behind:
+  upgrade the plugin for a store newer than it, or run `musefs migrate` for an
+  older one.
 - **Deletions prune by MusicBrainz id, scoped to rows this plugin owns.** On an
   Album/Artist delete, the sync removes the matching store rows
   (`musicbrainz_albumid` / `musicbrainz_artistid`) so the mount stops presenting
@@ -227,10 +228,13 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ../python-musefs    # shared library (editable, from the working tree)
 pip install -e ".[test]"
 
-python -m pytest                   # unit + integration (no Rust binary)
-python -m pytest -m musefs_bin     # path-matching gate vs the real `musefs` binary
+python -m pytest                   # unit + integration + the binary gate
+python -m pytest -m musefs_bin     # just the gate vs the real `musefs` binary
 ```
 
 The `musefs_bin` gate shells out to the real `musefs` binary, so build it first
-from the repo root (`cargo build`). It is deselected from the default run and
-skips cleanly if the binary is absent.
+from the repo root (`cargo build`) — it warns if the binary is older than the
+Rust sources. It **runs by default**: it is the only tier that sees the real
+schema rather than a fixture's, so a store-shape change breaks it and nothing
+else. Where the binary or `ffmpeg` is absent it skips cleanly, so a Rust
+toolchain is not required to work on the plugin.

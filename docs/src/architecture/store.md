@@ -4,15 +4,23 @@
 
 `musefs-db/src/schema.rs` defines the schema as an ordered list of migrations
 (`MIGRATIONS`: the `MIGRATION_V1` baseline, `MIGRATION_V2`, which adds the
-scanner-owned `fingerprint`/`content_hash` columns, and `MIGRATION_V3`, which
-widens the `tags.value` and `track_art.description` caps); `user_version`
-records the schema version (3).
+scanner-owned `fingerprint`/`content_hash` columns, `MIGRATION_V3`, which
+widens the `tags.value` and `track_art.description` caps, and `MIGRATION_V4`,
+which rebuilds every core table — a never-reused `AUTOINCREMENT` id, the
+path as bytes, an inode stamp, storage-class constraints throughout, independent
+ordinal spaces for text and binary tags, the picture's MIME type and dimensions
+moved off the shared blob and onto the art link (which also gains depth and
+colour count), immutable row ownership, and the retirement of
+every fingerprint written
+before the value included sampled audio); `user_version` records the schema
+version (4).
 The store is the **interface external tools write to** — the beets and Picard
 plugins under `contrib/` write tags and art here out-of-band.
 
 - The **baseline schema** (`MIGRATION_V1`): the core tables — `tracks` (one row
-  per backing file: path, format, audio byte range, size/nanosecond-mtime/ctime
-  stamps, `content_version`), `tags` (multi-value key/value rows ordered by
+  per backing file: path, format, audio byte range, the
+  size/nanosecond-mtime/ctime freshness stamp — joined by the inode in v4 —
+  and `content_version`), `tags` (multi-value key/value rows ordered by
   `ordinal`, with an optional `value_blob` for binary tags), `art`
   (content-addressed, deduplicated image blobs), `track_art` (per-track art
   links with picture type and ordering), and `structural_blocks` (read-only,
@@ -28,28 +36,118 @@ plugins under `contrib/` write tags and art here out-of-band.
   bytes: `art_reject_content_update` (art is content-addressed and immutable),
   `art_ad` (a deleted art row bumps referencing tracks so an orphan rebuilds to
   a clean serve-time error), `tracks_geometry_au` (scanner-owned geometry
-  changes), and `structural_blocks_ai`/`_ad`.
+  changes), and `structural_blocks_ai`/`_ad`. `tags_reject_reparent` and
+  `track_art_reject_reparent` make row ownership immutable, for the same reason
+  art content is.
+
+### Transparent and gated migrations
+
+Each entry in `MIGRATIONS` declares itself **transparent** or **gated**. A transparent step is
+applied as a side effect of opening the store, which is how every migration up
+to 1.3.0 behaved: nobody running `mount` or `scan` learns it happened, and for a
+step whose cost and consequences they would not notice that is right. A gated
+step is one that rewrites data nobody asked to have rewritten, transiently needs
+the store's size again in free disk, or ends compatibility with the binary they
+were running yesterday. Opening a store that needs one refuses with
+`DbError::StoreNeedsMigration`, naming
+[`musefs migrate`](../guide/maintenance.md#upgrading-the-store-musefs-migrate).
+That command drives `PendingMigration`, the one door that applies a gated step:
+it opens the store *without* migrating or validating it — the schema is by
+definition not the one this build expects — exposes the versions, the step
+list, an exclusive claim and a `VACUUM INTO` snapshot for the command's
+pre-flight, and hands back an ordinary `Db` once the migration has run.
+
+**A gated step ships only in a major release.** This is the contract, and the
+compiler enforces it: each entry records the release that introduced it, and a
+`const` assertion rejects the build if a `Gated` step names anything but an
+`x.0.0`. What a user needs to know is then not which `user_version` they are on
+but whether the release they are moving to crossed a major boundary — crossing
+one may ask for `musefs migrate`, a minor or a patch never will. The converse is
+deliberately not asserted: a major is free to carry only transparent steps, as
+`MIGRATION_V3` is, or none at all.
+
+Nothing about the classification is stored: the binary owns it, so a user
+jumping from 1.2 straight to 2.1 is still gated on the step that needs it. Two
+further rules follow from what the runner already knows. A store being *created*
+is exempt — it has no data to endanger, and gating it would stop `scan` from
+ever building a new library. And while a gated step is pending, an open applies
+nothing at all, not even the transparent steps ahead of it. Every step bumps
+`user_version`, which the previous release refuses, so a transparent step
+applied on the way to a refusal would lock that release out of the store with no
+snapshot taken. It waits for `musefs migrate` instead
+([#749](https://github.com/Sohex/musefs/issues/749)).
+
+`DbError::StoreNeedsMigration` is the opposite direction from
+`DbError::StoreTooNew`, and carries the opposite remedy: upgrade the store, not
+the binary.
 
 ### The external-writer contract
 
 **Ownership.** External tools get full read/write on `tags`, `art`, and
 `track_art`. The scanner owns the structural columns of `tracks` (`id`,
 `backing_path`, `format`, `audio_offset`, `audio_length`, `backing_size`,
-`backing_mtime_ns`, `backing_ctime_ns`, `content_version`, `updated_at`) and
-all of `structural_blocks`: those are derived from probing the file, and
-external tools must run `musefs scan` rather than compute them.
+`backing_mtime_ns`, `backing_ctime_ns`, `backing_ino`, `content_version`,
+`updated_at`) and all of `structural_blocks`: those are derived from probing
+the file, and external tools must run `musefs scan` rather than compute them.
+
+**`backing_ino` is a bit pattern, not a magnitude.** From schema v4 `tracks`
+records the backing file's inode as part of the freshness stamp, stored as the
+inode's two's-complement `i64` bit pattern — so a file whose inode is above
+`i64::MAX` has a *negative* value in the column. SQLite has no unsigned 64-bit
+integer and `st_ino` is a full `u64`, so some encoding is forced; this one is a
+bijection, and the column is only ever compared for equality (the invalidation
+trigger, and the Rust freshness stamp), never ordered or summed. Zero is the
+sentinel for "not recorded", which every row in a store upgraded to v4 carries
+until `musefs revalidate` (or a `scan --force` of the file) fills it in; a plain
+`scan` leaves tracked rows alone. A reader decoding this column must cast the bit
+pattern back rather than treat a negative value as invalid.
+
+**`backing_path` is bytes, not text.** From schema v4 it is a `BLOB` and the
+Rust model is a `PathBuf`, because a filesystem path is a byte string and the
+lossy text round-trip collapsed two distinct files onto one row. This matters to
+a *reader* as much as a writer:
+SQLite never compares a `TEXT` value equal to a `BLOB`, so a lookup that binds a
+string matches nothing at all rather than failing, and a `CHECK` pins the
+storage class so the two spellings cannot become two rows for one file. The
+`contrib` helpers encode and decode at the boundary (`path_param` and
+`path_value` in `musefs_common`); a third-party writer must do the same.
 
 `tracks.fingerprint` and `tracks.content_hash` are also scanner-owned,
 read-only-derived columns — like `structural_blocks`, they are never part of
 the editable tag contract and external tools never write them.
-`fingerprint` is a SHA-256 over the probe's parsed output (deterministic per
-file, excludes filesystem stamps such as `mtime`/`ctime`), computed in the
-parallel probe worker at zero extra I/O. `content_hash` is a full-file
-SHA-256, stored as 64-char hex; it is computed only at the `full` checksum
-tier (`--checksum=full`), which requires an eager whole-file read. Neither
-column is `UNIQUE` by design — duplicate-content tracks legitimately share
-both values. On a normal `scan`, when a probed file's path is not yet in the
-store and its fingerprint matches exactly one orphaned row (a row whose
+
+`fingerprint` is a SHA-256 over the probe's parsed output — format, audio
+bounds, text tags, art, binary tags, structural blocks — plus three bounded
+windows of sampled audio, taken at the start, midpoint and end of the audio
+region. It is deterministic per file and excludes every filesystem stamp such
+as `mtime`/`ctime`. The audio windows are what make it content-discriminating
+outside FLAC: the parsed output alone carries no audio bytes for MP3, M4A, Ogg
+or WAV, so two different files with the same tags, the same art and an equal
+audio length used to share one fingerprint, and a move could retarget the wrong
+one. Sampling adds at most 24 KiB of positioned reads per file, against the
+descriptor the probe already holds. It samples the audio rather than hashing all
+of it, so the fingerprint stays a heuristic: two files agreeing on every sampled
+window and differing only between them still collide, which is what
+`content_hash` arbitrates.
+
+`content_hash` is a full-file SHA-256 of the *current* backing file, stored as
+64-char hex. It is computed only at the `full` checksum tier
+(`--checksum=full`), which requires an eager whole-file read.
+
+Two rules keep "of the current backing file" true. Both checksums are derived
+inside the probe's `fstat` sandwich, from its own descriptor rather than by
+reopening the pathname, so a file that changes mid-probe is discarded as raced
+instead of committing a row whose stamp, geometry and tags describe one
+generation and whose hash describes another. And a pass that computes no full
+hash never leaves a stale one behind: every checksum write carries an explicit
+intent — keep the stored value, set a new one, or clear it — and a pass below
+the `full` tier clears the column whenever it observes that the recorded bytes
+changed. A pass over a file that has not changed keeps what is stored, so a
+cheap pass never undoes an expensive one.
+
+Neither column is `UNIQUE` by design — duplicate-content tracks legitimately
+share both values. On a normal `scan`, when a probed file's path is not yet in
+the store and its fingerprint matches exactly one orphaned row (a row whose
 `backing_path` no longer exists on disk), the scanner retargets that row to
 the new path in place, preserving its `id`, tags, and art rather than
 orphaning them. This is how musefs recovers from a backing-library move or
@@ -68,19 +166,56 @@ malformed *shapes* at commit, so an external writer cannot persist them:
 - a `tags.key` over 256 chars or `tags.value` over 16 MiB − 1 bytes (FLAC's
   24-bit metadata-block ceiling — the largest tag synthesis could serve, so the
   store never refuses a tag the format could carry);
-- `tags.key` must be non-empty and contain no ASCII control characters (a DB
-  `CHECK` enforces this, rejecting violating writes — with one blind spot: an
-  embedded NUL terminates SQLite's `length()`/`GLOB`, so a key like `a\0b` slips
-  the `CHECK`. The scanner's own floor drops it before insert, and the Vorbis
-  path rejects it on synthesis). Additionally, only keys within the Vorbis
+- `tags.key` must be non-empty and contain no ASCII control characters or NUL
+  (a DB `CHECK` enforces this, rejecting violating writes; the NUL test is an
+  explicit `instr(key, char(0)) = 0` from schema v4, because an embedded NUL
+  terminates SQLite's `length()`/`GLOB` and a key like `a\0b` slipped the older
+  `CHECK` — see **The NUL blind spot** below). Additionally, only keys within the Vorbis
   field-name grammar (ASCII `0x20`–`0x7D`, excluding `=`) survive FLAC/Ogg
   synthesis — others are dropped and logged. MP3/M4A custom keys may use the
   wider set (e.g. `=`, `:`, spaces, non-ASCII).
 - a `value_blob` over `MAX_BINARY_TAG_BYTES`;
-- an `art.mime` over 255 chars or `byte_len` over `MAX_ART_BYTES`;
-- a `track_art.description` over 8 KiB;
+- an `art.byte_len` over `MAX_ART_BYTES`;
+- a `track_art.mime` over 255 chars or `description` over 8 KiB, or either one,
+  or an `art.sha256`, containing NUL;
+- a `backing_path` that is not a non-empty `BLOB`, or that contains a NUL byte;
 - a `structural_blocks` row with an unknown `kind`, negative `ordinal`, or `body`
   over the FLAC 24-bit block limit.
+
+**The NUL blind spot.** SQLite permits an embedded U+0000 in a TEXT value and
+`length()` counts characters only up to the first one, so every `CHECK` above
+that caps a TEXT column in *characters* — `tags.key`, `track_art.mime`,
+`track_art.description` — measures 1 for a value of `"X\0"` followed by a
+hundred megabytes ([#693](https://github.com/Sohex/musefs/issues/693)). Blob
+columns are unaffected: `length()` on a BLOB counts bytes, which is why
+`tags.value` is capped as `length(CAST(value AS BLOB))`.
+
+The readers do not rely on those caps. Every reader that materializes one of
+these fields first projects *both* `length(col)` and `length(CAST(col AS
+BLOB))`, and rejects the row if either is over — the character cap the schema
+states, or the byte ceiling that cap implies, which is four bytes per character
+because that is UTF-8's widest scalar value. The byte bound is the one that
+matters against a hostile row: `Row::get::<String>` allocates the column's full
+byte length, so without it a NUL-prefixed field is an unbounded allocation on
+the serve path. Rejection is decided from the two lengths alone, never from the
+value, so an over-cap field provably cannot be materialized in order to reject
+it.
+
+The ceiling does not narrow what a field may hold: a `tags.key` of 256
+four-byte characters sits exactly on both bounds and reads back intact. Nor is
+it a ban on NUL — a short NUL-bearing value still reads. Schema v4 forbids NUL
+outright in these `CHECK`s ([#693](https://github.com/Sohex/musefs/issues/693)),
+so a store that passed `musefs migrate` holds no such row; the readers keep the
+guard for a store written with its constraints turned off.
+
+`get_art` is the one reader that materializes a whole `art` row, image blob
+included, rather than streaming it. It therefore guards both of its unbounded
+columns from lengths first — `sha256` as above, and `length(data)` against the
+`art.byte_len` cap, which a crafted store can have been written without since
+both that cap and `byte_len = length(data)` are `CHECK`s. `art.sha256` is the
+identity case the character cap never really guaranteed: `length(sha256) = 64`
+is satisfied by 64 hex characters, a NUL, and any amount of suffix. The mime is
+guarded the same way where it now lives, by the `track_art` readers.
 
 **One ordinal space per key.** `tags`' primary key is `(track_id, key,
 ordinal)`, which does not discriminate on `value_blob`: a track's text rows and
@@ -138,20 +273,74 @@ one-way step for existing data and logs at `info` only, and the common case — 
 store already at the latest version — stays silent, since that path runs on
 every open and every mount.
 
+**`art` holds bytes; `track_art` describes the embedding.** The MIME type,
+dimensions, colour depth and indexed-colour count live on the link, because they
+describe one file's picture block rather than the image every file shares. While
+`art` owned them, two files holding byte-identical art served whichever one the
+scan reached first — including its declared MIME type. An `art` row is now the
+content and its identity and nothing else: `id`, `sha256`, `byte_len`, `data`.
+A writer that supplies no `mime` on the link produces a picture block declaring
+the empty string, which is the writer's to get right.
+
 **Art is immutable once written.** `art` rows are content-addressed by
-`sha256`; a trigger rejects any in-place `UPDATE` of an art row's
-content columns (`data`, `sha256`, `mime`, `byte_len`, `width`, `height`) with
-`RAISE(ABORT)` — a multi-row `UPDATE art` touching any content column aborts the
-whole statement. To change a track's art, insert a new content-addressed row
+`sha256`; a trigger rejects any in-place `UPDATE` of an art row's **key or**
+content columns (`id`, `data`, `sha256`, `byte_len`)
+with `RAISE(ABORT)` — a multi-row `UPDATE art` touching any of them aborts the
+whole statement. `id` is in that list because changing it changes no content
+column: the guard's `WHEN` was false, so the one write that orphans every link
+to the row was the one write it did not stop. To change a track's art, insert a new content-addressed row
 and relink it via `track_art` (which bumps `content_version`); do not mutate an
 existing row. Deleting an `art` row still referenced by `track_art` (possible
 only with `foreign_keys` OFF) bumps every referencing track so the mount serves
 a clean `EIO` on the now-orphaned reference instead of stale bytes.
 
+**A digest has to name its bytes.** Nothing in the schema can tie `art.sha256`
+to `art.data` — SQLite has no hash a `CHECK` could call — so a writer can file a
+row under the digest of an image it does not hold. The writers do not trust
+such a row when they meet one: when an image dedups onto an existing row, that
+row's bytes are compared with the image's before the id is returned, and a
+mismatch is refused rather than linked
+([#724](https://github.com/Sohex/musefs/issues/724)). The scanner fails the one
+file that would have linked it, as it does for a constraint the store refuses,
+and compares each distinct row at most once per scan; the `contrib` helper
+`upsert_art` raises instead of returning the id. A fresh insert needs no check,
+since it just stored those bytes.
+
+What this does not do is audit the table: a poisoned row nothing ever dedups
+onto is never compared, and the readers serve whatever a link points at. Filing
+every row under the digest of its own bytes remains the external writer's job.
+
+**Row ownership is immutable too.** A `tags` or `track_art` row may not move
+between tracks: `tags_reject_reparent` and `track_art_reject_reparent` abort a
+`track_id` change with the same shape of message. Replace by delete-then-insert,
+which is what both `contrib` helpers already do. The reason is the same one that
+makes `art` immutable — an invalidation trigger that has to *enumerate*
+everything needing a bump fails silently by serving stale bytes when it gets
+that wrong, while a refusal fails loudly at the write. (The `UPDATE` triggers
+bump both the old and the new owner regardless, so the accounting is correct on
+its own terms rather than only because the refusal forbids the case.) Naming
+`track_id` in a `SET` list without changing its value is not a reparent and is
+allowed.
+
+**Text and binary tag rows have independent ordinal spaces.** `tags` has no
+primary key; a unique index on `(track_id, key, ordinal, (value_blob IS NULL))`
+enforces uniqueness *within* each class. A writer that rewrites one class alone
+— as both `contrib` helpers do, scoping their `DELETE` to `value_blob IS NULL`
+so scanner-written binary payloads survive a sync — can therefore reuse an
+ordinal the other class holds under the same key, which a single shared key
+space rejected.
+
+The class is a column of one index rather than the predicate of two partial
+ones, because a partial index only serves a query whose `WHERE` implies its
+predicate. A reader that wants *both* classes at once — `tags_for_track` in the
+`contrib` helpers — implies neither, and against two partial indexes it plans as
+a full table scan plus a sort. With `track_id` leading a single index, every
+read shape stays on it.
+
 **What musefs defends at serve time.** CHECKs cannot catch a scanner-owned
 field mutated to a *well-formed* value that no longer matches the real file
-on disk: `backing_size` or `backing_mtime_ns`/`backing_ctime_ns` that drift
-from the actual file's stat, or audio bounds that fit the stored
+on disk: `backing_size`, `backing_mtime_ns`/`backing_ctime_ns` or
+`backing_ino` that drift from the actual file's stat, or audio bounds that fit the stored
 `backing_size` but overrun the file once it has shrunk. musefs re-stats the
 backing file on every resolve and treats such rows as untrusted input,
 degrading to a controlled

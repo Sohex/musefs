@@ -1,0 +1,12 @@
+---
+# CodeRabbit reviews only pull requests targeting the default branch unless
+# other base branches are named here, and it reads this file from the PR's head
+# branch rather than its base. The 2.0.0 work integrates on a long-lived
+# `v2.0.0` release branch and merges to `main` once, so every sub-PR would
+# otherwise land unreviewed. The pattern is anchored and generic so a future
+# release branch does not silently lose review coverage the way this one would
+# have. Sub-branches must be cut from the release branch to inherit this file.
+reviews:
+  auto_review:
+    base_branches:
+      - '^v\d+\.\d+\.\d+$'

@@ -158,9 +158,23 @@ that bite plugin authors:
 - **Content-address art** through `upsert_art` (sha256 de-dup) rather than
   inserting `art` rows by hand; `sync_files` does this for you.
 - **Art rows are immutable.** A trigger rejects in-place updates of an
-  `art` row's content columns (`data`, `sha256`, `mime`, `byte_len`, `width`,
-  `height`). To change a track's art, insert a new content-addressed row via
-  `upsert_art` and relink it via `replace_track_art`.
+  `art` row's key or content columns (`id`, `data`, `sha256`, `byte_len`). To
+  change a track's art, insert a new content-addressed row via `upsert_art` and
+  relink it via `replace_track_art`. From schema v4 the row is the content and
+  nothing else: everything describing one file's embedding of it — the mime, the
+  dimensions, the colour depth and the indexed-colour count — lives on the
+  `track_art` link.
+- **You supply the mime; the library reads the dimensions it can.**
+  `replace_track_art` takes a mime per row because that is the value musefs
+  writes into the synthesized picture block, and a link stored without one
+  produces art whose declared type is the empty string. A row may also state the
+  link's `width` and `height`, and `sync_files` fills them from each image's own
+  header with `image_dimensions` — PNG's `IHDR`, a JPEG's start-of-frame —
+  reading a few header bytes rather than decoding the image (musefs #737). A
+  WebP or any header it cannot read leaves them `NULL`. It never writes `depth`
+  or `colors`, which would take a decoder, so those stay 0; `NULL` and 0 are how
+  both the FLAC picture block and musefs spell "not stated". A scan of a file
+  that declares them fills all four in from the file's own picture block.
 - **Path layout is just a tag.** To drive a reorganized mount, write your
   computed relative path into a custom tag (e.g. `beets_path`) and mount with
   `--template '$!{beets_path}'`. musefs sanitizes each path segment, so a writer
@@ -191,8 +205,14 @@ Everything in `__all__`, imported from the top-level `musefs_common` package.
 - `Record(key, pairs=[], art=None, delete_keys=None)` — one file's sync inputs
   (see *The `Record` shape*).
 - `ArtImage(data, mime, picture_type=3, description="")` — one embedded picture.
-- `realpath_key(path)` — canonical path string matching the scanner's
-  `backing_path`; accepts `str`/`bytes`, returns `str`.
+- `realpath_key(path)` — canonical path matching the scanner's `backing_path`;
+  accepts `str`/`bytes`, returns `str`. The resolution runs on bytes and is
+  decoded with `os.fsdecode`, so `os.fsencode` turns the key back into the exact
+  path on disk — which is what the store holds from schema v4 (#680). Two files
+  differing only in undecodable bytes therefore give two different keys. How
+  such a byte is *spelled* in the `str` is the filesystem encoding's business
+  (a surrogate under UTF-8 or ASCII, an ordinary character under a total codec
+  like Latin-1); what holds either way is the round trip.
 
 **Writing**
 
@@ -214,12 +234,17 @@ for a custom write loop)
 - `merge_tags(conn, track_id, managed_pairs, delete_keys)` — per-key replace of
   plugin-managed text tags, leaving unmanaged text rows intact.
 - `replace_tags(conn, track_id, pairs)` — replace all plugin-owned text tags.
-- `upsert_art(conn, data, mime)` → art id — content-address `data` by sha256,
+- `upsert_art(conn, data)` → art id — content-address `data` by sha256,
   inserting only if new.
 - `replace_track_art(conn, track_id, arts)` — replace a track's `track_art`
-  rows; `arts` is `[(art_id, picture_type, description), …]`.
+  rows; each entry of `arts` is `(art_id, picture_type, description, mime)` or
+  `(art_id, picture_type, description, mime, width, height)`, and the four-field
+  form leaves the dimensions unset.
 - `sniff_mime(data, path)` — image mime from magic bytes, falling back to file
   extension.
+- `image_dimensions(data)` → `(width, height)` or `None` — read from a PNG
+  `IHDR` or JPEG start-of-frame header without decoding; `None` for anything
+  else, including a malformed header or a zero dimension.
 - `prune_missing(conn, track_ids=None, *, unreadable=None)` → count — delete
   tracks whose backing file is *confirmed* gone (every track, or just
   `track_ids`). Only a `FileNotFoundError` from `os.stat` counts as gone: a path
@@ -256,8 +281,8 @@ for a custom write loop)
 
 - `SchemaMismatch(found)` — schema-version skew; `.found` is the DB's version.
   The message names which side is behind and the fix: a store newer than the
-  plugin means upgrading the plugin, an older one means rescanning with musefs
-  to migrate it.
+  plugin means upgrading the plugin, an older one means upgrading musefs and running
+  `musefs migrate` against the store.
 - `ScanError(kind, *, binary, target, …)` — a `musefs scan` failure; `.kind` ∈
   `{"not_found", "timeout", "failed"}`, with context attributes for messaging.
 

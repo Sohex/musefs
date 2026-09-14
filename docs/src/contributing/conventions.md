@@ -33,6 +33,24 @@
 - **Hidden API consumers.** `benches/` directories and each crate's
   `tests/` are compiled only by `--all-targets`: after an API change,
   compile-check with `cargo clippy --all-targets`, not `cargo build`.
+- **`#[non_exhaustive]`.** Mark a public enum or struct when every consumer in
+  another crate can take a new variant or field safely: errors and results, and
+  configuration structs callers build from `default()`. Leave it exhaustive when
+  another crate matches or builds it member by member on a path where a new one
+  must be wired deliberately — `Segment`, the store's write inputs — and say so
+  on the type. If marking takes away an exhaustive check the workspace relied
+  on across a crate boundary, add a stand-in (as
+  `a_new_format_must_be_wired_into_the_dispatch` does). `tests/` and `benches/`
+  count as other crates.
+- **Schema migrations.** Append to `MIGRATIONS` in `musefs-db/src/schema.rs`;
+  each entry carries its SQL, the release that introduced it (`since`), a
+  one-line `summary` the `migrate` command prints, and a `Gate`. **A `Gated`
+  step may only be introduced by a major release** — a `const` assertion
+  rejects the build otherwise. Gate a step that rewrites data the user did not
+  ask to have rewritten, needs the store's size again in free disk, or ends
+  compatibility with older binaries; everything else is `Transparent` and is
+  applied by any open. See
+  [the store](../architecture/store.md#transparent-and-gated-migrations).
 
 ## Adding a format
 
@@ -42,7 +60,10 @@
 2. Add the variant to `musefs-db`'s `Format` enum, then wire it into the
    `match track.format` arms in `reader::HeaderCache::resolve`
    (`musefs-core/src/reader.rs`) and into `scan.rs` (extension list, probe
-   dispatch).
+   dispatch). `Format` is `#[non_exhaustive]`, so the compiler will not point
+   at a missing arm in another crate. `a_new_format_must_be_wired_into_the_dispatch`
+   (in `reader.rs`) fails instead; it only sees its own list of variants, so
+   add the new one there once the arm exists.
 3. Extend the test surface: a `fuzz_check::fixtures::<fmt>()` minimal file,
    a `fuzz/fuzz_targets/<fmt>.rs` target with a seed in `generate_seeds`, a
    `musefs-format/tests/proptest_<fmt>.rs`, and a manifest row in
