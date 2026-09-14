@@ -5,11 +5,55 @@ per-change list see the [Changelog](changelog.md); for the external-writer
 `contrib/` packages (which version independently) see the
 [contrib changelog](integrations/overview.md#contrib-changelog).
 
-## v2.0.0 (unreleased)
+## v2.0.0
 
-A major release, being assembled on the `v2.0.0` branch; each change adds its
-upgrade steps here as it lands. See the [Changelog](changelog.md#unreleased) for
-the full list so far.
+The first major release. At its centre is the store: one schema migration, to
+version 4, that makes a track's identity, its backing path and its picture
+metadata mean what they say. It is applied by an explicit `musefs migrate`
+rather than silently on open. Around it ride the breaking cleanups a major
+version allows, and everything merged since v1.3.0, so the highlights below
+include features built during 1.x. Read
+[Upgrading from v1.3.0](#upgrading-from-v130) before installing it, because the
+store upgrade is one-way without the snapshot `migrate` takes.
+
+### Highlights
+
+- **`musefs migrate`** ([#705], [#706], [#749]). A store change too invasive to
+  apply on open — one that rewrites data, needs the store's size again in free
+  disk, or locks older builds out — now happens only when you ask. `migrate`
+  reports what it will do, checks every row against the new schema, snapshots
+  the store, then upgrades it. Until it has run, every other command refuses
+  the store and leaves it untouched.
+- **A store that means what it says** ([#674], [#678], [#680], [#693], [#716],
+  [#717], [#718]):
+  - track ids are never reused, so a deleted track's id cannot bless another;
+  - backing paths are the filesystem's bytes, so two non-UTF-8 names no longer
+    collapse into one track;
+  - the freshness stamp carries the inode;
+  - picture metadata belongs to each file rather than the shared image;
+  - tag and art rows cannot move between tracks;
+  - every column's storage class is enforced.
+- **Modification times that move with the bytes** ([#725], [#696]). A tag edit
+  is visible to anything comparing size and mtime, and a pre-1970 backing file
+  is served as one.
+- **`readdirplus`** ([#667]). A client that stats what it lists — `ls -l`, every
+  media scanner — spends one round trip on the directory instead of one per
+  entry.
+- **Chaptered `.m4b` audiobooks scan** ([#672]) instead of counting as
+  unparseable.
+- **`--trust-backing-mtime`** ([#668]) skips the backing `stat` on a metadata
+  cache hit, for network or spun-down backings.
+- **A scan survives a rejected file** ([#662]). A row the store refuses fails
+  that one file, and the scan runs to completion and exits `2`.
+- **Hardening across the serve path and the store**:
+  - backing changes are validated after the read, not before ([#682]);
+  - an over-cap directory listing stays stable across a refresh ([#695]);
+  - metadata work on the worker pool is admission-controlled ([#694]);
+  - content-addressed art is verified ([#724]);
+  - chained Ogg is refused, and an old row for one is removable ([#722],
+    [#747]).
+
+See the [Changelog](changelog.md#200---2026-09-14) for the full list.
 
 ### Upgrading from v1.3.0
 
@@ -104,10 +148,12 @@ A few files need more than that:
   removes them. The run that does so still exits `2`, and the next one does not.
   `migrate`'s offer never prunes; if its revalidate counts failures,
   `migrate` exits `2` ([#750]).
-- **Two files whose names differed only in non-UTF-8 bytes** ([#680]). 1.3.0
-  merged them into one track under a mangled path and served neither. A `scan`
-  adds both as new tracks; `revalidate --prune` removes the merged row, along
-  with any tags you had put on it.
+- **Files whose names are not valid UTF-8** ([#680]). 1.3.0 stored each under
+  a mangled path it could not serve, and merged two whose names differed only in
+  those bytes into one track. A `scan` adds the real files as new tracks. Until
+  `revalidate --prune` removes the mangled row, along with any tags you had put
+  on it, the mount lists that row as an entry that fails to open, and a real
+  file with the same displayed name appears with a ` (2)` suffix.
 
 **Sync tools will see changed files, twice unless you revalidate first**
 ([#725], [#696]). A synthesized file's modification time now carries its
@@ -120,6 +166,12 @@ without `--checksum`, Syncthing or a backup tool re-copy the library once
 rather than twice, revalidate before the first sync from the new mount. A
 whole-second comparison sees only the second change. `--mode structure-only`
 is unaffected.
+
+**`scan` exits `2` when the store rejects a file** ([#662]). A constraint
+violation on one file used to stop the scan with exit `1`. Now that file fails,
+everything else is stored, and the scan exits `2` with the file counted under
+`rejected` in the `failed N: …` summary. A script that treated exit `1` as "the
+store refused something" should check for `2` and read the summary.
 
 **Scan flags removed.** Both changes fail loudly rather than quietly doing
 something different, so a script or unit that needs updating will tell you:
@@ -222,11 +274,19 @@ directly.
   (`NewTrack`, `TrackArt`, `ArtInput` and the like) are unchanged, so a new store
   column is still a breaking change for code that writes rows.
 
+[#662]: https://github.com/Sohex/musefs/issues/662
+[#667]: https://github.com/Sohex/musefs/issues/667
+[#668]: https://github.com/Sohex/musefs/issues/668
+[#672]: https://github.com/Sohex/musefs/issues/672
 [#674]: https://github.com/Sohex/musefs/issues/674
+[#678]: https://github.com/Sohex/musefs/issues/678
 [#680]: https://github.com/Sohex/musefs/issues/680
+[#682]: https://github.com/Sohex/musefs/issues/682
 [#689]: https://github.com/Sohex/musefs/issues/689
 [#691]: https://github.com/Sohex/musefs/issues/691
 [#693]: https://github.com/Sohex/musefs/issues/693
+[#694]: https://github.com/Sohex/musefs/issues/694
+[#695]: https://github.com/Sohex/musefs/issues/695
 [#696]: https://github.com/Sohex/musefs/issues/696
 [#705]: https://github.com/Sohex/musefs/issues/705
 [#706]: https://github.com/Sohex/musefs/issues/706

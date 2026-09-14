@@ -10,49 +10,40 @@ and these packages adhere to [Semantic Versioning](https://semver.org/spec/v2.0.
 
 ## [Unreleased]
 
-### Fixed
+## [2.0.0] - 2026-09-14
 
-- **`upsert_art` refuses an `art` row whose digest names other bytes**
-  (musefs #724). On a `sha256` conflict it returned the row already filed under
-  the digest without looking at it, so a crafted or corrupt store holding a row
-  whose `sha256` does not match its `data` handed that row's image to every
-  track syncing the real one. It now compares the conflicting row's bytes with
-  the incoming image and raises the new `ArtDigestMismatch` on a mismatch. That
-  exception is a `sqlite3.IntegrityError`, so `sync_one` skips the one record
-  and counts it under `skipped_invalid`, exactly as it does for a constraint
-  violation, rather than aborting the sync. `musefs scan` does the same on the
-  Rust side.
+### Added
 
-- **A backing path that is not valid UTF-8 now resolves to the right track, and
-  two such files stay two.** `realpath_key` used to normalize undecodable bytes
-  to `U+FFFD`, reproducing what the scanner itself stored back when it wrote a
-  lossy conversion. Both sides agreed, and both were wrong: that mapping is not
-  injective, so two files differing only in such a byte collapsed onto one key —
-  and onto one row. From musefs 2.0.0 the scanner stores the real bytes, so the
-  old form matched nothing at all and a plugin skipped those files silently.
+- **Synced art states its dimensions** (musefs #737). `sync_files` linked a
+  plugin's art with `width` and `height` unset, so a FLAC whose picture a plugin
+  replaced served a block declaring no dimensions until the file was rescanned.
+  It now reads them from each image's own header — PNG's `IHDR`, a JPEG's
+  start-of-frame — with the new `image_dimensions(data)`, which decodes nothing
+  and needs no dependency. `replace_track_art` accepts
+  `(art_id, picture_type, description, mime, width, height)` rows alongside the
+  four-field ones, which still leave them unset. A WebP, an unreadable header or
+  a zero dimension stays `NULL`, and bit depth and colour count are still not
+  written.
 
-  The key now resolves on bytes and decodes with `os.fsdecode`, so
-  `os.fsencode(realpath_key(p))` is exactly the path on disk. `path_param` and
-  `path_value` use `os.fsencode`/`os.fsdecode` rather than a hardcoded `utf-8`,
-  which keeps both directions on one codec and makes the round trip hold
-  whatever the filesystem encoding is.
-
-  **This changes what `realpath_key` returns** for a non-UTF-8 path: the byte
-  itself, as the filesystem encoding spells it (a surrogate such as `\udc80`
-  under UTF-8), where it used to give `U+FFFD`. A caller that stores or compares
-  keys across the upgrade should recompute them. Callers that pass the key
-  straight to `sync_files` need no change.
+- **`musefs_common.path_param` / `musefs_common.path_value`** — the
+  `backing_path` boundary encode and decode. See the change above.
+- **`musefs_common.ScanResult`** — what a completed `run_scan` did. Carries
+  `binary`, `target`, `verb`, `returncode`, `partial` and `stderr`, and renders
+  the shared non-fatal message via `.warning()` (`None` for a clean run). See
+  the `run_scan` change below.
+- **`prune_missing`'s `unreadable` keyword** — pass a list to collect
+  `(track_id, backing_path, message)` for every row kept because its backing
+  path could not be stat'd, so a pass that pruned nothing can be told from one
+  that could not look. Existing callers are unaffected: the return value is
+  still the count actually pruned. See the `prune_missing` fix below.
+- **`musefs_common.MAX_TAG_VALUE_LEN`** — the store's byte cap on a
+  `tags.value`, generated from the Rust constant into the schema mirror rather
+  than hand-kept. A writer can now check a value against the contract instead of
+  discovering the limit as an `IntegrityError` from the `CHECK`. The cap moved
+  in the same change (musefs #644), which is exactly why it should not be a
+  literal in anyone's source.
 
 ### Changed
-
-- **`upsert_art` no longer takes a mime.** It is `upsert_art(conn, data)` now.
-  The argument was already being ignored whenever the image had been seen
-  before — the insert is `ON CONFLICT(sha256) DO NOTHING`, so the stored row
-  won — and from schema v4 there is no column on `art` for it to write.
-  `replace_track_art` is where the mime goes now — see the entry below, which
-  is the release that put it there. `sync_files` callers are unaffected; a
-  caller driving `upsert_art` directly must drop the argument, and a caller that
-  was relying on it to record the mime must pass one to `replace_track_art`.
 
 - **`replace_track_art` takes a fourth element per row: the mime.** Rows are now
   `(art_id, picture_type, description, mime)`. From schema v4 the MIME type
@@ -93,39 +84,6 @@ and these packages adhere to [Semantic Versioning](https://semver.org/spec/v2.0.
   `path_value(raw)` decodes on the way out, via `os.fsencode`/`os.fsdecode` so
   the round trip is lossless.
 
-### Added
-
-- **Synced art states its dimensions** (musefs #737). `sync_files` linked a
-  plugin's art with `width` and `height` unset, so a FLAC whose picture a plugin
-  replaced served a block declaring no dimensions until the file was rescanned.
-  It now reads them from each image's own header — PNG's `IHDR`, a JPEG's
-  start-of-frame — with the new `image_dimensions(data)`, which decodes nothing
-  and needs no dependency. `replace_track_art` accepts
-  `(art_id, picture_type, description, mime, width, height)` rows alongside the
-  four-field ones, which still leave them unset. A WebP, an unreadable header or
-  a zero dimension stays `NULL`, and bit depth and colour count are still not
-  written.
-
-- **`musefs_common.path_param` / `musefs_common.path_value`** — the
-  `backing_path` boundary encode and decode. See the change above.
-- **`musefs_common.ScanResult`** — what a completed `run_scan` did. Carries
-  `binary`, `target`, `verb`, `returncode`, `partial` and `stderr`, and renders
-  the shared non-fatal message via `.warning()` (`None` for a clean run). See
-  the `run_scan` change below.
-- **`prune_missing`'s `unreadable` keyword** — pass a list to collect
-  `(track_id, backing_path, message)` for every row kept because its backing
-  path could not be stat'd, so a pass that pruned nothing can be told from one
-  that could not look. Existing callers are unaffected: the return value is
-  still the count actually pruned. See the `prune_missing` fix below.
-- **`musefs_common.MAX_TAG_VALUE_LEN`** — the store's byte cap on a
-  `tags.value`, generated from the Rust constant into the schema mirror rather
-  than hand-kept. A writer can now check a value against the contract instead of
-  discovering the limit as an `IntegrityError` from the `CHECK`. The cap moved
-  in the same change (musefs #644), which is exactly why it should not be a
-  literal in anyone's source.
-
-### Changed
-
 - **`run_scan` no longer treats a partial scan as a failure** (musefs #647).
   `musefs scan` exits `2` when the batch completed and committed but some file
   could not be ingested; `run_scan` raised `ScanError` for any non-zero code, so
@@ -143,16 +101,59 @@ and these packages adhere to [Semantic Versioning](https://semver.org/spec/v2.0.
   It now says whether the store was written by a newer musefs (upgrade the
   plugin) or predates the plugin (upgrade musefs and run `musefs migrate`, which
   upgrades it in place). This string is what Picard and beets surface verbatim.
-- The store schema is now at `user_version` 4 (musefs #644 widens the
-  `tags.value` and `track_art.description` caps; musefs #691 retires every
-  stored `tracks.fingerprint`, whose value now includes sampled audio).
-  `EXPECTED_USER_VERSION` tracks it automatically; no plugin change is needed,
-  but a store must be upgraded with `musefs migrate` from a build
-  carrying those migrations before these packages will open it. Neither
-  migration touches a column these packages write: `fingerprint` is
-  scanner-owned and was never part of the tag contract.
+- The store schema is now at `user_version` 4. V3 widens the `tags.value` and
+  `track_art.description` caps (musefs #644); V4 rebuilds the core tables — the
+  path, art and ownership changes above — and retires every stored
+  `tracks.fingerprint`, whose value now includes sampled audio (musefs #691).
+  `EXPECTED_USER_VERSION` tracks it automatically, and a store must be upgraded
+  with `musefs migrate` from a build carrying those migrations before these
+  packages will open it. `fingerprint` is scanner-owned and was never part of
+  the tag contract.
+
+### Removed
+
+- **`upsert_art` no longer takes a mime.** It is `upsert_art(conn, data)` now.
+  The argument was already being ignored whenever the image had been seen before
+  — the insert is `ON CONFLICT(sha256) DO NOTHING`, so the stored row won — and
+  from schema v4 there is no column on `art` for it to write.
+  `replace_track_art` is where the mime goes now — see its entry under
+  *Changed*, which is the release that put it there. `sync_files` callers are
+  unaffected; a caller driving `upsert_art` directly must drop the argument, and
+  a caller that was relying on it to record the mime must pass one to
+  `replace_track_art`.
 
 ### Fixed
+
+- **`upsert_art` refuses an `art` row whose digest names other bytes**
+  (musefs #724). On a `sha256` conflict it returned the row already filed under
+  the digest without looking at it, so a crafted or corrupt store holding a row
+  whose `sha256` does not match its `data` handed that row's image to every
+  track syncing the real one. It now compares the conflicting row's bytes with
+  the incoming image and raises the new `ArtDigestMismatch` on a mismatch. That
+  exception is a `sqlite3.IntegrityError`, so `sync_one` skips the one record
+  and counts it under `skipped_invalid`, exactly as it does for a constraint
+  violation, rather than aborting the sync. `musefs scan` does the same on the
+  Rust side.
+
+- **A backing path that is not valid UTF-8 now resolves to the right track, and
+  two such files stay two.** `realpath_key` used to normalize undecodable bytes
+  to `U+FFFD`, reproducing what the scanner itself stored back when it wrote a
+  lossy conversion. Both sides agreed, and both were wrong: that mapping is not
+  injective, so two files differing only in such a byte collapsed onto one key —
+  and onto one row. From musefs 2.0.0 the scanner stores the real bytes, so the
+  old form matched nothing at all and a plugin skipped those files silently.
+
+  The key now resolves on bytes and decodes with `os.fsdecode`, so
+  `os.fsencode(realpath_key(p))` is exactly the path on disk. `path_param` and
+  `path_value` use `os.fsencode`/`os.fsdecode` rather than a hardcoded `utf-8`,
+  which keeps both directions on one codec and makes the round trip hold
+  whatever the filesystem encoding is.
+
+  **This changes what `realpath_key` returns** for a non-UTF-8 path: the byte
+  itself, as the filesystem encoding spells it (a surrogate such as `\udc80`
+  under UTF-8), where it used to give `U+FFFD`. A caller that stores or compares
+  keys across the upgrade should recompute them. Callers that pass the key
+  straight to `sync_files` need no change.
 
 - **`prune_missing` no longer treats an unstattable path as a deletion**
   (musefs #692). It decided with `os.path.exists`, which answers `False` both
@@ -168,6 +169,26 @@ and these packages adhere to [Semantic Versioning](https://semver.org/spec/v2.0.
   now logs each store row it kept because the old path could not be stat'd, so
   a rename that pruned nothing because the mount was unreachable is
   distinguishable from one with nothing to prune.
+
+## [1.2.0] - 2026-06-18
+
+Recorded after the fact: this release shipped without a section here.
+
+### Changed
+
+- **`run_scan` drives the `musefs revalidate` subcommand.** With
+  `revalidate=True` it runs `musefs revalidate <targets…>`, adding `--prune`
+  when `prune=True`, instead of `musefs scan --revalidate`, which musefs 1.2.0
+  deprecated. `force=True` adds `--force` to a plain scan. `beet musefs
+  --revalidate` forwards to `musefs revalidate --prune`, so it still prunes rows
+  whose backing file is gone.
+
+### Fixed
+
+- **`run_scan` rejects flag combinations it would otherwise drop.** `force`
+  with `revalidate`, `prune` without `revalidate`, and an empty target list each
+  raise `ValueError`, instead of silently losing a flag or failing with an
+  `IndexError`.
 
 ## [1.1.0] - 2026-06-17
 
