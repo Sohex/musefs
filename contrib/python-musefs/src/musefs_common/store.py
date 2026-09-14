@@ -509,6 +509,14 @@ def _track_art_row(track_id, ordinal, art):
     if len(art) == 4:
         art_id, picture_type, description, mime = art
         width = height = None
-    else:
+    elif len(art) == 6:
         art_id, picture_type, description, mime, width, height = art
+    else:
+        # A 1.x three-field row lands here too: name the shape that is wanted,
+        # rather than let an unpack fail on a count.
+        raise ValueError(
+            "replace_track_art rows are (art_id, picture_type, description, mime) "
+            f"or (art_id, picture_type, description, mime, width, height); "
+            f"got {len(art)} fields: {art!r}"
+        )
     return (track_id, art_id, picture_type, description, mime, width, height, ordinal)

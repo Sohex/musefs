@@ -178,3 +178,20 @@ def test_upsert_art_refuses_a_row_whose_digest_names_other_bytes(db_path):
         assert upsert_art(conn, JPEG) == honest
     finally:
         conn.close()
+
+
+def test_replace_track_art_names_the_row_shape_it_wants(db_path):
+    """A row of any other length, such as the three-field shape 1.x took, is
+    refused with the shapes spelled out, before anything is deleted."""
+    conn = connect(db_path)
+    try:
+        tid = insert_track(conn, "/m/a.flac")
+        art_id = upsert_art(conn, JPEG)
+        replace_track_art(conn, tid, [(art_id, 3, "", "image/jpeg")])
+        conn.commit()
+        with pytest.raises(ValueError, match="got 3 fields"):
+            replace_track_art(conn, tid, [(art_id, 3, "")])
+        rows = conn.execute("SELECT art_id FROM track_art WHERE track_id=?", (tid,)).fetchall()
+        assert rows == [(art_id,)], "the existing link is untouched"
+    finally:
+        conn.close()
