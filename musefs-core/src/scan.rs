@@ -1784,7 +1784,16 @@ fn structural_blocks_from(blocks: Vec<(String, Vec<u8>)>) -> Vec<musefs_db::Stru
 /// concrete type path (`Db::`/`BulkWriter::`), which names the inherent method
 /// unambiguously so the same-named trait method can't recurse into itself.
 trait TrackSink {
-    fn upsert_track(&mut self, t: &NewTrack) -> musefs_db::Result<i64>;
+    /// Write the track row and its checksums in one statement. One statement is
+    /// the point: the store bumps `content_version` for a changed ctime unless a
+    /// checksum written by the same statement vouches for the bytes, and a
+    /// trigger sees only the statement that fired it.
+    fn upsert_track_with_checksums(
+        &mut self,
+        t: &NewTrack,
+        fingerprint: ChecksumWrite<'_>,
+        content_hash: ChecksumWrite<'_>,
+    ) -> musefs_db::Result<i64>;
     fn replace_tags(&mut self, track_id: i64, tags: &[Tag]) -> musefs_db::Result<()>;
     fn set_binary_tags(
         &mut self,
@@ -1803,12 +1812,6 @@ trait TrackSink {
         track_id: i64,
         pictures: &[EmbeddedArt],
     ) -> musefs_db::Result<usize>;
-    fn set_track_checksums(
-        &mut self,
-        track_id: i64,
-        fingerprint: ChecksumWrite<'_>,
-        content_hash: ChecksumWrite<'_>,
-    ) -> musefs_db::Result<()>;
     /// The row already stored at `path`, if any. Returns the whole row rather
     /// than a bool because the ingest paths decide their [`ChecksumWrite`]
     /// intents by comparing the stored stamp and geometry against the probe's.
@@ -1828,8 +1831,13 @@ trait TrackSink {
 }
 
 impl TrackSink for &Db {
-    fn upsert_track(&mut self, t: &NewTrack) -> musefs_db::Result<i64> {
-        Db::upsert_track(self, t)
+    fn upsert_track_with_checksums(
+        &mut self,
+        t: &NewTrack,
+        fingerprint: ChecksumWrite<'_>,
+        content_hash: ChecksumWrite<'_>,
+    ) -> musefs_db::Result<i64> {
+        Db::upsert_track_with_checksums(self, t, fingerprint, content_hash)
     }
     fn replace_tags(&mut self, track_id: i64, tags: &[Tag]) -> musefs_db::Result<()> {
         Db::replace_tags(self, track_id, tags)
@@ -1860,14 +1868,6 @@ impl TrackSink for &Db {
         pictures: &[EmbeddedArt],
     ) -> musefs_db::Result<usize> {
         Db::refresh_embedded_art(self, track_id, pictures)
-    }
-    fn set_track_checksums(
-        &mut self,
-        track_id: i64,
-        fingerprint: ChecksumWrite<'_>,
-        content_hash: ChecksumWrite<'_>,
-    ) -> musefs_db::Result<()> {
-        Db::set_track_checksums(self, track_id, fingerprint, content_hash)
     }
     fn existing_track(&mut self, path: &Path) -> musefs_db::Result<Option<musefs_db::Track>> {
         Db::get_track_by_path(self, path)
@@ -1902,8 +1902,13 @@ impl TrackSink for &Db {
 }
 
 impl TrackSink for &mut musefs_db::BulkWriter<'_> {
-    fn upsert_track(&mut self, t: &NewTrack) -> musefs_db::Result<i64> {
-        musefs_db::BulkWriter::upsert_track(self, t)
+    fn upsert_track_with_checksums(
+        &mut self,
+        t: &NewTrack,
+        fingerprint: ChecksumWrite<'_>,
+        content_hash: ChecksumWrite<'_>,
+    ) -> musefs_db::Result<i64> {
+        musefs_db::BulkWriter::upsert_track_with_checksums(self, t, fingerprint, content_hash)
     }
     fn replace_tags(&mut self, track_id: i64, tags: &[Tag]) -> musefs_db::Result<()> {
         musefs_db::BulkWriter::replace_tags(self, track_id, tags)
@@ -1934,14 +1939,6 @@ impl TrackSink for &mut musefs_db::BulkWriter<'_> {
         pictures: &[EmbeddedArt],
     ) -> musefs_db::Result<usize> {
         musefs_db::BulkWriter::refresh_embedded_art(self, track_id, pictures)
-    }
-    fn set_track_checksums(
-        &mut self,
-        track_id: i64,
-        fingerprint: ChecksumWrite<'_>,
-        content_hash: ChecksumWrite<'_>,
-    ) -> musefs_db::Result<()> {
-        musefs_db::BulkWriter::set_track_checksums(self, track_id, fingerprint, content_hash)
     }
     fn existing_track(&mut self, path: &Path) -> musefs_db::Result<Option<musefs_db::Track>> {
         musefs_db::BulkWriter::get_track_by_path(self, path)
@@ -1995,17 +1992,20 @@ fn ingest_into(
     // writing a row the `CHECK` will reject mid-transaction.
     check_storable(abs_path, &probed)?;
 
-    let track_id = w.upsert_track(&NewTrack {
-        backing_path: abs_path.to_path_buf(),
-        format: probed.format,
-        audio_offset: probed.audio_offset,
-        audio_length: probed.audio_length,
-        backing_size: stamp.size,
-        backing_mtime_ns: stamp.mtime_ns,
-        backing_ctime_ns: stamp.ctime_ns,
-        backing_ino: stamp.ino,
-    })?;
-    w.set_track_checksums(track_id, fingerprint, content_hash)?;
+    let track_id = w.upsert_track_with_checksums(
+        &NewTrack {
+            backing_path: abs_path.to_path_buf(),
+            format: probed.format,
+            audio_offset: probed.audio_offset,
+            audio_length: probed.audio_length,
+            backing_size: stamp.size,
+            backing_mtime_ns: stamp.mtime_ns,
+            backing_ctime_ns: stamp.ctime_ns,
+            backing_ino: stamp.ino,
+        },
+        fingerprint,
+        content_hash,
+    )?;
 
     // Text rows first, then binary rows continuing the same per-key counters —
     // the `tags` primary key spans both classes (see `next_ordinal`).
@@ -2078,17 +2078,23 @@ fn refresh_structural_into(
     fingerprint: ChecksumWrite<'_>,
     content_hash: ChecksumWrite<'_>,
 ) -> Result<()> {
-    let track_id = w.upsert_track(&NewTrack {
-        backing_path: abs_path.to_path_buf(),
-        format: probed.format,
-        audio_offset: probed.audio_offset,
-        audio_length: probed.audio_length,
-        backing_size: stamp.size,
-        backing_mtime_ns: stamp.mtime_ns,
-        backing_ctime_ns: stamp.ctime_ns,
-        backing_ino: stamp.ino,
-    })?;
-    w.set_track_checksums(track_id, fingerprint, content_hash)?;
+    // One statement for the stamp and its checksums, as in `ingest_into`: a
+    // re-probe of a file whose ctime moved bumps `content_version` exactly when no
+    // checksum written with the new stamp vouches for the bytes.
+    let track_id = w.upsert_track_with_checksums(
+        &NewTrack {
+            backing_path: abs_path.to_path_buf(),
+            format: probed.format,
+            audio_offset: probed.audio_offset,
+            audio_length: probed.audio_length,
+            backing_size: stamp.size,
+            backing_mtime_ns: stamp.mtime_ns,
+            backing_ctime_ns: stamp.ctime_ns,
+            backing_ino: stamp.ino,
+        },
+        fingerprint,
+        content_hash,
+    )?;
     let structural_blocks = structural_blocks_from(probed.structural_blocks);
     w.set_structural_blocks(track_id, &structural_blocks)?;
     // The V4 migration could only copy each blob's shared metadata onto every

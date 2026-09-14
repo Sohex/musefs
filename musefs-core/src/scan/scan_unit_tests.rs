@@ -846,9 +846,9 @@ fn unit_with(abs_path: &str, fingerprint: Option<String>) -> Unit {
 }
 
 // Exercises the `&Db: TrackSink` ingest path: a fresh insert must persist the
-// unit's fingerprint via `Db::set_track_checksums` (kills the `&Db`
-// `set_track_checksums -> Ok(())` mutant — without the write the row's
-// fingerprint stays NULL).
+// unit's fingerprint through `Db::upsert_track_with_checksums`, the one
+// statement that writes the row and its checksums together — without the
+// checksums in that write the row's fingerprint stays NULL.
 #[test]
 fn ingest_unit_db_path_sets_checksums_on_fresh_insert() {
     let db = Db::open_in_memory().unwrap();

@@ -3,8 +3,10 @@ mod common;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use musefs_core::{MountConfig, Musefs, scan_directory};
-use musefs_db::{Db, Tag};
+use musefs_core::{
+    ChecksumTier, MountConfig, Musefs, ScanOptions, revalidate_with, scan_directory,
+};
+use musefs_db::{ChecksumWrite, Db, Tag};
 
 use common::corpus::{CorpusParams, Format, Target, prepare};
 use proptest::prelude::*;
@@ -13,6 +15,153 @@ use proptest::prelude::*;
 /// the tempdir — keep it alive for the whole test.
 fn small_corpus(n: usize) -> Target {
     prepare(&CorpusParams::single(Format::Flac, 1, n))
+}
+
+/// Let the kernel's coarse clock tick past `path`'s current ctime, so the change
+/// a test makes next is one ctime can record, and return the ctime it had. ctime
+/// is stamped from a coarse clock (a few milliseconds), so a change landing in
+/// the same tick as the last write leaves it where it was, and a test that needs
+/// ctime to move would then decide nothing.
+fn after_a_ctime_tick(path: &std::path::Path) -> i64 {
+    let before = common::real_ctime_ns(path);
+    std::thread::sleep(Duration::from_millis(25));
+    before
+}
+
+/// Scan a one-file WAV library and return its directory, the file, the store and
+/// the track id. WAV, because it carries no structural blocks whose rewrite would
+/// bump `content_version` on its own and hide whether the ctime rule fired.
+fn scanned_wav(fill: u8) -> (tempfile::TempDir, std::path::PathBuf, Db, i64) {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = dir.path().join("a.wav");
+    common::write_wav(&wav, &[fill; 4096]);
+    let db = Db::open_in_memory().unwrap();
+    scan_directory(&db, dir.path()).unwrap();
+    let id = db.list_tracks().unwrap()[0].id;
+    (dir, wav, db, id)
+}
+
+fn at_tier(checksum: ChecksumTier) -> ScanOptions {
+    let mut opts = ScanOptions::default();
+    opts.checksum = checksum;
+    opts
+}
+
+/// A same-size rewrite that puts its old mtime back changes ctime and nothing
+/// else the stamp records. The store bumps `content_version` for that unless a
+/// checksum written in the same statement proves the bytes unchanged, and a
+/// revalidate's re-probe is what writes one. While the scanner wrote the stamp
+/// and its checksums in two statements, the trigger saw the stamp without them:
+/// the row kept its old `content_version`, so the served mtime held still while
+/// a kernel page cache kept the old pages.
+#[test]
+fn a_ctime_only_rewrite_that_revalidate_reprobes_bumps_content_version() {
+    for (what, checksum, forget_fingerprint) in [
+        (
+            "the re-derived fingerprint differs",
+            ChecksumTier::Fingerprint,
+            false,
+        ),
+        (
+            "no fingerprint was stored to compare",
+            ChecksumTier::Fingerprint,
+            true,
+        ),
+        (
+            "a none-tier pass computes nothing",
+            ChecksumTier::None,
+            false,
+        ),
+    ] {
+        let (dir, wav, db, id) = scanned_wav(0xAB);
+        if forget_fingerprint {
+            db.set_track_checksums(id, ChecksumWrite::Clear, ChecksumWrite::Clear)
+                .unwrap();
+        }
+        let before = db.track_content_version(id).unwrap();
+        let row = db.get_track(id).unwrap().unwrap();
+
+        let old_ctime = after_a_ctime_tick(&wav);
+        let mtime = row.backing_mtime_ns;
+        common::write_wav(&wav, &[0xCD; 4096]);
+        common::set_mtime(
+            &wav,
+            mtime.div_euclid(1_000_000_000),
+            mtime.rem_euclid(1_000_000_000),
+        );
+        assert_eq!(
+            std::fs::metadata(&wav).unwrap().len(),
+            row.backing_size,
+            "{what}: the rewrite keeps the size"
+        );
+        assert_eq!(
+            common::real_mtime_ns(&wav),
+            mtime,
+            "{what}: the old mtime is back"
+        );
+        assert_ne!(
+            common::real_ctime_ns(&wav),
+            old_ctime,
+            "{what}: the rewrite must move ctime, or this test decides nothing"
+        );
+
+        let stats = revalidate_with(&db, dir.path(), &at_tier(checksum)).unwrap();
+        assert_eq!(stats.updated, 1, "{what}: the moved ctime is re-probed");
+        assert_eq!(
+            db.track_content_version(id).unwrap(),
+            before + 1,
+            "{what}: new bytes nothing vouches for move content_version"
+        );
+    }
+}
+
+/// A chmod moves ctime exactly as a same-size rewrite does, which is why ctime
+/// alone must not bump: the re-probe derives the fingerprint the row already
+/// holds and writes it with the stamp, which vouches for the bytes. Bumping here
+/// is the served-mtime churn #757 removed.
+#[test]
+fn a_chmod_only_change_that_revalidate_reprobes_does_not_bump() {
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, wav, db, id) = scanned_wav(0xAB);
+    let before = db.track_content_version(id).unwrap();
+
+    let old_ctime = after_a_ctime_tick(&wav);
+    let mut perms = std::fs::metadata(&wav).unwrap().permissions();
+    perms.set_mode(perms.mode() ^ 0o010);
+    std::fs::set_permissions(&wav, perms).unwrap();
+    assert_ne!(
+        common::real_ctime_ns(&wav),
+        old_ctime,
+        "the chmod must move ctime, or this test decides nothing"
+    );
+
+    let stats = revalidate_with(&db, dir.path(), &ScanOptions::default()).unwrap();
+    assert_eq!(stats.updated, 1, "the moved ctime is re-probed");
+    assert_eq!(
+        db.track_content_version(id).unwrap(),
+        before,
+        "an unchanged fingerprint vouches for the bytes"
+    );
+}
+
+/// A moved file keeps its row through a retarget, which writes the fingerprint
+/// it was matched on in the same statement as the new stamp. The served bytes
+/// are the ones the row already described, so nothing bumps.
+#[test]
+fn a_retarget_does_not_bump_content_version() {
+    let (dir, wav, db, id) = scanned_wav(0xAB);
+    let before = db.track_content_version(id).unwrap();
+
+    after_a_ctime_tick(&wav);
+    let moved = dir.path().join("moved.wav");
+    std::fs::rename(&wav, &moved).unwrap();
+    scan_directory(&db, dir.path()).unwrap();
+
+    let tracks = db.list_tracks().unwrap();
+    assert_eq!(tracks.len(), 1, "the row followed the file");
+    assert_eq!(tracks[0].id, id);
+    assert!(tracks[0].backing_path.ends_with("moved.wav"));
+    assert_eq!(db.track_content_version(id).unwrap(), before);
 }
 
 fn config() -> MountConfig {
