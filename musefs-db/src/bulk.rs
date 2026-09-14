@@ -469,6 +469,38 @@ mod tests {
         );
     }
 
+    /// The skip lives in the shared body, so the scanner's batch path gets it.
+    #[test]
+    fn bulk_set_structural_blocks_leaves_an_identical_set_alone() {
+        use crate::StructuralBlock;
+        let db = Db::open_in_memory().unwrap();
+        let blocks = [StructuralBlock {
+            kind: "STREAMINFO".into(),
+            ordinal: 0,
+            body: vec![1, 2],
+        }];
+        let id = db
+            .upsert_track(&NewTrack {
+                backing_path: std::path::PathBuf::from("/a.flac"),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 1,
+                backing_size: 1,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
+                backing_ino: None,
+            })
+            .unwrap();
+        db.set_structural_blocks(id, &blocks).unwrap();
+        let before = db.track_content_version(id).unwrap();
+
+        let mut bw = db.bulk_writer().unwrap();
+        bw.set_structural_blocks(id, &blocks).unwrap();
+        bw.commit().unwrap();
+
+        assert_eq!(db.track_content_version(id).unwrap(), before);
+    }
+
     #[test]
     fn bulk_set_structural_blocks_round_trips() {
         use crate::StructuralBlock;
