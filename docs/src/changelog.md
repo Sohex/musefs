@@ -825,6 +825,38 @@ see the [Release notes](release-notes.md).
 
 ### Fixed
 
+- **An MP3 that begins with more than one ID3v2 tag scans**
+  ([#767](https://github.com/Sohex/musefs/issues/767)). `mp3::locate_audio` and
+  its bounded twin called `id3v2::total_len` once, so `[ID3][ID3][MPEG…]` stepped
+  over the first tag and demanded a frame sync at the start of the second,
+  refusing the file as `NotMp3`, although `id3v2::leading_tags_len` already walked
+  such a run for FLAC. Both locators now step over the whole leading run; the
+  bounded one waits for the bytes that show the run has ended, so a window cut
+  inside a second tag's `ID3` widens instead of refusing.
+
+- **An appended ID3v2 tag is no longer served as audio, and is ingested**
+  ([#768](https://github.com/Sohex/musefs/issues/768)). ID3v2.4 lets a tag follow
+  the audio, requires it to carry a `3DI` footer, and lets a file carry tags at
+  both ends. musefs stepped over only a leading tag and a trailing ID3v1, so an
+  appended tag was stored as audio and served as audio, and its metadata never
+  reached the store; a file tagged at both ends served fresh metadata at the
+  front and the stale original at the end, where a v2.4 reader is told to look.
+  `mp3::locate_trailer` now walks back from the end of the file: a tag counts only
+  when its footer validates (`3DI`, version 4, the footer flag, a synchsafe size)
+  and matches the header its size points back to, up to 64 appended tags, with
+  one ID3v1 trailer allowed on either side of them and only tags after the frame
+  sync counted. The scan reads exactly the declared extents from the tail, within
+  the 64 MiB probe ceiling, and never the MPEG payload. Every tag at either end is
+  parsed within its own extent and merged in file order as ID3v2.4 §5 and §3.2
+  specify: a later tag replaces what came before unless its extended header sets
+  the update flag, in which case only the frames the frames document calls unique
+  override (text, `TXXX`, `COMM` and `USLT` by store key; `POPM` by rating and play
+  count together; `APIC` by description; binary frames by their own rules). A tag
+  the allocation guard will not parse contributes nothing and discards nothing.
+  Since ID3v2.3 has no update flag, a run of v2.3 tags now resolves to the last of
+  them, where the scan used to read only the first. `SEEK` frames are not
+  followed, and APEv2 tags remain out of scope.
+
 - **The published crates carry their license.** None of the six `.crate` files
   included the MIT `LICENSE`, whose notice has to travel with the code; each
   crate now ships it, through a `LICENSE` symlink to the workspace root's, which

@@ -441,6 +441,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **An MP3 that begins with more than one ID3v2 tag scans**
+  ([#767](https://github.com/Sohex/musefs/issues/767)). Both audio locators
+  stepped over only the first tag and refused the file as not MP3. They now step
+  over the whole run, and the tags' contents are merged as below.
+
+- **An appended ID3v2 tag is no longer served as audio, and is ingested**
+  ([#768](https://github.com/Sohex/musefs/issues/768)). A tag after the audio,
+  found by its `3DI` footer at the end of the file or beside an ID3v1 trailer,
+  stayed inside the audio region: its metadata never reached the store, and a
+  file tagged at both ends served fresh metadata at the front and the stale tag
+  at the end. Every ID3v2 tag at either end is now excluded from the audio, and
+  their contents are merged in file order as ID3v2.4 §5 specifies: a later tag
+  replaces the earlier one unless it sets the update flag, in which case only its
+  unique frames override. The scan reads each appended tag's declared extent from
+  the end of the file, within the probe ceiling, never the audio.
+
 - **The published crates carry their license.** None of the six `.crate` files
   included the MIT `LICENSE`, which has to travel with the code; each crate now
   ships it, and the crates that lacked them gained a README, keywords,

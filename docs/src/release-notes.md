@@ -177,6 +177,13 @@ A few files need more than that:
   where their audio starts. Tags and art that 1.3.0 never read from those files
   arrive only through `musefs scan --force <file>`, which replaces that file's
   curated tags and art with what it embeds.
+- **MP3s with an appended ID3v2 tag** ([#768]). 1.3.0 counted a tag appended
+  after the audio as part of it, so the served file carried the backing file's
+  own tag at its end. The revalidate re-probes every MP3 and corrects where its
+  audio ends, keeping your tags. That tag's contents reach the store only through
+  `musefs scan --force <file>`, which replaces that file's curated tags and art.
+  MP3s 1.3.0 refused because they begin with more than one ID3v2 tag ([#767])
+  have no row yet; a plain `musefs scan` adds them.
 - **Chained Ogg** stored by 1.3.0 ([#722], [#747]). 2.0.0 refuses to serve these,
   so they cannot be refreshed. Each counts as `failed` (reason `unsupported`),
   and `revalidate` exits `2` while any remain. Until they are removed, reads
@@ -423,6 +430,8 @@ directly.
 [#760]: https://github.com/Sohex/musefs/issues/760
 [#761]: https://github.com/Sohex/musefs/issues/761
 [#762]: https://github.com/Sohex/musefs/issues/762
+[#767]: https://github.com/Sohex/musefs/issues/767
+[#768]: https://github.com/Sohex/musefs/issues/768
 
 ## v1.3.0
 
