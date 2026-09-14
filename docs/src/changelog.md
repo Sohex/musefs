@@ -16,6 +16,20 @@ see the [Release notes](release-notes.md).
 
 ### Added
 
+- **Big-endian RIFX WAV files scan and serve**
+  ([#770](https://github.com/Sohex/musefs/issues/770)). `riff_wave_start` required
+  the literal `RIFF` and every size was decoded little-endian, so a `RIFX` file,
+  the big-endian WAVE variant, was refused as not a WAV. A `wav::ByteOrder` is now
+  read from the magic, and the chunk walk, the INFO subchunk reader and the
+  structural read decode sizes with it. Synthesis writes `RIFX` with every size
+  big-endian: the form, `fmt `/`fact`, the INFO subchunks, `id3 ` and `data`, as
+  libsndfile writes it; the `fmt `/`fact` payloads are carried untouched. Nothing
+  new is stored, because the serve path already re-reads `[0, audio_offset)` and
+  the magic is its first four bytes. libsndfile and sox read the served file
+  back correctly; FFmpeg decodes RIFX PCM byte-swapped and skips a big-endian
+  INFO list, a bug it shows equally on the untouched source file, and still reads
+  every tag from the `id3 ` chunk.
+
 - **An owed revalidate is reported until it runs**
   ([#705](https://github.com/Sohex/musefs/issues/705)). `migrate` counts the
   tracks the upgrade left needing a revalidate, but it prints that count once,
@@ -832,6 +846,18 @@ see the [Release notes](release-notes.md).
   `test-support` ([#751](https://github.com/Sohex/musefs/issues/751)).
 
 ### Fixed
+
+- **A WAV whose waveform is a `LIST('wavl')` is refused by name**
+  ([#769](https://github.com/Sohex/musefs/issues/769)). RIFF also lets a WAVE
+  store its waveform as a `LIST('wavl')` of `data` and `slnt` chunks instead of
+  one top-level `data`, and the scan skipped such a file as unparseable. No
+  mainstream decoder plays that layout (FFmpeg, libsndfile, GStreamer and sox all
+  fail on it for want of a top-level `data` chunk), so serving it is not
+  worthwhile: it is now counted as `unsupported`, with the reason "WAVE waveform
+  stored as LIST('wavl')", on both the bounded and the over-ceiling probe paths,
+  and a stored row for a WAV later rewritten that way is removable by
+  `revalidate --prune`, like a chained Ogg. The WAV format page now states the
+  supported surface: RIFF and RIFX, `wavl` refused, RF64/BW64 out of scope.
 
 - **Upgrading a 1.0.0 store no longer drops long tags.** The schema step that
   made `tags.value`'s cap count bytes (version 2, shipped in 1.1.0) rebuilt the

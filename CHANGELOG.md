@@ -16,6 +16,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Big-endian RIFX WAV files scan and serve**
+  ([#770](https://github.com/Sohex/musefs/issues/770)). A `RIFX` file was refused
+  as not a WAV. It is now read with big-endian sizes and served as RIFX, with
+  every chunk musefs writes (`LIST`/`INFO`, `id3 `, `data`) sized big-endian, as
+  libsndfile writes it. Nothing new is stored: the byte order is read from the
+  backing file's own header at serve time.
+
 - **An owed revalidate is reported until it runs.** `migrate` reports how many
   tracks the upgrade left needing a revalidate, but only once, and that line
   scrolls away. Now `mount`, `scan` and `revalidate` each print a warning with
@@ -451,6 +458,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   outside the test suites called them.
 
 ### Fixed
+
+- **A WAV whose waveform is a `LIST('wavl')` is refused by name**
+  ([#769](https://github.com/Sohex/musefs/issues/769)). It was skipped as
+  unparseable. No mainstream decoder plays that layout, so it is now counted as
+  `unsupported` with the reason "WAVE waveform stored as LIST('wavl')", and a
+  stored row for a WAV later rewritten that way is removable by
+  `revalidate --prune`. The WAV format page now states the supported surface:
+  RIFF and RIFX, `wavl` refused, RF64/BW64 out of scope.
 
 - **Upgrading a 1.0.0 store no longer drops long tags.** The 1.1.0 step that made
   `tags.value`'s cap count bytes rebuilt the table at 256 KiB and deleted every

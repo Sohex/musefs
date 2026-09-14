@@ -67,6 +67,8 @@ store upgrade is one-way without the snapshot `migrate` takes.
   characters (was 1,024). This is schema version 3, which only widens
   constraints and carries every row across; `musefs migrate` applies it together
   with version 4.
+- **Big-endian RIFX WAVs** ([#770]) scan and are served as RIFX; a
+  `LIST('wavl')` WAV is refused as unsupported rather than unparseable ([#769]).
 
 See the [Changelog](changelog.md#200---2026-09-14) for the full list.
 
@@ -471,6 +473,8 @@ directly.
 [#766]: https://github.com/Sohex/musefs/issues/766
 [#767]: https://github.com/Sohex/musefs/issues/767
 [#768]: https://github.com/Sohex/musefs/issues/768
+[#769]: https://github.com/Sohex/musefs/issues/769
+[#770]: https://github.com/Sohex/musefs/issues/770
 
 ## v1.3.0
 
