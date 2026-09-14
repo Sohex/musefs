@@ -56,7 +56,7 @@ library onto new storage gives every file a new change time, so every file reads
 as changed: opens fail until a revalidate re-probes them. A file that agrees on
 all four fields cannot be told apart and is served as the original. On
 filesystems with real timestamps that takes a coincidence nothing ordinary
-produces, but on FAT32 and exFAT, where only the size and a coarse modification
+produces, but on FAT and exFAT, where only the size and a coarse modification
 time are compared, a copy that preserved its timestamps can agree — one more
 reason [they are not recommended](installation.md) for the backing library.
 

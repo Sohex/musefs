@@ -135,7 +135,7 @@ upgrade leaves several things only a revalidate puts right, and it is the
   refuses to retarget.
 - **Stored inodes start unknown** ([#674]). The check that catches a backing
   file replaced in place cannot use the inode until a revalidate records it.
-  On FAT32 and exFAT none is ever recorded ([#757]): those filesystems renumber
+  On FAT and exFAT none is ever recorded ([#757]): those filesystems renumber
   files on every mount, so an inode there would fail every file after a replug.
   The check is weaker on them as a result, and they are
   [not recommended](guide/installation.md) for the backing library.
@@ -173,8 +173,8 @@ nearly every synthesized file's mtime changes. The first revalidate then moves
 it again. The upgrade cleared every fingerprint, so at the default checksum tier
 that revalidate re-probes every file, and a re-probe moves a file's mtime only
 where it records something the store did not hold ([#757]). Everywhere except
-FAT32 and exFAT that includes the file's inode, recorded for the first time, so
-nearly every file's mtime moves again, seconds included. FAT32 and exFAT keep no
+FAT and exFAT that includes the file's inode, recorded for the first time, so
+nearly every file's mtime moves again, seconds included. FAT and exFAT keep no
 inode numbers, so there the mtime moves only where the revalidate corrects what
 the store holds for the file: its picture metadata, an Ogg FLAC's bounds, or
 FLAC structural data an older scan never recorded. A restored picture or Ogg

@@ -305,7 +305,7 @@ see the [Release notes](release-notes.md).
     type and records no inode on those two, and `revalidate` asks the same
     question live rather than re-probing such a row on every pass. No device
     number is recorded beside the inode: the kernel reassigns device numbers
-    across reboots, which would fail a whole library at once. FAT32 and exFAT
+    across reboots, which would fail a whole library at once. FAT and exFAT
     are now documented as not recommended for backing storage.
   - The lower bounds on `backing_mtime_ns` and `backing_ctime_ns` are dropped
     ([#696](https://github.com/Sohex/musefs/issues/696)), so a file dated before

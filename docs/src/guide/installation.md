@@ -46,10 +46,11 @@ the target needs the FUSE userspace tools and `/dev/fuse`:
 
 No glibc/libfuse install is needed for the musl binaries beyond `fuse3`.
 
-**Backing storage:** FAT32 and exFAT are not recommended for the music library
-musefs serves from. musefs is fully functional on them, but its check that a
-backing file has not changed on disk is weaker there. That check normally
-compares a file's size, modification time, change time and inode number. FAT32
+**Backing storage:** FAT (FAT12, FAT16 and FAT32) and exFAT are not
+recommended for the music library musefs serves from. musefs is fully
+functional on them, but its check that a backing file has not changed on disk
+is weaker there. That check normally
+compares a file's size, modification time, change time and inode number. FAT
 stores the modification time in two-second steps and exFAT in 10 ms steps, both
 report the change time as the modification time, and neither keeps inode
 numbers stable, so musefs records none. What is left is size plus a coarse

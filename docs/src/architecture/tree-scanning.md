@@ -33,7 +33,7 @@ inode there, and `revalidate` asks the same question live before re-probing a
 row that has none, so such a library converges rather than being rewritten on
 every pass. The answer belongs to the filesystem, so it is asked, not stored. On
 FAT and exFAT the stamp is therefore size plus a coarse mtime — two-second steps
-on FAT32, 10 ms on exFAT, with ctime reported as mtime on both — which is why the
+on FAT, 10 ms on exFAT, with ctime reported as mtime on both — which is why the
 [installation guide](../guide/installation.md) recommends against them as
 backing storage.
 

@@ -137,7 +137,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     filesystems that store no sub-second timestamps and where a same-size
     replacement could otherwise pass the freshness guard. Zero means *not yet
     known*, so an upgraded store is not taken dark; each scan arms the guard for
-    the rows it touches. FAT32 and exFAT get no inode, since they renumber files
+    the rows it touches. FAT and exFAT get no inode, since they renumber files
     on every mount ([#757](https://github.com/Sohex/musefs/issues/757)), and are
     not recommended as backing storage.
   - A backing file dated before 1970 is no longer refused
@@ -563,7 +563,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is compared on the other three fields alone rather than failing closed on a
   field the store has nothing to say about, so an upgrade does not take a
   library dark. `musefs revalidate` re-probes exactly those rows and fills the
-  inode in, except on FAT32 and exFAT, which keep no inode numbers to record
+  inode in, except on FAT and exFAT, which keep no inode numbers to record
   ([#757](https://github.com/Sohex/musefs/issues/757)).
 
 - Two files holding byte-identical cover art no longer serve each other's
