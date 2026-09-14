@@ -78,11 +78,19 @@ and is the source of truth; this checklist is the human side.
    internal floor fails the publish.
 4. Promote the `## [Unreleased]` section of `CHANGELOG.md` to
    `## [X.Y.Z] - <date>`.
-5. Dry-run package each crate: `cargo package -p <crate> --locked` for each of
-   `musefs-db musefs-format musefs-core musefs-fuse musefs-cli musefs`. This
-   catches packaging errors but **not** the cross-crate index-propagation
-   problem (it resolves siblings via path deps); that is handled in-workflow
-   (next section).
+5. Dry-run package every published crate in **one** invocation, which packages
+   and verifies them in dependency order:
+
+   ```bash
+   cargo package --locked -p musefs-db -p musefs-format -p musefs-core \
+     -p musefs-fuse -p musefs-cli -p musefs
+   ```
+
+   Packaged one at a time, every crate after `musefs-db` fails while the new
+   version is not yet on crates.io: a lone `cargo package` resolves its
+   siblings from the registry, not the workspace. The dry run catches packaging
+   errors but **not** the cross-crate index-propagation problem at publish
+   time; that is handled in-workflow (next section).
 6. Commit, e.g. `git commit -am "release: vX.Y.Z"`.
 
 **Tag and push.**
