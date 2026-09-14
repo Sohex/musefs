@@ -349,6 +349,11 @@ pub struct OggScan {
 }
 
 /// What a file's final page says about how many logical bitstreams it holds.
+///
+/// Deliberately not `#[non_exhaustive]` (#708): the scanner decides from this
+/// whether a file is refused or served, and matches it exhaustively, so a new
+/// verdict fails to compile there rather than reaching a wildcard that serves
+/// the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Chaining {
     /// The final page belongs to the header's bitstream: one stream, start to end.

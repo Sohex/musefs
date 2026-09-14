@@ -268,7 +268,11 @@ pub struct Track {
 /// bytes with a checksum of the old ones (#689). The tier-preservation property
 /// the old `COALESCE` protected survives, because `Clear` is driven by an
 /// observed content change rather than by the pass's checksum tier.
+///
+/// `#[non_exhaustive]`: other crates only build it, and the one match that
+/// turns it into SQL is in this crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ChecksumWrite<'a> {
     /// No new information: leave whatever is stored. Only correct when the
     /// recorded bytes are known not to have changed.

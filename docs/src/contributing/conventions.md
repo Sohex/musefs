@@ -41,7 +41,19 @@
   on the type. If marking takes away an exhaustive check the workspace relied
   on across a crate boundary, add a stand-in (as
   `a_new_format_must_be_wired_into_the_dispatch` does). `tests/` and `benches/`
-  count as other crates.
+  count as other crates. A type no other crate touches yet still gets a
+  decision, and by this rule it is marked. The deliberately exhaustive types,
+  which a new public type or a change of mind updates:
+  - matched variant by variant in another crate: `Segment`, `Extent`,
+    `ogg::Codec`, `ogg::Chaining`, `Mp4ScanError`, `WarnDecision`;
+  - the store's write inputs: `NewTrack`, `NewArt`, `TrackArt`, `EmbeddedArt`,
+    `BinaryTag`, `StructuralBlock`;
+  - the synthesis inputs: `ArtInput`, `BinaryTagInput`, `TagInput`,
+    `MetadataBlock`, `OggArt`;
+  - telemetry another crate fills in: `FuseTelemetry`, `PassthroughTelemetry`,
+    `AllocatorStats`;
+  - value types tests build directly: `Attr`, `VirtualMtime`, `BackingStamp`,
+    `ResolvedFile`, `WavScan`, `EmbeddedPicture`, `EmbeddedBinaryTag`.
 - **Schema migrations.** Append to `MIGRATIONS` in `musefs-db/src/schema.rs`;
   each entry carries its SQL, the release that introduced it (`since`), a
   one-line `summary` the `migrate` command prints, and a `Gate`. **A `Gated`

@@ -1291,10 +1291,15 @@ fn probe_prefix(
                 // The header region only proves the file is not multiplexed. A
                 // chain's second bitstream begins after the first one's audio, so
                 // it is the *final* page that gives it away (#722).
-                if ogg_tail.is_some_and(|t| {
-                    ogg::classify_tail(&t.bytes, t.start, header.serial) == ogg::Chaining::Chained
-                }) {
-                    return Probe::Unsupported("chained Ogg (more than one logical bitstream)");
+                //
+                // Matched exhaustively rather than compared with `==`: `Chaining`
+                // stays exhaustive so that a verdict added to it has to be placed
+                // here, as refused or served, instead of being served by default.
+                match ogg_tail.map(|t| ogg::classify_tail(&t.bytes, t.start, header.serial)) {
+                    Some(ogg::Chaining::Chained) => {
+                        return Probe::Unsupported("chained Ogg (more than one logical bitstream)");
+                    }
+                    Some(ogg::Chaining::Single | ogg::Chaining::Unknown) | None => {}
                 }
                 let format = match header.codec {
                     ogg::Codec::Opus => Format::Opus,

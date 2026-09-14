@@ -20,6 +20,7 @@ const OP: &str = "migrating";
 
 /// How many rows of one rebuilt table the migrated schema would refuse.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TableRejections {
     /// The table as the store names it.
     pub table: &'static str,
