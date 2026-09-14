@@ -116,8 +116,11 @@ Structural blocks normally come from the `structural_blocks` store. A
 database scanned before that store existed has no rows there; synthesis then
 falls back to re-reading the file's front for every preserved block
 (carrying `APPLICATION`/`CUESHEET` inline and suppressing the streamed
-binary tags so nothing is emitted twice). A re-scan upgrades the track to
-the streamed path.
+binary tags so nothing is emitted twice). `musefs revalidate` upgrades the
+track to the streamed path: it re-probes a FLAC track with no structural rows
+even when the file is unchanged, and keeps the track's curated tags and art. A
+plain `scan` leaves an already-tracked file alone, and `scan --force` would
+replace its curated tags with the file's own.
 
 ## Quirks & invariants
 

@@ -88,8 +88,8 @@ fn clear_after_s1_hook() {
     AFTER_S1_HOOK.with(|h| *h.borrow_mut() = None);
 }
 
-/// A hook that runs on a scan worker after it resolves a walked path and before
-/// it probes it, for the one walked path it names (#684). Process-wide rather
+/// A hook that runs on a scan worker before it probes a path the walk resolved,
+/// for the one resolved path it names (#684, #766). Process-wide rather
 /// than `thread_local!` like the one above, because the workers are threads the
 /// test never touches; keyed by path so a scan in a parallel test cannot fire it.
 #[cfg(test)]
@@ -625,10 +625,20 @@ fn collect_audio_inner(
                 );
                 continue;
             }
-            match std::fs::metadata(&path) {
-                Ok(meta) if meta.is_dir() => {
+            // Resolved once, here, and the resolved path carried onward: the
+            // target's name decides eligibility, the skip tally buckets it, dedup
+            // and the already-present filter key on it, and the worker probes
+            // and stores it (#766). The link's own name decides nothing, so a
+            // link is ingested the same whether walked or passed as the root. A
+            // directory is descended by its resolved path too, which keeps every
+            // path under it canonical: nothing downstream resolves again, so the
+            // probe reads exactly what was resolved (#684).
+            let resolved = std::fs::canonicalize(&path)
+                .and_then(|target| std::fs::metadata(&target).map(|meta| (target, meta)));
+            match resolved {
+                Ok((target, meta)) if meta.is_dir() => {
                     descend(
-                        &path,
+                        &target,
                         out,
                         follow_symlinks,
                         visited,
@@ -637,10 +647,10 @@ fn collect_audio_inner(
                         progress,
                     )?;
                 }
-                Ok(meta) if meta.is_file() => {
-                    if is_supported_audio(&path) {
+                Ok((target, meta)) if meta.is_file() => {
+                    if is_supported_audio(&target) {
                         push_file(
-                            &path,
+                            &target,
                             out,
                             follow_symlinks,
                             files_visited,
@@ -648,7 +658,7 @@ fn collect_audio_inner(
                             progress,
                         );
                     } else {
-                        tally.skips.record(&path);
+                        tally.skips.record(&target);
                     }
                 }
                 Ok(_) => {}
@@ -2350,9 +2360,12 @@ fn ingest_bulk(
 /// (#651), and their per-file warns are capped per reason so a whole unreadable
 /// subtree cannot scale the log with the library.
 pub fn scan_directory_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<ScanStats> {
-    // Canonicalize the root once. With symlinks unfollowed (the default) every
-    // path the walk yields is then already absolute and symlink-free — i.e.
-    // canonical — so the workers need not canonicalize each probed file (#440).
+    // Canonicalize the root once. Every path the walk yields is then already
+    // absolute and symlink-free — i.e. canonical — so the workers need not
+    // canonicalize each probed file (#440). With symlinks followed that holds
+    // too: the walk resolves each link it follows and yields the resolved path
+    // (#766), so a link's target decides its eligibility here exactly as it
+    // does for a link passed as the root.
     let canon = std::fs::canonicalize(root)?;
     let root = canon.as_path();
     let mut files = Vec::new();
@@ -2379,17 +2392,8 @@ pub fn scan_directory_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<S
         // materialize every row's checksum strings just to drop them (#621).
         let existing: HashSet<PathBuf> = db.list_backing_paths()?.into_iter().collect();
         let before = files.len();
-        files.retain(|path| {
-            let key = if opts.follow_symlinks {
-                match std::fs::canonicalize(path) {
-                    Ok(abs) => abs,
-                    Err(_) => return true,
-                }
-            } else {
-                path.clone()
-            };
-            !existing.contains(&key)
-        });
+        // Walked paths are canonical, followed or not, so each is its own key.
+        files.retain(|path| !existing.contains(path));
         already_present = (before - files.len()) as u64;
     }
     if let Some(p) = &opts.progress {
@@ -2474,7 +2478,6 @@ fn run_pipeline(
     let total = files.len() as u64;
     let progress = opts.progress.as_ref();
     let window = opts.window;
-    let follow_symlinks = opts.follow_symlinks;
     let tier = opts.checksum;
     let strictness = opts.strictness;
     let cap = opts.batch_bytes;
@@ -2503,28 +2506,14 @@ fn run_pipeline(
             loop {
                 let i = cursor.fetch_add(1, Ordering::Relaxed);
                 let Some(path) = files.get(i) else { break };
-                // No-follow paths are canonical by construction (the root was
-                // canonicalized up front); only the opt-in symlink walk can yield a
-                // path with a symlink component to resolve (#440). It is resolved
-                // once, and the probe reads what was resolved: probing the walked
+                // Every path here is canonical: the root was canonicalized up
+                // front (#440), and the symlink walk resolved each link it
+                // followed once and handed on the resolved path (#766). The probe
+                // reads that path and nothing resolves it again: probing a link's
                 // name and canonicalizing it separately were two lookups, and a
                 // retarget between them stored one target's geometry and stamp
                 // against another's path (#684).
-                let abs_path = if follow_symlinks {
-                    match std::fs::canonicalize(path) {
-                        Ok(abs) => abs,
-                        Err(e) => {
-                            failures.record(
-                                SkipReason::Io,
-                                format_args!("skipping {}: {e}", path.display()),
-                            );
-                            failed.fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        }
-                    }
-                } else {
-                    path.clone()
-                };
+                let abs_path = path.clone();
                 #[cfg(test)]
                 fire_after_resolve(path);
                 match probe_file_caught(&abs_path, window, tier) {
@@ -2927,23 +2916,10 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
                 continue;
             }
         };
-        let key = if opts.follow_symlinks {
-            match std::fs::canonicalize(&path) {
-                Ok(abs) => abs,
-                Err(e) => {
-                    failures.record(
-                        SkipReason::Io,
-                        format_args!("skipping {}: {e}", path.display()),
-                    );
-                    skip_failed += 1;
-                    continue;
-                }
-            }
-        } else {
-            path.clone()
-        };
+        // The walk yields canonical paths, followed or not (#766), so the walked
+        // path is the stored `backing_path` it is looked up under.
         if let Some((stamp, id, format, has_fingerprint, has_content_hash)) =
-            existing.get(&key).copied()
+            existing.get(&path).copied()
         {
             let needs_backfill = format == Format::Flac && !have_structural.contains(&id);
             let needs_checksum = match opts.checksum {

@@ -215,23 +215,27 @@ fn collect_audio_ignores_symlink_to_non_file_target_when_following() {
 
     let dir = tempfile::tempdir().unwrap();
     // A FIFO is neither a regular file nor a directory, and mkfifo works in
-    // restricted sandboxes that deny Unix-socket bind (issue #277).
-    let fifo = dir.path().join("fifo");
+    // restricted sandboxes that deny Unix-socket bind (issue #277). It lives
+    // outside the walked directory, so the walk reaches it only through the link.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let fifo = elsewhere.path().join("track.flac");
     let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
     #[expect(unsafe_code, reason = "libc::mkfifo FFI; no std equivalent")]
     let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
     assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
 
-    // Name the link with a supported audio extension so the only thing
-    // keeping it out of `out` is the resolved target's is_file() check.
-    std::os::unix::fs::symlink(&fifo, dir.path().join("link.flac")).unwrap();
+    // The resolved target decides eligibility (#766), so it is the target that
+    // carries a supported audio extension: the only thing keeping it out of
+    // `out` is the resolved target's is_file() check.
+    std::os::unix::fs::symlink(&fifo, dir.path().join("link")).unwrap();
 
     let mut out = Vec::new();
-    collect_audio(dir.path(), &mut out, true).unwrap();
+    let skips = collect_audio(dir.path(), &mut out, true).unwrap();
     assert!(
         out.is_empty(),
         "a symlink to a non-file, non-dir target must not be collected"
     );
+    assert_eq!(skips.total, 0, "nor tallied as an unsupported file");
 }
 
 #[test]
@@ -255,6 +259,141 @@ fn collect_audio_tallies_direct_special_file_with_audio_extension() {
         tally.total, 1,
         "a direct special file must be tallied as skipped"
     );
+}
+
+/// A library holding one symlink, `library/<link_name>`, to
+/// `targets/<target_name>`: the two tempdirs to keep alive, and the target's
+/// canonical path.
+fn one_link(
+    link_name: &str,
+    target_name: &str,
+    contents: &[u8],
+) -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
+    let library = tempfile::tempdir().unwrap();
+    let targets = tempfile::tempdir().unwrap();
+    let target = targets.path().join(target_name);
+    std::fs::write(&target, contents).unwrap();
+    std::os::unix::fs::symlink(&target, library.path().join(link_name)).unwrap();
+    let canonical = std::fs::canonicalize(&target).unwrap();
+    (library, targets, canonical)
+}
+
+/// #766: a link with no extension to a FLAC is the FLAC, not an unsupported
+/// file. Scanning the link as the root already ingested it.
+#[test]
+fn a_followed_extensionless_link_to_audio_is_collected_as_its_target() {
+    let (library, _targets, target) = one_link("track", "song.flac", b"x");
+    let mut out = Vec::new();
+    let skips = collect_audio(library.path(), &mut out, true).unwrap();
+    assert_eq!(out, vec![target]);
+    assert_eq!(skips.total, 0);
+}
+
+/// #766: a `.txt` name on a link to a FLAC does not make it a skip.
+#[test]
+fn a_followed_txt_link_to_audio_is_collected_not_skipped() {
+    let (library, _targets, target) = one_link("nice.txt", "song.flac", b"x");
+    let mut out = Vec::new();
+    let skips = collect_audio(library.path(), &mut out, true).unwrap();
+    assert_eq!(out, vec![target]);
+    assert_eq!(skips.total, 0, "a link to audio is not an unsupported file");
+}
+
+/// #766: the walk yields the path the probe dispatches on. A `.flac` link to an
+/// MP3 is collected as the MP3, so eligibility and dispatch read one name.
+#[test]
+fn a_followed_audio_named_link_yields_the_target_it_dispatches_on() {
+    let (library, _targets, target) = one_link("nice.flac", "song.mp3", b"x");
+    let mut out = Vec::new();
+    collect_audio(library.path(), &mut out, true).unwrap();
+    assert_eq!(out, vec![target]);
+}
+
+/// #766: a `.flac` link to an extensionless file is a skip, bucketed by the
+/// target's extension, rather than a supported file the probe then refuses.
+#[test]
+fn a_followed_audio_named_link_to_a_non_audio_file_is_a_skip_of_the_target() {
+    let (library, _targets, _target) = one_link("nice.flac", "noext", b"not audio");
+    let mut out = Vec::new();
+    let skips = collect_audio(library.path(), &mut out, true).unwrap();
+    assert!(
+        out.is_empty(),
+        "a link to a non-audio file is not collected"
+    );
+    assert_eq!(skips.summary().as_deref(), Some("skipped 1: <none>=1"));
+}
+
+/// #766: a followed directory link is resolved once, so the files under it are
+/// yielded by their canonical paths. Nothing downstream resolves them again.
+#[test]
+fn files_under_a_followed_directory_link_are_yielded_canonical() {
+    let library = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let album = elsewhere.path().join("album");
+    std::fs::create_dir(&album).unwrap();
+    std::fs::write(album.join("song.flac"), b"x").unwrap();
+    std::os::unix::fs::symlink(&album, library.path().join("mirror")).unwrap();
+
+    let mut out = Vec::new();
+    collect_audio(library.path(), &mut out, true).unwrap();
+    assert_eq!(
+        out,
+        vec![std::fs::canonicalize(album.join("song.flac")).unwrap()]
+    );
+}
+
+/// #766: a link the walk cannot resolve, dangling or looping, is a counted walk
+/// error, never silently dropped.
+#[test]
+fn a_followed_link_that_cannot_be_resolved_is_a_walk_error() {
+    let dir = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(dir.path().join("nonexistent"), dir.path().join("dangling"))
+        .unwrap();
+    std::os::unix::fs::symlink(dir.path().join("b.flac"), dir.path().join("a.flac")).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("a.flac"), dir.path().join("b.flac")).unwrap();
+
+    let failures = FailureTally::default();
+    let mut out = Vec::new();
+    let skips = collect_audio_with(dir.path(), &mut out, true, None, &failures).unwrap();
+    assert!(out.is_empty());
+    assert_eq!(skips.total, 0);
+    assert_eq!(failures.walk_summary().unwrap(), "walk errors 3: symlink=3");
+}
+
+/// #766: discovery counts links by their targets, so the spinner counts what
+/// will be probed: two links to audio under non-audio names, but not an
+/// audio-named link to a text file.
+#[test]
+fn followed_links_are_discovered_by_their_targets() {
+    let library = tempfile::tempdir().unwrap();
+    let targets = tempfile::tempdir().unwrap();
+    for (link, target, contents) in [
+        ("track", "one.flac", &b"x"[..]),
+        ("nice.txt", "two.flac", b"x"),
+        ("nice.flac", "noext", b"not audio"),
+    ] {
+        std::fs::write(targets.path().join(target), contents).unwrap();
+        std::os::unix::fs::symlink(targets.path().join(target), library.path().join(link)).unwrap();
+    }
+    let found = Arc::new(AtomicU64::new(0));
+    let seen = Arc::clone(&found);
+    let sink = ProgressSink::new(move |ev| {
+        if let ScanProgress::Discovered { found } = ev {
+            seen.store(found, Ordering::Relaxed);
+        }
+    });
+
+    let mut out = Vec::new();
+    let skips = collect_audio_with(
+        library.path(),
+        &mut out,
+        true,
+        Some(&sink),
+        &FailureTally::default(),
+    )
+    .unwrap();
+    assert_eq!(found.load(Ordering::Relaxed), 2);
+    assert_eq!(skips.total, 1);
 }
 
 #[test]
@@ -329,10 +468,12 @@ fn write_flac(path: &std::path::Path, entries: &[&str], pic: Option<(u32, u32)>)
 }
 
 /// #684: under `--follow-symlinks` the stored path and the probed bytes come from
-/// one resolution. The hook retargets the symlink to a different file after the
-/// worker resolves the walked name and before it probes; the row must still be
-/// entirely the original target's. Were the probe to read the walked name again,
-/// it would read the new target and store its geometry against the old path.
+/// one resolution. The walk resolves the link (#766); the hook retargets it to a
+/// different file after that and before the worker probes. The row must still be
+/// entirely the original target's. Were the probe to read the link's name again,
+/// it would read the new target and store its geometry against the old path. The
+/// hook is keyed on the resolved target, so a walk that handed on the link's
+/// name instead would never fire it, and the retarget assertion fails.
 #[test]
 fn a_symlink_retargeted_after_resolution_cannot_split_path_from_geometry() {
     let library = tempfile::tempdir().unwrap();
@@ -351,11 +492,9 @@ fn a_symlink_retargeted_after_resolution_cannot_split_path_from_geometry() {
     let link = library.path().join("link.flac");
     std::os::unix::fs::symlink(&first, &link).unwrap();
 
-    let walked = std::fs::canonicalize(library.path())
-        .unwrap()
-        .join("link.flac");
+    let resolved = std::fs::canonicalize(&first).unwrap();
     let (retarget_link, retarget_to) = (link.clone(), second.clone());
-    set_after_resolve_hook(walked, move || {
+    set_after_resolve_hook(resolved, move || {
         std::fs::remove_file(&retarget_link).unwrap();
         std::os::unix::fs::symlink(&retarget_to, &retarget_link).unwrap();
     });

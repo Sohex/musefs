@@ -26,7 +26,8 @@ plugins under `contrib/` write tags and art here out-of-band.
   and `content_version`), `tags` (multi-value key/value rows ordered by
   `ordinal`, with an optional `value_blob` for binary tags), `art`
   (content-addressed, deduplicated image blobs), `track_art` (per-track art
-  links with picture type and ordering), and `structural_blocks` (read-only,
+  links with picture type and ordering, keyed `PRIMARY KEY (track_id, ordinal)`
+  so a track holds one link per ordinal), and `structural_blocks` (read-only,
   derived-from-file FLAC `STREAMINFO`/`SEEKTABLE` metadata, **not** part of the
   editable contract). Deleting a track cascades to its `tags` and `track_art`
   rows. Triggers bump the owning track's `content_version`/`updated_at` on any
@@ -143,7 +144,7 @@ window and differing only between them still collide, which is what
 `content_hash` arbitrates.
 
 `content_hash` is a full-file SHA-256 of the *current* backing file, stored as
-64-char hex. It is computed only at the `full` checksum tier
+64 lowercase hex characters. It is computed only at the `full` checksum tier
 (`--checksum=full`), which requires an eager whole-file read.
 
 Two rules keep "of the current backing file" true. Both checksums are derived
@@ -185,7 +186,8 @@ follow their backing files to the new locations.
 malformed *shapes* at write time — the offending statement aborts — so an
 external writer cannot persist them:
 
-- an unknown `format` string, or a negative length/offset/size/version;
+- an unknown `format` string, or a negative length/offset/size/version or
+  `updated_at`;
 - an `audio_offset + audio_length` running past the stored `backing_size`;
 - a binary tag row whose `value` is non-empty;
 - an `art.byte_len` that disagrees with its blob, or an `art.sha256` that is not
@@ -207,8 +209,8 @@ external writer cannot persist them:
   synthesis — others are dropped and logged. MP3/M4A custom keys may use the
   wider set (e.g. `=`, `:`, spaces, non-ASCII).
 - a `value_blob` over `MAX_BINARY_TAG_BYTES`;
-- an `art.byte_len` over `MAX_ART_BYTES`;
-- a `track_art.mime` over 255 chars or `description` over 8 KiB, or either one,
+- an `art.byte_len` that is negative or over `MAX_ART_BYTES`;
+- a `track_art.mime` over 255 chars or `description` over 8192 chars, or either one,
   or an `art.sha256`, containing NUL;
 - a `backing_path` that is not a non-empty `BLOB`, that contains a NUL byte, or
   that is over 64 KiB (`MAX_BACKING_PATH_BYTES`,

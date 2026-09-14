@@ -93,7 +93,11 @@ bash scripts/contract-roundtrip.sh
 It scans real ffmpeg-generated audio (so `musefs scan` owns the track geometry),
 writes tags/art through `musefs_common.store`, synthesizes the served bytes via
 `cargo test --test contract_emit`, and asserts with mutagen that the Python tags
-and art survived. Picard's `musefs_bin` tier runs in the same job: its path-gate
+and art survived. That includes picture geometry: one FLAC's art is linked with
+a six-field `replace_track_art` row whose dimensions come from the image header,
+plus a depth and colour count on the same link, and its served `PICTURE` block
+must carry exactly those; another's is linked with a four-field row and must
+serve every geometry field as 0. Picard's `musefs_bin` tier runs in the same job: its path-gate
 tests import the bundled `musefs._common`, not the system-Picard environment.
 
 The job also runs the beets `e2e` tier (`python -m pytest contrib/beets/tests -m

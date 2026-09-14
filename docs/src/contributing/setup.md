@@ -27,8 +27,11 @@ Map of this document:
 Prerequisites:
 
 - **Rust** — stable (edition 2024) with `rustfmt` and `clippy`.
+- **A C compiler and `make`** — rusqlite's bundled SQLite and the default
+  `jemalloc` feature compile C sources. No libfuse headers or `pkg-config`:
+  `fuser` is built without its `libfuse` feature and mounts in pure Rust.
 - **FUSE** (to mount, or to run the FUSE end-to-end tests) — Linux with
-  `/dev/fuse` and libfuse (`libfuse3-dev` / `libfuse3` plus `pkg-config`), or
+  `/dev/fuse` and the `fuse3` runtime (for the `fusermount3` helper), or
   FreeBSD with `/dev/fuse` and the `fusefs` kernel module (no libfuse — see
   [FreeBSD e2e](#freebsd-e2e) for the in-tree VM harness).
 - **Python 3** with `ruff` — needed for every commit: the pre-commit hook's
@@ -91,7 +94,7 @@ allocator + background purge thread). Build the system-allocator variant with
 The FUSE end-to-end tests perform real mounts and are `#[ignore]`d:
 
 ```bash
-cargo test -p musefs-fuse -- --ignored   # needs /dev/fuse + libfuse
+cargo test -p musefs-fuse -- --ignored   # needs /dev/fuse + fusermount3
 ```
 
 The kernel-passthrough e2e additionally needs `CAP_SYS_ADMIN`. Don't run

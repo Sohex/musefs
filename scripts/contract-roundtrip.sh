@@ -27,7 +27,10 @@ if [ ! -x "$bin" ]; then
 fi
 
 # 1. Real audio fixtures (ffmpeg is installed on this CI tier).
+#    Two FLACs: the writer links one picture with stated geometry and one
+#    without, and only a FLAC picture block carries geometry.
 ffmpeg -nostdin -loglevel error -f lavfi -i "sine=frequency=440:duration=1" -c:a flac "$backing/track.flac"
+ffmpeg -nostdin -loglevel error -f lavfi -i "sine=frequency=550:duration=1" -c:a flac "$backing/unstated.flac"
 ffmpeg -nostdin -loglevel error -f lavfi -i "sine=frequency=660:duration=1" -c:a libmp3lame "$backing/track.mp3"
 
 # 2. Scan owns the track geometry (an external writer cannot create it).

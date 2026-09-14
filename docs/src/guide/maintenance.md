@@ -141,7 +141,10 @@ upgrade to version 4 before this musefs build can open it; run `musefs migrate
 will no longer open it, which is why it is not applied automatically
 ```
 
-A command that refuses leaves the store exactly as it found it. While a gated
+A command that refuses changes neither the store's data nor its schema version,
+so the previous release can still open it. The raw file bytes are not
+guaranteed identical: closing the connection checkpoints any write-ahead-log
+frames a previous writer left pending into the database file. While a gated
 step is pending no step is applied, not even an automatic one, so the previous
 release still opens the store until `musefs migrate` has run
 ([#749](https://github.com/Sohex/musefs/issues/749)).

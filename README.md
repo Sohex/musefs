@@ -29,7 +29,7 @@ passes unit tests, but mounted end-to-end behaviour is not yet validated.*
 
 ```bash
 cargo install musefs    # compiles from source — needs a Rust toolchain,
-                        # libfuse3-dev and pkg-config; prebuilt binaries
+                        # a C compiler and make; prebuilt binaries
                         # and container images: see Installing
 
 musefs scan ~/Music --db library.db        # ingest your library

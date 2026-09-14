@@ -86,7 +86,7 @@ To run musefs on the host at login, drop-in units live in
 optional `musefs-scan.timer` that periodically runs `musefs revalidate --prune`
 (refreshing changed files and removing tracks whose files are gone; it adds no
 new files), and a commented
-`musefs.conf.example` holding every `MUSEFS_*` setting. Copy the units to
+`musefs.conf.example` holding the common `MUSEFS_*` settings. Copy the units to
 `~/.config/systemd/user/`, copy the config to `~/.config/musefs/musefs.conf`,
 edit `MUSEFS_MOUNTPOINT` and `MUSEFS_DB`, then
 `systemctl --user enable --now musefs.service`. See

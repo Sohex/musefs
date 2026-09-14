@@ -58,9 +58,11 @@ pub struct FuseConfig {
     pub max_background: u16,
     /// Keep the kernel page cache across opens (`FOPEN_KEEP_CACHE`). On by
     /// default (#432): the one measured storage win (~3× faster repeat-open on
-    /// HDD/NFS). An external re-tag auto-invalidates the affected inode on
-    /// refresh (`poll_refresh_notify` → `inval_inode`), so cached bytes are
-    /// dropped when content changes.
+    /// HDD/NFS). A store change that raises a track's `content_version`
+    /// invalidates its inode at the next refresh (`poll_refresh_notify` →
+    /// `inval_inode`). A backing file rewritten in place changes nothing in the
+    /// store, so pages cached before the rewrite stay readable from a file that
+    /// is already open; those reads never reach the daemon.
     pub keep_cache: bool,
     /// uid presented for every entry (the marker, synthetic dirs, real files).
     pub uid: u32,
