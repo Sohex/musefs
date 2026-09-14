@@ -1,12 +1,84 @@
 # WAV
 
-How musefs scans and synthesizes RIFF/WAVE files (`.wav`). WAV has no single
+How musefs scans and synthesizes RIFF/WAVE files (`.wav`), including their
+big-endian RIFX twin. WAV has no single
 native tag standard, so musefs writes metadata twice: a broad-compatibility
 `LIST`/`INFO` chunk and a full-fidelity embedded `id3 ` chunk. For the
 segment model these layouts plug into, see
 [the segment model](../architecture/serving.md#the-segment-model). The ID3v2 tag inside
 the `id3 ` chunk is built by the same code as MP3's — [MP3](mp3.md)'s
 round-trip and lossy-edge rules apply to it wholesale.
+
+## Supported surface
+
+Only files named `.wav` are probed. Of those:
+
+| Container | Outcome |
+| --------- | ------- |
+| `RIFF`/`WAVE`, one top-level `data` chunk | Served. |
+| `RIFX`/`WAVE` (big-endian) | Served, as RIFX (below). |
+| Waveform stored as `LIST('wavl')` | Refused as **unsupported**, by name. |
+| `RF64` / `BW64` | Refused as unparseable: out of scope. |
+
+### RIFX
+
+RIFX is WAVE with every integer big-endian. musefs reads its form size, chunk
+sizes and `LIST`/`INFO` subchunk sizes big-endian, and serves it as RIFX: the
+synthesized form, `fmt `/`fact`, `LIST`/`INFO` subchunk, `id3 ` and `data`
+sizes are all written big-endian, as libsndfile writes RIFX. The `fmt ` and
+`fact` payloads are carried verbatim and nothing in musefs interprets them, so
+a big-endian `fmt ` is never wrapped in a container that claims little-endian.
+The ID3v2 tag inside the `id3 ` chunk has no byte order of its own.
+
+Nothing about the byte order is stored. The serve path already re-reads the
+structural chunks from the front of the backing file (`[0, audio_offset)`),
+and the `RIFF`/`RIFX` magic is its first four bytes.
+
+Reader support for RIFX is uneven, for the source file as much as for the
+served one:
+
+- **libsndfile** and **sox** decode it correctly; libsndfile also reads the
+  `LIST`/`INFO` tags. The interop suite reads musefs's served RIFX through
+  libsndfile.
+- **FFmpeg** opens it and reads the `id3 ` chunk's tags, but decodes RIFX PCM
+  byte-swapped (it picks a little-endian PCM codec) and reads `INFO` subchunk
+  sizes little-endian, so it drops the `INFO` chunk with "too big INFO
+  subchunk". Little-endian `INFO` sizes would fix FFmpeg and break
+  libsndfile, which follows the RIFX rule; musefs follows the rule, and the
+  `id3 ` chunk carries every tag to FFmpeg regardless.
+- **mutagen** and **GStreamer** refuse RIFX outright.
+
+### `LIST('wavl')`
+
+RIFF also lets a waveform be a `LIST` of type `wavl`: an ordered run of `data`
+and `slnt` (silence) chunks in place of one `data` chunk. No mainstream reader
+plays one. FFmpeg, libsndfile, GStreamer and sox all fail with no `data` chunk
+found, and mutagen opens it with a length of zero. musefs refuses such a file
+rather than serve a layout nothing can play: the scan logs `skipping <path>:
+WAVE waveform stored as LIST('wavl')` and counts it as `unsupported`.
+
+That makes it a refusal of the file's shape, as for a chained Ogg: a stored WAV
+later rewritten as `LIST('wavl')` fails every `revalidate`, and
+`revalidate --prune` removes its row
+(see [maintenance](../guide/maintenance.md)). A file that has a top-level
+`data` chunk is served from it, whatever lists it also carries.
+
+### RF64 and BW64
+
+RF64 and BW64 hold their sizes in a `ds64` chunk as 64-bit values, with the
+32-bit fields set to `0xFFFFFFFF`, so that a waveform can exceed 4 GiB. musefs
+reads and writes 32-bit sizes only: the magic is not accepted, and synthesis
+refuses a served file whose size would not fit (`TooLarge`).
+
+### Other refusals
+
+A file fails to parse, and is counted `unparseable`, when:
+
+- it has no `fmt ` chunk, or no `data` chunk (and no `LIST('wavl')`), inside
+  its declared form;
+- the declared form runs past the end of the file, or the `data` payload runs
+  past the form (see [form-size enforcement](#riff-form-size-enforcement));
+- its form size is a streaming sentinel (`0` or `0xFFFFFFFF`).
 
 ## What round-trips
 
@@ -70,7 +142,7 @@ RIFF front, then serves the untouched payload:
  EOF     █ inline-generated   ▒ DB-streamed   ░ untouched backing
 ```
 
-1. `Inline` — `RIFF`/`WAVE` framing, the preserved `fmt ` (and `fact`)
+1. `Inline` — `RIFF`/`WAVE` framing (`RIFX` for a big-endian source), the preserved `fmt ` (and `fact`)
    chunks, the rebuilt `LIST`/`INFO` chunk, and the embedded `id3 ` chunk's
    text frames. Every chunk length is known up front, so the `RIFF` size and
    each chunk size field are byte-exact — no placeholder sizes. A pad byte
@@ -84,7 +156,8 @@ RIFF front, then serves the untouched payload:
 
 ## RIFF form-size enforcement
 
-Every RIFF/WAVE file declares a form size at bytes 4..8 (`riff_size`).
+Every RIFF/WAVE file declares a form size at bytes 4..8 (`riff_size`,
+big-endian in RIFX).
 The form covers bytes 8 through `8 + riff_size` and must encompass all
 top-level chunks (`fmt `, `data`, `LIST`, `id3 `, …). musefs enforces
 this at parse time:
@@ -103,8 +176,10 @@ this at parse time:
 
 ## Quirks & invariants
 
-- A file must have both a `fmt ` chunk and a `data` chunk to scan; the
-  declared `data` size must lie within the file.
+- A file must have both a `fmt ` chunk and a top-level `data` chunk to scan;
+  the declared `data` size must lie within the file. A `LIST('wavl')` standing
+  in for `data` is refused by name (see [the supported surface](#supported-surface)).
+- The served file keeps the source's byte order: `RIFX` in, `RIFX` out.
 - The ID3-in-WAV path inherits MP3's allocation-bomb guard
   (`id3v2_alloc_safe`): a crafted `id3 ` chunk cannot OOM the scanner — this
   exact vector was found by the `wav` fuzz target.
