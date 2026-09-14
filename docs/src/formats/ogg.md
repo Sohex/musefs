@@ -2,8 +2,8 @@
 
 How musefs scans and synthesizes Ogg files (`.ogg`, `.oga`, `.opus`) carrying
 an Opus, Vorbis, or FLAC logical bitstream. musefs serves exactly one logical
-bitstream per file; multiplexed and chained Ogg are detected and skipped at scan
-time (see [one bitstream per file](#one-bitstream-per-file)). For the segment
+bitstream per file; multiplexed and chained Ogg are detected at scan time and
+counted as `failed` (see [one bitstream per file](#one-bitstream-per-file)). For the segment
 model these layouts plug into, see
 [the segment model](../architecture/serving.md#the-segment-model). Native FLAC files
 are covered by [FLAC](flac.md).
@@ -188,11 +188,13 @@ in-memory index.
 A synthesized file renumbers every audio page by one constant — the difference
 between the regenerated header's page count and the original's. That constant
 belongs to *one* logical bitstream, so a file holding more than one cannot be
-served, and is skipped at scan time instead. Two shapes, caught two ways:
+served, and the scan refuses it instead: the file counts as `failed`, not
+`skipped`. Two shapes, caught two ways:
 
 - **Multiplexed** (streams interleaved, all beginning at the front): within the
   header region every page must share the first page's serial, and only the
-  first page may carry beginning-of-stream (`validate_single_bitstream`).
+  first page may carry beginning-of-stream (`validate_single_bitstream`). The
+  header parse fails, so the file counts under `unparseable`.
 - **Chained** (complete bitstreams concatenated end to end, which RFC 3533
   allows): the second stream necessarily begins *after* the first one's audio, so
   the header region proves nothing about it. The file's **final page** is the
@@ -216,8 +218,10 @@ revalidate can fix such a row: the scanner refuses the file, so nothing is
 written and the row stays, failing every revalidate after it.
 `musefs revalidate --prune` removes it
 ([#747](https://github.com/Sohex/musefs/issues/747)). Of the stored files a
-revalidate cannot re-probe, `--prune` removes only one refused for its shape,
-and only while the file still carries the stamp the refusing probe saw. A file
+revalidate cannot re-probe, `--prune` removes only one refused as `unsupported`
+(today, only a chained Ogg; a multiplexed file fails as `unparseable` and keeps
+its row), and only while the file still carries the stamp the refusing probe
+saw. A file
 that merely fails to parse or to read keeps its row, since a download still in
 progress looks the same.
 
@@ -241,8 +245,11 @@ progress looks the same.
   last ends the run at packet 0). A *nonzero* count is taken at its word — the
   mapping requires a count it gives to be accurate, and reserves zero for the
   unknown case. A row scanned before this fix keeps its wrong `audio_offset`
-  until a revalidate re-probes the file, which the first revalidate after the
-  2.0.0 upgrade does. Unlike a chained Ogg, the file itself parses, so the
+  until a revalidate re-probes the file, which the first default-tier revalidate
+  after the 2.0.0 upgrade does. A `--checksum=none` revalidate skips an
+  unchanged file wherever musefs records no inode (see
+  [Freshness](../architecture/tree-scanning.md#freshness-two-version-counters)),
+  so run it at the default tier. Unlike a chained Ogg, the file itself parses, so the
   re-probe corrects the row rather than refusing it. The revalidate fixes only
   the bounds: tags and art that 1.3.0 never read from such a file arrive only
   through `musefs scan --force <file>`, which replaces that file's curated

@@ -85,13 +85,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fire-and-forget there — but sampling the prefetch counters without it misses
   reads still in flight, and a caller that owns the backing filesystem itself
   (the latency-injecting mount the read benches use) can otherwise tear it down
-  under a worker mid-read and park that thread in uninterruptible sleep (#671).
+  under a worker mid-read and park that thread in uninterruptible sleep
+  ([#671](https://github.com/Sohex/musefs/issues/671)).
 
 - `musefs_readahead_prefetch_reads_total` and
   `musefs_readahead_prefetch_bytes_total` count the backing reads the Phase-2
   prefetch workers issue. The serve-path `musefs_backing_pread_*` counters never
   saw those threads, so a runaway prefetcher was invisible to the daemon's own
-  telemetry (#671).
+  telemetry ([#671](https://github.com/Sohex/musefs/issues/671)).
 
 - `musefs_dir_handle_rejections_total` counts `opendir` calls that could not be
   given a cached directory snapshot, so directory-handle pressure stays visible
@@ -107,12 +108,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   The default stays auto (2× the CPU count, oversized for I/O-bound work), but
   each worker lazily opens its own read-only SQLite connection, so steady-state
   memory scales with the pool — many-core hosts serving few concurrent readers
-  can now cap that component (#631).
+  can now cap that component
+  ([#631](https://github.com/Sohex/musefs/issues/631)).
 - `musefs_process_resident_bytes` (Linux) reports the whole-process RSS, and
   `musefs_sqlite_memory_bytes` reports what SQLite holds across all connections.
   SQLite allocates through libc, so the jemalloc `musefs_alloc_*` gauges never
   saw it — a full-library walk grew the process by hundreds of MB while the
-  allocator gauges barely moved (#631). The metrics surface now answers "how
+  allocator gauges barely moved
+  ([#631](https://github.com/Sohex/musefs/issues/631)). The metrics surface now answers "how
   much memory is this using" honestly.
 
 ### Changed
@@ -305,7 +308,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   NFS modes also disable NFS LOCALIO for the run: on Linux 6.12+ a loopback mount
   negotiates local I/O and bypasses the RPC transport, so `tc netem` on `lo` had
   no effect on the data path and every "NFS" row measured local disk at GB/s
-  (#671).
+  ([#671](https://github.com/Sohex/musefs/issues/671)).
 
 - **Behavior change.** A scan that hits a DB constraint violation on one file
   now runs to completion instead of stopping there
@@ -339,7 +342,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   same limiter, since a saturated client retries in a tight loop. The limiter is
   now process-wide rather than FUSE-local, so the warns emitted from inside
   synthesis — a dropped Vorbis tag key, over-cap art, a failed art-blob read —
-  are bounded by the same budget instead of bypassing it (#650). Log targets are
+  are bounded by the same budget instead of bypassing it
+  ([#650](https://github.com/Sohex/musefs/issues/650)). Log targets are
   unchanged: each warning is still attributed to the module that raised it, so
   per-crate `RUST_LOG` filters keep working.
 - Scan failures are broken down by reason, and the per-file warnings capped
@@ -360,7 +364,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   default is ~2 MiB). The serve path opens one connection per worker thread
   (2× CPUs), so the default multiplied into hundreds of MB of steady-state RSS
   after a full-library enumeration; the cap saved ~110 MB on a 200,000-track
-  walk with 64 workers and no measured latency change (#631). The tuning guide
+  walk with 64 workers and no measured latency change
+  ([#631](https://github.com/Sohex/musefs/issues/631)). The tuning guide
   now documents the post-enumeration steady state as the number to size a host
   against, and the transparent-hugepage inflation some distros' `THP=always`
   default adds on top.
@@ -1109,3 +1114,12 @@ First public release.
 - Initial MVP (FLAC and MP3 synthesis, virtual tree with beets-style templates,
   `synthesis` / `structure-only` mount modes, auto-refresh, `scan` /
   `scan --revalidate`). Never published publicly; superseded by 0.2.0.
+
+[Unreleased]: https://github.com/Sohex/musefs/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/Sohex/musefs/releases/tag/v2.0.0
+[1.3.0]: https://github.com/Sohex/musefs/releases/tag/v1.3.0
+[1.2.0]: https://github.com/Sohex/musefs/releases/tag/v1.2.0
+[1.1.0]: https://github.com/Sohex/musefs/releases/tag/v1.1.0
+[1.0.0]: https://github.com/Sohex/musefs/releases/tag/v1.0.0
+[0.2.0]: https://github.com/Sohex/musefs/releases/tag/v0.2.0
+[0.1.0]: https://github.com/Sohex/musefs/releases/tag/v0.1.0

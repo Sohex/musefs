@@ -2,6 +2,11 @@
 
 ## Supported versions
 
+| Version | Supported |
+| ------- | --------- |
+| 2.x     | Yes |
+| 1.x     | No — upgrade to 2.x, following the [upgrade steps](https://sohex.github.io/musefs/release-notes.html#upgrading-from-v130) |
+
 Security fixes target the latest release (see [CHANGELOG.md](https://sohex.github.io/musefs/changelog.html));
 there are no maintained backport branches.
 
