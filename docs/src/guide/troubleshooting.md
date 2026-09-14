@@ -40,7 +40,9 @@ Two kinds of output ignore the log level entirely: `scan`/`revalidate` progress
 and per-target summaries (suppressed with `--quiet` / `-q`, see
 [Scanning](scanning.md#scan)), and a handful of CLI diagnostics printed
 directly to stderr — `warning: mountpoint … is not empty`, the `--file-mode` /
-`--dir-mode` write-bit warnings, and the final `musefs: <error>` on a hard
+`--dir-mode` write-bit warnings, the `warning: N track(s) have not been
+re-probed since the store was upgraded …` that `mount`, `scan` and `revalidate`
+print while a revalidate is owed, and the final `musefs: <error>` on a hard
 failure.
 
 They share stderr with the log, but they do not collide with it: the progress
@@ -59,9 +61,9 @@ it. Raising verbosity during an interactive scan is safe.
   parseable audio metadata`. These are capped per reason — see
   [Scanning](scanning.md#scan).
 - The end-of-scan failure summaries: `failed 38: unparseable=30, io=5,
-  oversize=2, rejected=1` (these reasons, plus `panicked`, partition the
-  `failed` count the CLI reports and the exit-`2` signal keys on; empty buckets
-  are omitted) and `walk errors 12: unreadable=9, symlink=3` for entries the
+  oversize=2, rejected=1` (these reasons, plus `unsupported`, `panicked` and
+  `checksum-failed`, partition the `failed` count the CLI reports and the
+  exit-`2` signal keys on; empty buckets are omitted) and `walk errors 12: unreadable=9, symlink=3` for entries the
   walk never queued. Neither fires on a healthy library.
 - Degraded-but-correct fallbacks: `incremental tree mutation failed …; falling
   back to full rebuild`, `poll_refresh failed`, `inval_inode(…) failed`.
@@ -69,10 +71,9 @@ it. Raising verbosity during an interactive scan is safe.
   valid field name)`). Like the serve-path failures above, these go through the
   [warn limiter](#the-serve-path-warn-limiter).
 - An in-place store schema upgrade: `upgrading store schema at … from version 1
-  to version 3; this is irreversible …`. Once per store per schema bump — it is
+  to version 4; this is irreversible …`. Once per store per schema bump — it is
   at `warn` precisely so it lands in your scrollback before you ever try to run
   an older musefs against that store.
-- `scan --revalidate` deprecation.
 - `error` sits above it, reserved for a caught panic in a synthesis or scan
   worker, a scan aborted mid-ingest, and recovered lock poisoning.
 
@@ -116,7 +117,7 @@ behaviour are all `info`, so by default they are invisible:
   `skipped N` total is in the CLI's per-target summary at any level; `-v` gates
   only the breakdown.
 
-- `store schema at … is now at version 3 (took 0.4s)` — the completion half of
+- `store schema at … is now at version 4 (took 0.4s)` — the completion half of
   the upgrade announcement above.
 
 If a mount is behaving oddly and you only reach for one thing, reach for `-v`.
@@ -217,7 +218,7 @@ is not a log line at all: it is a hard error, `musefs: mounting at /mnt/musefs:
 | Code | Meaning |
 | ---- | ------- |
 | `0` | Success. For `mount`, a clean unmount. |
-| `2` | `scan` / `revalidate` completed, but at least one file failed to ingest (`failed Y` with `Y > 0`). The parseable files *are* in the store. |
+| `2` | `scan` / `revalidate` completed, but at least one file failed to ingest (`failed Y` with `Y > 0`). The parseable files *are* in the store. Also `migrate`, when it upgraded the store but the revalidate it ran counted failed files. |
 | `1` | Hard error — a missing target, an unreadable or absent store, a mount that could not be established. The message is printed as `musefs: <error>`. |
 
 Exit `2` is what makes a partial ingest machine-detectable, so

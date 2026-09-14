@@ -14,6 +14,8 @@ fn cover(art_id: i64, data_len: u64) -> ArtInput {
         picture_type: PictureType::new(3).unwrap(),
         width: 500,
         height: 500,
+        depth: 0,
+        colors: 0,
         data_len: BlobLen::new(data_len).unwrap(),
     }
 }
@@ -102,6 +104,8 @@ fn synthesize_errors_on_oversized_picture() {
         picture_type: PictureType::new(3).unwrap(),
         width: 0,
         height: 0,
+        depth: 0,
+        colors: 0,
         data_len: BlobLen::new(0x0100_0000).unwrap(), // just over the 24-bit FLAC PICTURE block limit
     };
     let streaminfo = [MetadataBlock {

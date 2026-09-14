@@ -3,7 +3,7 @@ mod common;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use musefs_core::{Mode, MountConfig, Musefs, scan_directory};
+use musefs_core::{MountConfig, Musefs, scan_directory};
 use musefs_db::{Db, Tag};
 
 use common::corpus::{CorpusParams, Format, Target, prepare};
@@ -16,37 +16,28 @@ fn small_corpus(n: usize) -> Target {
 }
 
 fn config() -> MountConfig {
-    MountConfig {
-        template: "$artist/$album/$title".into(),
-        fallbacks: BTreeMap::new(),
-        default_fallback: "Unknown".into(),
-        mode: Mode::Synthesis,
-        poll_interval: Duration::ZERO,
-        case_insensitive: false,
-        read_ahead_budget: 64 * 1024 * 1024,
-        read_ahead_prefetch: false,
-        skip_on_missing: false,
-        trust_backing_mtime: false,
-    }
+    let mut config = MountConfig::default();
+    config.template = "$artist/$album/$title".into();
+    config.poll_interval = Duration::ZERO;
+    config.case_insensitive = false;
+    config
 }
 
 fn config_ci() -> MountConfig {
-    MountConfig {
-        case_insensitive: true,
-        read_ahead_budget: 64 * 1024 * 1024,
-        read_ahead_prefetch: false,
-        skip_on_missing: false,
-        trust_backing_mtime: false,
-        ..config()
-    }
+    let mut new_config = config();
+    new_config.case_insensitive = true;
+    new_config.read_ahead_budget = 64 * 1024 * 1024;
+    new_config.read_ahead_prefetch = false;
+    new_config.skip_on_missing = false;
+    new_config.trust_backing_mtime = false;
+    new_config
 }
 
 fn config_skip() -> MountConfig {
-    MountConfig {
-        skip_on_missing: true,
-        trust_backing_mtime: false,
-        ..config()
-    }
+    let mut new_config = config();
+    new_config.skip_on_missing = true;
+    new_config.trust_backing_mtime = false;
+    new_config
 }
 
 /// (rendered tree path -> inode) for every FILE, walking from root. Tests compare
@@ -233,8 +224,8 @@ fn case_insensitive_refresh_merges_and_matches_full_rebuild() {
 
 #[test]
 fn non_render_column_edit_is_noop_refresh() {
-    // Re-running scan_directory over an unchanged corpus bumps data_version but
-    // changes no rendered path, so the tree must be identical before and after.
+    // Re-running scan_directory over an unchanged corpus changes no rendered
+    // path, so the tree must be identical before and after.
     let target = small_corpus(4);
     let db_path = target.db_path.clone();
     let corpus = target.corpus_dir.clone();
@@ -242,7 +233,7 @@ fn non_render_column_edit_is_noop_refresh() {
     scan_directory(&db, &corpus).unwrap();
     let fs = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
 
-    // Re-scan: touches updated_at (data_version bump) but no rendered path changes.
+    // Re-scan: no rendered path changes.
     let db2 = Db::open(&db_path).unwrap();
     scan_directory(&db2, &corpus).unwrap();
 
@@ -424,6 +415,171 @@ fn pruned_ring_prefix_is_a_gap_and_full_rebuild_recovers_lost_change() {
     );
 }
 
+/// Track-id reuse (#678). Without `AUTOINCREMENT`, SQLite hands out
+/// `max(rowid) + 1`, so deleting the highest-numbered track and ingesting another
+/// file gave the newcomer the freed id, and the incremental refresh, already
+/// holding that id, could keep serving the old file under it. The DB layer pins
+/// that no id is reused. This pins the substitution where it bit, with the
+/// delete and the ingest both landing between two polls.
+#[test]
+fn a_freed_id_is_not_handed_to_the_next_track_between_polls() {
+    let target = small_corpus(2);
+    let db_path = target.db_path.clone();
+    let corpus = target.corpus_dir.clone();
+    let db = Db::open(&db_path).unwrap();
+    scan_directory(&db, &corpus).unwrap();
+    let fs = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+
+    let tracks = db.list_tracks().unwrap();
+    let freed = tracks.iter().map(|t| t.id).max().unwrap();
+    let old_path = tracks
+        .iter()
+        .find(|t| t.id == freed)
+        .unwrap()
+        .backing_path
+        .clone();
+
+    // The substitute is the same bytes under a new name, so only the id and the
+    // path tell the two rows apart: exactly what a reused id hid.
+    db.delete_track(freed).unwrap();
+    let new_path = old_path.with_file_name("substitute.flac");
+    std::fs::rename(&old_path, &new_path).unwrap();
+    scan_directory(&db, &corpus).unwrap();
+    let newcomer = db
+        .list_tracks()
+        .unwrap()
+        .into_iter()
+        .find(|t| t.backing_path.ends_with("substitute.flac"))
+        .expect("the substitute was ingested");
+    assert!(
+        newcomer.id > freed,
+        "id {} reused the freed {freed}",
+        newcomer.id
+    );
+
+    assert!(fs.poll_refresh().unwrap());
+    let reference = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+    let live = tree_fingerprint(&fs);
+    assert_eq!(
+        live.keys().collect::<Vec<_>>(),
+        tree_fingerprint(&reference).keys().collect::<Vec<_>>(),
+        "the substitution must reach the live tree"
+    );
+    // Every file the live tree lists must serve: an entry still resolving to the
+    // renamed-away path fails its read.
+    for &ino in live.values() {
+        let size = fs.getattr(ino).unwrap().size;
+        let served = fs.read(ino, None, 0, size).unwrap();
+        assert_eq!(served.len() as u64, size);
+    }
+}
+
+/// A track id rewritten in place must leave the live tree the way a fresh open
+/// would see it (#762). The schema refuses the rekey, so this drops the refusal
+/// for the one statement — the shape a `writable_schema` writer produces — and
+/// checks that the changelog alone still carries the refresh to the right tree.
+/// Before it logged `OLD.id`, the incremental path saw the new id as an addition
+/// and never saw the old one leave, so the mount listed both.
+#[test]
+fn a_rekeyed_track_leaves_no_ghost_in_the_live_tree() {
+    let target = small_corpus(2);
+    let db_path = target.db_path.clone();
+    let corpus = target.corpus_dir.clone();
+    let db = Db::open(&db_path).unwrap();
+    scan_directory(&db, &corpus).unwrap();
+    let fs = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+    let ids: Vec<i64> = db.list_tracks().unwrap().iter().map(|t| t.id).collect();
+
+    // Childless first: with foreign keys enforced, a track that still has
+    // children cannot be rekeyed at all.
+    let raw = rusqlite::Connection::open(&db_path).unwrap();
+    raw.pragma_update(None, "foreign_keys", true).unwrap();
+    for table in ["tags", "track_art", "structural_blocks"] {
+        raw.execute(
+            &format!("DELETE FROM {table} WHERE track_id = ?1"),
+            [ids[0]],
+        )
+        .unwrap();
+    }
+    assert!(fs.poll_refresh().unwrap());
+
+    let refusal: Vec<String> = raw
+        .prepare("SELECT sql FROM sqlite_master WHERE name = 'tracks_reject_rekey'")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    raw.execute_batch("DROP TRIGGER IF EXISTS tracks_reject_rekey")
+        .unwrap();
+    raw.execute(
+        "UPDATE tracks SET id = (SELECT max(id) FROM tracks) + 100 WHERE id = ?1",
+        [ids[0]],
+    )
+    .unwrap();
+    // Restored verbatim, so the reference open below passes schema identity.
+    for sql in &refusal {
+        raw.execute_batch(sql).unwrap();
+    }
+
+    assert!(fs.poll_refresh().unwrap());
+    let reference = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+    assert_eq!(
+        tree_fingerprint(&fs).into_keys().collect::<Vec<_>>(),
+        tree_fingerprint(&reference).into_keys().collect::<Vec<_>>(),
+        "the old id must leave the tree when the row is rekeyed"
+    );
+}
+
+/// A changelog row whose `track_id` is not an integer (#760), from a store
+/// written with its constraints off. It used to be a conversion error, and an
+/// error moves no watermark, so every later poll re-read the same window and
+/// failed on the same row: the mount stopped picking up external edits. The
+/// refresh cannot tell which track the row named, so it treats it as a gap.
+#[test]
+fn a_malformed_changelog_row_falls_back_instead_of_stalling() {
+    let target = small_corpus(2);
+    let db_path = target.db_path.clone();
+    let corpus = target.corpus_dir.clone();
+    let db = Db::open(&db_path).unwrap();
+    scan_directory(&db, &corpus).unwrap();
+    let fs = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+    let writer = Db::open(&db_path).unwrap();
+    let ids: Vec<i64> = writer.list_tracks().unwrap().iter().map(|t| t.id).collect();
+
+    let raw = rusqlite::Connection::open(&db_path).unwrap();
+    raw.pragma_update(None, "ignore_check_constraints", true)
+        .unwrap();
+    raw.execute(
+        "INSERT INTO track_changes (track_id) VALUES ('not an id')",
+        [],
+    )
+    .unwrap();
+    writer
+        .replace_tags(ids[0], &[Tag::new("TITLE", "past-the-bad-row", 0)])
+        .unwrap();
+
+    assert!(
+        fs.poll_refresh().unwrap(),
+        "the poll must refresh, not fail"
+    );
+    assert_eq!(fs.gap_fallbacks_for_test(), 1, "an unreadable row is a gap");
+
+    // Not stuck: the watermark moved past the bad row, so the next edit is an
+    // ordinary incremental refresh.
+    writer
+        .replace_tags(ids[1], &[Tag::new("TITLE", "after-the-gap", 0)])
+        .unwrap();
+    assert!(fs.poll_refresh().unwrap());
+    assert_eq!(fs.gap_fallbacks_for_test(), 1);
+
+    let reference = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+    assert_eq!(
+        tree_fingerprint(&fs).into_keys().collect::<Vec<_>>(),
+        tree_fingerprint(&reference).into_keys().collect::<Vec<_>>(),
+    );
+}
+
 #[test]
 fn empty_ring_with_zero_watermark_polls_incremental() {
     // A data_version bump with no changelog rows and no watermark (the ring was
@@ -443,12 +599,7 @@ fn empty_ring_with_zero_watermark_polls_incremental() {
     // ring stays empty.
     let writer = Db::open(&db_path).unwrap();
     writer
-        .upsert_art(&musefs_db::NewArt {
-            mime: "image/png".into(),
-            width: None,
-            height: None,
-            data: vec![0u8; 8],
-        })
+        .upsert_art(&musefs_db::NewArt { data: vec![0u8; 8] })
         .unwrap();
 
     assert!(fs.poll_refresh().unwrap());
@@ -501,10 +652,13 @@ proptest! {
                     // DB-only track: tree-building never reads the backing file, and
                     // both fs and reference read the same DB, so equivalence holds.
                     let new = musefs_db::NewTrack {
-                        backing_path: format!("/virt/added-{add_seq}.flac"),
+                        backing_path: std::path::PathBuf::from(format!(
+                            "/virt/added-{add_seq}.flac"
+                        )),
                         format: musefs_db::Format::Flac,
                         audio_offset: 0, audio_length: 1, backing_size: 1, backing_mtime_ns: 0, backing_ctime_ns: 0,
-                    };
+                        backing_ino: None,
+};
                     // Surface DB errors instead of vacuously skipping the op.
                     let id = writer.upsert_track(&new).unwrap();
                     writer
@@ -555,6 +709,62 @@ fn revalidate_reprobes_on_ctime_only_change() {
     assert_eq!(stats.updated, 1, "ctime-only change must be re-probed");
 }
 
+/// #674's repopulation path. A store migrated into V4 has no recorded inode on
+/// any row, and `matches_live` has to ignore the field for those — so the stamp
+/// passes on three columns where it should pass on four. Revalidate is what
+/// closes that gap, alongside the structural and checksum backfills it already
+/// covered, so it must re-probe a row whose inode is missing even though every
+/// other field says the file is unchanged.
+#[test]
+fn revalidate_reprobes_a_row_with_no_recorded_inode() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("a.flac");
+    common::write_flac(&src, &["TITLE=T"], &[0xAB; 4096]);
+    let db_path = dir.path().join("m.db");
+    {
+        let db = Db::open(&db_path).unwrap();
+        scan_directory(&db, dir.path()).unwrap();
+    }
+
+    let db = Db::open(&db_path).unwrap();
+    let id = db.list_tracks().unwrap()[0].id;
+    assert!(
+        db.get_track(id).unwrap().unwrap().backing_ino.is_some(),
+        "a fresh scan records the inode"
+    );
+
+    // Rewind the column to the sentinel by upserting the row as a build older
+    // than #674 would have written it — which is the shape V4 leaves every
+    // existing row in, reached through the public writer rather than by
+    // standing up a migrated store.
+    let before = db.get_track(id).unwrap().unwrap();
+    db.upsert_track(&musefs_db::NewTrack {
+        backing_path: before.backing_path.clone(),
+        format: before.format,
+        audio_offset: before.bounds.audio_offset(),
+        audio_length: before.bounds.audio_length(),
+        backing_size: before.backing_size,
+        backing_mtime_ns: before.backing_mtime_ns,
+        backing_ctime_ns: before.backing_ctime_ns,
+        backing_ino: None,
+    })
+    .unwrap();
+    assert_eq!(db.get_track(id).unwrap().unwrap().backing_ino, None);
+
+    // Nothing about the file changed, so only the missing inode can make this
+    // re-probe.
+    let stats = musefs_core::revalidate(&db, dir.path()).unwrap();
+    assert_eq!(stats.updated, 1, "a row with no inode must be re-probed");
+    assert!(
+        db.get_track(id).unwrap().unwrap().backing_ino.is_some(),
+        "and the re-probe must fill it in"
+    );
+
+    // Idempotent: with the inode recorded, the same file is skipped again.
+    let stats = musefs_core::revalidate(&db, dir.path()).unwrap();
+    assert_eq!(stats.updated, 0, "a complete row is unchanged");
+}
+
 #[test]
 fn revalidate_changed_file_refreshes_layer_a_preserves_layer_b() {
     let dir = tempfile::tempdir().unwrap();
@@ -602,10 +812,8 @@ fn revalidate_prunes_only_with_flag() {
     assert_eq!(stats.pruned, 0);
     assert_eq!(db.list_tracks().unwrap().len(), 1);
 
-    let opts = musefs_core::ScanOptions {
-        prune: true,
-        ..Default::default()
-    };
+    let mut opts = musefs_core::ScanOptions::default();
+    opts.prune = true;
     let stats = musefs_core::revalidate_with(&db, dir.path(), &opts).unwrap();
     assert_eq!(stats.pruned, 1);
     assert_eq!(db.list_tracks().unwrap().len(), 0);

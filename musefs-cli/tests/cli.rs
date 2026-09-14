@@ -10,7 +10,7 @@ fn parses_scan_and_mount_invocations() {
             assert_eq!(db.to_str(), Some("/tmp/m.db"));
         }
         Command::Mount(..) => panic!("expected scan"),
-        Command::Vacuum { .. } | Command::Revalidate { .. } => unreachable!(),
+        _ => unreachable!(),
     }
 
     let cli = Cli::parse_from([
@@ -33,12 +33,12 @@ fn parses_scan_and_mount_invocations() {
             assert_eq!(args.default_fallback, "Unknown"); // default applied
         }
         Command::Scan { .. } => panic!("expected mount"),
-        Command::Vacuum { .. } | Command::Revalidate { .. } => unreachable!(),
+        _ => unreachable!(),
     }
 }
 
 #[test]
-fn parses_mode_and_revalidate_flags() {
+fn parses_mode_and_tuning_flags() {
     use musefs_cli::CliMode;
 
     let cli = Cli::parse_from([
@@ -53,7 +53,7 @@ fn parses_mode_and_revalidate_flags() {
     match cli.command {
         Command::Mount(args) => assert_eq!(args.mode, CliMode::StructureOnly),
         Command::Scan { .. } => panic!("expected mount"),
-        Command::Vacuum { .. } | Command::Revalidate { .. } => unreachable!(),
+        _ => unreachable!(),
     }
 
     // Mode defaults to synthesis; tuning knobs have conservative defaults.
@@ -68,7 +68,7 @@ fn parses_mode_and_revalidate_flags() {
             assert!(args.keep_cache); // #432: default on
         }
         Command::Scan { .. } => panic!("expected mount"),
-        Command::Vacuum { .. } | Command::Revalidate { .. } => unreachable!(),
+        _ => unreachable!(),
     }
 
     // Tuning flags parse to their given values.
@@ -97,28 +97,7 @@ fn parses_mode_and_revalidate_flags() {
             assert!(args.keep_cache);
         }
         Command::Scan { .. } => panic!("expected mount"),
-        Command::Vacuum { .. } | Command::Revalidate { .. } => unreachable!(),
-    }
-
-    // Scan --revalidate flag.
-    let cli = Cli::parse_from([
-        "musefs",
-        "scan",
-        "/music",
-        "--db",
-        "/tmp/m.db",
-        "--revalidate",
-    ]);
-    match cli.command {
-        Command::Scan { revalidate, .. } => assert!(revalidate),
-        Command::Mount(..) => panic!("expected scan"),
-        Command::Vacuum { .. } | Command::Revalidate { .. } => unreachable!(),
-    }
-    let cli = Cli::parse_from(["musefs", "scan", "/music", "--db", "/tmp/m.db"]);
-    match cli.command {
-        Command::Scan { revalidate, .. } => assert!(!revalidate),
-        Command::Mount(..) => panic!("expected scan"),
-        Command::Vacuum { .. } | Command::Revalidate { .. } => unreachable!(),
+        _ => unreachable!(),
     }
 }
 
@@ -132,22 +111,28 @@ fn scan_parses_checksum_and_strictness_flags() {
         "/tmp/m.db",
         "--checksum",
         "full",
-        "--strict",
+        "--match",
+        "strict",
     ]);
     match cli.command {
         Command::Scan {
             checksum,
-            strict,
-            fast,
+            match_mode,
             ..
         } => {
             assert_eq!(checksum, musefs_cli::ChecksumMode::Full);
-            assert!(strict);
-            assert!(!fast);
+            assert_eq!(match_mode, musefs_cli::MatchMode::Strict);
         }
         Command::Mount(..) => panic!("expected scan"),
-        Command::Vacuum { .. } | Command::Revalidate { .. } => unreachable!(),
+        _ => unreachable!(),
     }
+
+    // Unset is `auto`, the escalating default.
+    let cli = Cli::parse_from(["musefs", "scan", "/lib", "--db", "/tmp/m.db"]);
+    let Command::Scan { match_mode, .. } = cli.command else {
+        panic!("expected scan");
+    };
+    assert_eq!(match_mode, musefs_cli::MatchMode::Auto);
 }
 
 #[test]
@@ -175,7 +160,7 @@ fn dry_run_does_not_require_a_mountpoint() {
             assert_eq!(args.mountpoint, None);
         }
         Command::Scan { .. } => panic!("expected mount"),
-        Command::Vacuum { .. } | Command::Revalidate { .. } => unreachable!(),
+        _ => unreachable!(),
     }
 }
 
@@ -204,7 +189,7 @@ fn boolish_mount_flags_work_as_bare_switches() {
             assert!(args.read_ahead_prefetch);
         }
         Command::Scan { .. } => panic!("expected mount"),
-        Command::Vacuum { .. } | Command::Revalidate { .. } => unreachable!(),
+        _ => unreachable!(),
     }
 }
 
@@ -212,34 +197,28 @@ use musefs_cli::parse_mount_config;
 use musefs_core::Mode;
 use std::time::Duration;
 
+/// Mount args as the parser produces them from `flags`, after a fixed mountpoint
+/// and store. Going through the parser keeps these tests on the flags a user
+/// actually types; `MountArgs` cannot be built with a literal outside its crate.
+fn mount_args(flags: &[&str]) -> MountArgs {
+    let mut argv = vec!["musefs", "mount", "/mnt/x", "--db", "/tmp/x.db"];
+    argv.extend_from_slice(flags);
+    let Command::Mount(args) = Cli::parse_from(argv).command else {
+        panic!("expected mount");
+    };
+    args
+}
+
 #[test]
 fn parse_mount_config_defaults_are_sensible() {
-    let args = MountArgs {
-        mountpoint: Some("/mnt/x".into()),
-        db: "/tmp/x.db".into(),
-        template: "$artist/$title".to_string(),
-        default_fallback: "Unknown".to_string(),
-        fallbacks: vec![],
-        mode: musefs_cli::CliMode::Synthesis,
-        poll_interval_ms: 1000,
-        attr_ttl_ms: 1000,
-        max_readahead_kib: 512,
-        max_background: 64,
-        workers: 0,
-        keep_cache: false,
-        case_insensitive: false,
-        owner: None,
-        group: None,
-        file_mode: None,
-        dir_mode: None,
-        allow_other: false,
-        read_ahead_budget_mib: 64,
-        read_ahead_prefetch: false,
-        skip_on_missing: false,
-        trust_backing_mtime: false,
-        expose_metrics: false,
-        dry_run: false,
-    };
+    let args = mount_args(&[
+        "--template",
+        "$artist/$title",
+        "--keep-cache",
+        "false",
+        "--case-insensitive",
+        "false",
+    ]);
     let (config, fuse_config) = parse_mount_config(&args);
     assert_eq!(config.template, "$artist/$title");
     assert_eq!(config.default_fallback, "Unknown");
@@ -254,32 +233,22 @@ fn parse_mount_config_defaults_are_sensible() {
 
 #[test]
 fn parse_mount_config_keep_cache_sets_flag() {
-    let args = MountArgs {
-        mountpoint: Some("/mnt/x".into()),
-        db: "/tmp/x.db".into(),
-        template: "$title".to_string(),
-        default_fallback: "Unknown".to_string(),
-        fallbacks: vec![],
-        mode: musefs_cli::CliMode::StructureOnly,
-        poll_interval_ms: 250,
-        attr_ttl_ms: 5000,
-        max_readahead_kib: 256,
-        max_background: 32,
-        workers: 0,
-        keep_cache: true,
-        case_insensitive: false,
-        owner: None,
-        group: None,
-        file_mode: None,
-        dir_mode: None,
-        allow_other: false,
-        read_ahead_budget_mib: 64,
-        read_ahead_prefetch: false,
-        skip_on_missing: false,
-        trust_backing_mtime: false,
-        expose_metrics: false,
-        dry_run: false,
-    };
+    let args = mount_args(&[
+        "--template",
+        "$title",
+        "--mode",
+        "structure-only",
+        "--poll-interval-ms",
+        "250",
+        "--attr-ttl-ms",
+        "5000",
+        "--max-readahead-kib",
+        "256",
+        "--max-background",
+        "32",
+        "--case-insensitive",
+        "false",
+    ]);
     let (config, fuse_config) = parse_mount_config(&args);
     assert_eq!(config.mode, Mode::StructureOnly);
     assert_eq!(config.poll_interval, Duration::from_millis(250));
@@ -290,32 +259,16 @@ fn parse_mount_config_keep_cache_sets_flag() {
 
 #[test]
 fn parse_mount_config_saturating_readahead() {
-    let args = MountArgs {
-        mountpoint: Some("/mnt/x".into()),
-        db: "/tmp/x.db".into(),
-        template: "$title".to_string(),
-        default_fallback: "Unknown".to_string(),
-        fallbacks: vec![],
-        mode: musefs_cli::CliMode::Synthesis,
-        poll_interval_ms: 1000,
-        attr_ttl_ms: 1000,
-        max_readahead_kib: u32::MAX,
-        max_background: 64,
-        workers: 0,
-        keep_cache: false,
-        case_insensitive: false,
-        owner: None,
-        group: None,
-        file_mode: None,
-        dir_mode: None,
-        allow_other: false,
-        read_ahead_budget_mib: 64,
-        read_ahead_prefetch: false,
-        skip_on_missing: false,
-        trust_backing_mtime: false,
-        expose_metrics: false,
-        dry_run: false,
-    };
+    let args = mount_args(&[
+        "--template",
+        "$title",
+        "--max-readahead-kib",
+        &u32::MAX.to_string(),
+        "--keep-cache",
+        "false",
+        "--case-insensitive",
+        "false",
+    ]);
     let (_, fuse_config) = parse_mount_config(&args);
     assert_eq!(fuse_config.max_readahead, u32::MAX);
 }
@@ -342,41 +295,24 @@ fn parses_repeatable_fallback_flag() {
             ]
         ),
         Command::Scan { .. } => panic!("expected mount"),
-        Command::Vacuum { .. } | Command::Revalidate { .. } => unreachable!(),
+        _ => unreachable!(),
     }
 }
 
 #[test]
 fn parse_mount_config_populates_per_field_fallbacks() {
-    let args = MountArgs {
-        mountpoint: Some("/mnt/x".into()),
-        db: "/tmp/x.db".into(),
-        template: "$albumartist/$title".to_string(),
-        default_fallback: "Unknown".to_string(),
-        fallbacks: vec![
-            ("albumartist".to_string(), "Unknown Artist".to_string()),
-            ("genre".to_string(), "Misc".to_string()),
-        ],
-        mode: musefs_cli::CliMode::Synthesis,
-        poll_interval_ms: 1000,
-        attr_ttl_ms: 1000,
-        max_readahead_kib: 512,
-        max_background: 64,
-        workers: 0,
-        keep_cache: false,
-        case_insensitive: false,
-        owner: None,
-        group: None,
-        file_mode: None,
-        dir_mode: None,
-        allow_other: false,
-        read_ahead_budget_mib: 64,
-        read_ahead_prefetch: false,
-        skip_on_missing: false,
-        trust_backing_mtime: false,
-        expose_metrics: false,
-        dry_run: false,
-    };
+    let args = mount_args(&[
+        "--template",
+        "$albumartist/$title",
+        "--fallback",
+        "albumartist=Unknown Artist",
+        "--fallback",
+        "genre=Misc",
+        "--keep-cache",
+        "false",
+        "--case-insensitive",
+        "false",
+    ]);
     let (config, _) = parse_mount_config(&args);
     assert_eq!(
         config.fallbacks.get("albumartist").map(String::as_str),
@@ -407,7 +343,7 @@ fn fallback_keys_are_lowercased_to_match_template_fields() {
     let args = match cli.command {
         Command::Mount(args) => args,
         Command::Scan { .. } => panic!("expected mount"),
-        Command::Vacuum { .. } | Command::Revalidate { .. } => unreachable!(),
+        _ => unreachable!(),
     };
     let (config, _) = parse_mount_config(&args);
     assert_eq!(
@@ -441,7 +377,7 @@ fn fallback_value_may_contain_equals_and_last_duplicate_wins() {
     let args = match cli.command {
         Command::Mount(args) => args,
         Command::Scan { .. } => panic!("expected mount"),
-        Command::Vacuum { .. } | Command::Revalidate { .. } => unreachable!(),
+        _ => unreachable!(),
     };
     // Only the first '=' separates; the value keeps the rest verbatim.
     assert_eq!(
@@ -491,7 +427,7 @@ fn mount_fails_on_missing_db_without_creating_it() {
     let args = match cli.command {
         Command::Mount(args) => args,
         Command::Scan { .. } => panic!("expected mount"),
-        Command::Vacuum { .. } | Command::Revalidate { .. } => unreachable!(),
+        _ => unreachable!(),
     };
 
     let err = musefs_cli::run_mount(&args).unwrap_err();
@@ -503,4 +439,37 @@ fn mount_fails_on_missing_db_without_creating_it() {
         !db_path.exists(),
         "mount must not create the database when it is absent"
     );
+}
+
+/// `MountConfig::default()` and `FuseConfig::default()` promise to be what a bare
+/// `musefs mount` parses to, so code outside their crates can start from them and
+/// assign only what it changes. Hold both to that, field by field.
+#[test]
+fn config_defaults_are_what_a_bare_mount_parses_to() {
+    let (config, fuse_config) = parse_mount_config(&mount_args(&[]));
+
+    let default = musefs_core::MountConfig::default();
+    assert_eq!(config.template, default.template);
+    assert_eq!(config.fallbacks, default.fallbacks);
+    assert_eq!(config.default_fallback, default.default_fallback);
+    assert_eq!(config.mode, default.mode);
+    assert_eq!(config.poll_interval, default.poll_interval);
+    assert_eq!(config.case_insensitive, default.case_insensitive);
+    assert_eq!(config.read_ahead_budget, default.read_ahead_budget);
+    assert_eq!(config.read_ahead_prefetch, default.read_ahead_prefetch);
+    assert_eq!(config.skip_on_missing, default.skip_on_missing);
+    assert_eq!(config.trust_backing_mtime, default.trust_backing_mtime);
+
+    let default = musefs_fuse::FuseConfig::default();
+    assert_eq!(fuse_config.ttl, default.ttl);
+    assert_eq!(fuse_config.max_readahead, default.max_readahead);
+    assert_eq!(fuse_config.max_background, default.max_background);
+    assert_eq!(fuse_config.keep_cache, default.keep_cache);
+    assert_eq!(fuse_config.uid, default.uid);
+    assert_eq!(fuse_config.gid, default.gid);
+    assert_eq!(fuse_config.file_mode, default.file_mode);
+    assert_eq!(fuse_config.dir_mode, default.dir_mode);
+    assert_eq!(fuse_config.allow_other, default.allow_other);
+    assert_eq!(fuse_config.expose_metrics, default.expose_metrics);
+    assert_eq!(fuse_config.workers, default.workers);
 }

@@ -46,7 +46,7 @@ fn scan_directory_bounded_matches_full_for_flac() {
     let stats = scan_directory(&db, dir.path()).unwrap();
     assert_eq!(stats.scanned, 1);
     let track = db
-        .get_track_by_path(&std::fs::canonicalize(&path).unwrap().to_string_lossy())
+        .get_track_by_path(&std::fs::canonicalize(&path).unwrap())
         .unwrap()
         .unwrap();
     assert_eq!(track.bounds.audio_offset(), full.audio_offset);
@@ -81,7 +81,7 @@ fn revalidate_skips_unchanged_and_reprobes_changed() {
     assert_eq!(s2.unchanged, 0);
     // The track row now reflects the new (longer) audio length.
     let track = db
-        .get_track_by_path(&std::fs::canonicalize(&p).unwrap().to_string_lossy())
+        .get_track_by_path(&std::fs::canonicalize(&p).unwrap())
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -136,7 +136,7 @@ fn jobs1_and_jobs_n_produce_equivalent_state() {
             },
         )
         .unwrap();
-        let mut rows: Vec<(String, u64, u64)> = db
+        let mut rows: Vec<(std::path::PathBuf, u64, u64)> = db
             .list_tracks()
             .unwrap()
             .into_iter()
@@ -173,7 +173,7 @@ fn oversize_unparseable_file_is_skipped_not_read_whole() {
     drop(f);
 
     assert!(matches!(
-        probe_file(&path, WINDOW).unwrap(),
+        probe_file(&path, WINDOW, ChecksumTier::Fingerprint).unwrap(),
         ProbeOutcome::Failed(_)
     ));
 }
@@ -216,8 +216,8 @@ fn oversize_wav_is_served_via_data_header() {
     f.set_len(file_len).unwrap();
     drop(f);
 
-    let probed = match probe_file(&path, WINDOW).unwrap() {
-        ProbeOutcome::Probed(p, _) => p,
+    let probed = match probe_file(&path, WINDOW, ChecksumTier::Fingerprint).unwrap() {
+        ProbeOutcome::Probed(p, _, _) => p,
         other => panic!("expected Probed, got {other:?}"),
     };
     assert_eq!(probed.format, Format::Wav);
@@ -225,13 +225,9 @@ fn oversize_wav_is_served_via_data_header() {
     assert_eq!(probed.audio_length, data_len);
 }
 
-#[test]
-fn probe_file_reports_raced_on_mid_probe_mutation() {
+/// Write a minimal valid WAV the probe accepts (fmt + 64 bytes of data).
+fn write_tiny_wav(path: &std::path::Path) {
     use std::io::Write;
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("a.wav");
-
-    // Minimal valid WAV the probe accepts (fmt + tiny data).
     let mut fmt = Vec::new();
     for v in [1u16, 1, 0, 0, 0, 16] {
         fmt.extend_from_slice(&v.to_le_bytes());
@@ -246,10 +242,23 @@ fn probe_file_reports_raced_on_mid_probe_mutation() {
     front.extend_from_slice(&fmt);
     front.extend_from_slice(b"data");
     front.extend_from_slice(&64u32.to_le_bytes());
-    let mut f = std::fs::File::create(&path).unwrap();
+    let mut f = std::fs::File::create(path).unwrap();
     f.write_all(&front).unwrap();
     f.set_len(front.len() as u64 + 64).unwrap();
-    drop(f);
+}
+
+/// Append 4096 bytes to `path`, so its size, and with it the stamp, moves.
+fn grow(path: &std::path::Path) {
+    use std::io::Write;
+    let mut g = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    g.write_all(&[0u8; 4096]).unwrap();
+}
+
+#[test]
+fn probe_file_reports_raced_on_mid_probe_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.wav");
+    write_tiny_wav(&path);
 
     // Clear the shared hook even if `probe_file` panics, so a failure here can't
     // contaminate sibling tests that observe the global hook.
@@ -261,11 +270,33 @@ fn probe_file_reports_raced_on_mid_probe_mutation() {
     }
 
     let pc = path.clone();
-    set_after_s1_hook(move || {
-        let mut g = std::fs::OpenOptions::new().append(true).open(&pc).unwrap();
-        g.write_all(&[0u8; 4096]).unwrap(); // size moves -> S2 != S1
-    });
+    set_after_s1_hook(move || grow(&pc)); // size moves -> S2 != S1
     let _guard = HookGuard;
-    let out = probe_file(&path, WINDOW);
+    let out = probe_file(&path, WINDOW, ChecksumTier::Fingerprint);
+    assert!(matches!(out, Ok(ProbeOutcome::Raced)), "got {out:?}");
+}
+
+/// #690: the full-file hash is taken inside the probe's fstat sandwich, so a
+/// write landing while it is under way is a race, not a row pairing the old
+/// stamp with a hash that covers the new bytes. The hook fires once the hash
+/// has read its first chunk. A hash moved back outside the sandwich, before
+/// the first stat or after the second, returns `Probed` here.
+#[test]
+fn probe_file_reports_raced_when_the_file_changes_mid_hash() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.wav");
+    write_tiny_wav(&path);
+
+    struct HookGuard;
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            clear_hook(&DURING_FULL_HASH_HOOK);
+        }
+    }
+
+    let pc = path.clone();
+    set_hook(&DURING_FULL_HASH_HOOK, move || grow(&pc));
+    let _guard = HookGuard;
+    let out = probe_file(&path, WINDOW, ChecksumTier::Full);
     assert!(matches!(out, Ok(ProbeOutcome::Raced)), "got {out:?}");
 }

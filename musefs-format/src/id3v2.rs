@@ -126,6 +126,100 @@ pub(crate) fn leading_tags_len(data: &[u8]) -> Result<Extent<usize>> {
     Err(FormatError::Malformed)
 }
 
+/// Ceiling on how many appended tags the backwards walk steps over: the same
+/// bound as a prepended run, for the same reasons.
+pub(crate) const MAX_APPENDED_TAGS: usize = MAX_LEADING_TAGS;
+
+/// Where the appended ID3v2.4 tag ending at file offset `end` begins, as its
+/// footer declares.
+///
+/// `window` is the file from offset `window_start` to its end. The footer is "a
+/// copy of the header, but with a different identifier" (ID3v2.4.0 structure
+/// §3.4): it must hold the `3DI` identifier, version `$04` with a revision the
+/// §3.1 detection pattern allows, flags `%abcd0000` with the footer bit set, and
+/// a synchsafe size. The header it copies must then sit where that size puts it,
+/// matching the footer in every byte after the identifier. Anything else means
+/// no tag ends at `end`: `Complete(None)`.
+///
+/// `NeedMore { up_to }` counts back from the end of the file, as the window does.
+pub(crate) fn appended_tag_start(
+    window: &[u8],
+    window_start: u64,
+    end: u64,
+) -> Extent<Option<u64>> {
+    let file_len = window_start + window.len() as u64;
+    let Some(footer_start) = end.checked_sub(FOOTER_LEN as u64) else {
+        return Extent::Complete(None);
+    };
+    let Some(footer) = window_bytes(window, window_start, footer_start, FOOTER_LEN) else {
+        return Extent::NeedMore {
+            up_to: file_len - footer_start,
+        };
+    };
+    if !is_footer(footer) {
+        return Extent::Complete(None);
+    }
+    let tag_len = (HEADER_LEN + FOOTER_LEN) as u64 + u64::from(synchsafe_decode(&footer[6..]));
+    let Some(start) = end.checked_sub(tag_len) else {
+        return Extent::Complete(None);
+    };
+    let Some(header) = window_bytes(window, window_start, start, HEADER_LEN) else {
+        return Extent::NeedMore {
+            up_to: file_len - start,
+        };
+    };
+    let copies_it = &header[..3] == b"ID3" && header[3..] == footer[3..];
+    Extent::Complete(copies_it.then_some(start))
+}
+
+/// A footer's own fields, per §3.4: the `3DI` identifier, version `$04` and a
+/// revision other than `$FF`, flags `%abcd0000` with bit 4 (footer present) set,
+/// and a synchsafe size.
+fn is_footer(footer: &[u8]) -> bool {
+    &footer[..3] == b"3DI"
+        && footer[3] == 4
+        && footer[4] != 0xFF
+        && footer[5] & 0x1F == 0x10
+        && footer[6..].iter().all(|&b| b & 0x80 == 0)
+}
+
+/// `len` bytes of the file at offset `at`, out of a window holding the file from
+/// `window_start` to its end; `None` when they begin before the window does.
+fn window_bytes(window: &[u8], window_start: u64, at: u64, len: usize) -> Option<&[u8]> {
+    let offset = usize::try_from(at.checked_sub(window_start)?).ok()?;
+    window.get(offset..offset + len)
+}
+
+/// Length of the ID3v2.4 extended header (structure §3.2) that `tag`'s header
+/// flags declare, when it is well-formed: a synchsafe size counting the whole
+/// extended header, at least its own 6 fixed bytes, and no further than
+/// `body_end`; then the one flag byte v2.4 defines (`$01`). `None` for any
+/// other version, whose extended header is laid out differently.
+pub(crate) fn extended_header_len(tag: &[u8], body_end: usize) -> Option<usize> {
+    if tag[3] != 4 {
+        return None;
+    }
+    let ext = tag.get(HEADER_LEN..HEADER_LEN + 6)?;
+    if ext[..4].iter().any(|&b| b & 0x80 != 0) || ext[4] != 1 {
+        return None;
+    }
+    let len = synchsafe_decode(&ext[..4]) as usize;
+    (len >= 6 && HEADER_LEN + len <= body_end).then_some(len)
+}
+
+/// Does this ID3v2.4 tag declare itself an update? That is extended-header flag
+/// b: "the present tag is an update of a tag found earlier in the present file
+/// or stream" (structure §3.2). `tag` has passed `mp3::id3v2_alloc_safe`, so an
+/// extended header its flags declare is known to be there and well-formed.
+pub(crate) fn is_update(tag: &[u8]) -> bool {
+    tag[3] == 4
+        && tag[5] & 0x40 != 0
+        && matches!(
+            tag.get(HEADER_LEN + 4..HEADER_LEN + 6),
+            Some(&[1, flags]) if flags & 0x40 != 0
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

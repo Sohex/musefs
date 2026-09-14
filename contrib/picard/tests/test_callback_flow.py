@@ -1,3 +1,5 @@
+import re
+
 import pytest
 
 pytest.importorskip("picard")
@@ -50,5 +52,12 @@ def test_callback_runs_sync_and_logs_summary(
     finally:
         conn.close()
 
-    # _done logged the success summary.
-    assert any("synced=1" in line for line in logged)
+    # _done logged the success summary once, with exact counts: a substring test
+    # would also accept "synced=10". The same summary is echoed to the status
+    # line (logged without the file count), so match the summary's own shape.
+    summaries = [
+        (int(m[1]), int(m[2]))
+        for line in logged
+        if (m := re.fullmatch(r"musefs: synced=(\d+) .*\(files=(\d+)\)", line))
+    ]
+    assert summaries == [(1, 1)], logged

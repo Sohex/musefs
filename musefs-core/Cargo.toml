@@ -6,9 +6,23 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../README.md"
+keywords = ["fuse", "music", "metadata", "filesystem", "audio"]
+categories = ["filesystem", "multimedia::audio"]
+# Integration tests and benches stay in the repository: they need
+# `musefs-latencyfs` (unpublished) and the `test-support`/`fuzzing` features
+# that only path dev-dependencies turn on, and cargo strips path
+# dev-dependencies at publish, so they could not build from the published crate.
+exclude = ["tests/", "benches/"]
 
 [features]
 metrics = []
+# Test-only: compiles the scaffolding this crate's own integration tests reach
+# across the crate boundary — the whole-file oracle scan and the `Musefs`
+# `*_for_test` hooks. Enabled by the self-dev-dependency below, so `cargo test`
+# needs no flag; never part of the published API. Mirrors musefs-format's
+# `fuzzing` feature.
+test-support = []
 
 [dependencies]
 arc-swap = "1"
@@ -16,10 +30,14 @@ crossbeam-channel = "0.5"
 dashmap = "6"
 imbl = "7"
 log = "0.4"
-musefs-db = { path = "../musefs-db", version = "1.3.0" }
-musefs-format = { path = "../musefs-format", version = "1.3.0" }
+musefs-db = { path = "../musefs-db", version = "2.0.0" }
+musefs-format = { path = "../musefs-format", version = "2.0.0" }
 once_cell = "1"
 parking_lot = "0.12"
+# Positioned reads into uninitialized spare capacity, so a backing read that
+# is about to overwrite a buffer does not zero-fill it first (#670). `fs` for
+# `fstatfs`: whether the backing filesystem keeps inode numbers at all (#757).
+rustix = { version = "1", features = ["fs"] }
 quick_cache = { version = "0.7.0", features = ["stats"] }
 base16ct = "1.0"
 sha2 = "0.11"
@@ -36,6 +54,12 @@ criterion = "0.8"
 proptest = "1"
 rusqlite = { version = "0.40", features = ["bundled", "blob"] }
 musefs-format = { path = "../musefs-format", features = ["fuzzing"] }
+musefs-db = { path = "../musefs-db", features = ["test-support"] }
+# Self-dependency: turns `test-support` on for this crate's own test builds.
+musefs-core = { path = ".", features = ["test-support"] }
+# `Format::iter()`, for the test standing in for the exhaustive format match
+# that `#[non_exhaustive]` took away.
+strum = "0.28"
 ogg = "0.9"
 crc = "3"
 base64 = "0.23"

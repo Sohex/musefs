@@ -6,6 +6,7 @@ use common::{fmt_pcm_16bit_mono, resolve_layout};
 use musefs_format::fuzz_check::{assert_backing_covers_audio, fixtures};
 use musefs_format::{ArtInput, BinaryTagInput, BlobLen, TagInput, wav};
 use proptest::prelude::*;
+use std::collections::HashMap;
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(128))]
@@ -14,9 +15,14 @@ proptest! {
     fn wav_synthesis_preserves_audio(
         samples in proptest::collection::vec(any::<i16>(), 1..128),
         tags in proptest::collection::vec(("[A-Z]{1,12}", "[ -~]{0,40}"), 0..8),
+        big in any::<bool>(),
     ) {
-        let file = fixtures::wav(&samples);
+        // Both byte orders (#770): the served file must re-parse in the source's
+        // order, with its structure and audio exactly the source's.
+        let order = if big { wav::ByteOrder::Big } else { wav::ByteOrder::Little };
+        let file = fixtures::wav_in(&samples, order);
         let scan = wav::read_structure(&file).unwrap();
+        prop_assert_eq!(scan.byte_order, order);
         let bounds = wav::locate_audio(&file).unwrap();
         let taginputs: Vec<TagInput> = tags.iter().map(|(k, v)| TagInput::new(k, v)).collect();
         let arts: Vec<ArtInput> = Vec::new();
@@ -29,6 +35,14 @@ proptest! {
             &arts,
         ) {
             assert_backing_covers_audio(bounds.audio_offset, bounds.audio_length, &layout);
+            let served = resolve_layout(&layout, &file, &HashMap::new(), &HashMap::new());
+            let again = wav::locate_audio(&served).unwrap();
+            let range = |b: &wav::WavBounds| {
+                usize::try_from(b.audio_offset).unwrap()
+                    ..usize::try_from(b.audio_offset + b.audio_length).unwrap()
+            };
+            prop_assert_eq!(&served[range(&again)], &file[range(&bounds)]);
+            prop_assert_eq!(wav::read_structure(&served).unwrap(), scan);
         }
     }
 }
@@ -121,10 +135,11 @@ proptest! {
         // DB round-trip (synthetic rowids via the in-memory DB).
         let db = musefs_db::Db::open_in_memory().unwrap();
         let tid = db.upsert_track(&musefs_db::NewTrack {
-            backing_path: "/a.wav".into(),
+            backing_path: std::path::PathBuf::from("/a.wav"),
             format: musefs_db::Format::Wav,
             audio_offset: 0, audio_length: 0, backing_size: 0, backing_mtime_ns: 0, backing_ctime_ns: 0,
-        }).unwrap();
+            backing_ino: None,
+}).unwrap();
         let rows: Vec<musefs_db::BinaryTag> = opaque.iter().enumerate().map(|(i, e)| {
             musefs_db::BinaryTag { key: e.key.clone(), payload: e.payload.clone(), ordinal: u64::try_from(i).unwrap() }
         }).collect();
@@ -142,7 +157,7 @@ proptest! {
         let text: Vec<TagInput> = promoted.iter().map(|(k, v)| TagInput::new(k, v)).collect();
 
         // Synthesize a fresh WAV and re-parse.
-        let scan = wav::WavScan { fmt: fmt_pcm_16bit_mono(), fact: None };
+        let scan = wav::WavScan { fmt: fmt_pcm_16bit_mono(), fact: None, byte_order: wav::ByteOrder::Little };
         let layout = wav::synthesize_layout(&scan, 0, audio.len() as u64, &text, &inputs, &[]).unwrap();
         let served = resolve_layout(&layout, &audio, &HashMap::new(), &map);
         let (opaque2, promoted2) = wav::read_binary_tags(&served);

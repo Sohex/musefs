@@ -97,8 +97,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: Install libfuse3
-        run: ./scripts/apt-install.sh fuse3 libfuse3-dev pkg-config
+      - name: Install fuse3
+        run: ./scripts/apt-install.sh fuse3
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           components: rustfmt, clippy
@@ -107,6 +107,13 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+      - name: Rustdoc
+        # The docs docs.rs publishes. Nothing else builds them, so broken or
+        # private intra-doc links and stray HTML in doc comments accumulated
+        # unnoticed until this step denied rustdoc's warnings.
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps
       - name: Test
         run: cargo test --workspace
       - name: Property tests (fuzzing feature)
@@ -181,6 +188,9 @@ jobs:
     # mutagen reads back). All three plugins' musefs_bin tiers run here,
     # including Picard's (it imports the bundled `musefs._common`, not the
     # system-Picard env). The separate `picard` job runs the full Picard suite.
+    # So does the beets `e2e` tier — import, retag, sync, a real FUSE mount —
+    # which ran in no job before #728; MUSEFS_REQUIRE_BIN makes its tool guard
+    # fail rather than skip, so it cannot go dark again unnoticed.
     needs: changes
     if: needs.changes.outputs.src == 'true'
     runs-on: ubuntu-latest
@@ -191,7 +201,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install FUSE + ffmpeg
-        run: ./scripts/apt-install.sh fuse3 libfuse3-dev pkg-config ffmpeg
+        run: ./scripts/apt-install.sh fuse3 ffmpeg
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
@@ -229,6 +239,10 @@ jobs:
         run: python -m pytest contrib/picard/tests/test_vendor_sync.py -v
       - name: Python -> Rust synthesis round trip
         run: bash scripts/contract-roundtrip.sh
+      - name: beets e2e tier (non-skipping)
+        # Deselected by beets' default addopts; `-m e2e` selects it. Needs the
+        # fuse3/ffmpeg installed above and the binary built above.
+        run: python -m pytest contrib/beets/tests -m e2e -v
 
   python-musefs:
     needs: changes
@@ -348,13 +362,32 @@ jobs:
         with:
           persist-credentials: false
       - name: Install FUSE and ffmpeg
-        run: ./scripts/apt-install.sh fuse3 libfuse3-dev pkg-config ffmpeg
+        run: ./scripts/apt-install.sh fuse3 ffmpeg
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
       - name: FUSE end-to-end tests
         run: cargo test -p musefs-fuse -- --ignored
       - name: FUSE fault-injection + concurrency (metrics feature)
         run: cargo test -p musefs-fuse --features metrics -- --ignored
+      - name: Kernel passthrough read path (as root)
+        # structure_only_reads_are_kernel_passthrough needs CAP_SYS_ADMIN for
+        # the FUSE backing-open ioctl, so the unprivileged run above skips it.
+        # Build the test binary as the runner user (the step above already
+        # compiled it), then run only that test as root; GitHub's Ubuntu runners
+        # have passwordless sudo and /dev/fuse. MUSEFS_REQUIRE_PASSTHROUGH turns
+        # the test's own skips (kernel < 6.9, no CAP_SYS_ADMIN) into failures,
+        # and the grep fails a name filter that matched nothing, which the
+        # harness would otherwise report as a pass.
+        run: |
+          set -euo pipefail
+          bin="$(cargo test -p musefs-fuse --features metrics --test passthrough --no-run \
+            --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .target.name == "passthrough" and .profile.test) | .executable')"
+          test -x "$bin"
+          sudo env MUSEFS_REQUIRE_PASSTHROUGH=1 "$bin" \
+            --ignored --exact structure_only_reads_are_kernel_passthrough \
+            --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/passthrough.log"
+          grep -q '^test result: ok\. 1 passed' "$RUNNER_TEMP/passthrough.log"
       - name: Binary-level end-to-end tests (musefs)
         run: cargo test -p musefs -- --ignored
       - name: latencyfs end-to-end tests
@@ -407,9 +440,11 @@ jobs:
 
   tsan:
     # ThreadSanitizer is BEST-EFFORT and deliberately NOT in ci-ok: it cannot
-    # instrument the system C libs (libfuse, libsqlite3), so it sees races in
-    # our code around the FFI but may miss or false-positive inside the C deps.
-    # continue-on-error keeps a noisy run from showing as a hard failure.
+    # instrument C code — the bundled SQLite that libsqlite3-sys compiles, and
+    # libc — so it sees races in our code around the FFI but may miss or
+    # false-positive inside SQLite. (libfuse is not involved: fuser's pure-Rust
+    # mount links none.) continue-on-error keeps a noisy run from showing as a
+    # hard failure.
     #
     # Unlike AddressSanitizer (which is ABI-compatible with an uninstrumented
     # std), ThreadSanitizer changes the ABI, so nightly rejects linking tsan
@@ -423,8 +458,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: Install libfuse3
-        run: ./scripts/apt-install.sh fuse3 libfuse3-dev pkg-config
+      - name: Install fuse3
+        run: ./scripts/apt-install.sh fuse3
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           toolchain: nightly
@@ -491,8 +526,6 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - name: Install libfuse3
-        run: ./scripts/apt-install.sh libfuse3-dev
       - name: Install critcmp
         run: cargo install critcmp --locked --version 0.1.8
       - name: Run A/B
@@ -507,13 +540,43 @@ jobs:
         if: always()
         run: cat "$RUNNER_TEMP/perf-ab.md" >> "$GITHUB_STEP_SUMMARY"
 
+  msrv:
+    # `rust-version` promises that toolchain builds the workspace, but every
+    # other job uses stable, which accepts an API newer than the floor without
+    # a word. Check on exactly the declared version, read from Cargo.toml so the
+    # two cannot drift. `check`, not `test`: codegen adds nothing to the
+    # question, which keeps this a few minutes. No system packages: fuser uses
+    # its pure-Rust mount and SQLite is bundled.
+    needs: changes
+    if: needs.changes.outputs.src == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Read rust-version
+        id: msrv
+        run: |
+          set -euo pipefail
+          v="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)"
+          test -n "$v"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+      - name: cargo check on the declared MSRV
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: cargo "+$MSRV" check --workspace --all-targets --locked
+
   # Single required status check for branch protection. Always runs (even when
   # the heavy jobs were skipped on a docs-only change) so the check is always
   # reported; green when every needed job either succeeded or was skipped, red
   # if any failed or was cancelled.
   ci-ok:
     if: always()
-    needs: [changes, check, deny, interop, contract, python-musefs, beets, lidarr, picard, e2e, macos, freebsd, asan]
+    needs: [changes, check, deny, interop, contract, python-musefs, beets, lidarr, picard, e2e, macos, freebsd, asan, msrv]
     runs-on: ubuntu-latest
     steps:
       - name: Aggregate required-job results

@@ -27,14 +27,18 @@ if [ ! -x "$bin" ]; then
 fi
 
 # 1. Real audio fixtures (ffmpeg is installed on this CI tier).
+#    Two FLACs: the writer links one picture with stated geometry and one
+#    without, and only a FLAC picture block carries geometry.
 ffmpeg -nostdin -loglevel error -f lavfi -i "sine=frequency=440:duration=1" -c:a flac "$backing/track.flac"
+ffmpeg -nostdin -loglevel error -f lavfi -i "sine=frequency=550:duration=1" -c:a flac "$backing/unstated.flac"
 ffmpeg -nostdin -loglevel error -f lavfi -i "sine=frequency=660:duration=1" -c:a libmp3lame "$backing/track.mp3"
 
 # 2. Scan owns the track geometry (an external writer cannot create it).
 "$bin" scan "$backing" --db "$db"
 
 # 3. python-musefs writes the tags/art it owns.
-python scripts/contract_writer.py "$db"
+#    It finds each track from the backing file's path, as a plugin does.
+python scripts/contract_writer.py "$db" "$backing"
 
 # 4. Rust synthesizes the served bytes from the externally-written DB.
 MUSEFS_DB="$db" MUSEFS_INTEROP_DIR="$out" \

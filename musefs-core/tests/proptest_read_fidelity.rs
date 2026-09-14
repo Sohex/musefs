@@ -26,31 +26,30 @@ fn build_track(
     let db = Db::open_in_memory().unwrap();
     let id = db
         .upsert_track(&NewTrack {
-            backing_path: path.to_string_lossy().into_owned(),
+            backing_path: path.clone(),
             format,
             audio_offset,
             audio_length,
             backing_size: meta.len(),
             backing_mtime_ns: common::real_mtime_ns(&path),
             backing_ctime_ns: common::real_ctime_ns(&path),
+            backing_ino: None,
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("title", title, 0)]).unwrap();
     if let Some(art) = art {
-        let art_id = db
-            .upsert_art(&NewArt {
-                mime: "image/png".to_string(),
-                width: Some(8),
-                height: Some(8),
-                data: art.to_vec(),
-            })
-            .unwrap();
+        let art_id = db.upsert_art(&NewArt { data: art.to_vec() }).unwrap();
         db.set_track_art(
             id,
             &[TrackArt {
                 art_id,
                 picture_type: 3,
                 description: "front".to_string(),
+                mime: "image/png".into(),
+                width: None,
+                height: None,
+                depth: 0,
+                colors: 0,
                 ordinal: 0,
             }],
         )

@@ -49,17 +49,18 @@ segment model these layouts plug into, see
   re-emitted with the `com.apple.iTunes` mean (the scan keys text freeform
   by name only). Binary freeform atoms keep their mean via the
   `----:<mean>:<name>` key.
-- Binary `ilst` atoms outside the handled set (`trkn`/`disk`, the
-  `tmpo`/`cpil`/`pgap` integer atoms, and `----` freeform) are dropped at scan
-  time, since they are not re-emitted on synthesis.
+- `ilst` atoms outside the handled set are dropped at scan time, since they
+  are not re-emitted on synthesis: text atoms not in the shared vocabulary, and
+  binary atoms other than `trkn`/`disk`, the `tmpo`/`cpil`/`pgap` integer
+  atoms, and `----` freeform.
 - `covr` ingestion accepts only JPEG (type 13) and PNG (type 14) artwork;
   other type codes are skipped. MP4 has no picture-type or description
   fields: scanned art becomes "front cover" with an empty description, and
   any non-PNG stored art is emitted with the JPEG type code.
-- A `covr` image or binary `----` value larger than its size cap is skipped
-  at scan time — before the image is materialized out of a potentially large
-  `moov` — and logged (a `warn` line on stderr) so the lossy drop is explained
-  rather than silent.
+- A `covr` image or binary `----` value larger than its size cap fails the
+  whole file at scan time, counted under reason `oversize`. The size is checked
+  before the payload is copied out of a potentially large `moov`, so the
+  oversized item is never materialized.
 
 ## How synthesis works
 
@@ -84,8 +85,9 @@ box and serves `[ftyp][regenerated moov][mdat header][mdat payload]`:
          Δ = new mdat payload offset − old
 ```
 
-1. The scan keeps `moov`'s structural children and drops its old `udta`, save
-   for a `chpl` chapter list, which is carried through. A fresh
+1. Synthesis (`mp4::synthesize_layout`) keeps `moov`'s structural children
+   and drops its old `udta`, save for a `chpl` chapter list, which is carried
+   through. A fresh
    `udta`/`meta`/`ilst` is built from the DB: inline box framing, with
    each opaque `----` value and each cover image spliced in as streamed
    `BinaryTag`/`ArtImage` segments. Every enclosing box size accounts for

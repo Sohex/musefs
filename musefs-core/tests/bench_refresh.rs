@@ -1,26 +1,19 @@
 mod common;
 
-use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use common::corpus::{CorpusParams, Format, prepare, prepare_format};
 use common::report::RunReport;
-use musefs_core::{Mode, MountConfig, Musefs, scan_directory};
+use musefs_core::{MountConfig, Musefs, scan_directory};
 use musefs_db::Db;
 
 fn config() -> MountConfig {
-    MountConfig {
-        template: "$artist/$album/$title".to_string(),
-        fallbacks: BTreeMap::new(),
-        default_fallback: "Unknown".to_string(),
-        mode: Mode::Synthesis,
-        poll_interval: Duration::ZERO, // no debounce: each poll actually polls
-        case_insensitive: false,
-        read_ahead_budget: 64 * 1024 * 1024,
-        read_ahead_prefetch: false,
-        skip_on_missing: false,
-        trust_backing_mtime: false,
-    }
+    let mut config = MountConfig::default();
+    config.template = "$artist/$album/$title".to_string();
+    config.poll_interval = Duration::ZERO;
+    // no debounce: each poll actually polls
+    config.case_insensitive = false;
+    config
 }
 
 /// Replace all tags for `count` tracks via a separate connection, then time

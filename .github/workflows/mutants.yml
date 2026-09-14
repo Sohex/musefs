@@ -160,10 +160,10 @@ jobs:
           echo "Changed Rust lines:"; wc -l mutants.diff
       - name: Mutate changed lines (shard ${{ matrix.label }})
         run: |
-          # This fast gate runs the default `cargo test` (no libfuse, no
+          # This fast gate runs the default `cargo test` (no FUSE mounts, no
           # `--ignored`), so it can't exercise musefs-latencyfs — every mutant
           # there would falsely survive. That crate is mutation-tested in the
-          # scheduled `full` job below, which installs libfuse and runs its
+          # scheduled `full` job below, which installs fuse3 and runs its
           # mounted #[ignore]d tests. Exclude it here so the gate stays honest.
           # `--output` collects the per-mutant report (missed.txt / caught.txt /
           # outcomes.json) so it can be uploaded even when the gate fails, giving
@@ -279,7 +279,7 @@ jobs:
       - name: Install FUSE
         # Only the musefs-latencyfs leg mounts a passthrough FS in its tests.
         if: matrix.crate == 'musefs-latencyfs'
-        run: ./scripts/apt-install.sh fuse3 libfuse3-dev pkg-config
+        run: ./scripts/apt-install.sh fuse3
       - name: Install cargo-mutants
         # Unpinned (like fuzz.yml installs cargo-fuzz) for toolchain-compat;
         # known-good version is 27.0.0 (documented in scripts/mutants.sh).

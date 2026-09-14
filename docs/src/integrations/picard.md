@@ -1,7 +1,7 @@
 # musefs-picard
 
 A [MusicBrainz Picard](https://picard.musicbrainz.org/) plugin that syncs your
-Picard metadata (tags + front cover) into a [musefs](../introduction.md) SQLite
+Picard metadata (tags + cover art) into a [musefs](../introduction.md) SQLite
 store, so a live musefs mount shows a re-tagged view of your library **without
 rewriting any audio**.
 
@@ -13,7 +13,7 @@ selection → **"Sync to musefs"** *instead of* pressing Save. The plugin:
 
 1. runs `musefs scan` on each selected file to create/refresh its track row and
    structural columns (the offsets only musefs can compute), then
-2. writes Picard's tags and front cover into the store, keyed by the file's
+2. writes Picard's tags and cover art into the store, keyed by the file's
    canonical real path.
 
 musefs's auto-refresh surfaces the change at the mount with no remount. The
@@ -62,9 +62,12 @@ settings (handy for testing).
 
 ## Notes
 
-- **Front cover only:** the first front-cover image Picard holds is synced.
-  Picard art wins when present; otherwise any art `musefs scan` ingested from
-  the file's embedded picture is preserved. Re-syncing a file with no Picard
+- **Cover art:** every image Picard holds that can be saved to tags is synced,
+  in Picard's order, with its picture type (front, back, booklet or medium,
+  otherwise Other) and its comment as the description. Images over the store's
+  art size cap are skipped. Picard art wins when present; otherwise any art
+  `musefs scan` ingested from the file's embedded picture is preserved.
+  Re-syncing a file with no Picard
   art lets the embedded picture re-seed when autoscan is on (musefs scan
   re-reads the file); with autoscan off, existing art is left untouched.
 - **Tags are fully replaced** with Picard's view on every sync.
@@ -76,7 +79,9 @@ settings (handy for testing).
 - **Orphaned art:** replacing art can orphan old blobs; `musefs revalidate --prune`
   garbage-collects them.
 - **Schema version:** the plugin refuses to run if the DB's `user_version`
-  differs from the version it targets — rebuild the store after upgrading musefs.
+  differs from the version it targets. The message says which side is behind:
+  upgrade the plugin for a store newer than it, or run `musefs migrate` for an
+  older one.
 
 ## Tests
 
@@ -85,13 +90,16 @@ cd contrib/picard
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-python -m pytest                 # unit + integration (no Picard, no Rust binary)
-python -m pytest -m musefs_bin   # path-matching gate vs the real `musefs` binary
+python -m pytest                 # unit + integration + the binary gate (no Picard)
+python -m pytest -m musefs_bin   # just the gate vs the real `musefs` binary
 ```
 
 The `musefs_bin` gate shells out to the real `musefs` binary, so build it first
-from the repo root (`cargo build`). It is deselected from the default run and
-skips cleanly if the binary is absent.
+from the repo root (`cargo build`) — it warns if the binary is older than the
+Rust sources. It **runs by default**: it is the only tier that sees the real
+schema rather than a fixture's, so a store-shape change breaks it and nothing
+else. Where the binary is absent it skips cleanly, so a Rust toolchain is not
+required to work on the plugin.
 
 ### Real-Picard (pytest-qt) tests
 

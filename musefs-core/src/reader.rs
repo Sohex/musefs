@@ -29,7 +29,9 @@ pub struct ResolvedFile {
     pub content_version: i64,
     pub backing_path: PathBuf,
     pub stamp: BackingStamp,
-    pub mtime_secs: i64,
+    /// The timestamp this file reports, both halves derived together in
+    /// `build`'s `match self.mode` so they cannot describe different things.
+    pub mtime: crate::VirtualMtime,
     /// One-entry memo of the last patched Ogg page, so consecutive reads skip
     /// re-patching the page straddling a chunk boundary. Empty for non-Ogg files
     /// and reset whenever this resolved entry is rebuilt. (Concrete type spelled
@@ -127,7 +129,7 @@ impl HeaderCache {
         let stamp = BackingStamp::from_track(&track);
         let meta = std::fs::metadata(&track.backing_path)
             .map_err(|e| CoreError::backing_io(&track.backing_path, e))?;
-        if BackingStamp::from_metadata(&meta) != stamp {
+        if !stamp.matches_live(&BackingStamp::from_metadata(&meta)) {
             return Err(CoreError::BackingChanged(track.backing_path.clone()));
         }
 
@@ -139,6 +141,9 @@ impl HeaderCache {
         // verbatim (#679).
         if let Some(hit) = self.cache.get(&track_id)
             && hit.content_version == track.content_version
+            // Stored against stored (the cache entry and the row it was built
+            // from), so ordinary equality — see the note in `facade`'s
+            // size-cache hit.
             && hit.stamp == stamp
             && hit.backing_path.as_os_str() == std::ffi::OsStr::new(&track.backing_path)
         {
@@ -155,7 +160,7 @@ impl HeaderCache {
         track: &musefs_db::Track,
         meta: &std::fs::Metadata,
     ) -> Result<Arc<ResolvedFile>> {
-        let (layout, total_len, mtime_secs_val) = match self.mode {
+        let (layout, total_len, mtime) = match self.mode {
             Mode::StructureOnly => {
                 // Pure passthrough: the synthesized "file" is the backing file itself.
                 // The stored audio bounds are irrelevant here — the whole file is served
@@ -168,7 +173,17 @@ impl HeaderCache {
                 (
                     layout,
                     meta.len(),
-                    BackingStamp::from_track(track).display_secs(),
+                    crate::VirtualMtime {
+                        secs: BackingStamp::from_track(track).display_secs(),
+                        // No sub-second signal in passthrough, and deliberately
+                        // not `content_version` (#725). These bytes *are* the
+                        // backing file, so a tag or art edit does not change
+                        // them — reporting a moved mtime for one would tell
+                        // every size-plus-mtime consumer to re-copy a file that
+                        // is byte-identical. The version is the right answer
+                        // only where the served bytes are synthesized from it.
+                        content_version: 0,
+                    },
                 )
             }
             Mode::Synthesis => {
@@ -324,14 +339,27 @@ impl HeaderCache {
                             &src,
                         )?
                     }
+                    // `Format` is `#[non_exhaustive]` (#708), so the compiler no
+                    // longer flags a format this dispatch forgot. A stored format
+                    // with no arm is a bug here, not in the file;
+                    // `a_new_format_must_be_wired_into_the_dispatch` fails first.
+                    _ => {
+                        return Err(musefs_format::FormatError::ProducerBug(
+                            "stored format has no synthesis arm",
+                        )
+                        .into());
+                    }
                 };
                 let total = layout.total_len();
                 (
                     layout,
                     total,
-                    BackingStamp::from_track(track)
-                        .display_secs()
-                        .max(track.updated_at),
+                    crate::VirtualMtime {
+                        secs: BackingStamp::from_track(track)
+                            .display_secs()
+                            .max(track.updated_at),
+                        content_version: track.content_version,
+                    },
                 )
             }
         };
@@ -369,7 +397,7 @@ impl HeaderCache {
             // guaranteed-intended one. Documented, not enforced (#551).
             backing_path: PathBuf::from(&track.backing_path),
             stamp: BackingStamp::from_track(track),
-            mtime_secs: mtime_secs_val,
+            mtime,
             last_page: Mutex::new(None),
             cache_bytes,
             streams_db_rowid,
@@ -412,27 +440,16 @@ pub fn read_at_into<M>(
         .segments()
         .iter()
         .any(|s| matches!(s, Segment::BackingAudio { .. } | Segment::OggAudio { .. }));
-    // Open and re-validate the backing fd against the stamp the layout was
-    // resolved from (#503): between the resolve-time stat and this open the file
-    // can be rename-replaced or rewritten in place, which would otherwise splice
-    // bytes from a different/modified file behind the stamped header (or
-    // short-read against a stale size). The handle fast path validates per read
-    // via `validate_opened_backing`; this stateless fallback must too.
+    // The backing fd is validated against the stamp the layout was resolved
+    // from after the read below, not here (#682).
     let file = if needs_file {
         crate::metrics::on_open();
         // Opens the semi-trusted DB path verbatim — see the trust-boundary note
         // on `ResolvedFile::backing_path` in `HeaderCache::build` (#551).
-        let f = std::fs::File::open(&resolved.backing_path)
-            .map_err(|e| CoreError::backing_io(&resolved.backing_path, e))?;
-        let f_meta = f
-            .metadata()
-            .map_err(|e| CoreError::backing_io(&resolved.backing_path, e))?;
-        if BackingStamp::from_metadata(&f_meta) != resolved.stamp {
-            return Err(CoreError::BackingChanged(
-                resolved.backing_path.to_string_lossy().into_owned(),
-            ));
-        }
-        Some(f)
+        Some(
+            std::fs::File::open(&resolved.backing_path)
+                .map_err(|e| CoreError::backing_io(&resolved.backing_path, e))?,
+        )
     } else {
         None
     };
@@ -441,15 +458,13 @@ pub fn read_at_into<M>(
     // snapshot with a `content_version` recheck so a concurrent rowid-reuse
     // (delete + reinsert reusing a freed rowid) can't splice a wrong blob
     // mid-read (#502). Only the rare rowid-streaming layout pays this cost.
-    if resolved.streams_db_rowid {
+    let served = if resolved.streams_db_rowid {
         db.begin_read()?;
         let res = (|| {
             if db.track_content_version(resolved.track_id)? != resolved.content_version {
                 // Stale resolve: the layout no longer matches the live row.
                 // Surface a retryable error rather than risk wrong bytes.
-                return Err(CoreError::BackingChanged(
-                    resolved.backing_path.to_string_lossy().into_owned(),
-                ));
+                return Err(CoreError::BackingChanged(resolved.backing_path.clone()));
             }
             read_with_optional_backing(resolved, db, file.as_ref(), offset, size, out)
         })();
@@ -457,7 +472,29 @@ pub fn read_at_into<M>(
         res
     } else {
         read_with_optional_backing(resolved, db, file.as_ref(), offset, size, out)
+    };
+    #[cfg(test)]
+    crate::facade::fire_after_backing_read();
+    // Validate the fd against the stamp the layout was resolved from (#503):
+    // between the resolve-time stat and the read the file can be rename-replaced
+    // or rewritten in place, which would splice bytes from a different or
+    // modified file behind the stamped header, or short-read against a stale
+    // size. After the read rather than before it (#682), so a rewrite that lands
+    // mid-read fails that read instead of the next one — and ahead of whatever
+    // the read reported, since such a rewrite can surface as a short read first.
+    // The handle fast path does the same through `validate_opened_backing`.
+    if let Some(f) = &file {
+        let meta = f
+            .metadata()
+            .map_err(|e| CoreError::backing_io(&resolved.backing_path, e))?;
+        if !resolved
+            .stamp
+            .matches_live(&BackingStamp::from_metadata(&meta))
+        {
+            return Err(CoreError::BackingChanged(resolved.backing_path.clone()));
+        }
     }
+    served
 }
 
 /// Build the optional `BackingReader` from an already-validated `file` and run
@@ -543,9 +580,7 @@ fn read_segments_into<M>(
                 }
                 Segment::BackingAudio { offset: bo, .. } => {
                     let br = backing.expect("backing segment requires an open backing reader");
-                    let start = out.len();
-                    out.resize(start + n, 0);
-                    br.read_exact_at(&mut out[start..], bo + within)?;
+                    br.read_append(out, n, bo + within)?;
                 }
                 Segment::ArtImage { art_id, .. } => {
                     let db = db.expect("art segment requires a DB connection");
@@ -565,6 +600,7 @@ fn read_segments_into<M>(
                     offset: ao,
                     seq_delta,
                     len,
+                    serial,
                 } => {
                     let br = backing.expect("ogg-audio segment requires an open backing reader");
                     serve_ogg_window(
@@ -572,6 +608,7 @@ fn read_segments_into<M>(
                         *ao,
                         *len,
                         *seq_delta,
+                        *serial,
                         within,
                         within + n as u64,
                         &mut *out,
@@ -593,7 +630,7 @@ fn read_segments_into<M>(
                         crate::metrics::on_art_chunk();
                         let slice = musefs_format::ogg::encode_b64_slice(&raw, w.skip, n)
                             .ok_or_else(|| {
-                                CoreError::BackingChanged(format!(
+                                CoreError::DerivedStateStale(format!(
                                     "art {} shorter than its indexed base64 window",
                                     *art_id
                                 ))
@@ -644,6 +681,38 @@ pub fn read_at_with_file<M>(
 }
 
 #[cfg(test)]
+mod format_dispatch_tests {
+    use musefs_db::Format;
+    use strum::IntoEnumIterator;
+
+    /// A tripwire standing in for the check the compiler made before `Format`
+    /// became `#[non_exhaustive]` (#708) and `HeaderCache::resolve`'s dispatch
+    /// took a wildcard. It cannot see the dispatch: what it checks is that every
+    /// variant is one this list names, so a new variant fails here — naming the
+    /// dispatch to wire it into — rather than reaching a mount as an unservable
+    /// track. The list is only as honest as whoever extends it.
+    #[test]
+    fn a_new_format_must_be_wired_into_the_dispatch() {
+        for format in Format::iter() {
+            assert!(
+                matches!(
+                    format,
+                    Format::Flac
+                        | Format::Mp3
+                        | Format::M4a
+                        | Format::Wav
+                        | Format::Opus
+                        | Format::Vorbis
+                        | Format::OggFlac
+                ),
+                "{format:?} has no arm in HeaderCache::resolve's synthesis dispatch; \
+                 add one there, then add it here"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod ogg_serve_tests {
     use super::*;
     use musefs_format::Segment;
@@ -673,6 +742,7 @@ mod ogg_serve_tests {
                 offset: audio_offset,
                 len: audio.len() as u64,
                 seq_delta: 1, // 3->4, 4->5
+                serial: 0x99,
             },
         ])
         .unwrap();
@@ -686,7 +756,10 @@ mod ogg_serve_tests {
             // Stamp the real file so the fallback's backing-fd re-validation
             // (#503) passes; a dummy stamp would now read as a changed backing.
             stamp: BackingStamp::from_metadata(&std::fs::metadata(&path).unwrap()),
-            mtime_secs: 0,
+            mtime: crate::VirtualMtime {
+                secs: 0,
+                content_version: 0,
+            },
             last_page: Mutex::new(None),
             cache_bytes: 8,
             streams_db_rowid: false,
@@ -756,13 +829,14 @@ mod resolve_ogg_tests {
         let meta = std::fs::metadata(&path).unwrap();
         let track_id = db
             .upsert_track(&NewTrack {
-                backing_path: path.to_string_lossy().into_owned(),
+                backing_path: path.clone(),
                 format: Format::Opus,
                 audio_offset,
                 audio_length,
                 backing_size: meta.len(),
                 backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
                 backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                backing_ino: None,
             })
             .unwrap();
         db.replace_tags(track_id, &[Tag::new("title", "Telephasic Workshop", 0)])
@@ -811,13 +885,14 @@ mod resolve_ogg_tests {
         let meta = std::fs::metadata(&path).unwrap();
         let track_id = db
             .upsert_track(&NewTrack {
-                backing_path: path.to_string_lossy().into_owned(),
+                backing_path: path.clone(),
                 format: Format::Opus,
                 audio_offset,
                 audio_length,
                 backing_size: meta.len(),
                 backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
                 backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                backing_ino: None,
             })
             .unwrap();
         // `a=b` passes the DB floor but is not a valid Vorbis field name. Without the
@@ -854,13 +929,14 @@ mod resolve_ogg_tests {
         let meta = std::fs::metadata(&path).unwrap();
         let track_id = db
             .upsert_track(&NewTrack {
-                backing_path: path.to_string_lossy().into_owned(),
+                backing_path: path.clone(),
                 format: Format::Opus,
                 audio_offset,
                 audio_length,
                 backing_size: meta.len(),
                 backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
                 backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                backing_ino: None,
             })
             .unwrap();
         let cache = HeaderCache::new(Mode::Synthesis);
@@ -916,13 +992,14 @@ mod resolve_ogg_tests {
         let meta = std::fs::metadata(&path).unwrap();
         let track_id = db
             .upsert_track(&NewTrack {
-                backing_path: path.to_string_lossy().into_owned(),
+                backing_path: path.clone(),
                 format: Format::Wav,
                 audio_offset,
                 audio_length,
                 backing_size: meta.len(),
                 backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
                 backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                backing_ino: None,
             })
             .unwrap();
         db.replace_tags(track_id, &[Tag::new("title", "Wave One", 0)])
@@ -956,13 +1033,14 @@ mod resolve_ogg_tests {
         let meta = std::fs::metadata(&path).unwrap();
         let id = db
             .upsert_track(&NewTrack {
-                backing_path: path.to_string_lossy().into_owned(),
+                backing_path: path.clone(),
                 format: Format::Opus,
                 audio_offset,
                 audio_length,
                 backing_size: meta.len(),
                 backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
                 backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                backing_ino: None,
             })
             .unwrap();
         let cache = HeaderCache::new(Mode::Synthesis);
@@ -1003,9 +1081,6 @@ mod ogg_art_serve_tests {
         let db = musefs_db::Db::open_in_memory().unwrap();
         let art_id = db
             .upsert_art(&musefs_db::NewArt {
-                mime: "image/png".to_string(),
-                width: Some(1),
-                height: Some(1),
                 data: image.clone(),
             })
             .unwrap();
@@ -1033,8 +1108,12 @@ mod ogg_art_serve_tests {
                 size: 0,
                 mtime_ns: 0,
                 ctime_ns: 0,
+                ino: None,
             },
-            mtime_secs: 0,
+            mtime: crate::VirtualMtime {
+                secs: 0,
+                content_version: 0,
+            },
             last_page: Mutex::new(None),
             cache_bytes: 0,
             streams_db_rowid: false,
@@ -1060,9 +1139,6 @@ mod ogg_art_serve_tests {
         let db = musefs_db::Db::open_in_memory().unwrap();
         let art_id = db
             .upsert_art(&musefs_db::NewArt {
-                mime: "image/png".to_string(),
-                width: None,
-                height: None,
                 data: image.clone(),
             })
             .unwrap();
@@ -1085,8 +1161,12 @@ mod ogg_art_serve_tests {
                 size: 0,
                 mtime_ns: 0,
                 ctime_ns: 0,
+                ino: None,
             },
-            mtime_secs: 0,
+            mtime: crate::VirtualMtime {
+                secs: 0,
+                content_version: 0,
+            },
             last_page: Mutex::new(None),
             cache_bytes: 0,
             streams_db_rowid: false,
@@ -1124,13 +1204,14 @@ mod cache_bound_tests {
             let meta = std::fs::metadata(&path).unwrap();
             ids.push(
                 db.upsert_track(&NewTrack {
-                    backing_path: path.to_string_lossy().into_owned(),
+                    backing_path: path.clone(),
                     format: Format::Flac,
                     audio_offset,
                     audio_length,
                     backing_size: meta.len(),
                     backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
                     backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                    backing_ino: None,
                 })
                 .unwrap(),
             );
@@ -1160,8 +1241,12 @@ mod cache_bound_tests {
                 size: 0,
                 mtime_ns: 0,
                 ctime_ns: 0,
+                ino: None,
             },
-            mtime_secs: 0,
+            mtime: crate::VirtualMtime {
+                secs: 0,
+                content_version: 0,
+            },
             last_page: Mutex::new(None),
             cache_bytes: inline_len as u64,
             streams_db_rowid: false,
@@ -1177,13 +1262,14 @@ mod cache_bound_tests {
         let meta = std::fs::metadata(&path).unwrap();
         let id = db
             .upsert_track(&NewTrack {
-                backing_path: path.to_string_lossy().into_owned(),
+                backing_path: path.clone(),
                 format: Format::Flac,
                 audio_offset,
                 audio_length,
                 backing_size: meta.len(),
                 backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
                 backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                backing_ino: None,
             })
             .unwrap();
         let cache = HeaderCache::new(Mode::Synthesis); // NOTE: not `mut` — resolve is &self now
@@ -1206,13 +1292,14 @@ mod cache_bound_tests {
             let db = Db::open(&db_path).unwrap();
             let meta = std::fs::metadata(&flac_path).unwrap();
             db.upsert_track(&NewTrack {
-                backing_path: flac_path.to_string_lossy().into_owned(),
+                backing_path: flac_path.clone(),
                 format: Format::Flac,
                 audio_offset,
                 audio_length,
                 backing_size: meta.len(),
                 backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
                 backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                backing_ino: None,
             })
             .unwrap()
         };
@@ -1243,13 +1330,14 @@ mod cache_bound_tests {
             let (audio_offset, audio_length) = write_flac_local(&path);
             let meta = std::fs::metadata(&path).unwrap();
             db.upsert_track(&NewTrack {
-                backing_path: path.to_string_lossy().into_owned(),
+                backing_path: path.clone(),
                 format: Format::Flac,
                 audio_offset,
                 audio_length,
                 backing_size: meta.len(),
                 backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
                 backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                backing_ino: None,
             })
             .unwrap()
         };
@@ -1276,13 +1364,14 @@ mod cache_bound_tests {
             let (audio_offset, audio_length) = write_flac_local(&path);
             let meta = std::fs::metadata(&path).unwrap();
             db.upsert_track(&NewTrack {
-                backing_path: path.to_string_lossy().into_owned(),
+                backing_path: path.clone(),
                 format: Format::Flac,
                 audio_offset,
                 audio_length,
                 backing_size: meta.len(),
                 backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
                 backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                backing_ino: None,
             })
             .unwrap()
         };
@@ -1324,13 +1413,14 @@ mod cache_bound_tests {
         let meta = std::fs::metadata(path).unwrap();
         let id = db
             .upsert_track(&NewTrack {
-                backing_path: path.to_string_lossy().into_owned(),
+                backing_path: path.to_path_buf(),
                 format: Format::Flac,
                 audio_offset,
                 audio_length,
                 backing_size: meta.len(),
                 backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
                 backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                backing_ino: None,
             })
             .unwrap();
         (db, id)
@@ -1347,13 +1437,14 @@ mod cache_bound_tests {
         let meta = std::fs::metadata(&path).unwrap();
         let db = musefs_db::Db::open_in_memory().unwrap();
         let rejected = db.upsert_track(&musefs_db::NewTrack {
-            backing_path: path.to_string_lossy().into_owned(),
+            backing_path: path.clone(),
             format: musefs_db::Format::Flac,
             audio_offset: meta.len(),
             audio_length: 5,
             backing_size: meta.len(),
             backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
             backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+            backing_ino: None,
         });
         assert!(
             rejected.is_err(),
@@ -1529,13 +1620,14 @@ mod binary_tag_serve_tests {
         let meta = std::fs::metadata(&path).unwrap();
         let tid = db
             .upsert_track(&musefs_db::NewTrack {
-                backing_path: path.to_string_lossy().into_owned(),
+                backing_path: path.clone(),
                 format: musefs_db::Format::Mp3,
                 audio_offset: bounds.audio_offset,
                 audio_length: bounds.audio_length,
                 backing_size: meta.len(),
                 backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
                 backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                backing_ino: None,
             })
             .unwrap();
         db.set_binary_tags(
@@ -1562,13 +1654,14 @@ mod binary_tag_serve_tests {
         let db = Db::open_in_memory().unwrap();
         let id = db
             .upsert_track(&NewTrack {
-                backing_path: "/x.mp3".into(),
+                backing_path: std::path::PathBuf::from("/x.mp3"),
                 format: Format::Mp3,
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         db.set_binary_tags(
@@ -1598,8 +1691,12 @@ mod binary_tag_serve_tests {
                 size: 0,
                 mtime_ns: 0,
                 ctime_ns: 0,
+                ino: None,
             },
-            mtime_secs: 0,
+            mtime: crate::VirtualMtime {
+                secs: 0,
+                content_version: 0,
+            },
             last_page: Mutex::new(None),
             cache_bytes: 0,
             streams_db_rowid: true,
@@ -1633,7 +1730,10 @@ mod binary_tag_serve_tests {
             content_version: 0,
             backing_path: path.clone(),
             stamp: BackingStamp::from_metadata(&std::fs::metadata(&path).unwrap()),
-            mtime_secs: 0,
+            mtime: crate::VirtualMtime {
+                secs: 0,
+                content_version: 0,
+            },
             last_page: Mutex::new(None),
             cache_bytes: 3,
             streams_db_rowid: false,
@@ -1654,20 +1754,18 @@ mod binary_tag_serve_tests {
         let db = Db::open_in_memory().unwrap();
         let id = db
             .upsert_track(&NewTrack {
-                backing_path: "/y.mp3".into(),
+                backing_path: std::path::PathBuf::from("/y.mp3"),
                 format: Format::Mp3,
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         let art_id = db
             .upsert_art(&musefs_db::NewArt {
-                mime: "image/png".into(),
-                width: None,
-                height: None,
                 data: vec![1, 2, 3, 4],
             })
             .unwrap();
@@ -1687,8 +1785,12 @@ mod binary_tag_serve_tests {
                 size: 0,
                 mtime_ns: 0,
                 ctime_ns: 0,
+                ino: None,
             },
-            mtime_secs: 0,
+            mtime: crate::VirtualMtime {
+                secs: 0,
+                content_version: 0,
+            },
             last_page: Mutex::new(None),
             cache_bytes: 0,
             streams_db_rowid: true,
@@ -1726,13 +1828,14 @@ mod serve_cap_tests {
         let meta = std::fs::metadata(path).unwrap();
         let stamp = BackingStamp::from_metadata(&meta);
         db.upsert_track(&NewTrack {
-            backing_path: path.to_string_lossy().into_owned(),
+            backing_path: path.to_path_buf(),
             format,
             audio_offset: CAP + 1,
             audio_length: 1,
             backing_size: meta.len(),
             backing_mtime_ns: stamp.mtime_ns,
             backing_ctime_ns: stamp.ctime_ns,
+            backing_ino: None,
         })
         .unwrap()
     }
@@ -1860,13 +1963,14 @@ mod readahead_differential_tests {
         use std::os::unix::fs::MetadataExt;
         let track_id = db
             .upsert_track(&musefs_db::NewTrack {
-                backing_path: path.to_string_lossy().into_owned(),
+                backing_path: path.clone(),
                 format: musefs_db::Format::Wav,
                 audio_offset,
                 audio_length: audio_data.len() as u64,
                 backing_size: meta.len(),
                 backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
                 backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                backing_ino: None,
             })
             .unwrap();
         let cache = HeaderCache::new(Mode::Synthesis);

@@ -10,4 +10,4 @@ synthesis behavior and lossy edges.
 | [MP3](mp3.md) | `.mp3` | Regenerates the ID3v2.4 tag; audio frames (incl. Xing/LAME) untouched |
 | [M4A](m4a.md) | `.m4a`, `.m4b` | Rebuilds the `moov` atom, patching chunk offsets across every track; `mdat` served verbatim; chapters preserved |
 | [Ogg](ogg.md) | `.ogg`, `.oga`, `.opus` | Regenerates header pages; audio pages verbatim, only page seq/CRC patched in place |
-| [WAV](wav.md) | `.wav` | Regenerates the RIFF front (`LIST`/`INFO` + embedded ID3v2); `data` payload verbatim |
+| [WAV](wav.md) | `.wav` | Regenerates the RIFF front (`LIST`/`INFO` + embedded ID3v2), big-endian for a RIFX source; `data` payload verbatim |

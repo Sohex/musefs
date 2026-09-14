@@ -215,23 +215,27 @@ fn collect_audio_ignores_symlink_to_non_file_target_when_following() {
 
     let dir = tempfile::tempdir().unwrap();
     // A FIFO is neither a regular file nor a directory, and mkfifo works in
-    // restricted sandboxes that deny Unix-socket bind (issue #277).
-    let fifo = dir.path().join("fifo");
+    // restricted sandboxes that deny Unix-socket bind (issue #277). It lives
+    // outside the walked directory, so the walk reaches it only through the link.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let fifo = elsewhere.path().join("track.flac");
     let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
     #[expect(unsafe_code, reason = "libc::mkfifo FFI; no std equivalent")]
     let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
     assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
 
-    // Name the link with a supported audio extension so the only thing
-    // keeping it out of `out` is the resolved target's is_file() check.
-    std::os::unix::fs::symlink(&fifo, dir.path().join("link.flac")).unwrap();
+    // The resolved target decides eligibility (#766), so it is the target that
+    // carries a supported audio extension: the only thing keeping it out of
+    // `out` is the resolved target's is_file() check.
+    std::os::unix::fs::symlink(&fifo, dir.path().join("link")).unwrap();
 
     let mut out = Vec::new();
-    collect_audio(dir.path(), &mut out, true).unwrap();
+    let skips = collect_audio(dir.path(), &mut out, true).unwrap();
     assert!(
         out.is_empty(),
         "a symlink to a non-file, non-dir target must not be collected"
     );
+    assert_eq!(skips.total, 0, "nor tallied as an unsupported file");
 }
 
 #[test]
@@ -255,6 +259,141 @@ fn collect_audio_tallies_direct_special_file_with_audio_extension() {
         tally.total, 1,
         "a direct special file must be tallied as skipped"
     );
+}
+
+/// A library holding one symlink, `library/<link_name>`, to
+/// `targets/<target_name>`: the two tempdirs to keep alive, and the target's
+/// canonical path.
+fn one_link(
+    link_name: &str,
+    target_name: &str,
+    contents: &[u8],
+) -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
+    let library = tempfile::tempdir().unwrap();
+    let targets = tempfile::tempdir().unwrap();
+    let target = targets.path().join(target_name);
+    std::fs::write(&target, contents).unwrap();
+    std::os::unix::fs::symlink(&target, library.path().join(link_name)).unwrap();
+    let canonical = std::fs::canonicalize(&target).unwrap();
+    (library, targets, canonical)
+}
+
+/// #766: a link with no extension to a FLAC is the FLAC, not an unsupported
+/// file. Scanning the link as the root already ingested it.
+#[test]
+fn a_followed_extensionless_link_to_audio_is_collected_as_its_target() {
+    let (library, _targets, target) = one_link("track", "song.flac", b"x");
+    let mut out = Vec::new();
+    let skips = collect_audio(library.path(), &mut out, true).unwrap();
+    assert_eq!(out, vec![target]);
+    assert_eq!(skips.total, 0);
+}
+
+/// #766: a `.txt` name on a link to a FLAC does not make it a skip.
+#[test]
+fn a_followed_txt_link_to_audio_is_collected_not_skipped() {
+    let (library, _targets, target) = one_link("nice.txt", "song.flac", b"x");
+    let mut out = Vec::new();
+    let skips = collect_audio(library.path(), &mut out, true).unwrap();
+    assert_eq!(out, vec![target]);
+    assert_eq!(skips.total, 0, "a link to audio is not an unsupported file");
+}
+
+/// #766: the walk yields the path the probe dispatches on. A `.flac` link to an
+/// MP3 is collected as the MP3, so eligibility and dispatch read one name.
+#[test]
+fn a_followed_audio_named_link_yields_the_target_it_dispatches_on() {
+    let (library, _targets, target) = one_link("nice.flac", "song.mp3", b"x");
+    let mut out = Vec::new();
+    collect_audio(library.path(), &mut out, true).unwrap();
+    assert_eq!(out, vec![target]);
+}
+
+/// #766: a `.flac` link to an extensionless file is a skip, bucketed by the
+/// target's extension, rather than a supported file the probe then refuses.
+#[test]
+fn a_followed_audio_named_link_to_a_non_audio_file_is_a_skip_of_the_target() {
+    let (library, _targets, _target) = one_link("nice.flac", "noext", b"not audio");
+    let mut out = Vec::new();
+    let skips = collect_audio(library.path(), &mut out, true).unwrap();
+    assert!(
+        out.is_empty(),
+        "a link to a non-audio file is not collected"
+    );
+    assert_eq!(skips.summary().as_deref(), Some("skipped 1: <none>=1"));
+}
+
+/// #766: a followed directory link is resolved once, so the files under it are
+/// yielded by their canonical paths. Nothing downstream resolves them again.
+#[test]
+fn files_under_a_followed_directory_link_are_yielded_canonical() {
+    let library = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let album = elsewhere.path().join("album");
+    std::fs::create_dir(&album).unwrap();
+    std::fs::write(album.join("song.flac"), b"x").unwrap();
+    std::os::unix::fs::symlink(&album, library.path().join("mirror")).unwrap();
+
+    let mut out = Vec::new();
+    collect_audio(library.path(), &mut out, true).unwrap();
+    assert_eq!(
+        out,
+        vec![std::fs::canonicalize(album.join("song.flac")).unwrap()]
+    );
+}
+
+/// #766: a link the walk cannot resolve, dangling or looping, is a counted walk
+/// error, never silently dropped.
+#[test]
+fn a_followed_link_that_cannot_be_resolved_is_a_walk_error() {
+    let dir = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(dir.path().join("nonexistent"), dir.path().join("dangling"))
+        .unwrap();
+    std::os::unix::fs::symlink(dir.path().join("b.flac"), dir.path().join("a.flac")).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("a.flac"), dir.path().join("b.flac")).unwrap();
+
+    let failures = FailureTally::default();
+    let mut out = Vec::new();
+    let skips = collect_audio_with(dir.path(), &mut out, true, None, &failures).unwrap();
+    assert!(out.is_empty());
+    assert_eq!(skips.total, 0);
+    assert_eq!(failures.walk_summary().unwrap(), "walk errors 3: symlink=3");
+}
+
+/// #766: discovery counts links by their targets, so the spinner counts what
+/// will be probed: two links to audio under non-audio names, but not an
+/// audio-named link to a text file.
+#[test]
+fn followed_links_are_discovered_by_their_targets() {
+    let library = tempfile::tempdir().unwrap();
+    let targets = tempfile::tempdir().unwrap();
+    for (link, target, contents) in [
+        ("track", "one.flac", &b"x"[..]),
+        ("nice.txt", "two.flac", b"x"),
+        ("nice.flac", "noext", b"not audio"),
+    ] {
+        std::fs::write(targets.path().join(target), contents).unwrap();
+        std::os::unix::fs::symlink(targets.path().join(target), library.path().join(link)).unwrap();
+    }
+    let found = Arc::new(AtomicU64::new(0));
+    let seen = Arc::clone(&found);
+    let sink = ProgressSink::new(move |ev| {
+        if let ScanProgress::Discovered { found } = ev {
+            seen.store(found, Ordering::Relaxed);
+        }
+    });
+
+    let mut out = Vec::new();
+    let skips = collect_audio_with(
+        library.path(),
+        &mut out,
+        true,
+        Some(&sink),
+        &FailureTally::default(),
+    )
+    .unwrap();
+    assert_eq!(found.load(Ordering::Relaxed), 2);
+    assert_eq!(skips.total, 1);
 }
 
 #[test]
@@ -328,6 +467,97 @@ fn write_flac(path: &std::path::Path, entries: &[&str], pic: Option<(u32, u32)>)
     std::fs::write(path, &out).unwrap();
 }
 
+/// #684: under `--follow-symlinks` the stored path and the probed bytes come from
+/// one resolution. The walk resolves the link (#766); the hook retargets it to a
+/// different file after that and before the worker probes. The row must still be
+/// entirely the original target's. Were the probe to read the link's name again,
+/// it would read the new target and store its geometry against the old path. The
+/// hook is keyed on the resolved target, so a walk that handed on the link's
+/// name instead would never fire it, and the retarget assertion fails.
+#[test]
+fn a_symlink_retargeted_after_resolution_cannot_split_path_from_geometry() {
+    let library = tempfile::tempdir().unwrap();
+    let targets = tempfile::tempdir().unwrap();
+    let first = targets.path().join("first.flac");
+    let second = targets.path().join("second.flac");
+    write_flac(&first, &["TITLE=First"], None);
+    write_flac(
+        &second,
+        &[
+            "TITLE=Second",
+            "ARTIST=long enough to move the audio offset",
+        ],
+        None,
+    );
+    let link = library.path().join("link.flac");
+    std::os::unix::fs::symlink(&first, &link).unwrap();
+
+    let resolved = std::fs::canonicalize(&first).unwrap();
+    let (retarget_link, retarget_to) = (link.clone(), second.clone());
+    set_after_resolve_hook(resolved, move || {
+        std::fs::remove_file(&retarget_link).unwrap();
+        std::os::unix::fs::symlink(&retarget_to, &retarget_link).unwrap();
+    });
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    let options = ScanOptions {
+        follow_symlinks: true,
+        ..Default::default()
+    };
+    let scanned = crate::scan_directory_with(&db, library.path(), &options);
+    clear_after_resolve_hook();
+    assert_eq!(scanned.unwrap().scanned, 1);
+    assert_eq!(
+        std::fs::read_link(&link).unwrap(),
+        second,
+        "the hook must actually have retargeted the link"
+    );
+
+    let track = db.list_tracks().unwrap().into_iter().next().unwrap();
+    let meta = std::fs::metadata(&first).unwrap();
+    assert_eq!(track.backing_path, std::fs::canonicalize(&first).unwrap());
+    assert_eq!(track.backing_size, meta.len());
+    let expected = probe_full(&first, &std::fs::read(&first).unwrap()).unwrap();
+    assert_eq!(track.bounds.audio_offset(), expected.audio_offset);
+}
+
+/// #724: a store holding an `art` row filed under the digest of a file's
+/// picture but holding other bytes refuses that file, rather than linking the
+/// poisoned bytes to it — and fails only that file, not the scan.
+#[test]
+fn a_poisoned_art_row_fails_the_file_that_would_link_it() {
+    use sha2::Digest;
+    let library = tempfile::tempdir().unwrap();
+    write_flac(
+        &library.path().join("with_art.flac"),
+        &["TITLE=A"],
+        Some((8, 8)),
+    );
+    write_flac(&library.path().join("plain.flac"), &["TITLE=B"], None);
+    let store = tempfile::tempdir().unwrap();
+    let db_path = store.path().join("m.db");
+    let db = musefs_db::Db::open(&db_path).unwrap();
+
+    // The picture `write_flac` embeds; its digest, over other bytes.
+    let real = vec![0xAB_u8; 64];
+    let digest = sha2::Sha256::digest(&real);
+    let mut hex = [0u8; 64];
+    let sha = base16ct::lower::encode_str(&digest, &mut hex).unwrap();
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "INSERT INTO art (sha256, byte_len, data) VALUES (?1, 3, X'595959')",
+            rusqlite::params![sha],
+        )
+        .unwrap();
+
+    let stats = crate::scan_directory(&db, library.path()).unwrap();
+    assert_eq!(stats.failed, 1, "the file that would link the row fails");
+    assert_eq!(stats.scanned, 1, "and only that file");
+    let tracks = db.list_tracks().unwrap();
+    assert_eq!(tracks.len(), 1);
+    assert!(tracks[0].backing_path.ends_with("plain.flac"));
+}
+
 #[test]
 fn ingest_assigns_sequential_ordinals_per_key() {
     let dir = tempfile::tempdir().unwrap();
@@ -357,9 +587,10 @@ fn ingest_stores_nonzero_art_dimensions() {
     let track = db.list_tracks().unwrap().into_iter().next().unwrap();
     let ta = db.get_track_art(track.id).unwrap();
     assert_eq!(ta.len(), 1);
-    let meta = db.get_art_meta(ta[0].art_id).unwrap().unwrap();
-    assert_eq!(meta.width, Some(10));
-    assert_eq!(meta.height, Some(20));
+    // On the link, not the blob row: the dimensions describe this file's
+    // picture block (#716).
+    assert_eq!(ta[0].width, Some(10));
+    assert_eq!(ta[0].height, Some(20));
 }
 
 #[test]
@@ -374,9 +605,10 @@ fn ingest_oracle_path_stores_nonzero_art_dimensions() {
     let track = db.list_tracks().unwrap().into_iter().next().unwrap();
     let ta = db.get_track_art(track.id).unwrap();
     assert_eq!(ta.len(), 1);
-    let meta = db.get_art_meta(ta[0].art_id).unwrap().unwrap();
-    assert_eq!(meta.width, Some(10));
-    assert_eq!(meta.height, Some(20));
+    // On the link, not the blob row: the dimensions describe this file's
+    // picture block (#716).
+    assert_eq!(ta[0].width, Some(10));
+    assert_eq!(ta[0].height, Some(20));
 }
 
 #[test]
@@ -414,7 +646,7 @@ fn probe_file_caught_isolates_parser_panic_as_failed() {
     let path = dir.path().join("boom.flac");
     write_flac(&path, &["ARTIST=A", "TITLE=T"], None);
     set_after_s1_hook(|| panic!("parser exploded"));
-    let out = probe_file_caught(&path, WINDOW);
+    let out = probe_file_caught(&path, WINDOW, ChecksumTier::Fingerprint);
     clear_after_s1_hook();
     match out {
         Ok(ProbeOutcome::Failed(f)) => assert_eq!(
@@ -689,7 +921,7 @@ fn probe_reports_unparseable_with_its_reason() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bad.flac");
     std::fs::write(&path, b"not a real audio file").unwrap();
-    match probe_file(&path, WINDOW).unwrap() {
+    match probe_file(&path, WINDOW, ChecksumTier::Fingerprint).unwrap() {
         ProbeOutcome::Failed(f) => {
             assert_eq!(f.reason, SkipReason::Unparseable);
             assert!(
@@ -747,13 +979,14 @@ fn revalidate_does_not_prune_on_non_notfound_error() {
     let canon = std::fs::canonicalize(dir.path()).unwrap();
     let ghost = canon.join("real.flac").join("ghost.flac");
     db.upsert_track(&NewTrack {
-        backing_path: ghost.to_string_lossy().into_owned(),
+        backing_path: ghost.clone(),
         format: Format::Flac,
         audio_offset: 0,
         audio_length: 0,
         backing_size: 0,
         backing_mtime_ns: 0,
         backing_ctime_ns: 0,
+        backing_ino: None,
     })
     .unwrap();
 
@@ -763,9 +996,105 @@ fn revalidate_does_not_prune_on_non_notfound_error() {
         db.list_tracks()
             .unwrap()
             .iter()
-            .any(|t| t.backing_path == ghost.to_string_lossy()),
+            .any(|t| t.backing_path == ghost),
         "ghost track must still exist"
     );
+}
+
+/// #757: revalidate re-probes a row with no recorded inode so it can fill one
+/// in — except on a filesystem that keeps none, where no pass ever could. There
+/// a re-probe every time would never converge, and would rewrite the row on
+/// every pass, so the row counts as unchanged instead.
+#[test]
+fn revalidate_settles_an_unrecorded_inode_only_where_the_filesystem_keeps_none() {
+    use musefs_db::NewTrack;
+    let dir = tempfile::tempdir().unwrap();
+    write_flac(&dir.path().join("a.flac"), &["ARTIST=A", "TITLE=T"], None);
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    crate::scan_directory(&db, dir.path()).unwrap();
+
+    // The row a V4 migration leaves, or a scan on FAT records: all but the inode.
+    let t = db.list_tracks().unwrap().remove(0);
+    db.upsert_track(&NewTrack {
+        backing_path: t.backing_path,
+        format: t.format,
+        audio_offset: t.bounds.audio_offset(),
+        audio_length: t.bounds.audio_length(),
+        backing_size: t.backing_size,
+        backing_mtime_ns: t.backing_mtime_ns,
+        backing_ctime_ns: t.backing_ctime_ns,
+        backing_ino: None,
+    })
+    .unwrap();
+
+    {
+        let _fat = crate::freshness::pretend_no_inodes();
+        let s = crate::revalidate(&db, dir.path()).unwrap();
+        assert_eq!(
+            (s.unchanged, s.updated),
+            (1, 0),
+            "an inode the filesystem does not keep is as settled as it gets"
+        );
+    }
+    let s = crate::revalidate(&db, dir.path()).unwrap();
+    assert_eq!(
+        (s.unchanged, s.updated),
+        (0, 1),
+        "where inodes are kept, the missing one is re-probed"
+    );
+    assert!(db.list_tracks().unwrap()[0].backing_ino.is_some());
+}
+
+/// #757: re-probing a file that has not changed leaves its served mtime exactly
+/// as it was, the whole second (`updated_at`) and the nanoseconds
+/// (`content_version`) alike. Raising the checksum tier is the revalidate that
+/// re-probes every unchanged file, so it is the pass that used to churn them.
+#[test]
+fn reprobing_an_unchanged_flac_leaves_its_served_mtime_alone() {
+    let music = tempfile::tempdir().unwrap();
+    let flac = music.path().join("a.flac");
+    write_flac(&flac, &["ARTIST=A", "TITLE=T"], None);
+    // The backing second and the stored update time both sit well in the past,
+    // so a stamp of the current time cannot hide behind either.
+    std::fs::File::options()
+        .write(true)
+        .open(&flac)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_hours(271_752))
+        .unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let db_path = store.path().join("musefs.db");
+    let db = musefs_db::Db::open(&db_path).unwrap();
+    crate::scan_directory(&db, music.path()).unwrap();
+    let id = db.list_tracks().unwrap()[0].id;
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "UPDATE tracks SET updated_at = 1000000000 WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+    let served = || {
+        crate::HeaderCache::new(crate::Mode::Synthesis)
+            .resolve(&db, id)
+            .unwrap()
+            .mtime
+    };
+    let before = served();
+    assert_eq!(before.secs, 1_000_000_000);
+
+    let stats = crate::revalidate_with(
+        &db,
+        music.path(),
+        &ScanOptions {
+            checksum: ChecksumTier::Full,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(stats.updated, 1, "raising the tier re-probes the file");
+
+    assert_eq!(served(), before);
 }
 
 #[test]
@@ -866,13 +1195,7 @@ fn ingest_filters_empty_binary_tags() {
     let meta = std::fs::metadata(&path).unwrap();
     let db = Db::open_in_memory().unwrap();
 
-    ingest(
-        &db,
-        &path.to_string_lossy(),
-        &meta,
-        probed_with_mixed_binary_tags(),
-    )
-    .unwrap();
+    ingest(&db, &path, &meta, probed_with_mixed_binary_tags()).unwrap();
 
     let tid = db.list_tracks().unwrap()[0].id;
     let rows = db.get_binary_tags(tid).unwrap();
@@ -896,13 +1219,8 @@ fn ingest_rejects_a_file_with_an_oversize_binary_tag() {
     let meta = std::fs::metadata(&path).unwrap();
     let db = Db::open_in_memory().unwrap();
 
-    let err = ingest(
-        &db,
-        &path.to_string_lossy(),
-        &meta,
-        probed_with_oversize_binary_tag(),
-    )
-    .expect_err("an oversize binary tag must fail the file");
+    let err = ingest(&db, &path, &meta, probed_with_oversize_binary_tag())
+        .expect_err("an oversize binary tag must fail the file");
 
     let msg = err.to_string();
     assert!(msg.contains("SYLT"), "names the offending tag: {msg}");
@@ -924,11 +1242,12 @@ fn ingest_bulk_filters_empty_binary_tags() {
         let mut bw = db.bulk_writer().unwrap();
         ingest_bulk(
             &mut bw,
-            "/a.mp3",
+            Path::new("/a.mp3"),
             BackingStamp {
                 size: 1,
                 mtime_ns: 0,
                 ctime_ns: 0,
+                ino: None,
             },
             probed_with_mixed_binary_tags(),
         )
@@ -952,16 +1271,48 @@ fn ingest_bulk_rejects_a_file_with_an_oversize_binary_tag() {
     let mut bw = db.bulk_writer().unwrap();
     let err = ingest_bulk(
         &mut bw,
-        "/a.mp3",
+        Path::new("/a.mp3"),
         BackingStamp {
             size: 1,
             mtime_ns: 0,
             ctime_ns: 0,
+            ino: None,
         },
         probed_with_oversize_binary_tag(),
     )
     .expect_err("an oversize binary tag must fail the file");
     assert!(err.to_string().contains("SYLT"), "{err}");
+}
+
+/// #758: a path over `MAX_BACKING_PATH_BYTES` fails that one file on the batch
+/// ingest path. It is the store's `CHECK` that refuses it, so it classifies as a
+/// store rejection — which the scan counts as one failed file and carries on
+/// past, rather than aborting the run.
+#[test]
+fn ingest_bulk_fails_only_the_file_whose_path_is_over_the_cap() {
+    let db = Db::open_in_memory().unwrap();
+    let cap = usize::try_from(musefs_db::limits::MAX_BACKING_PATH_BYTES).unwrap();
+    let over = std::path::PathBuf::from(format!("/{}", "a".repeat(cap)));
+    {
+        let mut bw = db.bulk_writer().unwrap();
+        let err = ingest_bulk(
+            &mut bw,
+            &over,
+            BackingStamp {
+                size: 1,
+                mtime_ns: 0,
+                ctime_ns: 0,
+                ino: None,
+            },
+            probed_with_pictures(Vec::new()),
+        )
+        .expect_err("a path over the cap must fail the file");
+        assert!(super::is_store_rejection(&err), "{err}");
+    }
+    assert!(
+        db.list_tracks().unwrap().is_empty(),
+        "the refused file leaves no row behind"
+    );
 }
 
 fn picture_of_len(len: usize) -> EmbeddedPicture {
@@ -971,6 +1322,8 @@ fn picture_of_len(len: usize) -> EmbeddedPicture {
         description: String::new(),
         width: 0,
         height: 0,
+        depth: 0,
+        colors: 0,
         data: vec![0u8; len],
     }
 }
@@ -994,13 +1347,13 @@ fn probed_with_pictures(pictures: Vec<EmbeddedPicture>) -> Probed {
 fn check_storable_accepts_art_at_cap_and_rejects_one_over() {
     assert!(
         check_storable(
-            "/x.flac",
+            Path::new("/x.flac"),
             &probed_with_pictures(vec![picture_of_len(MAX_ART_BYTES)])
         )
         .is_ok()
     );
     let err = check_storable(
-        "/x.flac",
+        Path::new("/x.flac"),
         &probed_with_pictures(vec![picture_of_len(MAX_ART_BYTES + 1)]),
     )
     .expect_err("one byte over the art cap fails the file");
@@ -1017,8 +1370,8 @@ fn check_storable_accepts_binary_tag_at_cap_and_rejects_one_over() {
         }];
         p
     };
-    assert!(check_storable("/x.mp3", &mk(MAX_BINARY_TAG_BYTES)).is_ok());
-    assert!(check_storable("/x.mp3", &mk(MAX_BINARY_TAG_BYTES + 1)).is_err());
+    assert!(check_storable(Path::new("/x.mp3"), &mk(MAX_BINARY_TAG_BYTES)).is_ok());
+    assert!(check_storable(Path::new("/x.mp3"), &mk(MAX_BINARY_TAG_BYTES + 1)).is_err());
 }
 
 #[test]
@@ -1026,8 +1379,8 @@ fn check_storable_accepts_tag_value_at_cap_and_rejects_one_over() {
     let cap = usize::try_from(musefs_db::limits::MAX_TAG_VALUE_LEN).unwrap();
     // MP3, so the FLAC block-total check does not confound the per-value one.
     let mk = |len: usize| probed_with_text_tags(&[("LYRICS", &"v".repeat(len))]);
-    assert!(check_storable("/x.mp3", &mk(cap)).is_ok());
-    let err = check_storable("/x.mp3", &mk(cap + 1))
+    assert!(check_storable(Path::new("/x.mp3"), &mk(cap)).is_ok());
+    let err = check_storable(Path::new("/x.mp3"), &mk(cap + 1))
         .expect_err("one byte over the tag-value cap fails the file");
     let msg = err.to_string();
     assert!(msg.contains("LYRICS"), "names the tag: {msg}");
@@ -1039,8 +1392,8 @@ fn check_storable_accepts_tag_key_at_cap_and_rejects_one_over() {
     let cap = usize::try_from(musefs_db::limits::MAX_TAG_KEY_LEN).unwrap();
     let at = "k".repeat(cap);
     let over = "k".repeat(cap + 1);
-    assert!(check_storable("/x.mp3", &probed_with_text_tags(&[(&at, "v")])).is_ok());
-    assert!(check_storable("/x.mp3", &probed_with_text_tags(&[(&over, "v")])).is_err());
+    assert!(check_storable(Path::new("/x.mp3"), &probed_with_text_tags(&[(&at, "v")])).is_ok());
+    assert!(check_storable(Path::new("/x.mp3"), &probed_with_text_tags(&[(&over, "v")])).is_err());
 }
 
 #[test]
@@ -1051,8 +1404,8 @@ fn check_storable_accepts_art_description_at_cap_and_rejects_one_over() {
         pic.description = "d".repeat(len);
         probed_with_pictures(vec![pic])
     };
-    assert!(check_storable("/x.flac", &mk(cap)).is_ok());
-    assert!(check_storable("/x.flac", &mk(cap + 1)).is_err());
+    assert!(check_storable(Path::new("/x.flac"), &mk(cap)).is_ok());
+    assert!(check_storable(Path::new("/x.flac"), &mk(cap + 1)).is_err());
 }
 
 /// The TEXT caps are compared against SQLite `length()`, which counts
@@ -1065,7 +1418,7 @@ fn check_storable_counts_characters_not_bytes_for_text_caps() {
     let key = "é".repeat(cap); // `cap` chars, 2 * cap bytes
     assert!(key.len() > cap, "fixture must be multibyte");
     assert!(
-        check_storable("/x.mp3", &probed_with_text_tags(&[(&key, "v")])).is_ok(),
+        check_storable(Path::new("/x.mp3"), &probed_with_text_tags(&[(&key, "v")])).is_ok(),
         "a key at the character cap must pass even when its byte length exceeds it"
     );
 }
@@ -1078,8 +1431,8 @@ fn check_storable_accepts_art_mime_at_cap_and_rejects_one_over() {
         pic.mime = "m".repeat(len);
         probed_with_pictures(vec![pic])
     };
-    assert!(check_storable("/x.flac", &mk(cap)).is_ok());
-    let err = check_storable("/x.flac", &mk(cap + 1))
+    assert!(check_storable(Path::new("/x.flac"), &mk(cap)).is_ok());
+    let err = check_storable(Path::new("/x.flac"), &mk(cap + 1))
         .expect_err("one character over the MIME cap fails the file");
     assert!(err.to_string().contains("MIME"), "{err}");
 }
@@ -1105,7 +1458,7 @@ fn check_storable_comment_block_boundary_is_inclusive_and_exactly_framed() {
     let cap = usize::try_from(musefs_format::flac::MAX_BLOCK_BODY).unwrap();
     assert!(
         check_storable(
-            "/x.flac",
+            Path::new("/x.flac"),
             &probed_with_comment_block_total(musefs_db::Format::Flac, cap)
         )
         .is_ok(),
@@ -1113,7 +1466,7 @@ fn check_storable_comment_block_boundary_is_inclusive_and_exactly_framed() {
     );
     assert!(
         check_storable(
-            "/x.flac",
+            Path::new("/x.flac"),
             &probed_with_comment_block_total(musefs_db::Format::Flac, cap + 1)
         )
         .is_err(),
@@ -1128,13 +1481,13 @@ fn check_storable_applies_the_comment_block_ceiling_to_ogg_flac() {
     let cap = usize::try_from(musefs_format::flac::MAX_BLOCK_BODY).unwrap();
     assert!(
         check_storable(
-            "/x.oga",
+            Path::new("/x.oga"),
             &probed_with_comment_block_total(musefs_db::Format::OggFlac, cap)
         )
         .is_ok()
     );
     let err = check_storable(
-        "/x.oga",
+        Path::new("/x.oga"),
         &probed_with_comment_block_total(musefs_db::Format::OggFlac, cap + 1),
     )
     .expect_err("Ogg FLAC is bound by FLAC's block ceiling too");
@@ -1151,14 +1504,14 @@ fn check_storable_rejects_flac_tags_that_cannot_fit_a_comment_block() {
     let big = "v".repeat(cap * 2 / 3);
     let mut probed = probed_with_text_tags(&[("A", &big), ("B", &big)]);
     probed.format = musefs_db::Format::Flac;
-    let err = check_storable("/x.flac", &probed)
+    let err = check_storable(Path::new("/x.flac"), &probed)
         .expect_err("two two-thirds-cap tags overflow the comment block");
     assert!(err.to_string().contains("FLAC"), "{err}");
 
     // The same tags in an MP3 are fine: ID3v2's ceiling is 256 MiB.
     let mut mp3 = probed_with_text_tags(&[("A", &big), ("B", &big)]);
     mp3.format = musefs_db::Format::Mp3;
-    assert!(check_storable("/x.mp3", &mp3).is_ok());
+    assert!(check_storable(Path::new("/x.mp3"), &mp3).is_ok());
 }
 
 fn probed_with_text_tags(tags: &[(&str, &str)]) -> Probed {
@@ -1186,7 +1539,7 @@ fn ingest_skips_empty_and_control_char_keys() {
 
     ingest(
         &db,
-        &path.to_string_lossy(),
+        &path,
         &meta,
         probed_with_text_tags(&[
             ("artist", "Alice"),
@@ -1216,11 +1569,12 @@ fn ingest_bulk_skips_empty_and_control_char_keys() {
         let mut bw = db.bulk_writer().unwrap();
         ingest_bulk(
             &mut bw,
-            "/a.mp3",
+            Path::new("/a.mp3"),
             BackingStamp {
                 size: 1,
                 mtime_ns: 0,
                 ctime_ns: 0,
+                ino: None,
             },
             probed_with_text_tags(&[
                 ("artist", "Alice"),
@@ -1271,13 +1625,7 @@ fn ingest_assigns_sequential_structural_ordinals_per_kind() {
     let meta = std::fs::metadata(&path).unwrap();
     let db = Db::open_in_memory().unwrap();
 
-    ingest(
-        &db,
-        &path.to_string_lossy(),
-        &meta,
-        probed_with_duplicate_structural_kind(),
-    )
-    .unwrap();
+    ingest(&db, &path, &meta, probed_with_duplicate_structural_kind()).unwrap();
 
     let tid = db.list_tracks().unwrap()[0].id;
     let got = db.get_structural_blocks(tid).unwrap();
@@ -1320,13 +1668,7 @@ fn ingest_assigns_sequential_tag_ordinals_per_key() {
     let meta = std::fs::metadata(&path).unwrap();
     let db = Db::open_in_memory().unwrap();
 
-    ingest(
-        &db,
-        &path.to_string_lossy(),
-        &meta,
-        probed_with_duplicate_tag_key(),
-    )
-    .unwrap();
+    ingest(&db, &path, &meta, probed_with_duplicate_tag_key()).unwrap();
 
     let tid = db.list_tracks().unwrap()[0].id;
     let got = db.get_tags(tid).unwrap();
@@ -1346,11 +1688,12 @@ fn ingest_bulk_assigns_sequential_structural_ordinals_per_kind() {
         let mut bw = db.bulk_writer().unwrap();
         ingest_bulk(
             &mut bw,
-            "/a.flac",
+            Path::new("/a.flac"),
             BackingStamp {
                 size: 1,
                 mtime_ns: 0,
                 ctime_ns: 0,
+                ino: None,
             },
             probed_with_duplicate_structural_kind(),
         )
@@ -1401,13 +1744,7 @@ fn ingest_keeps_text_and_binary_rows_of_one_key_apart() {
     let meta = std::fs::metadata(&path).unwrap();
     let db = Db::open_in_memory().unwrap();
 
-    ingest(
-        &db,
-        &path.to_string_lossy(),
-        &meta,
-        probed_with_key_in_both_tag_classes(),
-    )
-    .unwrap();
+    ingest(&db, &path, &meta, probed_with_key_in_both_tag_classes()).unwrap();
 
     let tid = db.list_tracks().unwrap()[0].id;
     let text = db.get_tags(tid).unwrap();
@@ -1433,11 +1770,12 @@ fn ingest_bulk_keeps_text_and_binary_rows_of_one_key_apart() {
         let mut bw = db.bulk_writer().unwrap();
         ingest_bulk(
             &mut bw,
-            "/a.flac",
+            Path::new("/a.flac"),
             BackingStamp {
                 size: 1,
                 mtime_ns: 0,
                 ctime_ns: 0,
+                ino: None,
             },
             probed_with_key_in_both_tag_classes(),
         )
@@ -1458,11 +1796,12 @@ fn ingest_numbers_binary_tags_per_key() {
         let mut bw = db.bulk_writer().unwrap();
         ingest_bulk(
             &mut bw,
-            "/a.mp3",
+            Path::new("/a.mp3"),
             BackingStamp {
                 size: 1,
                 mtime_ns: 0,
                 ctime_ns: 0,
+                ino: None,
             },
             Probed {
                 format: musefs_db::Format::Mp3,
@@ -1647,7 +1986,7 @@ fn scan_fails_only_the_file_whose_rows_the_store_rejects() {
 
     assert_eq!(stats.failed, 1, "the rejected file is one `failed` file");
     assert_eq!(stats.scanned, 2, "the other two files are still ingested");
-    let paths: Vec<String> = db
+    let paths: Vec<std::path::PathBuf> = db
         .list_tracks()
         .unwrap()
         .into_iter()
@@ -1655,7 +1994,7 @@ fn scan_fails_only_the_file_whose_rows_the_store_rejects() {
         .collect();
     assert_eq!(paths.len(), 2, "{paths:?}");
     assert!(
-        !paths.iter().any(|p| p.contains("poison")),
+        !paths.iter().any(|p| p.to_string_lossy().contains("poison")),
         "the rejected file must leave no rows behind, not a track with no tags: {paths:?}"
     );
 

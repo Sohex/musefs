@@ -9,8 +9,8 @@ the `musefs scan` shell-out (`run_scan`), and the per-file sync write-loop
 (`Record` / `sync_files`).
 
 Field mapping stays in each plugin — beets expands multi-valued
-`genres`/`composers` into one tag each, Picard takes the first value — so this
-library deliberately does not own it.
+`genres`/`composers` into one tag each, Picard writes every value of a tag as its
+own row — so this library deliberately does not own it.
 
 ## Writing a plugin
 
@@ -84,9 +84,11 @@ committed, but at least one file could not be ingested (see
 non-fatal message an adapter should surface before going on to sync the files
 that *did* land. Any other exit code is a hard failure and raises `ScanError`
 (`kind` ∈ `{"not_found", "timeout", "failed"}`), as do a missing binary and a
-timeout. `check_schema_version` raises `SchemaMismatch`; a host adapter formats
-its own user-facing message from the exception attributes (see the beets
-plugin's `_scan_user_error`).
+timeout; a host adapter formats its own user-facing message from the
+`ScanError` attributes (see the beets plugin's `_scan_user_error`).
+`check_schema_version` raises `SchemaMismatch`, whose message already names
+which side is behind and the fix, so the beets and Picard adapters surface it
+verbatim.
 
 ### The `Record` shape
 
@@ -153,14 +155,29 @@ that bite plugin authors:
 - **Binary tags survive a sync.** `merge_tags` / `replace_tags` scope their
   deletes to text rows (`value_blob IS NULL`), so the write loop never wipes
   scanner-written binary tags. You may write binary tags yourself too — a binary
-  row carries its payload in `value_blob` and must leave `value` empty (the only
-  `CHECK` on the row).
+  row carries its payload in `value_blob`, a `BLOB` of at most 16,711,680 bytes
+  (16 MiB − 64 KiB, the same cap as `MAX_ART_BYTES`), and must leave `value`
+  empty (the `value_blob IS NULL OR value = ''` `CHECK`).
 - **Content-address art** through `upsert_art` (sha256 de-dup) rather than
   inserting `art` rows by hand; `sync_files` does this for you.
 - **Art rows are immutable.** A trigger rejects in-place updates of an
-  `art` row's content columns (`data`, `sha256`, `mime`, `byte_len`, `width`,
-  `height`). To change a track's art, insert a new content-addressed row via
-  `upsert_art` and relink it via `replace_track_art`.
+  `art` row's key or content columns (`id`, `data`, `sha256`, `byte_len`). To
+  change a track's art, insert a new content-addressed row via `upsert_art` and
+  relink it via `replace_track_art`. From schema v4 the row is the content and
+  nothing else: everything describing one file's embedding of it — the mime, the
+  dimensions, the colour depth and the indexed-colour count — lives on the
+  `track_art` link.
+- **You supply the mime; the library reads the dimensions it can.**
+  `replace_track_art` takes a mime per row because that is the value musefs
+  writes into the synthesized picture block, and a link stored without one
+  produces art whose declared type is the empty string. A row may also state the
+  link's `width` and `height`, and `sync_files` fills them from each image's own
+  header with `image_dimensions` — PNG's `IHDR`, a JPEG's start-of-frame —
+  reading a few header bytes rather than decoding the image (musefs #737). A
+  WebP or any header it cannot read leaves them `NULL`. It never writes `depth`
+  or `colors`, which would take a decoder, so those stay 0; `NULL` and 0 are how
+  both the FLAC picture block and musefs spell "not stated". A scan of a file
+  that declares them fills all four in from the file's own picture block.
 - **Path layout is just a tag.** To drive a reorganized mount, write your
   computed relative path into a custom tag (e.g. `beets_path`) and mount with
   `--template '$!{beets_path}'`. musefs sanitizes each path segment, so a writer
@@ -179,9 +196,13 @@ Everything in `__all__`, imported from the top-level `musefs_common` package.
 
 **Scanning**
 
-- `run_scan(binary, db_path, target, *, timeout=None)` → `ScanResult` — shell
-  out to `musefs scan`; `target` is one path or an iterable, all scanned under
-  one process. Creates the DB if absent. Raises `ScanError` on a hard failure.
+- `run_scan(binary, db_path, target, *, revalidate=False, force=False,
+  prune=False, timeout=None)` → `ScanResult` — shell out to `musefs scan`, or to
+  `musefs revalidate` with `revalidate=True`; `force` adds `--force` to a scan
+  and `prune` adds `--prune` to a revalidate. `target` is one path or an
+  iterable, all handled by one process. Creates the DB if absent. Raises
+  `ValueError` for an empty target list, `force` with `revalidate`, or `prune`
+  without it, and `ScanError` on a hard failure.
 - `ScanResult(binary, target, verb, returncode, partial, stderr)` — a completed
   run. `partial` marks the exit-2 partial success (the batch committed; some
   file failed to ingest) and `warning()` renders its non-fatal message.
@@ -191,8 +212,14 @@ Everything in `__all__`, imported from the top-level `musefs_common` package.
 - `Record(key, pairs=[], art=None, delete_keys=None)` — one file's sync inputs
   (see *The `Record` shape*).
 - `ArtImage(data, mime, picture_type=3, description="")` — one embedded picture.
-- `realpath_key(path)` — canonical path string matching the scanner's
-  `backing_path`; accepts `str`/`bytes`, returns `str`.
+- `realpath_key(path)` — canonical path matching the scanner's `backing_path`;
+  accepts `str`/`bytes`, returns `str`. The resolution runs on bytes and is
+  decoded with `os.fsdecode`, so `os.fsencode` turns the key back into the exact
+  path on disk — which is what the store holds from schema v4 (#680). Two files
+  differing only in undecodable bytes therefore give two different keys. How
+  such a byte is *spelled* in the `str` is the filesystem encoding's business
+  (a surrogate under UTF-8 or ASCII, an ordinary character under a total codec
+  like Latin-1); what holds either way is the round trip.
 
 **Writing**
 
@@ -203,7 +230,8 @@ Everything in `__all__`, imported from the top-level `musefs_common` package.
   record into a caller-supplied `SyncStats`.
 - `SyncStats` — `synced` / `skipped` / `art_linked` / `skipped_art` /
   `skipped_invalid` counters, plus `.summary()`. A record whose tags or art
-  violate a store CHECK constraint is rolled back and skipped (not raised),
+  violate a store CHECK constraint, or whose art raises `ArtDigestMismatch`, is
+  rolled back and skipped (not raised),
   bumping `skipped_invalid` and appending `(record.key, message)` to the
   `invalid` list — one malformed record never aborts the batch.
 
@@ -211,15 +239,28 @@ Everything in `__all__`, imported from the top-level `musefs_common` package.
 for a custom write loop)
 
 - `track_id_for_path(conn, key)` → track id or `None`.
+- `path_param(key)` → `bytes` — encode a `backing_path` key for binding, with
+  `os.fsencode`. The column is a `BLOB` from schema v4, and SQLite never
+  compares `TEXT` equal to a `BLOB`, so a `str` bound as-is matches no row
+  rather than failing. Use it in any query of your own that matches on a path.
+- `path_value(raw)` → `str` — decode a `backing_path` read back out, with
+  `os.fsdecode`; the inverse of `path_param`, so the round trip is lossless.
 - `merge_tags(conn, track_id, managed_pairs, delete_keys)` — per-key replace of
   plugin-managed text tags, leaving unmanaged text rows intact.
 - `replace_tags(conn, track_id, pairs)` — replace all plugin-owned text tags.
-- `upsert_art(conn, data, mime)` → art id — content-address `data` by sha256,
-  inserting only if new.
+- `upsert_art(conn, data)` → art id — content-address `data` by sha256,
+  inserting only if new. Raises `ArtDigestMismatch` when the row already filed
+  under that digest holds different bytes.
 - `replace_track_art(conn, track_id, arts)` — replace a track's `track_art`
-  rows; `arts` is `[(art_id, picture_type, description), …]`.
+  rows; each entry of `arts` is `(art_id, picture_type, description, mime)` or
+  `(art_id, picture_type, description, mime, width, height)`, and the four-field
+  form leaves the dimensions unset. A row of any other length raises
+  `ValueError`.
 - `sniff_mime(data, path)` — image mime from magic bytes, falling back to file
   extension.
+- `image_dimensions(data)` → `(width, height)` or `None` — read from a PNG
+  `IHDR` or JPEG start-of-frame header without decoding; `None` for anything
+  else, including a malformed header or a zero dimension.
 - `prune_missing(conn, track_ids=None, *, unreadable=None)` → count — delete
   tracks whose backing file is *confirmed* gone (every track, or just
   `track_ids`). Only a `FileNotFoundError` from `os.stat` counts as gone: a path
@@ -250,16 +291,25 @@ for a custom write loop)
 
 - `EXPECTED_USER_VERSION` — schema `user_version` this library targets.
 - `MAX_ART_BYTES` — per-image art cap; larger images are skipped.
+- `MAX_TAG_VALUE_LEN` — the store's cap on a `tags.value`, in bytes (the `CHECK`
+  counts `length(CAST(value AS BLOB))`), generated from the Rust constant into
+  the schema mirror. Check a value against it rather than taking an
+  `IntegrityError` from the `CHECK`.
 - `SCAN_TIMEOUT_SECONDS` — default wall-clock cap for one `run_scan`.
 
 **Exceptions**
 
 - `SchemaMismatch(found)` — schema-version skew; `.found` is the DB's version.
   The message names which side is behind and the fix: a store newer than the
-  plugin means upgrading the plugin, an older one means rescanning with musefs
-  to migrate it.
+  plugin means upgrading the plugin, an older one means upgrading musefs and running
+  `musefs migrate` against the store.
 - `ScanError(kind, *, binary, target, …)` — a `musefs scan` failure; `.kind` ∈
   `{"not_found", "timeout", "failed"}`, with context attributes for messaging.
+- `ArtDigestMismatch(art_id, sha256)` — raised by `upsert_art` when the `art`
+  row filed under `.sha256` (id `.art_id`) holds bytes that do not hash to it,
+  which only a crafted or corrupt store can contain. It subclasses
+  `sqlite3.IntegrityError`, so `sync_one` skips the one record and counts it in
+  `skipped_invalid` rather than aborting the sync.
 
 ## Consumers
 

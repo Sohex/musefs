@@ -119,3 +119,225 @@ fn probe_logs_an_undecodable_picture_and_keeps_the_others() {
     assert!(logged[0].contains("undecodable base64"), "{}", logged[0]);
     assert!(logged[0].contains("16 bytes"), "{}", logged[0]);
 }
+
+/// Stream A (serial 0x1234) complete, then a second logical bitstream under its
+/// own serial: a chain in the shape RFC 3533 defines.
+fn chained_opus_bytes() -> Vec<u8> {
+    let head = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".to_vec();
+    let mut tags = b"OpusTags".to_vec();
+    tags.extend_from_slice(&vorbis_body_empty());
+    let (mut bytes, _) = build_header_pub(0x1234, &[&head, &tags]);
+    let (audio, _) = lace_packet_pub(0x1234, 2, false, 960, &[0u8; 100]);
+    bytes.extend_from_slice(&audio);
+
+    let (b_header, b_pages) = build_header_pub(0x5678, &[&head, &tags]);
+    bytes.extend_from_slice(&b_header);
+    let (b_audio, _) = lace_packet_pub(0x5678, b_pages, false, 960, &[1u8; 100]);
+    bytes.extend_from_slice(&b_audio);
+    bytes
+}
+
+#[test]
+fn scan_skips_a_chained_ogg_and_says_so() {
+    // Chained Ogg was accepted, and a tag edit then renumbered the second
+    // stream's pages into self-consistent corruption (#722). Both probe paths
+    // must now refuse the file, and the operator must be told why.
+    crate::warn_limit::log_capture::install();
+    let bytes = chained_opus_bytes();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("chained-scan.opus");
+    std::fs::File::create(&path)
+        .unwrap()
+        .write_all(&bytes)
+        .unwrap();
+
+    assert!(
+        probe_full(&path, &bytes).is_none(),
+        "the oracle path must refuse it too"
+    );
+
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    let stats = crate::scan_directory(&db, &path).unwrap();
+    assert_eq!(stats.scanned, 0);
+    assert_eq!(stats.failed, 1);
+
+    let logged = crate::warn_limit::log_capture::messages_containing("chained-scan.opus");
+    assert_eq!(logged.len(), 1, "one skip, one line: {logged:?}");
+    assert!(logged[0].contains("chained Ogg"), "{}", logged[0]);
+}
+
+/// Plant the row an older binary stored for `path`: every build since #722
+/// refuses a chained file, so no scan of this one would write it (#747).
+fn plant_stored_row(db: &musefs_db::Db, path: &std::path::Path) {
+    let meta = std::fs::metadata(path).unwrap();
+    let stamp = BackingStamp::from_metadata(&meta);
+    db.upsert_track(&musefs_db::NewTrack {
+        backing_path: std::fs::canonicalize(path).unwrap(),
+        format: Format::Opus,
+        audio_offset: 0,
+        audio_length: meta.len(),
+        backing_size: stamp.size,
+        backing_mtime_ns: stamp.mtime_ns,
+        backing_ctime_ns: stamp.ctime_ns,
+        // As V4 leaves every row, which makes revalidate re-probe it.
+        backing_ino: None,
+    })
+    .unwrap();
+}
+
+/// #747: a chained Ogg row stored before 2.0.0 fails every revalidate — the
+/// probe refuses it and nothing is written — and neither a rescan nor pruning
+/// missing files removes it. `--prune` does, and only for that refusal: a stored
+/// file that merely fails to parse, which a download still in progress can,
+/// keeps its row.
+#[test]
+fn revalidate_prunes_a_stored_chained_ogg_only_when_asked() {
+    crate::warn_limit::log_capture::install();
+    let dir = tempfile::tempdir().unwrap();
+    let chained = dir.path().join("stuck-chained.opus");
+    std::fs::write(&chained, chained_opus_bytes()).unwrap();
+    let broken = dir.path().join("stuck-broken.opus");
+    std::fs::write(&broken, b"OggS and nothing after it").unwrap();
+
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    plant_stored_row(&db, &chained);
+    plant_stored_row(&db, &broken);
+
+    for pass in 0..2 {
+        let stats = crate::revalidate(&db, dir.path()).unwrap();
+        assert_eq!(
+            (stats.failed, stats.pruned),
+            (2, 0),
+            "pass {pass}: both fail, neither is pruned unasked"
+        );
+        assert_eq!(db.list_tracks().unwrap().len(), 2);
+    }
+    // Unasked, the run says what `--prune` would remove. The count is this
+    // test's own: no other test stores a refused file, so no other can log it.
+    let told = crate::warn_limit::log_capture::messages_containing(
+        "1 stored track(s) are in a form this version refuses to serve",
+    );
+    assert!(!told.is_empty(), "an unpruned refusal is reported");
+
+    let opts = ScanOptions {
+        prune: true,
+        ..ScanOptions::default()
+    };
+    let stats = crate::revalidate_with(&db, dir.path(), &opts).unwrap();
+    assert_eq!(
+        (stats.failed, stats.pruned),
+        (2, 1),
+        "both still fail on the pass that prunes, and only the chained row goes"
+    );
+    let left = db.list_tracks().unwrap();
+    assert_eq!(left.len(), 1);
+    assert!(
+        left[0].backing_path.ends_with("stuck-broken.opus"),
+        "the unparseable file keeps its row: {}",
+        left[0].backing_path.display()
+    );
+
+    let stats = crate::revalidate(&db, dir.path()).unwrap();
+    assert_eq!(stats.failed, 1, "the failure count comes back down");
+}
+
+/// #747's other condition: `--prune` deletes a refused file only while it still
+/// carries the stamp the refusing probe saw. One rewritten in between keeps its
+/// row for the next pass to judge, which here refuses it again and prunes it.
+#[test]
+fn revalidate_prune_spares_a_refused_file_rewritten_since_the_refusal() {
+    let dir = tempfile::tempdir().unwrap();
+    let chained = dir.path().join("rewritten-chained.opus");
+    std::fs::write(&chained, chained_opus_bytes()).unwrap();
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    plant_stored_row(&db, &chained);
+
+    struct HookGuard;
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            clear_hook(&BEFORE_PRUNE_REFUSED_HOOK);
+        }
+    }
+    let pc = chained.clone();
+    // An explicit mtime rather than a second write: a rewrite this soon after
+    // the probe can land in the same coarse timestamp tick and move nothing.
+    set_hook(&BEFORE_PRUNE_REFUSED_HOOK, move || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&pc)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10))
+            .unwrap();
+    });
+    let _guard = HookGuard;
+
+    let opts = ScanOptions {
+        prune: true,
+        ..ScanOptions::default()
+    };
+    let stats = crate::revalidate_with(&db, dir.path(), &opts).unwrap();
+    assert_eq!(
+        (stats.failed, stats.pruned),
+        (1, 0),
+        "refused, but rewritten before the prune"
+    );
+    assert_eq!(db.list_tracks().unwrap().len(), 1);
+
+    let stats = crate::revalidate_with(&db, dir.path(), &opts).unwrap();
+    assert_eq!(
+        (stats.failed, stats.pruned),
+        (1, 1),
+        "unchanged since this pass refused it"
+    );
+    assert!(db.list_tracks().unwrap().is_empty());
+}
+
+#[test]
+fn scan_ingests_an_oggflac_whose_header_count_is_unknown() {
+    // A zero following-packet count means "unknown", not "none": the real
+    // VORBIS_COMMENT still follows. Reading it as "none" left the tags inside
+    // the audio region, un-ingested and replayed by synthesis (#723).
+    let mut streaminfo = Vec::new();
+    streaminfo.push(0u8); // STREAMINFO, not the last block
+    streaminfo.extend_from_slice(&34u32.to_be_bytes()[1..]); // 24-bit length
+    streaminfo.extend(std::iter::repeat_n(0u8, 34));
+
+    let mut mapping = vec![0x7F];
+    mapping.extend_from_slice(b"FLAC");
+    mapping.push(1);
+    mapping.push(0);
+    mapping.extend_from_slice(&0u16.to_be_bytes()); // count: unknown
+    mapping.extend_from_slice(b"fLaC");
+    mapping.extend_from_slice(&streaminfo);
+
+    let body = vorbis_body_with(&[("title", "RealTitle")]);
+    let mut comment = vec![0x80 | 4]; // VORBIS_COMMENT, last block
+    comment.extend_from_slice(&u32::try_from(body.len()).unwrap().to_be_bytes()[1..]);
+    comment.extend_from_slice(&body);
+
+    let (mut bytes, pages) = build_header_pub(0x4321, &[&mapping, &comment]);
+    let header_len = bytes.len();
+    let (audio, _) = lace_packet_pub(0x4321, pages, false, 4096, &[0xFFu8, 0xF8, 0x69, 0x18]);
+    bytes.extend_from_slice(&audio);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unknown-count.oga");
+    std::fs::File::create(&path)
+        .unwrap()
+        .write_all(&bytes)
+        .unwrap();
+
+    let probed = probe_full(&path, &bytes).expect("oggflac should probe");
+    assert_eq!(probed.format, Format::OggFlac);
+    assert_eq!(probed.audio_offset, header_len as u64);
+    assert_eq!(
+        probed.tags,
+        vec![("title".to_string(), "RealTitle".to_string())]
+    );
+
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    let stats = crate::scan_directory(&db, &path).unwrap();
+    assert_eq!(stats.scanned, 1);
+    assert_eq!(stats.failed, 0);
+}

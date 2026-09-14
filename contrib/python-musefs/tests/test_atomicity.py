@@ -9,6 +9,7 @@ from musefs_common import (
     SyncStats,
     connect,
     merge_tags,
+    path_param,
     replace_tags,
     replace_track_art,
     sync_files,
@@ -106,16 +107,16 @@ def test_replace_track_art_atomic_on_fk_violation(db_path):
     conn = _autocommit(db_path)  # FK on, autocommit; no failure injection needed
     try:
         tid = insert_track(conn, "/m/a.flac")
-        art_id = upsert_art(conn, JPEG, "image/jpeg")
-        replace_track_art(conn, tid, [(art_id, 3, "")])
+        art_id = upsert_art(conn, JPEG)
+        replace_track_art(conn, tid, [(art_id, 3, "", "image/png")])
         before_cv = conn.execute(
             "SELECT content_version FROM tracks WHERE id = ?", (tid,)
         ).fetchone()[0]
         # 999999 has no row in `art`: the INSERT (after the DELETE) trips the FK.
         with pytest.raises(sqlite3.IntegrityError):
-            replace_track_art(conn, tid, [(999999, 3, "")])
+            replace_track_art(conn, tid, [(999999, 3, "", "image/png")])
         rows = conn.execute(
-            "SELECT art_id, picture_type, ordinal FROM track_art WHERE track_id = ?", (tid,)
+            "SELECT art_id, picture_type, mime, ordinal FROM track_art WHERE track_id = ?", (tid,)
         ).fetchall()
         after_cv = conn.execute(
             "SELECT content_version FROM tracks WHERE id = ?", (tid,)
@@ -123,7 +124,7 @@ def test_replace_track_art_atomic_on_fk_violation(db_path):
     finally:
         conn.close()
     # The DELETE + the content_version trigger bump both rolled back with the FK failure.
-    assert rows == [(art_id, 3, 0)]
+    assert rows == [(art_id, 3, "image/png", 0)]
     assert after_cv == before_cv
 
 
@@ -174,7 +175,7 @@ def test_sync_files_deferred_batch_commits_atomically(db_path):
             path: check.execute(
                 "SELECT value FROM tags t JOIN tracks tr ON tr.id = t.track_id "
                 "WHERE tr.backing_path = ? AND t.key = 'title'",
-                (path,),
+                (path_param(path),),
             ).fetchone()[0]
             for path in ("/m/a.flac", "/m/b.flac")
         }

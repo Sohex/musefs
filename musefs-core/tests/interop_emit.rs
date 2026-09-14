@@ -104,6 +104,63 @@ fn richer_m4a(mdat_payload: &[u8]) -> Vec<u8> {
 const COVR_JPEG: &[u8] = b"\xFF\xD8\xFF\xE0interop-jpeg-cover";
 const COVR_PNG: &[u8] = b"\x89PNG\r\n\x1a\ninterop-png-cover";
 
+/// One art link as a fixture declares it.
+struct ArtLink {
+    data: &'static [u8],
+    mime: &'static str,
+    picture_type: u32,
+    description: &'static str,
+    width: Option<u32>,
+    height: Option<u32>,
+    depth: u32,
+    colors: u32,
+}
+
+impl ArtLink {
+    /// A link that states nothing beyond its mime: MP4 `covr` has no field for
+    /// the rest.
+    const fn plain(data: &'static [u8], mime: &'static str) -> ArtLink {
+        ArtLink {
+            data,
+            mime,
+            picture_type: 3,
+            description: "",
+            width: None,
+            height: None,
+            depth: 0,
+            colors: 0,
+        }
+    }
+}
+
+/// The FLAC and MP3 fixtures' pictures, every field away from its default so a
+/// serializer that drops one is caught rather than matched by the default. The
+/// PNG comes first so the order is not the M4A fixture's either. Mirrored in
+/// tests/interop/test_mutagen_roundtrip.py (PICTURES); ID3 `APIC` carries no
+/// geometry, so the MP3 side asserts all but width/height/depth/colors.
+const PICTURES: [ArtLink; 2] = [
+    ArtLink {
+        data: COVR_PNG,
+        mime: "image/png",
+        picture_type: 4,
+        description: "Back Cover",
+        width: Some(300),
+        height: Some(200),
+        depth: 8,
+        colors: 256,
+    },
+    ArtLink {
+        data: COVR_JPEG,
+        mime: "image/jpeg",
+        picture_type: 6,
+        description: "Disc",
+        width: Some(640),
+        height: Some(480),
+        depth: 24,
+        colors: 0,
+    },
+];
+
 fn real_mtime_ns(p: &Path) -> i64 {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::metadata(p).unwrap();
@@ -155,19 +212,20 @@ fn emit(
     format: Format,
     audio_offset: u64,
     audio_length: u64,
-    arts: &[(&[u8], &str)],
+    arts: &[ArtLink],
 ) -> (u64, u64) {
     std::fs::write(src, bytes).unwrap();
     let db = Db::open_in_memory().unwrap();
     let id = db
         .upsert_track(&NewTrack {
-            backing_path: src.to_string_lossy().into_owned(),
+            backing_path: src.to_path_buf(),
             format,
             audio_offset,
             audio_length,
             backing_size: std::fs::metadata(src).unwrap().len(),
             backing_mtime_ns: real_mtime_ns(src),
             backing_ctime_ns: real_ctime_ns(src),
+            backing_ino: None,
         })
         .unwrap();
     db.replace_tags(
@@ -181,19 +239,24 @@ fn emit(
     let links: Vec<TrackArt> = arts
         .iter()
         .enumerate()
-        .map(|(i, (data, mime))| {
+        .map(|(i, art)| {
             let art_id = db
                 .upsert_art(&NewArt {
-                    mime: (*mime).to_string(),
-                    width: None,
-                    height: None,
-                    data: data.to_vec(),
+                    data: art.data.to_vec(),
                 })
                 .unwrap();
+            // Every field is the fixture's own: mutagen reads each one back off
+            // the synthesized block, which is the round trip this suite exists
+            // to prove.
             TrackArt {
                 art_id,
-                picture_type: 3,
-                description: String::new(),
+                picture_type: art.picture_type,
+                description: art.description.to_string(),
+                mime: art.mime.to_string(),
+                width: art.width,
+                height: art.height,
+                depth: art.depth,
+                colors: art.colors,
                 ordinal: i as u64,
             }
         })
@@ -225,13 +288,14 @@ fn emit_binary(
     let db = Db::open_in_memory().unwrap();
     let id = db
         .upsert_track(&NewTrack {
-            backing_path: src.to_string_lossy().into_owned(),
+            backing_path: src.to_path_buf(),
             format,
             audio_offset,
             audio_length,
             backing_size: std::fs::metadata(src).unwrap().len(),
             backing_mtime_ns: real_mtime_ns(src),
             backing_ctime_ns: real_ctime_ns(src),
+            backing_ino: None,
         })
         .unwrap();
     db.replace_tags(id, text).unwrap();
@@ -260,7 +324,7 @@ fn emit_interop_fixtures() {
             Format::Flac,
             scan.audio_offset,
             scan.audio_length,
-            &[],
+            &PICTURES,
         );
         manifest.push(ManifestRow {
             file: "out.flac",
@@ -287,11 +351,40 @@ fn emit_interop_fixtures() {
             Format::Mp3,
             b.audio_offset,
             b.audio_length,
-            &[],
+            &PICTURES,
         );
         manifest.push(ManifestRow {
             file: "out.mp3",
             source_file: "src.mp3",
+            title: "Interop Title",
+            artist: "Interop Artist",
+            source_audio_offset: b.audio_offset,
+            source_audio_length: b.audio_length,
+            synth_audio_offset: ao,
+            synth_audio_length: al,
+            ogg_payload_only: false,
+            covr_count: 0,
+        });
+    }
+
+    // MP3 whose backing carries a prepended tag, an appended ID3v2.4 tag with
+    // its footer, and an ID3v1 trailer (#768). The served file must carry the
+    // synthesized front tag and none of the three.
+    {
+        let bytes = fixtures::mp3_with_front_and_back_tags();
+        let b = musefs_format::mp3::locate_audio(&bytes).unwrap();
+        let (ao, al) = emit(
+            &dir.join("src_multi.mp3"),
+            &dir.join("out_multi.mp3"),
+            &bytes,
+            Format::Mp3,
+            b.audio_offset,
+            b.audio_length,
+            &PICTURES,
+        );
+        manifest.push(ManifestRow {
+            file: "out_multi.mp3",
+            source_file: "src_multi.mp3",
             title: "Interop Title",
             artist: "Interop Artist",
             source_audio_offset: b.audio_offset,
@@ -315,7 +408,10 @@ fn emit_interop_fixtures() {
             Format::M4a,
             scan.mdat_payload_offset,
             scan.mdat_payload_len,
-            &[(COVR_JPEG, "image/jpeg"), (COVR_PNG, "image/png")],
+            &[
+                ArtLink::plain(COVR_JPEG, "image/jpeg"),
+                ArtLink::plain(COVR_PNG, "image/png"),
+            ],
         );
         manifest.push(ManifestRow {
             file: "out.m4a",
@@ -385,11 +481,44 @@ fn emit_interop_fixtures() {
         });
     }
 
+    // WAV, big-endian (RIFX, #770). mutagen reads only RIFF, so the Python side
+    // reads this one through libsndfile instead.
+    {
+        let bytes = fixtures::wav_in(
+            &[0x0102i16, -2, 300, -32768, 32767, 5, 6, 7],
+            musefs_format::wav::ByteOrder::Big,
+        );
+        let b = musefs_format::wav::locate_audio(&bytes).unwrap();
+        let (ao, al) = emit(
+            &dir.join("src_rifx.wav"),
+            &dir.join("out_rifx.wav"),
+            &bytes,
+            Format::Wav,
+            b.audio_offset,
+            b.audio_length,
+            &[],
+        );
+        manifest.push(ManifestRow {
+            file: "out_rifx.wav",
+            source_file: "src_rifx.wav",
+            title: "Interop Title",
+            artist: "Interop Artist",
+            source_audio_offset: b.audio_offset,
+            source_audio_length: b.audio_length,
+            synth_audio_offset: ao,
+            synth_audio_length: al,
+            ogg_payload_only: false,
+            covr_count: 0,
+        });
+    }
+
     // ── Binary-frame fixtures (spec §Testing: POPM/UFID/PRIV/GEOB + MP4 ----) ──
     // Known ASCII payloads so the Python side compares without hex.
     let priv_owner = "musefs";
     let priv_data = "PRIV-ANALYSIS-001";
     let geob_data = "GEOB-OBJECT-XYZ";
+    let geob_filename = "analysis.bin";
+    let geob_desc = "musefs interop";
     let mb_trackid = "11111111-2222-3333-4444-555555555555";
     let rating = "200";
     let playcount = "42";
@@ -405,8 +534,10 @@ fn emit_interop_fixtures() {
         priv_body.extend_from_slice(priv_data.as_bytes());
         let mut geob_body = vec![0x00u8]; // latin-1 text encoding
         geob_body.extend_from_slice(b"application/octet-stream\0");
-        geob_body.push(0); // empty filename
-        geob_body.push(0); // empty description
+        geob_body.extend_from_slice(geob_filename.as_bytes());
+        geob_body.push(0);
+        geob_body.extend_from_slice(geob_desc.as_bytes());
+        geob_body.push(0);
         geob_body.extend_from_slice(geob_data.as_bytes());
         emit_binary(
             &dir.join("src_bin.mp3"),
@@ -463,7 +594,8 @@ fn emit_interop_fixtures() {
     // Emit the binary manifest the Python test consumes.
     let binary_manifest = format!(
         "{{\"mp3\":{{\"file\":\"out_bin.mp3\",\"priv_owner\":{priv_owner:?},\"priv_data\":{priv_data:?},\
-         \"geob_data\":{geob_data:?},\"rating\":{rating},\"playcount\":{playcount},\
+         \"geob_data\":{geob_data:?},\"geob_mime\":\"application/octet-stream\",\
+         \"geob_filename\":{geob_filename:?},\"geob_desc\":{geob_desc:?},\"rating\":{rating},\"playcount\":{playcount},\
          \"mb_trackid\":{mb_trackid:?}}},\
          \"mp4\":{{\"file\":\"out_bin.m4a\",\"freeform_key\":\"----:com.apple.iTunes:{freeform_name}\",\
          \"freeform_data\":{freeform_data:?}}}}}",

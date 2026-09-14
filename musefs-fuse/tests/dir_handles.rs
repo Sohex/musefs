@@ -127,14 +127,13 @@ fn over_cap_opendir_still_lists_every_directory() {
     let core = Musefs::open(db, config()).unwrap();
 
     let mountpoint = tempfile::tempdir().unwrap();
+    let mut fuse_config = FuseConfig::default();
+    fuse_config.expose_metrics = true;
     let session = musefs_fuse::spawn_with(
         core,
         mountpoint.path(),
         "musefs-dir-handles-e2e",
-        FuseConfig {
-            expose_metrics: true,
-            ..FuseConfig::default()
-        },
+        fuse_config,
     )
     .unwrap();
     let root = mountpoint.path();
@@ -207,14 +206,13 @@ fn many_handles_on_one_directory_share_one_listing() {
     let core = Musefs::open(db, config()).unwrap();
 
     let mountpoint = tempfile::tempdir().unwrap();
+    let mut fuse_config = FuseConfig::default();
+    fuse_config.expose_metrics = true;
     let session = musefs_fuse::spawn_with(
         core,
         mountpoint.path(),
         "musefs-dir-sharing-e2e",
-        FuseConfig {
-            expose_metrics: true,
-            ..FuseConfig::default()
-        },
+        fuse_config,
     )
     .unwrap();
     let root = mountpoint.path();

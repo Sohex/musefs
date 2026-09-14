@@ -15,6 +15,30 @@ Registry:
 (glibc) tags suit everything else. Floating `:latest` / `:musl` track the most
 recent stable release only — prereleases publish only version-pinned tags.
 
+**Upgrading from 1.x.** The floating tags now pull 2.0.0, which refuses a store
+written by 1.x until `musefs migrate` has upgraded it: `mount`, `scan`,
+`revalidate` and `vacuum` exit with an error naming the command. Stop the musefs container
+first, since `migrate` refuses a store another container still has open, then
+run it once against the store volume (the image's entrypoint is `musefs`):
+
+```bash
+docker run --rm \
+  -v /path/to/library:/library:ro \
+  -v /path/to/store:/store \
+  ghcr.io/sohex/musefs:latest migrate --db /store/musefs.db --yes --revalidate
+```
+
+Without `-it` there is no terminal, so `migrate` needs `--yes` to upgrade, and
+its vacuum and revalidate offers decline unless `--vacuum` or `--revalidate`
+asks for them. No FUSE flags are needed; nothing is mounted. `--revalidate`
+walks the directory the stored tracks share, at the paths they were scanned
+from, so mount the library read-only at that same path, as above. If the
+library is not mounted in that container, pass `--revalidate=false` (or leave
+it off) and run `revalidate /library --db /store/musefs.db` afterwards from a
+container that has it. The
+[release notes](../release-notes.md#upgrading-from-v130) list what else the
+upgrade changes.
+
 **Running musefs on the host is the simplest, best-supported option** — it is an
 ordinary FUSE daemon and the image exists mainly to colocate musefs with
 containerized media managers (e.g. Lidarr). If you do containerize, mind the
@@ -22,19 +46,20 @@ gotchas below.
 
 ### Required flags
 
-musefs mounts via FUSE, so the container needs `/dev/fuse` and the matching
-capability:
+musefs mounts via FUSE, so a container running `mount` needs `/dev/fuse` and
+the matching capability:
 
 ```bash
 docker run --rm \
   --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
   -v /path/to/library:/library:ro \
   -v /path/to/store:/store \
-  ghcr.io/sohex/musefs:latest scan /library --db /store/musefs.db
+  ghcr.io/sohex/musefs:latest mount /mnt/musefs --db /store/musefs.db
 ```
 
 Without `--device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined`
-the mount cannot be established.
+the mount cannot be established. `scan`, `revalidate`, `vacuum` and `migrate`
+mount nothing and need none of these flags.
 
 > **Note:** The apparmor flag may or may not be necessary depending on how your system is configured.
 

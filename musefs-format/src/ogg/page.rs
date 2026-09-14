@@ -4,6 +4,11 @@ use crate::error::{FormatError, Result};
 
 pub const CAPTURE: &[u8; 4] = b"OggS";
 
+/// The largest an Ogg page can be: 27 fixed header bytes + a 255-entry segment
+/// table + 255 × 255 payload bytes. A window this wide is guaranteed to contain
+/// one whole page wherever it is anchored.
+pub const MAX_PAGE_BYTES: u64 = 27 + 255 + 255 * 255;
+
 /// Header-type flag bits.
 pub const FLAG_CONTINUED: u8 = 0x01;
 pub const FLAG_BOS: u8 = 0x02;
@@ -13,6 +18,7 @@ pub const FLAG_EOS: u8 = 0x04;
 /// A parsed Ogg page header (the 27 fixed bytes + the segment table) plus the
 /// derived payload length. Multi-byte fields are little-endian on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PageHeader {
     pub header_type: u8,
     pub granule: u64,
@@ -79,6 +85,11 @@ pub(crate) fn lacing_values(payload_len: usize) -> Vec<u8> {
 /// Each page carries up to 255 lacing values (≤ 65 025 payload bytes). `bos` sets
 /// the BOS flag on the packet's first page; continuation pages get FLAG_CONTINUED.
 /// All pages use the given `granule`. Returns `(bytes, pages_used)`.
+///
+/// A fixture builder: synthesis patches pages in place and never lays out fresh
+/// ones, so this has no production caller and compiles only with the test
+/// surface.
+#[cfg(any(test, feature = "fuzzing"))]
 pub fn lace_packet(
     serial: u32,
     seq_start: u32,
@@ -131,7 +142,9 @@ pub fn lace_packet(
 
 /// Lace a sequence of header packets onto fresh pages starting at sequence 0, with
 /// BOS on the very first page and granule 0 throughout (header pages carry no
-/// audio). Each packet begins a new page. Returns `(bytes, page_count)`.
+/// audio). Each packet begins a new page. Returns `(bytes, page_count)`. A
+/// fixture builder, like [`lace_packet`].
+#[cfg(any(test, feature = "fuzzing"))]
 pub fn build_header(serial: u32, packets: &[&[u8]]) -> (Vec<u8>, u32) {
     let mut out = Vec::new();
     let mut seq = 0u32;
@@ -152,16 +165,24 @@ pub struct ReadPacket {
     pub pages_through_end: u32,
 }
 
-/// Reassemble up to `want` packets from the pages starting at `data[0]`. Stops as
-/// soon as `want` packets have completed (audio for Opus/Vorbis/OggFLAC begins on
-/// a fresh page after the header packets). A packet ends at the first lacing value
-/// < 255.
-pub fn read_packets(data: &[u8], want: usize) -> Result<Vec<ReadPacket>> {
+/// Reassemble packets from the pages starting at `data[0]`, asking `more` after
+/// each completed packet whether to take another. A packet ends at the first
+/// lacing value < 255.
+///
+/// Stopping is what bounds the read: audio for Opus/Vorbis/OggFLAC begins on a
+/// fresh page after the header packets, so a caller that stops at the end of the
+/// header run never reads a byte of audio. A caller that asks for more than the
+/// data holds gets `Malformed` from the page parse, which the bounded probe reads
+/// as "widen the window".
+pub fn read_packets_while(
+    data: &[u8],
+    mut more: impl FnMut(&[ReadPacket]) -> Result<bool>,
+) -> Result<Vec<ReadPacket>> {
     let mut out: Vec<ReadPacket> = Vec::new();
     let mut pos = 0usize;
     let mut pages = 0u32;
     let mut cur: Vec<u8> = Vec::new();
-    while out.len() < want {
+    loop {
         let h = parse_page(data, pos)?;
         pages += 1;
         let table_start = pos + 27;
@@ -181,14 +202,22 @@ pub fn read_packets(data: &[u8], want: usize) -> Result<Vec<ReadPacket>> {
                     end_offset: pos + h.total_len(),
                     pages_through_end: pages,
                 });
-                if out.len() == want {
-                    break;
+                if !more(&out)? {
+                    return Ok(out);
                 }
             }
         }
         pos += h.total_len();
     }
-    Ok(out)
+}
+
+/// Reassemble up to `want` packets from the pages starting at `data[0]`. Stops as
+/// soon as `want` packets have completed.
+pub fn read_packets(data: &[u8], want: usize) -> Result<Vec<ReadPacket>> {
+    if want == 0 {
+        return Ok(Vec::new());
+    }
+    read_packets_while(data, |out| Ok(out.len() < want))
 }
 
 /// Given the full bytes of one page, return just its header bytes (length
@@ -882,5 +911,20 @@ mod tests {
         let h = parse_page(&page, 0).unwrap();
         let truncated = &page[..h.total_len() - 10];
         assert!(verify_page_crc(truncated).is_err());
+    }
+
+    #[test]
+    fn max_page_bytes_is_the_rfc_maximum() {
+        // The largest page RFC 3533 can express, and the width of the tail window
+        // the chain check reads: a wrong value silently shrinks that window, so
+        // the constant is pinned rather than left to its own arithmetic.
+        assert_eq!(MAX_PAGE_BYTES, 65_307);
+        // Built from the real page it describes: a packet too large for one page
+        // fills the first page's segment table with 255 lacing values of 255,
+        // which is the maximum-size page.
+        let (pages, _) = lace_packet(1, 0, false, 0, &vec![0u8; 255 * 255 + 1]);
+        let first = parse_page(&pages, 0).unwrap();
+        assert_eq!(first.seg_count, 255);
+        assert_eq!(first.total_len() as u64, MAX_PAGE_BYTES);
     }
 }

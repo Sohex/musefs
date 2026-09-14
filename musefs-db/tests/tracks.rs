@@ -1,3 +1,4 @@
+use std::path::Path;
 mod common;
 use common::{jpeg, new_track};
 use musefs_db::{Db, Format, NewArt, NewTrack, Tag, TrackArt};
@@ -9,13 +10,13 @@ fn insert_then_get_by_id_and_path() {
 
     let by_id = db.get_track(id).unwrap().expect("track by id");
     assert_eq!(by_id.id, id);
-    assert_eq!(by_id.backing_path, "/music/a.flac");
+    assert_eq!(by_id.backing_path, Path::new("/music/a.flac"));
     assert_eq!(by_id.format, Format::Flac);
     assert_eq!(by_id.bounds.audio_offset(), 100);
     assert_eq!(by_id.content_version, 0);
 
     let by_path = db
-        .get_track_by_path("/music/a.flac")
+        .get_track_by_path(Path::new("/music/a.flac"))
         .unwrap()
         .expect("track by path");
     assert_eq!(by_path.id, id);
@@ -34,6 +35,11 @@ fn track_identity_returns_content_version_and_backing_identity() {
             art_id,
             picture_type: 3,
             description: String::new(),
+            mime: "image/png".into(),
+            width: None,
+            height: None,
+            depth: 0,
+            colors: 0,
             ordinal: 0,
         }],
     )
@@ -45,16 +51,16 @@ fn track_identity_returns_content_version_and_backing_identity() {
         "linking art must bump content_version above the default"
     );
     let track = db.get_track(id).unwrap().expect("track by id");
+    let identity = db.track_identity(id).unwrap().expect("identity by id");
+    assert_eq!(identity.content_version, cv);
     assert_eq!(
-        db.track_identity(id).unwrap(),
-        Some(musefs_db::TrackIdentity {
-            content_version: cv,
-            backing_path: "/music/a.flac".to_string(),
-            backing_size: track.backing_size,
-            backing_mtime_ns: track.backing_mtime_ns,
-            backing_ctime_ns: track.backing_ctime_ns,
-        }),
+        identity.backing_path,
+        std::path::PathBuf::from("/music/a.flac")
     );
+    assert_eq!(identity.backing_size, track.backing_size);
+    assert_eq!(identity.backing_mtime_ns, track.backing_mtime_ns);
+    assert_eq!(identity.backing_ctime_ns, track.backing_ctime_ns);
+    assert_eq!(identity.backing_ino, track.backing_ino);
     assert!(db.track_identity(999_999).unwrap().is_none());
 }
 
@@ -117,21 +123,19 @@ fn delete_track_cascades_tags_and_track_art() {
     let db = Db::open_in_memory().unwrap();
     let id = db
         .upsert_track(&NewTrack {
-            backing_path: "/x/a.flac".to_string(),
+            backing_path: std::path::PathBuf::from("/x/a.flac"),
             format: Format::Flac,
             audio_offset: 0,
             audio_length: 0,
             backing_size: 0,
             backing_mtime_ns: 0,
             backing_ctime_ns: 0,
+            backing_ino: None,
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("artist", "A", 0)]).unwrap();
     let art_id = db
         .upsert_art(&NewArt {
-            mime: "image/png".to_string(),
-            width: None,
-            height: None,
             data: vec![1, 2, 3],
         })
         .unwrap();
@@ -141,6 +145,11 @@ fn delete_track_cascades_tags_and_track_art() {
             art_id,
             picture_type: 3,
             description: String::new(),
+            mime: "image/png".into(),
+            width: None,
+            height: None,
+            depth: 0,
+            colors: 0,
             ordinal: 0,
         }],
     )
@@ -162,13 +171,14 @@ fn upsert_conflict_updates_all_mutable_columns() {
 
     // Same backing_path => ON CONFLICT update path; change every mutable column.
     let changed = NewTrack {
-        backing_path: "/m/a.flac".to_string(),
+        backing_path: std::path::PathBuf::from("/m/a.flac"),
         format: Format::Mp3,
         audio_offset: 222,
         audio_length: 333,
         backing_size: 555,
         backing_mtime_ns: 555,
         backing_ctime_ns: 666,
+        backing_ino: None,
     };
     let id2 = db.upsert_track(&changed).unwrap();
     assert_eq!(id, id2, "conflict update must keep the same id");
@@ -208,6 +218,44 @@ fn changelog_since_empty_table_reports_zero_bounds() {
     let log = db.changelog_since(0).unwrap();
     assert!(log.changed_ids.is_empty());
     assert_eq!((log.min_seq, log.max_seq), (0, 0));
+    assert!(!log.malformed);
+}
+
+/// A row whose `track_id` is not an integer, in a store written with its
+/// constraints off (#760). The read must not fail on it: an error advances no
+/// watermark, so the refresh would hit the same row on every poll. It is
+/// skipped and reported instead, and only while it is past the watermark.
+#[test]
+fn changelog_since_skips_a_malformed_row_and_reports_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.db");
+    let db = Db::open(&path).unwrap();
+    let id = db.upsert_track(&new_track("/a.flac")).unwrap();
+
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.pragma_update(None, "ignore_check_constraints", true)
+        .unwrap();
+    for bad in ["'not an id'", "1.5", "X'01'"] {
+        raw.execute(
+            &format!("INSERT INTO track_changes (track_id) VALUES ({bad})"),
+            [],
+        )
+        .unwrap();
+    }
+
+    let log = db.changelog_since(0).unwrap();
+    assert_eq!(
+        log.changed_ids,
+        vec![id],
+        "only the readable id is returned"
+    );
+    assert!(log.malformed, "the unreadable rows are reported");
+
+    let later = db.changelog_since(log.max_seq).unwrap();
+    assert!(
+        !later.malformed,
+        "a malformed row behind the watermark is none of the caller's business"
+    );
 }
 
 #[test]
@@ -236,6 +284,132 @@ fn delete_changelog_through_for_test_prunes_the_prefix() {
         (log.max_seq, log.max_seq),
         "rows through max_seq - 1 must actually be deleted"
     );
+}
+
+/// An over-cap `backing_path` is refused by every reader from its length alone
+/// (#758). The row is smuggled past the V4 `CHECK`, as a store written with its
+/// constraints off would hold it; each reader has to reject it from
+/// `length(backing_path)` before loading the value, or a crafted store picks the
+/// size of the allocation.
+#[test]
+fn every_backing_path_reader_refuses_an_over_cap_path() {
+    use musefs_db::DbError;
+    use musefs_db::limits::MAX_BACKING_PATH_BYTES;
+    use std::os::unix::ffi::OsStrExt;
+
+    // Never formats the value: on failure that would print the 64 KiB path.
+    fn refused<T>(reader: &str, got: musefs_db::Result<T>) {
+        match got {
+            Err(DbError::FieldTooLarge {
+                table: "tracks",
+                field: "backing_path",
+                ..
+            }) => {}
+            Err(other) => panic!("{reader} refused with the wrong error: {other}"),
+            Ok(_) => panic!("{reader} loaded the over-cap path"),
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("s.db");
+    let db = Db::open(&store).unwrap();
+    let mut long = vec![b'/'];
+    long.resize(usize::try_from(MAX_BACKING_PATH_BYTES).unwrap() + 1, b'a');
+    let fingerprint = "a".repeat(64);
+
+    let raw = rusqlite::Connection::open(&store).unwrap();
+    raw.pragma_update(None, "ignore_check_constraints", true)
+        .unwrap();
+    raw.execute(
+        "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+         backing_size, backing_mtime_ns, updated_at, fingerprint) \
+         VALUES (?1, 'flac', 0, 0, 0, 0, 0, ?2)",
+        rusqlite::params![long, fingerprint],
+    )
+    .unwrap();
+    let id = raw.last_insert_rowid();
+
+    refused("get_track", db.get_track(id));
+    refused(
+        "get_track_by_path",
+        db.get_track_by_path(Path::new(std::ffi::OsStr::from_bytes(&long))),
+    );
+    refused("list_tracks", db.list_tracks());
+    refused(
+        "tracks_by_fingerprint",
+        db.tracks_by_fingerprint(&fingerprint),
+    );
+    refused("track_identity", db.track_identity(id));
+    refused("list_backing_paths", db.list_backing_paths());
+}
+
+/// A `backing_path` that is not a BLOB is refused by every reader from its
+/// storage class, before the value is loaded. The one planted here is TEXT with a
+/// NUL near its start, whose `length()` reads 1, well under the cap: the length
+/// check alone passed it, and loaded it to find out it was not bytes.
+/// `get_track_by_path` is not among the readers: it binds the path as bytes, and
+/// SQLite never compares TEXT equal to a BLOB, so it finds no row to refuse.
+#[test]
+fn every_backing_path_reader_refuses_a_path_that_is_not_a_blob() {
+    use musefs_db::DbError;
+
+    fn refused<T>(reader: &str, got: musefs_db::Result<T>) {
+        match got {
+            Err(DbError::WrongStorageClass {
+                table: "tracks",
+                field: "backing_path",
+                ..
+            }) => {}
+            Err(other) => panic!("{reader} refused with the wrong error: {other}"),
+            Ok(_) => panic!("{reader} loaded the TEXT path"),
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("s.db");
+    let db = Db::open(&store).unwrap();
+    let fingerprint = "a".repeat(64);
+    let raw = rusqlite::Connection::open(&store).unwrap();
+    raw.pragma_update(None, "ignore_check_constraints", true)
+        .unwrap();
+    raw.execute(
+        "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+         backing_size, backing_mtime_ns, updated_at, fingerprint) \
+         VALUES ('/' || char(0) || 'lib/a.flac', 'flac', 0, 0, 0, 0, 0, ?1)",
+        [&fingerprint],
+    )
+    .unwrap();
+    let id = raw.last_insert_rowid();
+
+    refused("get_track", db.get_track(id));
+    refused("list_tracks", db.list_tracks());
+    refused(
+        "tracks_by_fingerprint",
+        db.tracks_by_fingerprint(&fingerprint),
+    );
+    refused("track_identity", db.track_identity(id));
+    refused("list_backing_paths", db.list_backing_paths());
+}
+
+/// The cap is inclusive: a path exactly at it stores and reads back, and one
+/// byte more is refused at the write.
+#[test]
+fn a_backing_path_at_the_cap_round_trips_and_one_byte_more_is_refused() {
+    use musefs_db::limits::MAX_BACKING_PATH_BYTES;
+    let cap = usize::try_from(MAX_BACKING_PATH_BYTES).unwrap();
+    let db = Db::open_in_memory().unwrap();
+
+    let at_cap = format!("/{}", "a".repeat(cap - 1));
+    let id = db.upsert_track(&new_track(&at_cap)).unwrap();
+    let track = db
+        .get_track(id)
+        .unwrap()
+        .expect("the at-cap track reads back");
+    assert_eq!(track.backing_path, Path::new(&at_cap));
+
+    let over = format!("/{}", "b".repeat(cap));
+    let err = db.upsert_track(&new_track(&over)).unwrap_err().to_string();
+    assert!(err.contains("CHECK constraint failed"), "{err}");
 }
 
 #[test]

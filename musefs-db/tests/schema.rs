@@ -57,3 +57,37 @@ fn default_db_is_unmigrated_version_zero() {
     assert_eq!(db.user_version().unwrap(), 0);
     assert_ne!(0, LATEST_VERSION);
 }
+
+/// The 2.0.0 step is gated, so an ordinary open of an older store refuses and
+/// names the command; `PendingMigration` is the one door that applies it.
+#[test]
+fn a_gated_store_is_refused_on_open_and_upgraded_by_pending_migration() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("musefs.db");
+
+    // Stand in for what an older build left behind: the earlier steps, run for
+    // real, because a current store with its stamp rewound is not one.
+    let gated_from = LATEST_VERSION - 1;
+    musefs_db::seed_store_at_version(&path, gated_from).unwrap();
+
+    let err = Db::open(&path).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            musefs_db::DbError::StoreNeedsMigration { found, target }
+                if found == gated_from && target == LATEST_VERSION
+        ),
+        "expected StoreNeedsMigration {{ found: {gated_from}, target: {LATEST_VERSION} }}, \
+         got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("musefs migrate"),
+        "the refusal must name the command that gets past it: {err}"
+    );
+
+    let db = musefs_db::PendingMigration::open(&path)
+        .expect("opening for migration does not migrate")
+        .apply()
+        .expect("the gated step is what this door is for");
+    assert_eq!(db.user_version().unwrap(), LATEST_VERSION);
+}

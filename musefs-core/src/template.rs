@@ -19,6 +19,7 @@ const MAX_SECTION_DEPTH: usize = 64;
 /// [`crate::CoreError::InvalidTemplate`] when `Musefs::open` parses a bad
 /// `--template`.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum TemplateError {
     /// `[...]` sections nested deeper than `limit`.
     #[error("template nesting exceeds the maximum depth of {limit}")]
@@ -63,7 +64,7 @@ enum Part {
 impl Template {
     /// Parse a beets-style template. Returns `Err` for a template that cannot
     /// produce valid path components: control/NUL bytes in literal text
-    /// (#275), `[...]` nesting deeper than [`MAX_SECTION_DEPTH`] (#304), an
+    /// (#275), `[...]` nesting deeper than `MAX_SECTION_DEPTH` (#304), an
     /// unterminated `${`/`$!{` field (no closing `}`), or an unclosed `[`
     /// section (no closing `]`).
     ///

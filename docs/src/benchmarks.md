@@ -67,16 +67,17 @@ deployment-representative tier.
 
 ## CI regression gating
 
-`BENCHMARKS.md` records hand-run absolute numbers; CI guards against regressions
+This page records hand-run absolute numbers; CI guards against regressions
 in three lanes:
 
 1. **Counter gate (every non-doc PR, hard).** `perf_counters.rs` +
    `tree.rs` golden work-counter assertions under `--features metrics`. Catches
    algorithmic regressions (extra copy, whole-file slurp, O(N) tree rebuild).
-2. **A/B wall-clock (warn-only, core `src` PRs).** The `perf-bench` matrix job
-   benches the base and PR commits in parallel on separate runners; the `perf-ab`
-   job then diffs the two exported baselines and posts a `critcmp` delta as a PR
-   comment. Never blocks.
+2. **A/B wall-clock (warn-only, PRs touching `musefs-core/src` or
+   `musefs-format/src`).** The `perf-ab` job runs `scripts/perf-ab.sh`, which
+   benches the base and PR commits back-to-back on one runner and posts a
+   `critcmp` delta as a sticky PR comment (a job summary only, for fork PRs).
+   Never blocks.
 3. **Release record.** The `benchmarks` job runs the full bench suite at the
    `ci` tier on a tag and uploads the numbers as an artifact for curation here.
 
@@ -1099,6 +1100,13 @@ FUSE mount. Default thread count (`jobs: 0`). 3 runs each, median reported.
 +8.6% (+95 µs/file), well within the plan's ≤15% threshold. The RAM bench's +129% (+303 µs/file) was
 an artefact of RAM eliminating the I/O that would normally dwarf the extra SHA-256 hash and DB write.
 At real SSD rates the fingerprint cost is operationally negligible.
+
+**Both figures above predate #691**, which added three bounded audio windows
+(≤ 24 KiB) to the fingerprint's input. The extra cost is up to three more
+positioned reads per file on a descriptor the probe already holds, so the shape
+is unchanged — a bounded constant per file, not a pass over the file — but on a
+seek-bound backing the tail window is one more seek per file and these
+percentages understate the current tier. Neither bench has been re-run.
 
 ---
 

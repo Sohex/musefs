@@ -6,6 +6,11 @@ toolchain needed), [building from source](#building-from-source), or a
 Whichever you pick, mounting needs a 64-bit FUSE-capable OS (Linux, FreeBSD, macOS) — see
 [Platform support](#platform-support).
 
+> **Upgrading from 1.x:** 2.0.0 changes the store's schema, and every command
+> other than `musefs migrate` refuses a 1.x store until it has been upgraded.
+> Stop any running mount, then run `musefs migrate --db <store>`; the
+> [release notes](../release-notes.md#upgrading-from-v130) walk through it.
+
 > **Important:** Linux and FreeBSD are E2E tested. I don't have anything running macOS to test on, if you run this on one let me know if it works, or especially if it doesn't!
 >
 > At present AMD64, AARCH64, and RISC-V 64 are supported. If you'd like 32-bit support please open an issue.
@@ -46,23 +51,44 @@ the target needs the FUSE userspace tools and `/dev/fuse`:
 
 No glibc/libfuse install is needed for the musl binaries beyond `fuse3`.
 
+**Backing storage:** FAT (FAT12, FAT16 and FAT32) and exFAT are not
+recommended for the music library musefs serves from. musefs is fully
+functional on them, but its check that a backing file has not changed on disk
+is weaker there. That check normally
+compares a file's size, modification time, change time and inode number. FAT
+stores the modification time in two-second steps and exFAT in 10 ms steps, both
+report the change time as the modification time, and neither keeps inode
+numbers stable. On Linux musefs detects both filesystems and records no inode
+for their files. What is left is size plus a coarse modification time: a
+same-size replacement or rewrite inside that window goes undetected, and the
+file is served with metadata laid out for its old content. Other platforms
+record whatever inode number the filesystem reports, so there the check is only
+as reliable as that number is across remounts.
+Filesystems with real timestamps and stable inode numbers, such as ext4, btrfs
+and XFS, get the full check; see
+[freshness](../architecture/tree-scanning.md) for how it works.
+
 > **Note:** On Ubuntu 24.04+ (libfuse ≥ 3.17) the `fusermount3` AppArmor
 > profile only permits unprivileged mounts under whitelisted prefixes
 > (`$HOME/**`, `/mnt`, `/media`, `/tmp`, …). Mounting elsewhere fails with
 > `fusermount3: mount failed: Permission denied` — see
-> [Mounting](mounting.md#mounting) for the whitelist and the fix.
+> [Mounting](mounting.md#mount) for the whitelist and the fix.
 
 ## Building from source
 
-`cargo install musefs` compiles the latest release; building needs a stable
-Rust toolchain (2024 edition) plus the FUSE headers (`libfuse3-dev`) and
-`pkg-config`. To install the latest development version instead:
+`cargo install musefs` compiles the latest release; building needs Rust 1.95
+or newer (2024 edition) plus a C compiler, for the bundled SQLite, and `make`,
+for jemalloc. No FUSE headers or `pkg-config` are needed: musefs does not link
+libfuse (on Linux it mounts through `fusermount3`). To install the latest
+development version instead:
 
 ```bash
 cargo install --git https://github.com/Sohex/musefs musefs
 ```
 
-The same `fuse3` runtime requirement as the prebuilt binaries applies.
+On Linux the same `fuse3` runtime requirement as the prebuilt binaries applies;
+FreeBSD and macOS use their own FUSE implementations, listed under
+[Platform support](#platform-support).
 
 The binary uses **jemalloc** as its global allocator by default (it bounds
 resident memory for the long-lived mount daemon under heavy concurrent reads).

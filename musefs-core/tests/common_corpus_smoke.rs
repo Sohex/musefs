@@ -233,7 +233,7 @@ fn write_ogg_vorbis_renumbers_every_audio_page_on_serve() {
     // own page, so the served header outgrows the original and every audio page's
     // sequence number shifts. Without that shift `crc32(DELTA)` is zero and the
     // algebraic patch short-circuits — which is exactly what the Opus fixture does.
-    use musefs_core::{Mode, MountConfig, Musefs, VirtualTree};
+    use musefs_core::{MountConfig, Musefs, VirtualTree};
 
     let dir = tempfile::tempdir().unwrap();
     let audio = vec![0x5Au8; 64 * 1024];
@@ -243,22 +243,12 @@ fn write_ogg_vorbis_renumbers_every_audio_page_on_serve() {
 
     let db = Db::open_in_memory().unwrap();
     scan_directory(&db, dir.path()).unwrap();
-    let fs = Musefs::open(
-        db,
-        MountConfig {
-            template: "$artist/$album/$title".to_string(),
-            fallbacks: std::collections::BTreeMap::new(),
-            default_fallback: "Unknown".to_string(),
-            mode: Mode::Synthesis,
-            poll_interval: std::time::Duration::ZERO,
-            case_insensitive: false,
-            read_ahead_budget: 0,
-            read_ahead_prefetch: false,
-            skip_on_missing: false,
-            trust_backing_mtime: false,
-        },
-    )
-    .unwrap();
+    let mut config = MountConfig::default();
+    config.template = "$artist/$album/$title".to_string();
+    config.poll_interval = std::time::Duration::ZERO;
+    config.case_insensitive = false;
+    config.read_ahead_budget = 0;
+    let fs = Musefs::open(db, config).unwrap();
 
     let mut inodes = Vec::new();
     collect_file_inodes(&fs, VirtualTree::ROOT, &mut inodes);

@@ -54,7 +54,7 @@ fn flac_with_big_art(data_len: usize, audio: &[u8]) -> Vec<u8> {
 }
 
 /// Normalize a DB to comparable `(path, audio_offset, audio_length)` rows.
-fn rows(db: &Db) -> Vec<(String, u64, u64)> {
+fn rows(db: &Db) -> Vec<(std::path::PathBuf, u64, u64)> {
     let mut r: Vec<_> = db
         .list_tracks()
         .unwrap()
@@ -101,15 +101,9 @@ fn widen_then_fallback_matches_oracle_under_tiny_window() {
     let oracle = rows(&oracle_db);
 
     let bounded_db = Db::open_in_memory().unwrap();
-    let stats = scan_directory_with(
-        &bounded_db,
-        dir.path(),
-        &ScanOptions {
-            window: 64,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut options = ScanOptions::default();
+    options.window = 64;
+    let stats = scan_directory_with(&bounded_db, dir.path(), &options).unwrap();
 
     assert_eq!(stats.scanned, 2);
     assert_eq!(rows(&bounded_db), oracle, "bounded widen/fallback diverged");
@@ -139,15 +133,9 @@ fn widen_preserves_art_bytes_vs_oracle() {
 
     // Tiny window forces a multi-step widen to reach the 4 KiB picture body.
     let db = Db::open_in_memory().unwrap();
-    scan_directory_with(
-        &db,
-        dir.path(),
-        &ScanOptions {
-            window: 16,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut options = ScanOptions::default();
+    options.window = 16;
+    scan_directory_with(&db, dir.path(), &options).unwrap();
 
     let track = db.list_tracks().unwrap().into_iter().next().unwrap();
     assert_eq!(track.bounds.audio_offset(), o_track.bounds.audio_offset());
@@ -181,15 +169,9 @@ fn scans_more_than_batch_files_persists_all_once() {
         .unwrap();
     }
     let db = Db::open_in_memory().unwrap();
-    let stats = scan_directory_with(
-        &db,
-        dir.path(),
-        &ScanOptions {
-            jobs: 4,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut options = ScanOptions::default();
+    options.jobs = 4;
+    let stats = scan_directory_with(&db, dir.path(), &options).unwrap();
     assert_eq!(stats.scanned, n as u64, "every file must be scanned once");
     assert_eq!(
         db.list_tracks().unwrap().len(),
@@ -199,15 +181,9 @@ fn scans_more_than_batch_files_persists_all_once() {
 
     // Idempotent re-scan: still exactly n rows (catches duplicate writes from a
     // wrong flush cadence).
-    let stats2 = scan_directory_with(
-        &db,
-        dir.path(),
-        &ScanOptions {
-            jobs: 4,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut options = ScanOptions::default();
+    options.jobs = 4;
+    let stats2 = scan_directory_with(&db, dir.path(), &options).unwrap();
     assert_eq!(stats2.scanned, 0);
     assert_eq!(stats2.already_present, n as u64);
     assert_eq!(db.list_tracks().unwrap().len(), n);
@@ -231,16 +207,10 @@ fn byte_threshold_flush_persists_all_art() {
     }
     // Cap below a couple files' cumulative art so the byte branch flushes often.
     let db = Db::open_in_memory().unwrap();
-    let stats = scan_directory_with(
-        &db,
-        dir.path(),
-        &ScanOptions {
-            jobs: 4,
-            batch_bytes: 100,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut options = ScanOptions::default();
+    options.jobs = 4;
+    options.batch_bytes = 100;
+    let stats = scan_directory_with(&db, dir.path(), &options).unwrap();
 
     assert_eq!(stats.scanned, n as u64);
     let tracks = db.list_tracks().unwrap();
@@ -373,10 +343,8 @@ fn follow_symlinks_dedups_file_and_sibling_symlink() {
     symlink(&song, dir.path().join("link.flac")).unwrap();
 
     let db = Db::open_in_memory().unwrap();
-    let opts = ScanOptions {
-        follow_symlinks: true,
-        ..Default::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.follow_symlinks = true;
     let stats = scan_directory_with(&db, dir.path(), &opts).unwrap();
 
     assert_eq!(stats.scanned, 1, "real file and its symlink ingest once");
@@ -401,10 +369,8 @@ fn follow_symlinks_dedups_file_across_directories() {
     symlink(&song, b.join("alias.flac")).unwrap();
 
     let db = Db::open_in_memory().unwrap();
-    let opts = ScanOptions {
-        follow_symlinks: true,
-        ..Default::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.follow_symlinks = true;
     let stats = scan_directory_with(&db, dir.path(), &opts).unwrap();
 
     assert_eq!(stats.scanned, 1);
@@ -424,10 +390,8 @@ fn follow_symlinks_dedups_via_symlinked_directory() {
     symlink(&real, dir.path().join("mirror")).unwrap();
 
     let db = Db::open_in_memory().unwrap();
-    let opts = ScanOptions {
-        follow_symlinks: true,
-        ..Default::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.follow_symlinks = true;
     let stats = scan_directory_with(&db, dir.path(), &opts).unwrap();
 
     assert_eq!(stats.scanned, 1);
@@ -447,10 +411,8 @@ fn follow_symlinks_counts_unsupported_symlink_target_as_skipped() {
     std::fs::write(dir.path().join("song.flac"), flac_minimal(b"AUDIO")).unwrap();
 
     let db = Db::open_in_memory().unwrap();
-    let opts = ScanOptions {
-        follow_symlinks: true,
-        ..Default::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.follow_symlinks = true;
     let stats = scan_directory_with(&db, dir.path(), &opts).unwrap();
 
     assert_eq!(stats.scanned, 1);
@@ -501,10 +463,8 @@ fn follow_symlinks_mirrored_dir_counts_unsupported_file_once() {
     symlink(&real, dir.path().join("mirror")).unwrap();
 
     let db = Db::open_in_memory().unwrap();
-    let opts = ScanOptions {
-        follow_symlinks: true,
-        ..Default::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.follow_symlinks = true;
     let stats = scan_directory_with(&db, dir.path(), &opts).unwrap();
 
     assert_eq!(stats.scanned, 0);
@@ -522,10 +482,8 @@ fn follow_symlinks_dedups_hardlinks_to_same_inode() {
     std::fs::hard_link(&song, dir.path().join("link.flac")).unwrap();
 
     let db = Db::open_in_memory().unwrap();
-    let opts = ScanOptions {
-        follow_symlinks: true,
-        ..Default::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.follow_symlinks = true;
     let stats = scan_directory_with(&db, dir.path(), &opts).unwrap();
 
     assert_eq!(

@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lidarr-musefs"
-version = "1.2.0"
+version = "2.0.0"
 description = "Sync Lidarr metadata into the musefs SQLite store"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Conor Futro" }]
-dependencies = ["python-musefs>=1.2.0"]
+dependencies = ["python-musefs>=2.0.0"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -39,6 +39,5 @@ where = ["src"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 markers = [
-    "musefs_bin: tests that shell out to the real `musefs` Rust binary (opt-in)",
+    "musefs_bin: tests that shell out to the real `musefs` Rust binary",
 ]
-addopts = "-m 'not musefs_bin'"

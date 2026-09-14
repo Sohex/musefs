@@ -74,6 +74,8 @@ fn m4a_synthesis_includes_every_cover_art() {
         picture_type: PictureType::new(3).unwrap(),
         width: 0,
         height: 0,
+        depth: 0,
+        colors: 0,
         data_len: BlobLen::new(100).unwrap(),
     };
     let art2 = ArtInput {
@@ -83,6 +85,8 @@ fn m4a_synthesis_includes_every_cover_art() {
         picture_type: PictureType::new(0).unwrap(),
         width: 0,
         height: 0,
+        depth: 0,
+        colors: 0,
         data_len: BlobLen::new(200).unwrap(),
     };
 

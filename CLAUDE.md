@@ -37,7 +37,7 @@ the integration layer — cross-cutting logic belongs there, and `musefs-fuse`
 cargo build                              # build the workspace
 cargo test                               # all crates (excludes FUSE e2e)
 cargo test -p musefs-core read_at        # one crate / substring filter
-cargo test -p musefs-fuse -- --ignored   # FUSE e2e; needs /dev/fuse + libfuse
+cargo test -p musefs-fuse -- --ignored   # FUSE e2e; needs /dev/fuse + fusermount3
 cargo clippy --all-targets               # lint; benches/ and tests/ only compile here
 cargo fmt
 ```
@@ -50,7 +50,7 @@ cargo fmt
 | Dev workflow: full test tiers (fuzzing, interop, mutation gate), conventions (errors, integer casts), adding a format, contrib test suites | [Contributing](docs/src/contributing/setup.md) |
 | Per-format synthesis behavior and lossy edges | [Formats](docs/src/formats/overview.md) |
 | External-writer store contract | [architecture/store.md](docs/src/architecture/store.md#the-external-writer-contract) |
-| Usage / CLI flags | [README.md](README.md) |
+| Usage / CLI flags | [guide/configuration.md](docs/src/guide/configuration.md) |
 | Historical design specs / implementation plans | `docs/superpowers/specs/` / `docs/superpowers/plans/` |
 
 Consult these before exploring by hand; they are kept current.

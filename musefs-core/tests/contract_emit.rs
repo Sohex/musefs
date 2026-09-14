@@ -30,12 +30,14 @@ fn emit_contract_fixtures() {
         let br = BackingReader::new(&file, &buf, &pool, 0, resolved.stamp.size, &epoch);
         let bytes = read_at_with_file(&resolved, &db, &br, 0, resolved.total_len)
             .expect("synthesize served bytes");
-        // Name the output by track id + the backing file's extension, so the
-        // independent reader can pick the right parser.
-        let ext = std::path::Path::new(&track.backing_path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("bin");
-        std::fs::write(out.join(format!("{}.{ext}", track.id)), &bytes).unwrap();
+        // Name the output after the backing file, so the independent reader
+        // can pick the right parser and the right expectations for each track.
+        let name = track
+            .backing_path
+            .file_name()
+            .expect("backing path names a file");
+        let dest = out.join(name);
+        assert!(!dest.exists(), "two tracks share the file name {name:?}");
+        std::fs::write(dest, &bytes).unwrap();
     }
 }

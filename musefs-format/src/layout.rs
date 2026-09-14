@@ -2,6 +2,7 @@ use crate::BlobLen;
 
 /// Validation errors discovered in a layout at synthesis time.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum LayoutError {
     /// A segment reported zero length.
     #[error("a segment reported zero length")]
@@ -23,6 +24,9 @@ pub enum LayoutError {
 
 /// One contiguous run of bytes in a synthesized virtual file.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// Deliberately not `#[non_exhaustive]` (#708): `read_at` matches every segment
+// kind, and a new one must fail to compile there rather than fall into a
+// wildcard on the path that splices audio bytes.
 pub enum Segment {
     /// Generated framing/text bytes, fully materialized.
     Inline(Vec<u8>),
@@ -33,10 +37,14 @@ pub enum Segment {
     /// A run of original audio pages served with each page's sequence number
     /// shifted by `seq_delta` and its CRC recomputed. The byte length is unchanged
     /// (renumbering patches in place), so `len` equals the backing audio length.
+    /// `serial` is the logical bitstream the run belongs to: a page carrying any
+    /// other serial is a second bitstream the shift would corrupt, and is refused
+    /// at serve time (#722).
     OggAudio {
         offset: u64,
         len: u64,
         seq_delta: i64,
+        serial: u32,
     },
     /// A run of an embedded picture's serialized bytes, served lazily from the art
     /// store (never stored in the layout). When `base64`, the run is `len` chars of

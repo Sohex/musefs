@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # Same-runner A/B wall-clock comparison of the read_throughput criterion bench.
 # Benches the base ref and HEAD back-to-back on ONE machine (robust to
-# runner-to-runner variance), then diffs with critcmp. This is the local-dev /
-# single-machine entry point; CI instead splits the two bench runs across
-# separate runners (perf-bench-one.sh) for wall-clock and joins them with the
-# same perf-ab-compare.sh. The A/B job is informational (excluded from the ci-ok
-# gate); a build/bench failure surfaces as a red job rather than being swallowed.
+# runner-to-runner variance), then diffs with critcmp. CI's PR-only `perf-ab`
+# job runs this same script on one runner, and a local run reproduces it. The
+# A/B job is informational (excluded from the ci-ok gate); a build/bench failure
+# surfaces as a red job rather than being swallowed.
 #
 # Usage: scripts/perf-ab.sh <base-sha> <out-markdown-file>
 # Requires: cargo, critcmp on PATH. Run from the repo root with a clean tree.

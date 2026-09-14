@@ -65,6 +65,11 @@ pub struct ArtInput {
     pub picture_type: PictureType,
     pub width: u32,
     pub height: u32,
+    /// Bits per pixel, or 0 for unknown — which is what the format itself means
+    /// by the value, so it needs no separate sentinel.
+    pub depth: u32,
+    /// Colours used, for an indexed image; 0 for non-indexed or unknown.
+    pub colors: u32,
     pub data_len: BlobLen,
 }
 
@@ -77,6 +82,13 @@ pub struct EmbeddedPicture {
     pub description: String,
     pub width: u32,
     pub height: u32,
+    /// Bits per pixel, 0 for unknown. Only FLAC's `PICTURE` block carries this;
+    /// ID3's `APIC` and MP4's `covr` have no field for it, so those readers
+    /// report 0 — the same value the format uses for "not stated".
+    pub depth: u32,
+    /// Colours used for an indexed image, 0 for non-indexed or unknown. Same
+    /// per-format availability as `depth`.
+    pub colors: u32,
     pub data: Vec<u8>,
 }
 

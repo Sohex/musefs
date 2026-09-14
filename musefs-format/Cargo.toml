@@ -6,6 +6,15 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../README.md"
+keywords = ["audio", "metadata", "tags", "flac", "id3"]
+categories = ["multimedia::audio", "parser-implementations", "encoding"]
+# Integration tests stay in the repository: they need the `fuzzing` feature,
+# which only the path self-dev-dependency below turns on, and cargo strips path
+# dev-dependencies at publish. From the published crate some would fail to
+# build and the `#![cfg(feature = "fuzzing")]` proptests would silently
+# compile to nothing.
+exclude = ["tests/"]
 
 [dependencies]
 thiserror = "2"
@@ -22,7 +31,7 @@ metaflac = "0.2"
 mp4 = "0.14"
 crc = "3"
 hound = "3"
-musefs-db = { path = "../musefs-db", version = "1.3.0" }
+musefs-db = { path = "../musefs-db", version = "2.0.0" }
 proptest = "1"
 # Self-dependency: turns the `fuzzing` feature on for this crate's own test
 # builds, so tests/ can use fuzz_check and the proptests run without an

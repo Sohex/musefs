@@ -1,3 +1,8 @@
+//! The musefs integration layer: scanning a library into the store
+//! ([`scan_directory`]), the virtual tree of re-tagged paths ([`VirtualTree`]),
+//! and serving any byte range of a synthesized file ([`read_at`]), behind the
+//! [`Musefs`] facade the FUSE adapter drives.
+
 mod byte_budget;
 mod db_pool;
 mod error;
@@ -18,10 +23,11 @@ pub mod warn_limit;
 
 pub use db_pool::DbPool;
 pub use error::{CoreError, Result};
-pub use facade::{Attr, Fh, Mode, MountConfig, Musefs, PassthroughFd, TreeSnapshot};
+pub use facade::{Attr, Fh, Mode, MountConfig, Musefs, PassthroughFd, TreeSnapshot, VirtualMtime};
 pub use musefs_db::convert;
 pub use readahead::{BackingReader, ReadAhead, ReadAheadPool};
 pub use reader::{HeaderCache, ResolvedFile, read_at, read_at_with_file};
+#[cfg(any(test, feature = "test-support"))]
 pub use scan::scan_directory_full_oracle;
 pub use scan::{
     ChecksumTier, MatchStrictness, ProgressSink, RevalidateStats, ScanOptions, ScanProgress,

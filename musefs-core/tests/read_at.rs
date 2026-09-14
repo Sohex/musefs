@@ -16,13 +16,14 @@ fn setup() -> (tempfile::TempDir, Db, i64) {
     let db = Db::open_in_memory().unwrap();
     let id = db
         .upsert_track(&NewTrack {
-            backing_path: flac.to_string_lossy().into_owned(),
+            backing_path: flac.clone(),
             format: Format::Flac,
             audio_offset,
             audio_length,
             backing_size: meta.len(),
             backing_mtime_ns: common::real_mtime_ns(&flac),
             backing_ctime_ns: common::real_ctime_ns(&flac),
+            backing_ino: None,
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("title", "Real", 0)])
@@ -78,12 +79,7 @@ fn read_at_streams_art_image_segments() {
     let db = Db::open_in_memory().unwrap();
     let art = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
     let art_id = db
-        .upsert_art(&musefs_db::NewArt {
-            mime: "image/png".to_string(),
-            width: None,
-            height: None,
-            data: art.clone(),
-        })
+        .upsert_art(&musefs_db::NewArt { data: art.clone() })
         .unwrap();
 
     let layout = RegionLayout::validated(vec![
@@ -105,8 +101,12 @@ fn read_at_streams_art_image_segments() {
             size: 0,
             mtime_ns: 0,
             ctime_ns: 0,
+            ino: None,
         },
-        mtime_secs: 0,
+        mtime: musefs_core::VirtualMtime {
+            secs: 0,
+            content_version: 0,
+        },
         last_page: std::sync::Mutex::new(None),
         cache_bytes: 0,
         // Splicing test: bypass the snapshot/version-recheck path (no real track

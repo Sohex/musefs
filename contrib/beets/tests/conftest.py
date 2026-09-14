@@ -3,7 +3,27 @@ import time
 
 import pytest
 from musefs_common import connect as musefs_connect
+from musefs_common import path_param
 from musefs_common.schema import SCHEMA_SQL
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _no_beets_migration_backups():
+    """Stop beets backing its database up before each migration.
+
+    beets does that by default, naming the copy after the database path — which
+    for an in-memory library is the literal ``:memory:`` — so a test opening one
+    wrote eleven ``:memory:-before-*.bak`` files into the working directory.
+    beets' own test helper turns the option off the same way. Session-wide, so
+    any test that opens a real library gets it without asking."""
+    try:
+        import beets
+    except ImportError:
+        # The beets-dependent modules importorskip; the rest never open a library.
+        yield
+        return
+    beets.config["create_backup_before_migrations"] = False
+    yield
 
 
 @pytest.fixture
@@ -31,7 +51,15 @@ def insert_track(
     cur = conn.execute(
         "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, "
         "backing_size, backing_mtime_ns, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (backing_path, fmt, audio_offset, audio_length, backing_size, backing_mtime_ns, now),
+        (
+            path_param(backing_path),
+            fmt,
+            audio_offset,
+            audio_length,
+            backing_size,
+            backing_mtime_ns,
+            now,
+        ),
     )
     return cur.lastrowid
 

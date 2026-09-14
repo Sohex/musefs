@@ -231,34 +231,58 @@ pub mod fixtures {
     /// little-endian sample bytes. Avoids hound (a dev-dep) so the fixture is
     /// usable from the fuzz crate as well as tests.
     pub fn wav(samples: &[i16]) -> Vec<u8> {
+        wav_in(samples, crate::wav::ByteOrder::Little)
+    }
+
+    /// [`wav`] in either byte order. `Big` builds the `RIFX` twin (#770): the
+    /// form size, both chunk sizes, every `fmt ` field and every sample are
+    /// big-endian.
+    pub fn wav_in(samples: &[i16], order: crate::wav::ByteOrder) -> Vec<u8> {
+        use crate::wav::ByteOrder;
+        let big = order == ByteOrder::Big;
+        let u16_bytes = |v: u16| {
+            if big {
+                v.to_be_bytes()
+            } else {
+                v.to_le_bytes()
+            }
+        };
+        let u32_bytes = |v: u32| {
+            if big {
+                v.to_be_bytes()
+            } else {
+                v.to_le_bytes()
+            }
+        };
+
         // fmt  chunk payload: PCM format (16 bytes)
         let mut fmt = Vec::with_capacity(16);
-        fmt.extend_from_slice(&1u16.to_le_bytes()); // wFormatTag = PCM
-        fmt.extend_from_slice(&1u16.to_le_bytes()); // nChannels = 1
-        fmt.extend_from_slice(&44_100u32.to_le_bytes()); // nSamplesPerSec
-        fmt.extend_from_slice(&88_200u32.to_le_bytes()); // nAvgBytesPerSec = 44100*2
-        fmt.extend_from_slice(&2u16.to_le_bytes()); // nBlockAlign = 2
-        fmt.extend_from_slice(&16u16.to_le_bytes()); // wBitsPerSample
+        fmt.extend_from_slice(&u16_bytes(1)); // wFormatTag = PCM
+        fmt.extend_from_slice(&u16_bytes(1)); // nChannels = 1
+        fmt.extend_from_slice(&u32_bytes(44_100)); // nSamplesPerSec
+        fmt.extend_from_slice(&u32_bytes(88_200)); // nAvgBytesPerSec = 44100*2
+        fmt.extend_from_slice(&u16_bytes(2)); // nBlockAlign = 2
+        fmt.extend_from_slice(&u16_bytes(16)); // wBitsPerSample
 
         let mut data_payload: Vec<u8> = Vec::with_capacity(samples.len() * 2);
         for &s in samples {
-            data_payload.extend_from_slice(&s.to_le_bytes());
+            data_payload.extend_from_slice(&u16_bytes(s.cast_unsigned()));
         }
 
-        // Chunk helpers: 4-byte id + LE 32-bit size + payload.
+        // Chunk helpers: 4-byte id + 32-bit size + payload.
         let mut fmt_chunk = b"fmt ".to_vec();
-        fmt_chunk.extend_from_slice(&u32::try_from(fmt.len()).unwrap().to_le_bytes());
+        fmt_chunk.extend_from_slice(&u32_bytes(u32::try_from(fmt.len()).unwrap()));
         fmt_chunk.extend_from_slice(&fmt);
 
         let mut data_chunk = b"data".to_vec();
-        data_chunk.extend_from_slice(&u32::try_from(data_payload.len()).unwrap().to_le_bytes());
+        data_chunk.extend_from_slice(&u32_bytes(u32::try_from(data_payload.len()).unwrap()));
         data_chunk.extend_from_slice(&data_payload);
 
         // RIFF size = 4 ("WAVE") + fmt_chunk.len() + data_chunk.len()
         let riff_size = u32::try_from(4 + fmt_chunk.len() + data_chunk.len()).unwrap();
         let mut out = Vec::with_capacity(12 + fmt_chunk.len() + data_chunk.len());
-        out.extend_from_slice(b"RIFF");
-        out.extend_from_slice(&riff_size.to_le_bytes());
+        out.extend_from_slice(if big { b"RIFX" } else { b"RIFF" });
+        out.extend_from_slice(&u32_bytes(riff_size));
         out.extend_from_slice(b"WAVE");
         out.extend_from_slice(&fmt_chunk);
         out.extend_from_slice(&data_chunk);
@@ -362,6 +386,76 @@ pub mod fixtures {
         out
     }
 
+    /// The audio region of the multi-tag MP3 fixtures: an MPEG frame sync, then
+    /// bytes no locator decodes.
+    pub const MP3_FIXTURE_AUDIO: &[u8] = &[
+        0xFF, 0xFB, 0x90, 0x00, 0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04,
+    ];
+
+    /// An ID3v2.4 tag carrying `tags` as text frames, encoded by the production
+    /// ID3v2 builder, so the fixture is exactly what synthesis would emit. Its
+    /// header carries no flags.
+    pub fn id3v24_text_tag(tags: &[(&str, &str)]) -> Vec<u8> {
+        let inputs: Vec<crate::TagInput> = tags
+            .iter()
+            .map(|(k, v)| crate::TagInput::new(k, v))
+            .collect();
+        let (segments, _) =
+            crate::mp3::build_id3v2_segments(&inputs, &[], &[]).expect("a text-only tag builds");
+        segments
+            .iter()
+            .flat_map(|s| match s {
+                crate::Segment::Inline(b) => b.clone(),
+                _ => unreachable!("text frames are inline"),
+            })
+            .collect()
+    }
+
+    /// `tag` as an appended ID3v2.4 tag: the header's footer flag set, and the
+    /// 10-byte `3DI` footer the spec requires after a tag that follows the audio
+    /// (ID3v2.4 structure §3.4), which is a copy of the header under its own
+    /// magic. `tag` must carry no header flags, as [`id3v24_text_tag`]'s do not.
+    pub fn with_id3v24_footer(tag: &[u8]) -> Vec<u8> {
+        let mut out = tag.to_vec();
+        debug_assert_eq!(
+            out[5], 0,
+            "with_id3v24_footer expects a tag with no header flags"
+        );
+        out[5] = 0x10; // footer present, and nothing else
+        let mut footer = b"3DI".to_vec();
+        footer.extend_from_slice(&out[3..10]);
+        out.extend_from_slice(&footer);
+        out
+    }
+
+    /// A 128-byte ID3v1 trailer: `TAG` and zeroed fields.
+    pub fn id3v1_trailer() -> Vec<u8> {
+        let mut out = b"TAG".to_vec();
+        out.extend_from_slice(&[0u8; 125]);
+        out
+    }
+
+    /// `[ID3v2.4][ID3v2.4][MPEG audio]`: a run of two prepended tags (#767).
+    pub fn mp3_with_leading_tag_run() -> Vec<u8> {
+        let mut out = id3v24_text_tag(&[("title", "First Tag")]);
+        out.extend(id3v24_text_tag(&[("title", "Second Tag")]));
+        out.extend_from_slice(MP3_FIXTURE_AUDIO);
+        out
+    }
+
+    /// `[ID3v2.4][MPEG audio][ID3v2.4 + footer][ID3v1]`: ID3v2.4's
+    /// prepend-and-append layout (structure §5) ahead of a legacy trailer (#768).
+    pub fn mp3_with_front_and_back_tags() -> Vec<u8> {
+        let mut out = id3v24_text_tag(&[("title", "Front Title"), ("artist", "Front Artist")]);
+        out.extend_from_slice(MP3_FIXTURE_AUDIO);
+        out.extend(with_id3v24_footer(&id3v24_text_tag(&[(
+            "title",
+            "Back Title",
+        )])));
+        out.extend(id3v1_trailer());
+        out
+    }
+
     /// A well-formed ID3v2.4 MP3 carrying one binary `GEOB` frame (General
     /// Encapsulated Object) ahead of the audio. `GEOB` is not a text/`COMM`/
     /// `USLT`/`APIC` frame, so `mp3::read_binary_tags` classifies it as opaque —
@@ -432,11 +526,13 @@ mod tests {
                 offset: 200,
                 len: 30,
                 seq_delta: 1,
+                serial: 7,
             },
             Segment::OggAudio {
                 offset: 230,
                 len: 70,
                 seq_delta: 1,
+                serial: 7,
             },
         ]);
         assert_backing_covers_audio(200, 100, &layout);
@@ -590,6 +686,29 @@ mod fixtures_tests {
         // is meant to reach immediately.
         let (opaque, _promoted) = crate::mp3::read_binary_tags(&f);
         assert!(!opaque.is_empty(), "expected an opaque binary ID3 frame");
+    }
+
+    #[test]
+    fn multi_tag_mp3_fixtures_are_the_layouts_they_name() {
+        let audio = fixtures::MP3_FIXTURE_AUDIO;
+        let run = fixtures::mp3_with_leading_tag_run();
+        let b = crate::mp3::locate_audio(&run).unwrap();
+        assert_eq!(b.audio_offset, (run.len() - audio.len()) as u64);
+        assert_eq!(b.audio_length, audio.len() as u64);
+        assert_eq!(b.id3v2_tags.len(), 2);
+
+        let both = fixtures::mp3_with_front_and_back_tags();
+        let b = crate::mp3::locate_audio(&both).unwrap();
+        let start = usize::try_from(b.audio_offset).unwrap();
+        assert_eq!(&both[start..start + audio.len()], audio);
+        assert_eq!(b.audio_length, audio.len() as u64);
+        assert!(both.ends_with(&fixtures::id3v1_trailer()));
+        let back = &b.id3v2_tags[1];
+        let back_end = usize::try_from(back.end).unwrap();
+        assert_eq!(back_end, both.len() - 128, "the appended tag, before ID3v1");
+        assert_eq!(&both[back_end - 10..back_end - 7], b"3DI");
+        let tags = crate::mp3::read_metadata(&both, &both, both.len() as u64, &b).tags;
+        assert_eq!(tags, vec![("title".to_string(), "Back Title".to_string())]);
     }
 
     #[test]

@@ -1,5 +1,7 @@
-use crate::art::{set_track_art_in, upsert_art_in};
-use crate::models::{BinaryTag, NewArt, NewTrack, StructuralBlock, Tag, Track, TrackArt};
+use crate::art::{refresh_embedded_art_in, set_track_art_in, upsert_art_in};
+use crate::models::{
+    BinaryTag, ChecksumWrite, EmbeddedArt, NewArt, NewTrack, StructuralBlock, Tag, Track, TrackArt,
+};
 use crate::structural::set_structural_blocks_in;
 use crate::tags::{replace_tags_in, set_binary_tags_in};
 use crate::tracks::{
@@ -30,6 +32,7 @@ impl Db<ReadWrite> {
     pub fn bulk_writer(&self) -> Result<BulkWriter<'_>> {
         Ok(BulkWriter {
             tx: self.conn.unchecked_transaction()?,
+            verified_art: std::collections::HashSet::new(),
         })
     }
 }
@@ -41,11 +44,25 @@ impl Db<ReadWrite> {
 /// on a single caller-held transaction so a whole batch commits with one fsync.
 pub struct BulkWriter<'c> {
     tx: Transaction<'c>,
+    /// `art` rows this writer has already verified hold the bytes their digest
+    /// names (#724), so a cover shared by every track of an album is compared
+    /// once per batch rather than once per track.
+    verified_art: std::collections::HashSet<i64>,
 }
 
 impl BulkWriter<'_> {
     pub fn upsert_track(&mut self, t: &NewTrack) -> Result<i64> {
-        upsert_track_in(&self.tx, t)
+        upsert_track_in(&self.tx, t, ChecksumWrite::Keep, ChecksumWrite::Keep)
+    }
+
+    /// See [`crate::Db::upsert_track_with_checksums`].
+    pub fn upsert_track_with_checksums(
+        &mut self,
+        t: &NewTrack,
+        fingerprint: ChecksumWrite<'_>,
+        content_hash: ChecksumWrite<'_>,
+    ) -> Result<i64> {
+        upsert_track_in(&self.tx, t, fingerprint, content_hash)
     }
 
     pub fn tracks_by_fingerprint(&self, fp: &str) -> Result<Vec<Track>> {
@@ -55,8 +72,8 @@ impl BulkWriter<'_> {
     pub fn set_track_checksums(
         &self,
         id: i64,
-        fingerprint: Option<&str>,
-        content_hash: Option<&str>,
+        fingerprint: ChecksumWrite<'_>,
+        content_hash: ChecksumWrite<'_>,
     ) -> Result<()> {
         set_track_checksums_in(&self.tx, id, fingerprint, content_hash)
     }
@@ -65,14 +82,15 @@ impl BulkWriter<'_> {
     pub fn retarget_track(
         &self,
         id: i64,
-        new_backing_path: &str,
+        new_backing_path: &std::path::Path,
         backing_size: u64,
         backing_mtime_ns: i64,
         backing_ctime_ns: i64,
+        backing_ino: Option<u64>,
         audio_offset: u64,
         audio_length: u64,
-        fingerprint: Option<&str>,
-        content_hash: Option<&str>,
+        fingerprint: ChecksumWrite<'_>,
+        content_hash: ChecksumWrite<'_>,
     ) -> Result<()> {
         retarget_track_in(
             &self.tx,
@@ -81,6 +99,7 @@ impl BulkWriter<'_> {
             backing_size,
             backing_mtime_ns,
             backing_ctime_ns,
+            backing_ino,
             audio_offset,
             audio_length,
             fingerprint,
@@ -88,7 +107,7 @@ impl BulkWriter<'_> {
         )
     }
 
-    pub fn get_track_by_path(&self, path: &str) -> Result<Option<Track>> {
+    pub fn get_track_by_path(&self, path: &std::path::Path) -> Result<Option<Track>> {
         get_track_by_path_in(&self.tx, path)
     }
 
@@ -109,11 +128,19 @@ impl BulkWriter<'_> {
     }
 
     pub fn upsert_art(&mut self, a: &NewArt) -> Result<i64> {
-        upsert_art_in(&self.tx, a)
+        upsert_art_in(&self.tx, a, &mut self.verified_art)
     }
 
     pub fn set_track_art(&mut self, track_id: i64, items: &[TrackArt]) -> Result<()> {
         set_track_art_in(&self.tx, track_id, items)
+    }
+
+    pub fn refresh_embedded_art(
+        &mut self,
+        track_id: i64,
+        pictures: &[EmbeddedArt],
+    ) -> Result<usize> {
+        refresh_embedded_art_in(&self.tx, track_id, pictures)
     }
 
     /// Run one item's writes inside a `SAVEPOINT`, so an error discards only
@@ -175,22 +202,20 @@ mod tests {
             for i in 0..3 {
                 let id = bw
                     .upsert_track(&NewTrack {
-                        backing_path: format!("/m/{i}.flac"),
+                        backing_path: std::path::PathBuf::from(format!("/m/{i}.flac")),
                         format: Format::Flac,
                         audio_offset: 100,
                         audio_length: 200,
                         backing_size: 300,
                         backing_mtime_ns: 1,
                         backing_ctime_ns: 0,
+                        backing_ino: None,
                     })
                     .unwrap();
                 bw.replace_tags(id, &[Tag::new("title", &format!("t{i}"), 0)])
                     .unwrap();
                 let art_id = bw
                     .upsert_art(&NewArt {
-                        mime: "image/png".into(),
-                        width: None,
-                        height: None,
                         data: vec![1, 2, 3, 4],
                     })
                     .unwrap();
@@ -200,6 +225,11 @@ mod tests {
                         art_id,
                         picture_type: 3,
                         description: String::new(),
+                        mime: "image/png".into(),
+                        width: None,
+                        height: None,
+                        depth: 0,
+                        colors: 0,
                         ordinal: 0,
                     }],
                 )
@@ -246,6 +276,7 @@ mod tests {
             backing_size: 0,
             backing_mtime_ns: 0,
             backing_ctime_ns: 0,
+            backing_ino: None,
         }
     }
 
@@ -271,7 +302,7 @@ mod tests {
             bw.upsert_track(&new_track("/m/after.flac")).unwrap();
             bw.commit().unwrap();
         }
-        let paths: Vec<String> = db
+        let paths: Vec<std::path::PathBuf> = db
             .list_tracks()
             .unwrap()
             .into_iter()
@@ -282,7 +313,10 @@ mod tests {
             2,
             "the doomed item must leave nothing: {paths:?}"
         );
-        assert!(!paths.iter().any(|p| p.contains("doomed")), "{paths:?}");
+        assert!(
+            !paths.iter().any(|p| p.to_string_lossy().contains("doomed")),
+            "{paths:?}"
+        );
     }
 
     /// A successful item releases its savepoint rather than rolling it back, and
@@ -323,7 +357,7 @@ mod tests {
             }
             bw.commit().unwrap();
         }
-        let paths: Vec<String> = db
+        let paths: Vec<std::path::PathBuf> = db
             .list_tracks()
             .unwrap()
             .into_iter()
@@ -367,13 +401,14 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let tid = db
             .upsert_track(&crate::NewTrack {
-                backing_path: "/a.mp3".into(),
+                backing_path: std::path::PathBuf::from("/a.mp3"),
                 format: crate::Format::Mp3,
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         db.set_binary_tags(
@@ -409,13 +444,14 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let tid = db
             .upsert_track(&crate::NewTrack {
-                backing_path: "/a.mp3".into(),
+                backing_path: std::path::PathBuf::from("/a.mp3"),
                 format: crate::Format::Mp3,
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         {
@@ -443,6 +479,38 @@ mod tests {
         );
     }
 
+    /// The skip lives in the shared body, so the scanner's batch path gets it.
+    #[test]
+    fn bulk_set_structural_blocks_leaves_an_identical_set_alone() {
+        use crate::StructuralBlock;
+        let db = Db::open_in_memory().unwrap();
+        let blocks = [StructuralBlock {
+            kind: "STREAMINFO".into(),
+            ordinal: 0,
+            body: vec![1, 2],
+        }];
+        let id = db
+            .upsert_track(&NewTrack {
+                backing_path: std::path::PathBuf::from("/a.flac"),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 1,
+                backing_size: 1,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
+                backing_ino: None,
+            })
+            .unwrap();
+        db.set_structural_blocks(id, &blocks).unwrap();
+        let before = db.track_content_version(id).unwrap();
+
+        let mut bw = db.bulk_writer().unwrap();
+        bw.set_structural_blocks(id, &blocks).unwrap();
+        bw.commit().unwrap();
+
+        assert_eq!(db.track_content_version(id).unwrap(), before);
+    }
+
     #[test]
     fn bulk_set_structural_blocks_round_trips() {
         use crate::StructuralBlock;
@@ -451,13 +519,14 @@ mod tests {
             let mut bw = db.bulk_writer().unwrap();
             let id = bw
                 .upsert_track(&NewTrack {
-                    backing_path: "/a.flac".into(),
+                    backing_path: std::path::PathBuf::from("/a.flac"),
                     format: Format::Flac,
                     audio_offset: 0,
                     audio_length: 1,
                     backing_size: 1,
                     backing_mtime_ns: 0,
                     backing_ctime_ns: 0,
+                    backing_ino: None,
                 })
                 .unwrap();
             bw.set_structural_blocks(
@@ -492,13 +561,14 @@ mod tests {
         {
             let mut bw = db.bulk_writer().unwrap();
             bw.upsert_track(&NewTrack {
-                backing_path: "/m/ghost.flac".into(),
+                backing_path: std::path::PathBuf::from("/m/ghost.flac"),
                 format: Format::Flac,
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
             // Dropped here without `commit()` → Transaction rolls back.

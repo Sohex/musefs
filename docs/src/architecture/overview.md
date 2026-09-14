@@ -30,8 +30,11 @@ musefs-core ← (db, format)     orchestration: virtual tree, resolution, scanni
 musefs-fuse ← (core)           thin FUSE adapter (fuser)
         ↑
 musefs-cli  ← (core, fuse, db) clap commands library (scan/mount logic)
-musefs      ← (cli)            thin binary entrypoint; published as `musefs`
+musefs      ← (cli, fuse)      thin binary entrypoint; published as `musefs`
 ```
+
+The binary's `musefs-fuse` edge is optional: it comes with the default
+`jemalloc` feature, so the binary can install the allocator-stats probe.
 
 `musefs-core` is the integration layer — cross-cutting logic belongs there.
 `musefs-fuse`, `musefs-cli`, and the `musefs` binary crate are deliberately

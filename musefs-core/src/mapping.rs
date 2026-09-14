@@ -76,13 +76,18 @@ pub(crate) fn track_art_to_inputs<M>(db: &Db<M>, track_id: i64) -> Result<Vec<Ar
                 value: ta.picture_type,
             });
         };
+        // Every one of these but `data_len` now comes from the link (#716).
+        // They describe this file's picture block; only the length belongs to
+        // the deduplicated blob.
         inputs.push(ArtInput {
             art_id: ta.art_id,
-            mime: meta.mime,
+            mime: ta.mime,
             description: ta.description,
             picture_type,
-            width: meta.width.unwrap_or(0),
-            height: meta.height.unwrap_or(0),
+            width: ta.width.unwrap_or(0),
+            height: ta.height.unwrap_or(0),
+            depth: ta.depth,
+            colors: ta.colors,
             data_len,
         });
     }
@@ -184,31 +189,22 @@ mod tests {
         let db = Db::open(&path).unwrap();
         let tid = db
             .upsert_track(&NewTrack {
-                backing_path: "/a.flac".into(),
+                backing_path: std::path::PathBuf::from("/a.flac"),
                 format: Format::Flac,
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         let nonempty = db
             .upsert_art(&NewArt {
-                mime: "image/png".into(),
-                width: None,
-                height: None,
                 data: vec![1, 2, 3],
             })
             .unwrap();
-        let empty = db
-            .upsert_art(&NewArt {
-                mime: "image/png".into(),
-                width: None,
-                height: None,
-                data: vec![],
-            })
-            .unwrap();
+        let empty = db.upsert_art(&NewArt { data: vec![] }).unwrap();
         db.set_track_art(
             tid,
             &[
@@ -216,12 +212,22 @@ mod tests {
                     art_id: nonempty,
                     picture_type: 3,
                     description: String::new(),
+                    mime: "image/png".into(),
+                    width: None,
+                    height: None,
+                    depth: 0,
+                    colors: 0,
                     ordinal: 0,
                 },
                 TrackArt {
                     art_id: empty,
                     picture_type: 3,
                     description: String::new(),
+                    mime: "image/png".into(),
+                    width: None,
+                    height: None,
+                    depth: 0,
+                    colors: 0,
                     ordinal: 1,
                 },
             ],
@@ -240,13 +246,14 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let tid = db
             .upsert_track(&NewTrack {
-                backing_path: "/a.mp3".into(),
+                backing_path: std::path::PathBuf::from("/a.mp3"),
                 format: Format::Mp3,
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         db.set_binary_tags(
@@ -273,13 +280,14 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let tid = db
             .upsert_track(&NewTrack {
-                backing_path: "/a.mp3".into(),
+                backing_path: std::path::PathBuf::from("/a.mp3"),
                 format: Format::Mp3,
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         db.replace_tags(tid, &[Tag::new("artist", "A", 0)]).unwrap();
@@ -310,20 +318,18 @@ mod tests {
         let db = Db::open(&path).unwrap();
         let tid = db
             .upsert_track(&NewTrack {
-                backing_path: "/a.flac".into(),
+                backing_path: std::path::PathBuf::from("/a.flac"),
                 format: Format::Flac,
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         let good = db
             .upsert_art(&NewArt {
-                mime: "image/png".into(),
-                width: None,
-                height: None,
                 data: vec![1, 2, 3, 4],
             })
             .unwrap();
@@ -342,8 +348,8 @@ mod tests {
         // under test (length and byte_len disagree, and byte_len is negative) —
         // do not "fix" the mismatch.
         raw.execute(
-            "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
-             VALUES (?1, 'image/png', NULL, NULL, -1, X'0909090909')",
+            "INSERT INTO art (sha256, byte_len, data) \
+             VALUES (?1, -1, X'0909090909')",
             [&"9".repeat(64)],
         )
         .unwrap();
@@ -365,12 +371,22 @@ mod tests {
                     art_id: good,
                     picture_type: 3,
                     description: String::new(),
+                    mime: "image/png".into(),
+                    width: None,
+                    height: None,
+                    depth: 0,
+                    colors: 0,
                     ordinal: 0,
                 },
                 TrackArt {
                     art_id: bad,
                     picture_type: 3,
                     description: String::new(),
+                    mime: "image/png".into(),
+                    width: None,
+                    height: None,
+                    depth: 0,
+                    colors: 0,
                     ordinal: 1,
                 },
             ],
@@ -392,20 +408,18 @@ mod tests {
         let db = Db::open(&path).unwrap();
         let tid = db
             .upsert_track(&NewTrack {
-                backing_path: "/a.flac".into(),
+                backing_path: std::path::PathBuf::from("/a.flac"),
                 format: Format::Flac,
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         let orphan_id = db
             .upsert_art(&NewArt {
-                mime: "image/png".into(),
-                width: None,
-                height: None,
                 data: vec![1, 2, 3, 4],
             })
             .unwrap();
@@ -415,6 +429,11 @@ mod tests {
                 art_id: orphan_id,
                 picture_type: 3,
                 description: String::new(),
+                mime: "image/png".into(),
+                width: None,
+                height: None,
+                depth: 0,
+                colors: 0,
                 ordinal: 0,
             }],
         )
@@ -466,13 +485,14 @@ mod tests {
         let db = Db::open(&path).unwrap();
         let tid = db
             .upsert_track(&NewTrack {
-                backing_path: "/a.opus".into(),
+                backing_path: std::path::PathBuf::from("/a.opus"),
                 format: Format::Opus,
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
 
@@ -481,7 +501,7 @@ mod tests {
             .unwrap();
         let plant = |byte_len: i64, sha: &str| {
             raw.execute(
-                "INSERT INTO art (sha256, mime, byte_len, data) VALUES (?1, 'image/png', ?2, X'')",
+                "INSERT INTO art (sha256, byte_len, data) VALUES (?1, ?2, X'')",
                 rusqlite::params![sha, byte_len],
             )
             .unwrap();
@@ -497,6 +517,11 @@ mod tests {
                 art_id: at_cap,
                 picture_type: 3,
                 description: String::new(),
+                mime: "image/png".into(),
+                width: None,
+                height: None,
+                depth: 0,
+                colors: 0,
                 ordinal: 0,
             }],
         )
@@ -511,6 +536,11 @@ mod tests {
                 art_id: over,
                 picture_type: 3,
                 description: String::new(),
+                mime: "image/png".into(),
+                width: None,
+                height: None,
+                depth: 0,
+                colors: 0,
                 ordinal: 0,
             }],
         )
@@ -535,9 +565,6 @@ mod tests {
         let db = Db::open(dir.path().join("src.db")).unwrap();
         let art_id = db
             .upsert_art(&NewArt {
-                mime: "image/png".into(),
-                width: None,
-                height: None,
                 data: vec![10, 20, 30, 40, 50],
             })
             .unwrap();

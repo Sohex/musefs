@@ -20,7 +20,6 @@ fn get_art_returns_data_and_len() {
     let art = db.get_art(id).unwrap().expect("art row");
     assert_eq!(art.data, vec![1, 2, 3, 4]);
     assert_eq!(art.byte_len, 4);
-    assert_eq!(art.mime, "image/jpeg");
 }
 
 #[test]
@@ -35,6 +34,11 @@ fn set_and_get_track_art() {
             art_id,
             picture_type: 3,
             description: "front".to_string(),
+            mime: "image/png".into(),
+            width: None,
+            height: None,
+            depth: 0,
+            colors: 0,
             ordinal: 0,
         }],
     )
@@ -59,6 +63,11 @@ fn get_track_art_with_meta_joins_the_art_row() {
             art_id,
             picture_type: 3,
             description: "front".to_string(),
+            mime: "image/png".into(),
+            width: None,
+            height: None,
+            depth: 0,
+            colors: 0,
             ordinal: 0,
         }],
     )
@@ -71,8 +80,8 @@ fn get_track_art_with_meta_joins_the_art_row() {
     assert_eq!(ta.picture_type, 3);
     assert_eq!(ta.description, "front");
     assert_eq!(ta.ordinal, 0);
+    assert_eq!(ta.mime, "image/png");
     let meta = meta.as_ref().expect("joined art metadata must be present");
-    assert_eq!(meta.mime, "image/jpeg");
     assert_eq!(meta.byte_len, 3);
 }
 
@@ -89,6 +98,11 @@ fn linking_art_bumps_content_version() {
             art_id,
             picture_type: 3,
             description: String::new(),
+            mime: "image/png".into(),
+            width: None,
+            height: None,
+            depth: 0,
+            colors: 0,
             ordinal: 0,
         }],
     )
@@ -102,9 +116,6 @@ fn read_art_chunk_streams_a_slice() {
     let db = Db::open_in_memory().unwrap();
     let id = db
         .upsert_art(&NewArt {
-            mime: "image/png".to_string(),
-            width: Some(2),
-            height: Some(3),
             data: vec![10, 11, 12, 13, 14, 15],
         })
         .unwrap();
@@ -116,8 +127,6 @@ fn read_art_chunk_streams_a_slice() {
 
     // Metadata without loading the blob.
     let meta = db.get_art_meta(id).unwrap().unwrap();
-    assert_eq!(meta.mime, "image/png");
-    assert_eq!(meta.width, Some(2));
     assert_eq!(meta.byte_len, 6);
 
     assert!(db.get_art_meta(999_999).unwrap().is_none());
@@ -128,28 +137,23 @@ fn gc_orphan_art_removes_unreferenced_rows() {
     let db = Db::open_in_memory().unwrap();
     let track = db
         .upsert_track(&musefs_db::NewTrack {
-            backing_path: "/x/a.flac".to_string(),
+            backing_path: std::path::PathBuf::from("/x/a.flac"),
             format: musefs_db::Format::Flac,
             audio_offset: 0,
             audio_length: 0,
             backing_size: 0,
             backing_mtime_ns: 0,
             backing_ctime_ns: 0,
+            backing_ino: None,
         })
         .unwrap();
     let referenced = db
         .upsert_art(&NewArt {
-            mime: "image/png".to_string(),
-            width: None,
-            height: None,
             data: vec![1, 2, 3],
         })
         .unwrap();
     let orphan = db
         .upsert_art(&NewArt {
-            mime: "image/png".to_string(),
-            width: None,
-            height: None,
             data: vec![9, 9, 9],
         })
         .unwrap();
@@ -159,6 +163,11 @@ fn gc_orphan_art_removes_unreferenced_rows() {
             art_id: referenced,
             picture_type: 3,
             description: String::new(),
+            mime: "image/png".into(),
+            width: None,
+            height: None,
+            depth: 0,
+            colors: 0,
             ordinal: 0,
         }],
     )
@@ -180,6 +189,11 @@ fn shared_art_survives_until_last_reference_gone() {
         art_id: art,
         picture_type: 3,
         description: String::new(),
+        mime: "image/png".into(),
+        width: None,
+        height: None,
+        depth: 0,
+        colors: 0,
         ordinal: ord,
     };
     db.set_track_art(t1, &[link(0)]).unwrap();
@@ -210,12 +224,22 @@ fn set_track_art_replaces_links() {
                 art_id: a,
                 picture_type: 3,
                 description: "front".to_string(),
+                mime: "image/png".into(),
+                width: None,
+                height: None,
+                depth: 0,
+                colors: 0,
                 ordinal: 0,
             },
             TrackArt {
                 art_id: b,
                 picture_type: 4,
                 description: "back".to_string(),
+                mime: "image/png".into(),
+                width: None,
+                height: None,
+                depth: 0,
+                colors: 0,
                 ordinal: 1,
             },
         ],
@@ -230,6 +254,11 @@ fn set_track_art_replaces_links() {
             art_id: b,
             picture_type: 3,
             description: "now-front".to_string(),
+            mime: "image/png".into(),
+            width: None,
+            height: None,
+            depth: 0,
+            colors: 0,
             ordinal: 0,
         }],
     )

@@ -19,8 +19,11 @@ model these layouts plug into, see
   4-byte application id) and re-emitted on synthesis, streamed from the DB
   rather than held in memory.
 - **Embedded pictures.** Each `PICTURE` block round-trips with its MIME type,
-  picture type, description, and dimensions; image bytes are stored
-  content-addressed and streamed at read time.
+  picture type, description, dimensions, colour depth, and indexed-colour
+  count (the last two since 2.0.0,
+  [#716](https://github.com/Sohex/musefs/issues/716)). These per-file values
+  live on the `track_art` link; the image bytes are stored content-addressed in
+  `art` and streamed at read time.
 - **Structural blocks.** `STREAMINFO` and `SEEKTABLE` are preserved
   bit-exact. They are captured into the read-only `structural_blocks` store
   at scan time (external tools must not edit them) and re-emitted on
@@ -113,8 +116,11 @@ Structural blocks normally come from the `structural_blocks` store. A
 database scanned before that store existed has no rows there; synthesis then
 falls back to re-reading the file's front for every preserved block
 (carrying `APPLICATION`/`CUESHEET` inline and suppressing the streamed
-binary tags so nothing is emitted twice). A re-scan upgrades the track to
-the streamed path.
+binary tags so nothing is emitted twice). `musefs revalidate` upgrades the
+track to the streamed path: it re-probes a FLAC track with no structural rows
+even when the file is unchanged, and keeps the track's curated tags and art. A
+plain `scan` leaves an already-tracked file alone, and `scan --force` would
+replace its curated tags with the file's own.
 
 ## Quirks & invariants
 

@@ -1,4 +1,4 @@
-use musefs_cli::{ChecksumMode, run_scan};
+use musefs_cli::{ChecksumMode, MatchMode, run_revalidate, run_scan};
 
 fn flac_block(block_type: u8, body: &[u8], is_last: bool) -> Vec<u8> {
     let mut out = Vec::new();
@@ -58,13 +58,11 @@ fn scan_ingests_flacs_into_a_fresh_db() {
         &db_path,
         &[backing.path().to_path_buf()],
         false,
-        false,
         0,
         false,
         false,
         ChecksumMode::Fingerprint,
-        false,
-        false,
+        MatchMode::Auto,
     )
     .unwrap();
 
@@ -100,13 +98,11 @@ fn scan_ingests_multiple_targets_under_one_db() {
             backing_b.path().to_path_buf(),
         ],
         false,
-        false,
         0,
         false,
         false,
         ChecksumMode::Fingerprint,
-        false,
-        false,
+        MatchMode::Auto,
     )
     .unwrap();
 
@@ -132,13 +128,11 @@ fn scan_fails_fast_on_a_bad_target() {
         &db_path,
         &[backing.path().to_path_buf(), missing],
         false,
-        false,
         0,
         false,
         false,
         ChecksumMode::Fingerprint,
-        false,
-        false,
+        MatchMode::Auto,
     );
     assert!(result.is_err());
 }
@@ -162,13 +156,11 @@ fn scan_returns_per_file_failed_count() {
         &db_path,
         &[backing.path().to_path_buf()],
         false,
-        false,
         0,
         false,
         false,
         ChecksumMode::Fingerprint,
-        false,
-        false,
+        MatchMode::Auto,
     )
     .unwrap();
 
@@ -199,13 +191,11 @@ fn scan_with_progress_ingests_all_files() {
         &db_path,
         &[backing.path().to_path_buf()],
         false,
-        false,
         0,
         false,
         false,
         ChecksumMode::Fingerprint,
-        false,
-        false,
+        MatchMode::Auto,
     )
     .unwrap();
 
@@ -224,13 +214,11 @@ fn quiet_scan_still_ingests_all_files() {
         &db_path,
         &[backing.path().to_path_buf()],
         false,
-        false,
         0,
         false,
         true,
         ChecksumMode::Fingerprint,
-        false,
-        false,
+        MatchMode::Auto,
     )
     .unwrap();
 
@@ -249,28 +237,24 @@ fn revalidate_with_progress_reports_unchanged() {
         &db_path,
         &[backing.path().to_path_buf()],
         false,
-        false,
         0,
         false,
         false,
         ChecksumMode::Fingerprint,
-        false,
-        false,
+        MatchMode::Auto,
     )
     .unwrap();
-    run_scan(
+    let failed = run_revalidate(
         &db_path,
         &[backing.path().to_path_buf()],
-        true,
         false,
         0,
         false,
         false,
         ChecksumMode::Fingerprint,
-        false,
-        false,
     )
     .unwrap();
+    assert_eq!(failed, 0);
 
     let db = musefs_db::Db::open(&db_path).unwrap();
     assert_eq!(db.list_tracks().unwrap().len(), 20);

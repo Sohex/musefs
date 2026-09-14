@@ -27,6 +27,16 @@ fn main() {
     // synthesis path gets immediate coverage instead of waiting for the fuzzer to
     // mutate its way to a non-empty arb_binary_tags from the empty-tag seed0.
     write("mp3", "seed_binary", &fixtures::mp3_with_binary_frame());
+    // #767/#768: a run of prepended tags, and tags at both ends plus an ID3v1
+    // trailer. The leading-run walk and the backwards footer walk then start
+    // from valid structures, instead of waiting for the fuzzer to forge a
+    // footer whose header copy matches at the offset its size gives.
+    write("mp3", "seed_leading_run", &fixtures::mp3_with_leading_tag_run());
+    write(
+        "mp3",
+        "seed_front_and_back",
+        &fixtures::mp3_with_front_and_back_tags(),
+    );
     write("mp4", "seed0", &fixtures::m4a(&[9u8; 32]));
     // m4a seed with a larger mdat payload: the extra bytes lengthen `data` so the
     // fuzz target's `Unstructured` yields non-empty arb_binary_tags/arb_arts, while

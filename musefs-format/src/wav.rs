@@ -1,4 +1,4 @@
-use crate::bytes::read_u32_le;
+use crate::bytes::{read_u32_be, read_u32_le};
 use crate::error::{FormatError, Result};
 use crate::input::{BinaryTagInput, EmbeddedBinaryTag, EmbeddedPicture};
 use crate::probe::Extent;
@@ -7,6 +7,7 @@ use std::collections::HashSet;
 
 /// The served audio bounds of a WAV: the `data` chunk's payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct WavBounds {
     pub audio_offset: u64,
     pub audio_length: u64,
@@ -18,28 +19,74 @@ pub struct WavBounds {
 pub struct WavScan {
     pub fmt: Vec<u8>,
     pub fact: Option<Vec<u8>>,
+    /// The source's byte order, which the synthesized front must share: the
+    /// preserved `fmt `/`fact` payloads are only meaningful under it.
+    pub byte_order: ByteOrder,
+}
+
+/// The byte order of a WAVE file's integers, fixed by its container magic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByteOrder {
+    /// `RIFF`: every size field and `fmt ` field is little-endian.
+    Little,
+    /// `RIFX`: the big-endian variant. Every integer the container holds is
+    /// big-endian — the form size, each chunk size (`LIST`/`INFO` subchunks
+    /// included), and the `fmt `/`fact` fields.
+    Big,
+}
+
+impl ByteOrder {
+    /// The container FourCC that declares this byte order.
+    fn form_id(self) -> &'static [u8; 4] {
+        match self {
+            ByteOrder::Little => b"RIFF",
+            ByteOrder::Big => b"RIFX",
+        }
+    }
+
+    fn read_u32(self, buf: &[u8], pos: usize) -> Result<u32> {
+        match self {
+            ByteOrder::Little => read_u32_le(buf, pos),
+            ByteOrder::Big => read_u32_be(buf, pos),
+        }
+    }
+
+    fn u32_bytes(self, v: u32) -> [u8; 4] {
+        match self {
+            ByteOrder::Little => v.to_le_bytes(),
+            ByteOrder::Big => v.to_be_bytes(),
+        }
+    }
 }
 
 /// Validate the RIFF/WAVE container header and return `(first_chunk_offset,
-/// form_end)`, where `form_end = 8 + riff_size` is the byte just past the
-/// declared RIFF form. Rejects RF64/BW64 and any non-`WAVE` RIFF file.
-fn riff_wave_start(buf: &[u8]) -> Result<(usize, u64)> {
-    if buf.len() < 12 || &buf[0..4] != b"RIFF" || &buf[8..12] != b"WAVE" {
+/// form_end, byte_order)`, where `form_end = 8 + riff_size` is the byte just past
+/// the declared form. Accepts `RIFF` and its big-endian twin `RIFX`; rejects
+/// RF64/BW64 (64-bit sizes in a `ds64` chunk, out of scope) and any non-`WAVE`
+/// form.
+fn riff_wave_start(buf: &[u8]) -> Result<(usize, u64, ByteOrder)> {
+    if buf.len() < 12 || &buf[8..12] != b"WAVE" {
         return Err(FormatError::NotWav);
     }
-    let riff_size =
-        read_u32_le(buf, 4).expect("RIFF size field within the validated 12-byte header");
-    Ok((12, 8 + u64::from(riff_size)))
+    let order = match &buf[0..4] {
+        b"RIFF" => ByteOrder::Little,
+        b"RIFX" => ByteOrder::Big,
+        _ => return Err(FormatError::NotWav),
+    };
+    let riff_size = order
+        .read_u32(buf, 4)
+        .expect("form size field within the validated 12-byte header");
+    Ok((12, 8 + u64::from(riff_size), order))
 }
 
 /// Walk the top-level WAVE chunks, returning `(fourcc, payload_offset, payload_len)`
-/// for each chunk whose 8-byte header is present. Advances header-to-header with
-/// RIFF word-alignment padding, skipping payloads. Stops (after recording it) when
-/// a chunk's declared payload runs past the buffer — e.g. the `data` chunk in a
-/// front-only buffer.
+/// for each chunk whose 8-byte header is present. Sizes are decoded in the form's
+/// byte order. Advances header-to-header with RIFF word-alignment padding,
+/// skipping payloads. Stops (after recording it) when a chunk's declared payload
+/// runs past the buffer — e.g. the `data` chunk in a front-only buffer.
 fn walk_chunks(buf: &[u8]) -> Vec<([u8; 4], usize, u64)> {
     let mut out = Vec::new();
-    let Ok((mut pos, form_end)) = riff_wave_start(buf) else {
+    let Ok((mut pos, form_end, order)) = riff_wave_start(buf) else {
         return out;
     };
     // Walk only within the declared RIFF form: chunks past `form_end` are not
@@ -50,7 +97,9 @@ fn walk_chunks(buf: &[u8]) -> Vec<([u8; 4], usize, u64)> {
         let mut id = [0u8; 4];
         id.copy_from_slice(&buf[pos..pos + 4]);
         let size = u64::from(
-            read_u32_le(buf, pos + 4).expect("chunk size field within the loop-guarded bounds"),
+            order
+                .read_u32(buf, pos + 4)
+                .expect("chunk size field within the loop-guarded bounds"),
         );
         let payload_offset = pos + 8;
         out.push((id, payload_offset, size));
@@ -69,23 +118,21 @@ fn chunk_slice(buf: &[u8], offset: usize, len: u64) -> Option<&[u8]> {
     buf.get(offset..end)
 }
 
-/// Parse the file and return the `data` chunk payload bounds, or an error to skip
-/// it. Requires both `fmt ` and `data` within the declared RIFF form, and the
-/// `data` payload must fit in that form.
-pub fn locate_audio(buf: &[u8]) -> Result<WavBounds> {
-    let (_, form_end) = riff_wave_start(buf)?;
-    if form_end > buf.len() as u64 {
-        return Err(FormatError::Malformed);
-    }
+/// The `data` payload bounds out of a form-bounded walk of `buf`, shared by the
+/// full and the ceiling locators (each has already checked `form_end` against the
+/// bound it trusts). Requires both `fmt ` and a top-level `data`. A file with
+/// `fmt ` whose waveform is a `LIST('wavl')` instead is refused by name (#769): no
+/// mainstream decoder plays one.
+fn data_bounds(buf: &[u8], form_end: u64) -> Result<WavBounds> {
     let chunks = walk_chunks(buf);
     let has_fmt = chunks.iter().any(|(id, _, _)| id == b"fmt ");
     let data = chunks.iter().find(|(id, _, _)| id == b"data");
     match (has_fmt, data) {
         (true, Some(&(_, off, len))) => {
             // `walk_chunks` bounds chunk headers to `form_end`; this additionally
-            // rejects a `data` chunk whose payload spills past the form. (`form_end
-            // <= buf.len()` is enforced above, so a separate buffer-bound check on
-            // `data_end` would be redundant.)
+            // rejects a `data` chunk whose payload spills past the form. (Each
+            // caller bounds `form_end` by the buffer or the file, so a separate
+            // check of `data_end` against those would be redundant.)
             let data_end = (off as u64).saturating_add(len);
             if data_end > form_end {
                 return Err(FormatError::Malformed);
@@ -95,8 +142,26 @@ pub fn locate_audio(buf: &[u8]) -> Result<WavBounds> {
                 audio_length: len,
             })
         }
+        (true, None)
+            if chunks
+                .iter()
+                .any(|&(id, off, _)| &id == b"LIST" && buf.get(off..off + 4) == Some(b"wavl")) =>
+        {
+            Err(FormatError::WavWaveList)
+        }
         _ => Err(FormatError::NotWav),
     }
+}
+
+/// Parse the file and return the `data` chunk payload bounds, or an error to skip
+/// it. Requires both `fmt ` and `data` within the declared RIFF form, and the
+/// `data` payload must fit in that form.
+pub fn locate_audio(buf: &[u8]) -> Result<WavBounds> {
+    let (_, form_end, _) = riff_wave_start(buf)?;
+    if form_end > buf.len() as u64 {
+        return Err(FormatError::Malformed);
+    }
+    data_bounds(buf, form_end)
 }
 
 /// Bounded twin of [`locate_audio`]. WAV metadata chunks can trail the `data`
@@ -118,37 +183,18 @@ pub fn locate_audio_bounded(prefix: &[u8], file_len: u64) -> Result<Extent<WavBo
 /// rejected. Unlike [`locate_audio`] the payload need not be present in `prefix`;
 /// any tags trailing it are necessarily lost.
 pub fn locate_audio_at_ceiling(prefix: &[u8], file_len: u64) -> Result<WavBounds> {
-    let (_, form_end) = riff_wave_start(prefix)?;
+    let (_, form_end, _) = riff_wave_start(prefix)?;
     if form_end > file_len {
         return Err(FormatError::Malformed);
     }
-    let chunks = walk_chunks(prefix);
-    let has_fmt = chunks.iter().any(|(id, _, _)| id == b"fmt ");
-    let data = chunks.iter().find(|(id, _, _)| id == b"data");
-    match (has_fmt, data) {
-        (true, Some(&(_, off, len))) => {
-            // `walk_chunks` bounds chunk headers to `form_end`; this additionally
-            // rejects a `data` chunk whose payload spills past the form. (`form_end
-            // <= file_len` is enforced above, so a separate file-bound check on
-            // `data_end` would be redundant.)
-            let data_end = (off as u64).saturating_add(len);
-            if data_end > form_end {
-                return Err(FormatError::Malformed);
-            }
-            Ok(WavBounds {
-                audio_offset: off as u64,
-                audio_length: len,
-            })
-        }
-        _ => Err(FormatError::NotWav),
-    }
+    data_bounds(prefix, form_end)
 }
 
 /// Read the preserved structural chunks (`fmt `, optional `fact`) from the front
 /// of the file (everything before the `data` payload). Errors if `fmt ` is absent
 /// or a preserved chunk's payload is truncated.
 pub fn read_structure(front: &[u8]) -> Result<WavScan> {
-    riff_wave_start(front)?;
+    let (_, _, byte_order) = riff_wave_start(front)?;
     let chunks = walk_chunks(front);
 
     let &(_, fmt_off, fmt_len) = chunks
@@ -168,7 +214,11 @@ pub fn read_structure(front: &[u8]) -> Result<WavScan> {
         None => None,
     };
 
-    Ok(WavScan { fmt, fact })
+    Ok(WavScan {
+        fmt,
+        fact,
+        byte_order,
+    })
 }
 
 use crate::input::{ArtInput, TagInput};
@@ -191,9 +241,10 @@ fn info_fourcc(key: &str) -> Option<&'static [u8; 4]> {
 }
 
 /// Build the `LIST`/`INFO` chunk payload (`"INFO"` + subchunks) from the first
-/// value of each mappable tag key, in first-seen order. Returns `None` when no
-/// tag maps to an INFO field (so the chunk is omitted entirely).
-fn build_info_payload(tags: &[TagInput]) -> Result<Option<Vec<u8>>> {
+/// value of each mappable tag key, in first-seen order. Subchunk sizes are
+/// written in `order`. Returns `None` when no tag maps to an INFO field (so the
+/// chunk is omitted entirely).
+fn build_info_payload(tags: &[TagInput], order: ByteOrder) -> Result<Option<Vec<u8>>> {
     let mut entries: Vec<(&'static [u8; 4], &str)> = Vec::new();
     let mut used: Vec<&str> = Vec::new();
     for t in tags {
@@ -213,23 +264,23 @@ fn build_info_payload(tags: &[TagInput]) -> Result<Option<Vec<u8>>> {
     for (cc, value) in entries {
         let mut v = value.as_bytes().to_vec();
         v.push(0x00); // INFO values are NUL-terminated
-        append_chunk(&mut payload, cc, &v)?;
+        append_chunk(&mut payload, cc, &v, order)?;
     }
     Ok(Some(payload))
 }
 
-/// 8-byte RIFF chunk header: fourcc + LE u32 size.
-fn chunk_header(id: &[u8; 4], len: u32) -> [u8; 8] {
+/// 8-byte RIFF chunk header: fourcc + u32 size in `order`.
+fn chunk_header(id: &[u8; 4], len: u32, order: ByteOrder) -> [u8; 8] {
     let mut h = [0u8; 8];
     h[..4].copy_from_slice(id);
-    h[4..].copy_from_slice(&len.to_le_bytes());
+    h[4..].copy_from_slice(&order.u32_bytes(len));
     h
 }
 
-/// Append a chunk (`fourcc + LE size + payload + word-align pad`) to `out`.
-fn append_chunk(out: &mut Vec<u8>, id: &[u8; 4], payload: &[u8]) -> Result<()> {
+/// Append a chunk (`fourcc + size + payload + word-align pad`) to `out`.
+fn append_chunk(out: &mut Vec<u8>, id: &[u8; 4], payload: &[u8], order: ByteOrder) -> Result<()> {
     let len = u32::try_from(payload.len()).map_err(|_| FormatError::TooLarge)?;
-    out.extend_from_slice(&chunk_header(id, len));
+    out.extend_from_slice(&chunk_header(id, len, order));
     out.extend_from_slice(payload);
     if payload.len() % 2 == 1 {
         out.push(0x00);
@@ -237,10 +288,15 @@ fn append_chunk(out: &mut Vec<u8>, id: &[u8; 4], payload: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Push a fully-inline chunk (`fourcc + LE size + payload + word-align pad`).
-fn push_inline_chunk(segments: &mut Vec<Segment>, id: &[u8; 4], payload: &[u8]) -> Result<()> {
+/// Push a fully-inline chunk (`fourcc + size + payload + word-align pad`).
+fn push_inline_chunk(
+    segments: &mut Vec<Segment>,
+    id: &[u8; 4],
+    payload: &[u8],
+    order: ByteOrder,
+) -> Result<()> {
     let mut chunk = Vec::with_capacity(8 + payload.len() + 1);
-    append_chunk(&mut chunk, id, payload)?;
+    append_chunk(&mut chunk, id, payload, order)?;
     segments.push(Segment::Inline(chunk));
     Ok(())
 }
@@ -249,7 +305,10 @@ fn push_inline_chunk(segments: &mut Vec<Segment>, id: &[u8; 4], payload: &[u8]) 
 /// preserved `fmt `/`fact`, a native `LIST`/`INFO` chunk, and an embedded `id3 `
 /// chunk (full ID3v2 + APIC art), followed by the untouched `data` payload as a
 /// `BackingAudio` segment. Every length is known up front, so the `RIFF` and
-/// chunk size fields are byte-exact.
+/// chunk size fields are byte-exact. A `RIFX` source (`scan.byte_order` big)
+/// gets a `RIFX` front with every size big-endian: the preserved `fmt `/`fact`
+/// payloads are big-endian, and a container claiming otherwise would misdescribe
+/// them.
 pub fn synthesize_layout(
     scan: &WavScan,
     audio_offset: u64,
@@ -260,14 +319,15 @@ pub fn synthesize_layout(
 ) -> Result<RegionLayout> {
     let audio_length_u32 = u32::try_from(audio_length).map_err(|_| FormatError::TooLarge)?; // RF64 territory; out of scope
 
+    let order = scan.byte_order;
     let mut segments: Vec<Segment> = Vec::new();
 
-    push_inline_chunk(&mut segments, b"fmt ", &scan.fmt)?;
+    push_inline_chunk(&mut segments, b"fmt ", &scan.fmt, order)?;
     if let Some(fact) = &scan.fact {
-        push_inline_chunk(&mut segments, b"fact", fact)?;
+        push_inline_chunk(&mut segments, b"fact", fact, order)?;
     }
-    if let Some(info) = build_info_payload(tags)? {
-        push_inline_chunk(&mut segments, b"LIST", &info)?;
+    if let Some(info) = build_info_payload(tags, order)? {
+        push_inline_chunk(&mut segments, b"LIST", &info, order)?;
     }
 
     // Embedded `id3 ` chunk: 8-byte chunk header + the ID3v2 tag segments, padded.
@@ -275,7 +335,9 @@ pub fn synthesize_layout(
     // so WAV inherits that invariant by delegating to `build_id3v2_segments`.
     let (tag_segments, tag_len) = crate::mp3::build_id3v2_segments(tags, binary_tags, arts)?;
     let tag_len_u32 = u32::try_from(tag_len).map_err(|_| FormatError::TooLarge)?;
-    segments.push(Segment::Inline(chunk_header(b"id3 ", tag_len_u32).to_vec()));
+    segments.push(Segment::Inline(
+        chunk_header(b"id3 ", tag_len_u32, order).to_vec(),
+    ));
     segments.extend(tag_segments);
     if tag_len % 2 == 1 {
         segments.push(Segment::Inline(vec![0x00]));
@@ -283,7 +345,7 @@ pub fn synthesize_layout(
 
     // `data` chunk: header + the original payload (BackingAudio) + word-align pad.
     segments.push(Segment::Inline(
-        chunk_header(b"data", audio_length_u32).to_vec(),
+        chunk_header(b"data", audio_length_u32, order).to_vec(),
     ));
     segments.push(Segment::BackingAudio {
         offset: audio_offset,
@@ -298,8 +360,8 @@ pub fn synthesize_layout(
     let riff_size =
         u32::try_from(size::checked_add(body_len, 4)?).map_err(|_| FormatError::TooLarge)?;
     let mut header = Vec::with_capacity(12);
-    header.extend_from_slice(b"RIFF");
-    header.extend_from_slice(&riff_size.to_le_bytes());
+    header.extend_from_slice(order.form_id());
+    header.extend_from_slice(&order.u32_bytes(riff_size));
     header.extend_from_slice(b"WAVE");
     segments.insert(0, Segment::Inline(header));
 
@@ -330,14 +392,15 @@ fn find_id3_chunk<'a>(buf: &'a [u8], chunks: &[([u8; 4], usize, u64)]) -> Option
 }
 
 /// Parse `LIST`/`INFO` subchunks into canonical `(key, value)` pairs. `body` is the
-/// INFO payload after the leading `"INFO"` FourCC.
-fn read_info_tags(body: &[u8]) -> Vec<(String, String)> {
+/// INFO payload after the leading `"INFO"` FourCC; subchunk sizes are in `order`.
+fn read_info_tags(body: &[u8], order: ByteOrder) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut pos = 0usize;
     while pos + 8 <= body.len() {
         let mut id = [0u8; 4];
         id.copy_from_slice(&body[pos..pos + 4]);
-        let size = read_u32_le(body, pos + 4)
+        let size = order
+            .read_u32(body, pos + 4)
             .expect("subchunk size field within the loop-guarded bounds")
             as usize;
         let val_start = pos + 8;
@@ -358,6 +421,9 @@ fn read_info_tags(body: &[u8]) -> Vec<(String, String)> {
 /// `LIST`/`INFO` chunk, merged per field with id3 taking precedence and INFO filling
 /// gaps. Walks chunk headers without reading the `data` payload.
 pub fn read_tags(buf: &[u8]) -> Vec<(String, String)> {
+    let Ok((_, _, order)) = riff_wave_start(buf) else {
+        return Vec::new();
+    };
     let chunks = walk_chunks(buf);
 
     let from_id3 = find_id3_chunk(buf, &chunks)
@@ -369,7 +435,7 @@ pub fn read_tags(buf: &[u8]) -> Vec<(String, String)> {
         .find(|(id, _, _)| id == b"LIST")
         .and_then(|&(_, off, len)| chunk_slice(buf, off, len))
         .filter(|slice| slice.len() >= 4 && &slice[0..4] == b"INFO")
-        .map(|slice| read_info_tags(&slice[4..]))
+        .map(|slice| read_info_tags(&slice[4..], order))
         .unwrap_or_default();
 
     let id3_keys: HashSet<&str> = from_id3.iter().map(|(k, _)| k.as_str()).collect();
@@ -405,6 +471,7 @@ pub fn read_pictures(buf: &[u8]) -> Vec<EmbeddedPicture> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::convert::usize_from;
 
     /// Regression for the fuzz-discovered WAV OOM vector
     /// (fuzz/artifacts/wav/oom-4a21767820d5f05328f01d975fb6d3314f3fb902):
@@ -448,7 +515,7 @@ mod tests {
         // The `<=` mutant computes `12 <= 12` (true) and wrongly rejects it.
         let buf = b"RIFF\0\0\0\0WAVE".to_vec();
         assert_eq!(buf.len(), 12);
-        assert_eq!(riff_wave_start(&buf), Ok((12, 8)));
+        assert_eq!(riff_wave_start(&buf), Ok((12, 8, ByteOrder::Little)));
     }
 
     #[test]
@@ -479,6 +546,322 @@ mod tests {
         out.extend_from_slice(b"WAVE");
         out.extend_from_slice(&body);
         out
+    }
+
+    /// Build a minimal big-endian `RIFX/WAVE` buffer: [`wav`] with every size field
+    /// (the form size and each chunk's) written big-endian, payloads untouched.
+    fn rifx(chunks: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (id, payload) in chunks {
+            body.extend_from_slice(*id);
+            body.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
+            body.extend_from_slice(payload);
+            if payload.len() % 2 == 1 {
+                body.push(0x00);
+            }
+        }
+        let mut out = b"RIFX".to_vec();
+        out.extend_from_slice(&u32::try_from(body.len() + 4).unwrap().to_be_bytes());
+        out.extend_from_slice(b"WAVE");
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// The 16-byte PCM `fmt ` payload of a RIFX file: the same fields as
+    /// [`fmt_pcm`], stored big-endian.
+    fn fmt_pcm_be() -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(&1u16.to_be_bytes());
+        f.extend_from_slice(&1u16.to_be_bytes());
+        f.extend_from_slice(&44_100u32.to_be_bytes());
+        f.extend_from_slice(&88_200u32.to_be_bytes());
+        f.extend_from_slice(&2u16.to_be_bytes());
+        f.extend_from_slice(&16u16.to_be_bytes());
+        f
+    }
+
+    /// An `INFO` payload whose subchunk sizes are big-endian, as a RIFX file stores them.
+    fn info_payload_be(pairs: &[(&[u8; 4], &str)]) -> Vec<u8> {
+        let mut p = b"INFO".to_vec();
+        for (cc, val) in pairs {
+            let mut v = val.as_bytes().to_vec();
+            v.push(0x00);
+            p.extend_from_slice(*cc);
+            p.extend_from_slice(&u32::try_from(v.len()).unwrap().to_be_bytes());
+            p.extend_from_slice(&v);
+            if v.len() % 2 == 1 {
+                p.push(0x00);
+            }
+        }
+        p
+    }
+
+    #[test]
+    fn locate_audio_reads_rifx_sizes_big_endian() {
+        // A size of 0x0000_0100 read little-endian is 0x0001_0000: past the file, so
+        // an LE walk of this RIFX buffer cannot find the payload where it lies.
+        let buf = rifx(&[
+            (b"fmt ", fmt_pcm_be()),
+            (b"fact", vec![0, 0, 0, 7]),
+            (b"data", vec![0x5A; 0x100]),
+        ]);
+        let b = locate_audio(&buf).unwrap();
+        assert_eq!(b.audio_offset, 12 + 8 + 16 + 8 + 4 + 8);
+        assert_eq!(b.audio_length, 0x100);
+    }
+
+    #[test]
+    fn rifx_form_end_is_decoded_big_endian() {
+        // The form size alone decides this: data spans 36..52 while the BE form
+        // size puts form_end at 48, so the payload spills out of the form. Read LE,
+        // 40 would be a size of 0x2800_0000 and fail the physical-length check instead.
+        let mut buf = rifx(&[(b"fmt ", fmt_pcm_be()), (b"data", vec![0x11; 8])]);
+        let file_len = buf.len() as u64;
+        buf[4..8].copy_from_slice(&40u32.to_be_bytes());
+        assert_eq!(riff_wave_start(&buf), Ok((12, 48, ByteOrder::Big)));
+        assert_eq!(locate_audio(&buf), Err(FormatError::Malformed));
+        assert_eq!(
+            locate_audio_at_ceiling(&buf, file_len),
+            Err(FormatError::Malformed)
+        );
+    }
+
+    #[test]
+    fn riff_wave_start_names_each_byte_order() {
+        assert_eq!(
+            riff_wave_start(b"RIFF\x04\0\0\0WAVE"),
+            Ok((12, 12, ByteOrder::Little))
+        );
+        assert_eq!(
+            riff_wave_start(b"RIFX\0\0\0\x04WAVE"),
+            Ok((12, 12, ByteOrder::Big))
+        );
+        // Neither magic in another case, nor RF64/BW64, is a byte order musefs reads.
+        for magic in [b"rifx", b"RF64", b"BW64", b"XFIR"] {
+            let mut buf = magic.to_vec();
+            buf.extend_from_slice(b"\0\0\0\x04WAVE");
+            assert_eq!(riff_wave_start(&buf), Err(FormatError::NotWav));
+        }
+    }
+
+    #[test]
+    fn locate_audio_at_ceiling_reads_rifx_front() {
+        let data_len = 0x0300u32;
+        let mut front = b"RIFX".to_vec();
+        front.extend_from_slice(&(36 + data_len).to_be_bytes());
+        front.extend_from_slice(b"WAVE");
+        front.extend_from_slice(b"fmt ");
+        front.extend_from_slice(&16u32.to_be_bytes());
+        front.extend_from_slice(&fmt_pcm_be());
+        front.extend_from_slice(b"data");
+        front.extend_from_slice(&data_len.to_be_bytes());
+        let audio_offset = front.len() as u64;
+        let b = locate_audio_at_ceiling(&front, audio_offset + u64::from(data_len)).unwrap();
+        assert_eq!(b.audio_offset, audio_offset);
+        assert_eq!(b.audio_length, u64::from(data_len));
+    }
+
+    #[test]
+    fn read_structure_of_rifx_front_keeps_payloads_verbatim() {
+        let fact = vec![0, 0, 0x30, 0x39];
+        let buf = rifx(&[
+            (b"fmt ", fmt_pcm_be()),
+            (b"fact", fact.clone()),
+            (b"data", vec![0u8; 64]),
+        ]);
+        let front = &buf[..usize_from(locate_audio(&buf).unwrap().audio_offset)];
+        let scan = read_structure(front).unwrap();
+        assert_eq!(scan.fmt, fmt_pcm_be());
+        assert_eq!(scan.fact, Some(fact));
+        assert_eq!(scan.byte_order, ByteOrder::Big);
+        let le = wav(&[(b"fmt ", fmt_pcm()), (b"data", vec![0u8; 4])]);
+        assert_eq!(read_structure(&le).unwrap().byte_order, ByteOrder::Little);
+    }
+
+    #[test]
+    fn read_tags_reads_rifx_info_and_id3_chunks() {
+        use id3::{Tag, TagLike, Version};
+        let mut tag = Tag::new();
+        tag.set_album_artist("Various");
+        let mut id3 = Vec::new();
+        id3::Encoder::new()
+            .version(Version::Id3v24)
+            .encode(&tag, &mut id3)
+            .unwrap();
+        let buf = rifx(&[
+            (b"fmt ", fmt_pcm_be()),
+            (
+                b"LIST",
+                info_payload_be(&[(b"INAM", "Big Title"), (b"IART", "Big Artist")]),
+            ),
+            (b"id3 ", id3),
+            (b"data", vec![0u8; 8]),
+        ]);
+        let tags = read_tags(&buf);
+        for (k, v) in [
+            ("title", "Big Title"),
+            ("artist", "Big Artist"),
+            ("albumartist", "Various"),
+        ] {
+            assert!(
+                tags.contains(&(k.to_string(), v.to_string())),
+                "{k} missing from {tags:?}"
+            );
+        }
+    }
+
+    /// Resolve an inline-only-except-audio layout against `audio` (no art, no
+    /// binary tags), yielding the served bytes.
+    fn serve(layout: &RegionLayout, audio: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for s in layout.segments() {
+            match s {
+                Segment::Inline(b) => out.extend_from_slice(b),
+                Segment::BackingAudio { offset, len } => out.extend_from_slice(
+                    &audio[usize_from(*offset)..usize_from(*offset) + usize_from(*len)],
+                ),
+                other => panic!("unexpected segment {other:?}"),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn synthesize_rifx_source_emits_rifx_with_big_endian_sizes() {
+        let audio: Vec<u8> = (0..=6u8).collect(); // odd: exercises the data pad
+        let src = rifx(&[
+            (b"fmt ", fmt_pcm_be()),
+            (b"fact", vec![0, 0, 0, 7]),
+            (b"data", audio.clone()),
+        ]);
+        let bounds = locate_audio(&src).unwrap();
+        let scan = read_structure(&src[..usize_from(bounds.audio_offset)]).unwrap();
+        let tags = [
+            TagInput::new("title", "Big"),
+            TagInput::new("albumartist", "Various"),
+        ];
+        let layout = synthesize_layout(
+            &scan,
+            bounds.audio_offset,
+            bounds.audio_length,
+            &tags,
+            &[],
+            &[],
+        )
+        .unwrap();
+        let out = serve(&layout, &src);
+
+        assert_eq!(&out[0..4], b"RIFX");
+        assert_eq!(
+            u32::from_be_bytes(out[4..8].try_into().unwrap()) as usize,
+            out.len() - 8
+        );
+        // Every chunk the synthesizer writes carries a big-endian size: walked BE,
+        // the chunks tile the form exactly and each lands where its size says.
+        let chunks = walk_chunks(&out);
+        let ids: Vec<[u8; 4]> = chunks.iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(ids, vec![*b"fmt ", *b"fact", *b"LIST", *b"id3 ", *b"data"]);
+        let &(_, last_off, last_len) = chunks.last().unwrap();
+        assert_eq!(
+            last_off as u64 + last_len + (last_len & 1),
+            out.len() as u64
+        );
+        // The source payloads ride through untouched, and so does the audio.
+        let again = locate_audio(&out).unwrap();
+        assert_eq!(
+            &out[usize_from(again.audio_offset)..usize_from(again.audio_offset) + audio.len()],
+            audio.as_slice()
+        );
+        assert_eq!(again.audio_length, 7);
+        let rescan = read_structure(&out).unwrap();
+        assert_eq!(rescan, scan);
+        // The INFO subchunk sizes inside the LIST are big-endian too.
+        let info = chunks.iter().find(|(id, _, _)| id == b"LIST").unwrap();
+        let body = chunk_slice(&out, info.1, info.2).unwrap();
+        assert_eq!(&body[4..8], b"INAM");
+        assert_eq!(u32::from_be_bytes(body[8..12].try_into().unwrap()), 4);
+        let tags = read_tags(&out);
+        assert!(tags.contains(&("title".to_string(), "Big".to_string())));
+        assert!(tags.contains(&("albumartist".to_string(), "Various".to_string())));
+    }
+
+    /// A `LIST('wavl')` waveform (#769): a `data` run, then a `slnt` silence of
+    /// 1 000 samples, in place of a top-level `data` chunk.
+    fn wavl_list(order: ByteOrder) -> Vec<u8> {
+        let mut list = b"wavl".to_vec();
+        for (id, payload) in [
+            (b"data", vec![0x11u8; 4]),
+            (b"slnt", order.u32_bytes(1_000).to_vec()),
+        ] {
+            list.extend_from_slice(id);
+            list.extend_from_slice(&order.u32_bytes(4));
+            list.extend_from_slice(&payload);
+        }
+        list
+    }
+
+    #[test]
+    fn a_wavl_waveform_is_refused_by_name() {
+        let le = wav(&[
+            (b"fmt ", fmt_pcm()),
+            (b"LIST", wavl_list(ByteOrder::Little)),
+        ]);
+        let be = rifx(&[
+            (b"fmt ", fmt_pcm_be()),
+            (b"LIST", wavl_list(ByteOrder::Big)),
+        ]);
+        for buf in [le, be] {
+            let len = buf.len() as u64;
+            assert_eq!(locate_audio(&buf), Err(FormatError::WavWaveList));
+            assert_eq!(
+                locate_audio_bounded(&buf, len).unwrap_err(),
+                FormatError::WavWaveList
+            );
+            assert_eq!(
+                locate_audio_at_ceiling(&buf[..12 + 24 + 12], len),
+                Err(FormatError::WavWaveList),
+                "the ceiling path sees only the list's header and type"
+            );
+        }
+        assert!(
+            FormatError::WavWaveList
+                .to_string()
+                .contains("LIST('wavl')")
+        );
+    }
+
+    #[test]
+    fn only_a_wavl_list_standing_in_for_data_is_refused_by_name() {
+        // Another list type without `data` is still just not a WAV.
+        let info = wav(&[
+            (b"fmt ", fmt_pcm()),
+            (b"LIST", info_payload(&[(b"INAM", "x")])),
+        ]);
+        assert_eq!(locate_audio(&info), Err(FormatError::NotWav));
+        // So is a wavl list with no `fmt ` to describe it.
+        let no_fmt = wav(&[(b"LIST", wavl_list(ByteOrder::Little))]);
+        assert_eq!(locate_audio(&no_fmt), Err(FormatError::NotWav));
+        let len = no_fmt.len() as u64;
+        assert_eq!(
+            locate_audio_at_ceiling(&no_fmt, len),
+            Err(FormatError::NotWav)
+        );
+        // A list header whose type lies past the buffer cannot be named.
+        let le = wav(&[
+            (b"fmt ", fmt_pcm()),
+            (b"LIST", wavl_list(ByteOrder::Little)),
+        ]);
+        assert_eq!(
+            locate_audio_at_ceiling(&le[..12 + 24 + 8], le.len() as u64),
+            Err(FormatError::NotWav)
+        );
+        // A top-level `data` chunk is the waveform, whatever else the file holds.
+        let both = wav(&[
+            (b"fmt ", fmt_pcm()),
+            (b"LIST", wavl_list(ByteOrder::Little)),
+            (b"data", vec![0x22; 6]),
+        ]);
+        assert_eq!(locate_audio(&both).unwrap().audio_length, 6);
     }
 
     #[test]
@@ -539,7 +922,7 @@ mod tests {
             ("tracknumber", b"ITRK"),
         ];
         for (key, cc) in cases {
-            let payload = build_info_payload(&[TagInput::new(key, "X")])
+            let payload = build_info_payload(&[TagInput::new(key, "X")], ByteOrder::Little)
                 .unwrap()
                 .unwrap_or_else(|| panic!("INFO payload for {key}"));
             assert!(
@@ -556,13 +939,13 @@ mod tests {
         // Value "a"  -> v.len()=2 (even, NO pad). Kills `% → /` (2/2==1 pads) and
         //               `== → !=` (2%2=0 != 1 pads).
         // Value "ab" -> v.len()=3 (odd, padded). Kills `% → +` (3+2 != 1, no pad).
-        let even = build_info_payload(&[TagInput::new("title", "a")])
+        let even = build_info_payload(&[TagInput::new("title", "a")], ByteOrder::Little)
             .unwrap()
             .unwrap();
         // "INFO"(4) + "INAM"(4) + len(4) + "a\0"(2) = 14, no pad.
         assert_eq!(even.len(), 14);
 
-        let odd = build_info_payload(&[TagInput::new("title", "ab")])
+        let odd = build_info_payload(&[TagInput::new("title", "ab")], ByteOrder::Little)
             .unwrap()
             .unwrap();
         // "INFO"(4) + "INAM"(4) + len(4) + "ab\0"(3) + pad(1) = 16.
@@ -574,13 +957,13 @@ mod tests {
         // :168 `payload.len() % 2 == 1`.
         // Even payload (len 2): NO pad. Kills `% → /` (2/2==1 pads).
         let mut segs = Vec::new();
-        push_inline_chunk(&mut segs, b"test", &[0xAA, 0xBB]).unwrap();
+        push_inline_chunk(&mut segs, b"test", &[0xAA, 0xBB], ByteOrder::Little).unwrap();
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].len(), 10); // "test"(4) + len(4) + payload(2)
 
         // Odd payload (len 3): padded. Kills `% → +` (3+2 != 1, no pad).
         let mut segs2 = Vec::new();
-        push_inline_chunk(&mut segs2, b"test", &[0xAA, 0xBB, 0xCC]).unwrap();
+        push_inline_chunk(&mut segs2, b"test", &[0xAA, 0xBB, 0xCC], ByteOrder::Little).unwrap();
         assert_eq!(segs2[0].len(), 12); // 4 + 4 + 3 + pad(1)
     }
 
@@ -680,6 +1063,7 @@ mod tests {
         let scan = WavScan {
             fmt: fmt_pcm(),
             fact: None,
+            byte_order: ByteOrder::Little,
         };
         let layout = synthesize_layout(&scan, 0, 8, &tags, &[], &[]).unwrap();
         assert_eq!(
@@ -701,6 +1085,7 @@ mod tests {
         let scan = WavScan {
             fmt: fmt_pcm(),
             fact: None,
+            byte_order: ByteOrder::Little,
         };
         let res = synthesize_layout(&scan, 0, u64::from(u32::MAX), &[], &[], &[]);
         assert_eq!(res, Err(FormatError::TooLarge));
