@@ -604,9 +604,11 @@ INSERT INTO tracks (id, backing_path, format, audio_offset, audio_length,
 -- rewrites text rows alone -- which both `contrib` helpers do, scoping their
 -- DELETE to `value_blob IS NULL` so scanner-written binary payloads survive --
 -- could write a text row onto an ordinal a binary row already held. The two
--- classes now get independent ordinal spaces. The rowid is untouched: binary
--- tag payloads are addressed by it from the served layout, so it has to keep
--- meaning what it meant.
+-- classes now get independent ordinal spaces. The rowids are not carried
+-- across: the refill below lets SQLite assign fresh ones. Binary tag payloads
+-- are addressed by rowid only from a served layout, and every layout is built
+-- from the store after it opens, which a store behind this gated step cannot do
+-- until the migration has finished.
 DROP TABLE tags;
 CREATE TABLE tags (
     track_id   INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
