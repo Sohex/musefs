@@ -30,6 +30,8 @@ fuser = { version = "0.18", features = ["macos-no-mount"] }
 [dev-dependencies]
 # Self-dependency: turns `test-support` on for this crate's own test builds.
 musefs-fuse = { path = ".", features = ["test-support"] }
+# `CoreError::every_variant_for_test`, for the errno mapping's coverage test.
+musefs-core = { path = "../musefs-core", features = ["test-support"] }
 tempfile = "3"
 rustix = { version = "1", features = ["fs"] }
 metaflac = "0.2"

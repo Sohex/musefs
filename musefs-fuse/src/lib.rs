@@ -91,6 +91,23 @@ pub struct FuseConfig {
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub pool_admission_cap: Option<usize>,
+    /// Test-only: the directory-handle cap, in place of `MAX_DIR_HANDLES`
+    /// (#616), so a mount test can serve every `opendir` statelessly. `None`
+    /// keeps the real cap.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub dir_handle_cap: Option<usize>,
+    /// Test-only: how many listings stateless enumerations keep pinned, in
+    /// place of `MAX_STATELESS_LISTINGS` (#695), so a mount test can evict one
+    /// on demand. `None` keeps the real cap.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub stateless_listing_cap: Option<usize>,
+    /// Test-only: record every job the mount hands its worker pool, with the
+    /// route it took (#694). `None` records nothing.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub route_trace: Option<RouteTrace>,
 }
 
 impl Default for FuseConfig {
@@ -109,6 +126,12 @@ impl Default for FuseConfig {
             workers: 0,
             #[cfg(feature = "test-support")]
             pool_admission_cap: None,
+            #[cfg(feature = "test-support")]
+            dir_handle_cap: None,
+            #[cfg(feature = "test-support")]
+            stateless_listing_cap: None,
+            #[cfg(feature = "test-support")]
+            route_trace: None,
         }
     }
 }
@@ -188,15 +211,20 @@ fn statfs_params() -> (u64, u64, u64, u64, u64, u32, u32, u32) {
 }
 
 /// Map a core error onto a POSIX errno for the FUSE reply. `Io` errors carry the
-/// underlying errno when present; everything structural collapses to `EIO`.
-#[expect(
-    clippy::match_same_arms,
-    reason = "the named EIO arm records which errors are deliberately EIO; the wildcard is \
-              `#[non_exhaustive]`'s fallback for variants not yet placed, and folding the \
-              two would erase the record"
-)]
+/// underlying errno when present; everything structural collapses to `EIO`, and
+/// so does a variant [`placed_errno`] has not placed yet.
 pub fn errno(err: &CoreError) -> fuser::Errno {
-    match err {
+    placed_errno(err).unwrap_or(fuser::Errno::EIO)
+}
+
+/// The errno for a variant this mapping names, or `None` for one it does not.
+///
+/// `CoreError` is `#[non_exhaustive]` (#708), so the match needs a wildcard,
+/// and a variant added to `musefs-core` falls into it without a compile error.
+/// Keeping that fallback out of the named arms is what lets a test tell a
+/// variant deliberately mapped to `EIO` from one nobody has placed.
+fn placed_errno(err: &CoreError) -> Option<fuser::Errno> {
+    Some(match err {
         CoreError::NoEntry(_) | CoreError::TrackNotFound(_) => fuser::Errno::ENOENT,
         CoreError::IsDir(_) => fuser::Errno::EISDIR,
         CoreError::NotADir(_) => fuser::Errno::ENOTDIR,
@@ -221,11 +249,10 @@ pub fn errno(err: &CoreError) -> fuser::Errno {
         | CoreError::TrackMetadataTooLarge { .. }
         | CoreError::Format(_)
         | CoreError::InvalidTemplate(_) => fuser::Errno::EIO,
-        // `CoreError` is `#[non_exhaustive]` (#708). A variant added after this
-        // list collapses to `EIO` with the structural errors above until it is
-        // given a place in it.
-        _ => fuser::Errno::EIO,
-    }
+        // A variant added after this list: `errno` collapses it to `EIO` until
+        // it is given a place above.
+        _ => return None,
+    })
 }
 
 /// Log a serve-path failure before it collapses to an errno reply, so the
@@ -311,6 +338,54 @@ fn admission_cap(_config: &FuseConfig) -> usize {
     MAX_QUEUED_JOBS
 }
 
+/// Where a job a mount handed its worker pool went (#694), as a test-support
+/// [`RouteTrace`] records it.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PoolRoute {
+    /// Admitted and queued on the pool.
+    Queued,
+    /// Over the admission cap, run on the submitting thread.
+    InPlace,
+    /// Over the admission cap, dropped unrun.
+    Dropped,
+    /// A read, on its own lane past the metadata gate.
+    ReadLane,
+}
+
+/// Every job a mount handed its worker pool, as `(op label, route)`, in order.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub type RouteTrace = Arc<Mutex<Vec<(&'static str, PoolRoute)>>>;
+
+/// The directory-handle cap a mount runs with: [`MAX_DIR_HANDLES`], unless a
+/// test forced another through `FuseConfig::dir_handle_cap`.
+#[cfg(feature = "test-support")]
+fn configured_dir_handle_cap(config: &FuseConfig) -> usize {
+    config.dir_handle_cap.unwrap_or(MAX_DIR_HANDLES)
+}
+
+#[cfg(not(feature = "test-support"))]
+fn configured_dir_handle_cap(_config: &FuseConfig) -> usize {
+    MAX_DIR_HANDLES
+}
+
+/// How many listings a mount's stateless enumerations keep pinned:
+/// [`MAX_STATELESS_LISTINGS`], unless a test forced another through
+/// `FuseConfig::stateless_listing_cap`.
+#[cfg(feature = "test-support")]
+fn configured_stateless_listing_cap(config: &FuseConfig) -> usize {
+    config
+        .stateless_listing_cap
+        .unwrap_or(MAX_STATELESS_LISTINGS)
+}
+
+#[cfg(not(feature = "test-support"))]
+fn configured_stateless_listing_cap(_config: &FuseConfig) -> usize {
+    MAX_STATELESS_LISTINGS
+}
+
 /// The worker pool behind one admission gate for everything but reads (#694).
 /// Cloning shares the pool, the count and the counter.
 #[derive(Clone)]
@@ -322,6 +397,9 @@ struct Workers {
     /// `readdirplus` entry's attrs, not run at all (`musefs_pool_over_cap_total`).
     over_cap: Arc<AtomicU64>,
     cap: usize,
+    /// Test-only: where each job went (#694).
+    #[cfg(feature = "test-support")]
+    trace: Option<RouteTrace>,
 }
 
 /// Gives one [`Workers::admitted`] slot back when dropped: when its job ends,
@@ -341,6 +419,28 @@ impl Workers {
             admitted: Arc::new(AtomicUsize::new(0)),
             over_cap: Arc::new(AtomicU64::new(0)),
             cap,
+            #[cfg(feature = "test-support")]
+            trace: None,
+        }
+    }
+
+    /// Test-only: record every job's route into `trace` (#694).
+    #[cfg(feature = "test-support")]
+    fn traced(mut self, trace: Option<RouteTrace>) -> Workers {
+        self.trace = trace;
+        self
+    }
+
+    /// Test-only: record where `op`'s job went, if a test asked for a trace.
+    /// Called before the job runs or is dropped, so the entry exists before
+    /// any reply the job sends can unblock the test's syscall.
+    #[cfg(feature = "test-support")]
+    fn record(&self, op: &'static str, route: PoolRoute) {
+        if let Some(trace) = &self.trace {
+            trace
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((op, route));
         }
     }
 
@@ -365,12 +465,17 @@ impl Workers {
     /// Nothing is refused: a failed `lookup` or `getattr` fails the caller's
     /// syscall outright, and refusing directory work is what #616 walked back.
     fn submit(&self, op: &'static str, work: impl FnOnce() + Send + 'static) {
-        match self.admit() {
-            Some(slot) => execute_guarded(&self.pool, op, move || {
+        if let Some(slot) = self.admit() {
+            #[cfg(feature = "test-support")]
+            self.record(op, PoolRoute::Queued);
+            execute_guarded(&self.pool, op, move || {
                 let _slot = slot;
                 work();
-            }),
-            None => run_guarded(op, work),
+            });
+        } else {
+            #[cfg(feature = "test-support")]
+            self.record(op, PoolRoute::InPlace);
+            run_guarded(op, work);
         }
     }
 
@@ -378,8 +483,12 @@ impl Workers {
     /// report which (#694). For work with a cheaper answer than running in place.
     fn try_submit(&self, op: &'static str, work: impl FnOnce() + Send + 'static) -> bool {
         let Some(slot) = self.admit() else {
+            #[cfg(feature = "test-support")]
+            self.record(op, PoolRoute::Dropped);
             return false;
         };
+        #[cfg(feature = "test-support")]
+        self.record(op, PoolRoute::Queued);
         execute_guarded(&self.pool, op, move || {
             let _slot = slot;
             work();
@@ -390,6 +499,8 @@ impl Workers {
     /// Queue a read. Reads are admitted against their own cap before they get
     /// here (#308), so they bypass this gate.
     fn submit_read(&self, work: impl FnOnce() + Send + 'static) {
+        #[cfg(feature = "test-support")]
+        self.record("read", PoolRoute::ReadLane);
         execute_guarded(&self.pool, "read", work);
     }
 
@@ -576,7 +687,6 @@ const MAX_STATELESS_LISTINGS: usize = 64;
 /// or skip one. Instead the first page of an enumeration tags the current
 /// generation and pins its listing here, and every cookie it hands out carries
 /// the tag, so each later page reads the same listing.
-#[derive(Default)]
 struct StatelessListings {
     /// The [`TreeSnapshot::generation`] new enumerations are tagged with, and its
     /// tag. It only ever advances: a generation number is never reused, so
@@ -588,6 +698,15 @@ struct StatelessListings {
     last_tag: u32,
     /// `((directory inode, tag), listing)`, least recently used first.
     pinned: std::collections::VecDeque<((u64, u32), Arc<DirListing>)>,
+    /// How many listings `pinned` holds before it evicts:
+    /// [`MAX_STATELESS_LISTINGS`] outside a test that forced another.
+    cap: usize,
+}
+
+impl Default for StatelessListings {
+    fn default() -> StatelessListings {
+        StatelessListings::with_cap(MAX_STATELESS_LISTINGS)
+    }
 }
 
 impl StatelessListings {
@@ -620,11 +739,21 @@ impl StatelessListings {
         Some(listing)
     }
 
+    /// An empty cache that pins at most `cap` listings.
+    fn with_cap(cap: usize) -> StatelessListings {
+        StatelessListings {
+            current: None,
+            last_tag: 0,
+            pinned: std::collections::VecDeque::new(),
+            cap,
+        }
+    }
+
     /// Pin `listing` for `(ino, tag)`, evicting the least recently used past the cap.
     fn insert(&mut self, ino: u64, tag: u32, listing: Arc<DirListing>) {
         self.pinned.retain(|(key, _)| *key != (ino, tag));
         self.pinned.push_back(((ino, tag), listing));
-        while self.pinned.len() > MAX_STATELESS_LISTINGS {
+        while self.pinned.len() > self.cap {
             self.pinned.pop_front();
         }
     }
@@ -1128,11 +1257,11 @@ fn spawn_plus_round(fill: &Arc<PlusFill>, start: usize) {
             // carry at least one entry, since an empty reply reads as the end of
             // the directory. Only this one, so a very wide directory still
             // cannot chain round after round on one thread.
-            fill.pool.submit("readdirplus", resolve);
+            fill.pool.submit("readdirplus_attr", resolve);
         } else {
             // Over the cap every other entry is left unrun, and the page ends
             // before it (see `plan_round`); the kernel asks again from there.
-            fill.pool.try_submit("readdirplus", resolve);
+            fill.pool.try_submit("readdirplus_attr", resolve);
         }
     }
     drop(dispatching);
@@ -1368,6 +1497,9 @@ pub struct MusefsFs {
     /// this is also the only signal that directories are being re-listed on every
     /// `readdir` — worth knowing before it shows up as CPU.
     dir_handle_rejections: Arc<AtomicU64>,
+    /// The directory-handle cap: `MAX_DIR_HANDLES` outside a test that forced
+    /// another (#616).
+    dir_handle_cap: usize,
     /// `readdirplus` calls served, surfaced as `musefs_readdirplus_total`. The
     /// op is negotiated at mount and `FUSE_READDIRPLUS_AUTO` lets the kernel
     /// choose per listing, so whether a mount is getting the folded-in lookups
@@ -1401,6 +1533,13 @@ impl MusefsFs {
             n => n,
         };
         let structure_only = core.mode() == musefs_core::Mode::StructureOnly;
+        // Built before the struct literal, which moves `config`.
+        let pool = Workers::new(ThreadPool::new(workers), admission_cap(&config));
+        #[cfg(feature = "test-support")]
+        let pool = pool.traced(config.route_trace.clone());
+        let dir_handle_cap = configured_dir_handle_cap(&config);
+        let stateless_listings =
+            StatelessListings::with_cap(configured_stateless_listing_cap(&config));
         MusefsFs {
             core: Arc::new(core),
             // `ThreadPool`'s queue is unbounded, so nothing reaches it ungated:
@@ -1410,7 +1549,7 @@ impl MusefsFs {
             // `MAX_DIR_HANDLES` and degrade to the stateless fh over it (#307,
             // #616). `max_background` (set in `init`) separately caps the
             // kernel's background/readahead requests.
-            pool: Workers::new(ThreadPool::new(workers), admission_cap(&config)),
+            pool,
             refresh: threadpool::Builder::new()
                 .num_threads(1)
                 .thread_name("musefs-refresh".to_string())
@@ -1423,9 +1562,10 @@ impl MusefsFs {
             poll_pending: Arc::new(AtomicBool::new(false)),
             passthrough: platform::passthrough::PassthroughState::new(structure_only),
             dir_handles: Arc::new(Mutex::new(DirHandles::default())),
-            stateless_listings: Arc::new(Mutex::new(StatelessListings::default())),
+            stateless_listings: Arc::new(Mutex::new(stateless_listings)),
             dir_fh: Arc::new(AtomicU64::new(1)),
             dir_handle_rejections: Arc::new(AtomicU64::new(0)),
+            dir_handle_cap,
             readdirplus_calls: Arc::new(AtomicU64::new(0)),
             inflight_reads: Arc::new(AtomicUsize::new(0)),
             read_errors: Arc::new(AtomicU64::new(0)),
@@ -1515,7 +1655,7 @@ impl MusefsFs {
             read_errors: self.read_errors.load(Ordering::Relaxed),
             dir_handles,
             dir_listings,
-            dir_handles_max: MAX_DIR_HANDLES as u64,
+            dir_handles_max: self.dir_handle_cap as u64,
             dir_handle_rejections: self.dir_handle_rejections.load(Ordering::Relaxed),
             readdirplus_calls: self.readdirplus_calls.load(Ordering::Relaxed),
             pool_workers: self.pool.max_count() as u64,
@@ -1734,6 +1874,7 @@ impl Filesystem for MusefsFs {
         let handles = Arc::clone(&self.dir_handles);
         let counter = Arc::clone(&self.dir_fh);
         let rejections = Arc::clone(&self.dir_handle_rejections);
+        let dir_handle_cap = self.dir_handle_cap;
         let expose_metrics = self.config.expose_metrics;
         self.pool.submit("opendir", move || {
             // Pin the tree generation first: it names what a listing of this
@@ -1774,7 +1915,7 @@ impl Filesystem for MusefsFs {
                     &mut guard,
                     &counter,
                     &rejections,
-                    MAX_DIR_HANDLES,
+                    dir_handle_cap,
                     key,
                     snapshot,
                     listing,
@@ -1787,7 +1928,7 @@ impl Filesystem for MusefsFs {
                 // `musefs_dir_handle_rejections_total` is the operator-facing
                 // signal that the degraded path is in use (#626).
                 log::debug!(
-                    "opendir({ino}) over the {MAX_DIR_HANDLES}-handle cap: serving it statelessly",
+                    "opendir({ino}) over the {dir_handle_cap}-handle cap: serving it statelessly",
                     ino = ino.0
                 );
             }
@@ -3519,12 +3660,59 @@ mod tests {
 
 #[cfg(test)]
 mod errno_tests {
-    use super::errno;
+    use super::{errno, placed_errno};
     use musefs_core::CoreError;
 
     #[test]
     fn handle_table_full_maps_to_enfile() {
         assert_eq!(errno(&CoreError::HandleTableFull).code(), libc::ENFILE);
+    }
+
+    /// #708: every `CoreError` variant has a place in the mapping, and the
+    /// place it is meant to have.
+    ///
+    /// `errno` needs a wildcard, so a variant added to `musefs-core` compiles
+    /// here without one. It fails this instead: core's sample list cannot leave
+    /// a variant out (its own test sees to that), and an unplaced one has no
+    /// `placed_errno`. The table below has no wildcard either, so a variant
+    /// moved out of the `EIO` arm, or a new one given an arm, has to be
+    /// recorded here as a decision.
+    #[test]
+    fn every_core_error_variant_is_placed_and_maps_as_intended() {
+        for err in CoreError::every_variant_for_test() {
+            let expected = match &err {
+                CoreError::NoEntry(_) | CoreError::TrackNotFound(_) => libc::ENOENT,
+                CoreError::IsDir(_) => libc::EISDIR,
+                CoreError::NotADir(_) => libc::ENOTDIR,
+                CoreError::HandleTableFull => libc::ENFILE,
+                // The OS errno passes through.
+                CoreError::Io(source) | CoreError::BackingIo { source, .. } => source
+                    .raw_os_error()
+                    .expect("the samples carry a real OS errno"),
+                CoreError::BackingChanged(_)
+                | CoreError::DerivedStateStale(_)
+                | CoreError::Db(_)
+                | CoreError::DbOpen { .. }
+                | CoreError::Mp4MetadataTooLarge { .. }
+                | CoreError::OrphanedArt { .. }
+                | CoreError::ArtTooLarge { .. }
+                | CoreError::InvalidPictureType { .. }
+                | CoreError::HeaderTooLarge { .. }
+                | CoreError::TrackFieldTooLarge { .. }
+                | CoreError::TrackMetadataTooLarge { .. }
+                | CoreError::Format(_)
+                | CoreError::InvalidTemplate(_) => libc::EIO,
+                other => panic!(
+                    "{other:?} is a CoreError variant this table does not know: decide \
+                     its errno, give it an arm in placed_errno, and record it here"
+                ),
+            };
+            let placed = placed_errno(&err).unwrap_or_else(|| {
+                panic!("{err:?} has no arm in placed_errno, so errno collapses it to EIO unplaced")
+            });
+            assert_eq!(placed.code(), expected, "{err:?}");
+            assert_eq!(errno(&err).code(), expected, "{err:?}");
+        }
     }
 }
 
