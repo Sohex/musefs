@@ -216,7 +216,7 @@ fn statfs_params() -> (u64, u64, u64, u64, u64, u32, u32, u32) {
 
 /// Map a core error onto a POSIX errno for the FUSE reply. `Io` errors carry the
 /// underlying errno when present; everything structural collapses to `EIO`, and
-/// so does a variant [`placed_errno`] has not placed yet.
+/// so does a variant `placed_errno` has not placed yet.
 pub fn errno(err: &CoreError) -> fuser::Errno {
     placed_errno(err).unwrap_or(fuser::Errno::EIO)
 }

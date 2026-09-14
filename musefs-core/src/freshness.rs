@@ -26,7 +26,7 @@ const NANOS_PER_SEC: i64 = 1_000_000_000;
 /// almost every tagger does.
 ///
 /// It is recorded only where the filesystem's inode numbers are known to survive
-/// a remount (#757; see [`keeps_inodes`]). FAT and exFAT number a file each time
+/// a remount (#757; see `keeps_inodes`). FAT and exFAT number a file each time
 /// it enters the inode cache, and SMB, FUSE and overlayfs mounts can renumber on
 /// a remount. Recording such a number would fail every serve of an untouched file
 /// after one, so `BackingStamp::recordable` drops it. There the stamp is size,

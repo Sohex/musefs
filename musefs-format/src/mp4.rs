@@ -741,14 +741,14 @@ fn number_total(value: &[u8]) -> String {
 /// key on their name (folded when known). Every `data` sub-box of an atom is
 /// read, so multi-value atoms recover all their values. Other atoms are skipped.
 ///
-/// QuickTime keyed metadata ([`keyed_items`], #771) then fills in keys the `ilst`
+/// QuickTime keyed metadata (`keyed_items`, #771) then fills in keys the `ilst`
 /// does not define. A key name folds onto the vocabulary when it has a mapping
 /// (`com.apple.quicktime.artist` → `artist`), and is otherwise kept verbatim, as
 /// an unknown `----` name is. Precedence is all-or-nothing per key, compared
 /// case-insensitively: a key the `ilst` carries takes nothing from keyed
-/// metadata, and among keyed items the first (in [`keyed_items`] order) that
+/// metadata, and among keyed items the first (in `keyed_items` order) that
 /// yields a value supplies the key. Each item yields at most one value
-/// ([`pick_value`], [`keyed_text`]); the artwork key is art, not text.
+/// (`pick_value`, `keyed_text`); the artwork key is art, not text.
 pub fn read_tags(buf: &[u8]) -> Vec<(String, String)> {
     let mut out = itunes_ilst(buf).map_or_else(Vec::new, read_ilst_tags);
     let mut present: HashSet<String> = out.iter().map(|(k, _)| k.to_ascii_lowercase()).collect();
@@ -902,7 +902,7 @@ fn push_picture(
 /// multiple-artwork convention); non-`data` children are skipped. Only when the
 /// `covr` atoms yield nothing (not even an oversize drop) is QuickTime keyed
 /// metadata's `com.apple.quicktime.artwork` consulted: the first artwork item, in
-/// [`keyed_items`] order, holding a JPEG/PNG value gives one picture.
+/// `keyed_items` order, holding a JPEG/PNG value gives one picture.
 ///
 /// `max_art_bytes` caps each image body: a `data` payload whose image bytes
 /// (after the 8-byte `[type][locale]` header) exceed it is skipped before any
