@@ -309,11 +309,11 @@ impl PendingMigration {
         };
         for entry in entries {
             let entry = entry?;
-            let is_partial = entry.file_name().to_str().is_some_and(|n| {
-                n.strip_prefix(&prefix).is_some_and(|tag| {
-                    !tag.is_empty() && tag.bytes().all(|b| b.is_ascii_digit() || b == b'-')
-                })
-            });
+            let is_partial = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.strip_prefix(&prefix))
+                .is_some_and(is_partial_tag);
             if is_partial {
                 std::fs::remove_file(entry.path())?;
                 removed.push(entry.path());
@@ -693,9 +693,20 @@ impl PendingMigration {
 }
 
 /// What a snapshot being written carries after its destination's file name, then
-/// a unique numeric tag. Unique because `VACUUM INTO` refuses a destination that
-/// exists; recognisable so the next run can clear one a kill left behind.
+/// a unique tag, `<pid>-<seq>-<nanos>`. Unique because `VACUUM INTO` refuses a
+/// destination that exists; recognisable so the next run can clear one a kill
+/// left behind.
 const PARTIAL_SNAPSHOT: &str = ".partial-";
+
+/// Whether `tag` is one `partial_snapshot_path` writes: exactly three non-empty
+/// runs of decimal digits joined by `-`, and nothing else.
+fn is_partial_tag(tag: &str) -> bool {
+    let fields: Vec<&str> = tag.split('-').collect();
+    fields.len() == 3
+        && fields
+            .iter()
+            .all(|field| !field.is_empty() && field.bytes().all(|b| b.is_ascii_digit()))
+}
 
 /// The directory `path` sits in, `.` for a bare file name.
 fn parent_dir(path: &Path) -> &Path {
@@ -871,6 +882,42 @@ mod snapshot_tests {
             .snapshot_to(&dest)
             .unwrap();
         assert_eq!(user_version(&dest), 3);
+    }
+
+    /// Only a name `partial_snapshot_path` could have made is cleared: the
+    /// destination's name, the marker, then exactly three non-empty decimal
+    /// fields. A file that merely resembles one is someone else's.
+    #[test]
+    fn only_a_name_the_snapshot_itself_makes_is_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("library.db.v2.bak");
+        let generated = super::partial_snapshot_path(&dest);
+        std::fs::write(&generated, b"torn").unwrap();
+        let lookalikes = [
+            "partial-2026",
+            "partial-1-2",
+            "partial-1-2-3-4",
+            "partial--1-2",
+            "partial-1--2",
+            "partial-1-2-",
+            "partial-1-2-x",
+            "partial-+1-2-3",
+        ]
+        .map(|tag| dir.path().join(format!("library.db.v2.bak.{tag}")));
+        for lookalike in &lookalikes {
+            std::fs::write(lookalike, b"not musefs's").unwrap();
+        }
+
+        let removed = PendingMigration::clear_partial_snapshots(&dest).unwrap();
+        assert_eq!(removed, vec![generated.clone()]);
+        assert!(!generated.exists());
+        for lookalike in &lookalikes {
+            assert!(
+                lookalike.exists(),
+                "{} must be left alone",
+                lookalike.display()
+            );
+        }
     }
 
     /// The destination is still never replaced, and refusing it leaves no copy.
