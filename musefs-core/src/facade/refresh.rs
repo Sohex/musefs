@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -8,7 +8,7 @@ use crate::error::{CoreError, Result};
 use crate::mapping::tags_to_fields;
 use crate::refresh_diff::{ChangeSet, TrackRenderState, partition_changelog};
 use crate::template::Template;
-use crate::tree::{InodeAllocator, VirtualTree};
+use crate::tree::{InodeAllocator, NodeKind, VirtualTree};
 
 use super::{MountConfig, Musefs};
 
@@ -46,6 +46,10 @@ struct IncrementalOutcome {
     /// no `ChangeSet` entry, and open handles still have to re-resolve (#679).
     any_logged: bool,
     new_seq: i64,
+    /// Every track the in-place mutation inserted, or `None` when it fell back to
+    /// a full build, so that every track has to be checked for an inode that
+    /// changed hands (#778).
+    reinserted: Option<Vec<i64>>,
 }
 
 impl Musefs {
@@ -192,7 +196,7 @@ impl Musefs {
         let tree = VirtualTree::build_with_ci(&entries, &mut alloc, self.config.case_insensitive);
         alloc.prune_retired(&tree);
         drop(alloc);
-        self.tree.store(Arc::new(tree));
+        self.publish_tree(tree);
         Ok(snapshot)
     }
 
@@ -353,20 +357,22 @@ impl Musefs {
         }
 
         let mut alloc = crate::lock::lock_or_flag(&self.inodes, &self.needs_rebuild, "inodes");
-        let mut tree = (*self.tree.load_full()).clone(); // O(1) im clone
+        let mut tree = self.tree.load_full().tree.clone(); // O(1) im clone
+        let mut reinserted = Vec::new();
         let applied = if self.force_apply_fail.swap(false, Ordering::AcqRel) {
             Err(crate::tree::RebuildError::TestInjected) // test injection
         } else {
-            tree.apply_changes(
+            tree.apply_changes_reinserting(
                 &snap,
                 &change.changed,
                 &change.added,
                 &change.removed,
                 &mut alloc,
+                &mut reinserted,
             )
         };
         #[allow(clippy::single_match_else)]
-        let tree = match applied {
+        let (tree, reinserted) = match applied {
             Ok(_) => {
                 #[cfg(debug_assertions)]
                 {
@@ -386,7 +392,7 @@ impl Musefs {
                         "incremental tree diverged from build_with"
                     );
                 }
-                tree
+                (tree, Some(reinserted))
             }
             Err(reason) => {
                 log::warn!(
@@ -397,11 +403,13 @@ impl Musefs {
                     .map(|(&id, s)| (id, Arc::clone(&s.path)))
                     .collect();
                 entries.sort_by_key(|(id, _)| *id);
-                VirtualTree::build_with_ci(&entries, &mut alloc, self.config.case_insensitive)
+                let tree =
+                    VirtualTree::build_with_ci(&entries, &mut alloc, self.config.case_insensitive);
+                (tree, None)
             }
         };
         alloc.prune_retired(&tree);
-        self.tree.store(Arc::new(tree));
+        self.publish_tree(tree);
         drop(alloc);
         drop(snap);
         Ok(Some(IncrementalOutcome {
@@ -410,6 +418,7 @@ impl Musefs {
             new_states,
             any_logged: !log.changed_ids.is_empty(),
             new_seq,
+            reinserted,
         }))
     }
 
@@ -557,6 +566,7 @@ impl Musefs {
                     &out.change,
                     &out.displaced,
                     &out.new_states,
+                    out.reinserted.as_deref(),
                     &old_tree,
                     &tree,
                     &mut on_changed,
@@ -623,10 +633,11 @@ impl Musefs {
         }
     }
 
-    /// Fire `on_changed` for every inode that must drop kernel cache: a track whose
-    /// served bytes changed (content_version rose, path stable) and the OLD inode of
-    /// any track that was removed or whose path moved (incl. a format-only move that
-    /// did not bump content_version). Path-move detection is decoupled from
+    /// Fire `on_changed` once for every inode that must drop kernel cache: a track
+    /// whose served bytes changed (content_version rose, path stable), the OLD
+    /// inode of any track that was removed or whose path moved (incl. a format-only
+    /// move that did not bump content_version), and every inode that now serves a
+    /// different track (#778). Path-move detection is decoupled from
     /// content_version. See SP2 Component 2.
     fn notify_changed(
         old: &HashMap<i64, TrackRenderState>,
@@ -635,14 +646,17 @@ impl Musefs {
         new_tree: &VirtualTree,
         on_changed: &mut impl FnMut(u64),
     ) {
+        let mut inodes = BTreeSet::new();
         for (tid, ns) in new {
             if let Some(os) = old.get(tid)
                 && os.content_version != ns.content_version
                 && os.path == ns.path
                 && let Some(ino) = new_tree.inode_of_track(*tid)
             {
-                on_changed(ino);
+                inodes.insert(ino);
             }
+            // A full rebuild already walks every track, so every one is checked.
+            Self::note_inode_taken_over(old_tree, new_tree, *tid, &mut inodes);
         }
         for (tid, os) in old {
             let moved_or_gone = match new.get(tid) {
@@ -650,22 +664,30 @@ impl Musefs {
                 Some(ns) => ns.path != os.path,
             };
             if moved_or_gone && let Some(ino) = old_tree.inode_of_track(*tid) {
-                on_changed(ino);
+                inodes.insert(ino);
             }
+        }
+        for ino in inodes {
+            on_changed(ino);
         }
     }
 
-    /// ChangeSet-driven counterpart of `notify_changed` (#69): same notification
-    /// rules, evaluated only over changed/removed ids. `displaced` holds the old
-    /// states the in-place mutation returned; `new_states` the fresh renders.
+    /// ChangeSet-driven counterpart of `notify_changed` (#69): the same
+    /// notifications, evaluated only over changed/removed ids and the tracks the
+    /// in-place mutation inserted. `displaced` holds the old states the mutation
+    /// returned; `new_states` the fresh renders; `reinserted` every track the
+    /// mutation inserted, or `None` when it fell back to a full build and every
+    /// track has to be checked (#778).
     fn notify_changed_delta(
         change: &ChangeSet,
         displaced: &HashMap<i64, TrackRenderState>,
         new_states: &HashMap<i64, TrackRenderState>,
+        reinserted: Option<&[i64]>,
         old_tree: &VirtualTree,
         new_tree: &VirtualTree,
         on_changed: &mut impl FnMut(u64),
     ) {
+        let mut inodes = BTreeSet::new();
         for &id in &change.changed {
             let (Some(os), Some(ns)) = (displaced.get(&id), new_states.get(&id)) else {
                 continue;
@@ -674,18 +696,57 @@ impl Musefs {
                 && os.path == ns.path
                 && let Some(ino) = new_tree.inode_of_track(id)
             {
-                on_changed(ino);
+                inodes.insert(ino);
             }
             if ns.path != os.path
                 && let Some(ino) = old_tree.inode_of_track(id)
             {
-                on_changed(ino);
+                inodes.insert(ino);
             }
         }
         for &id in &change.removed {
             if let Some(ino) = displaced.get(&id).and_then(|_| old_tree.inode_of_track(id)) {
-                on_changed(ino);
+                inodes.insert(ino);
             }
+        }
+        match reinserted {
+            Some(ids) => {
+                for &id in ids {
+                    Self::note_inode_taken_over(old_tree, new_tree, id, &mut inodes);
+                }
+            }
+            None => {
+                for id in new_tree.track_ids() {
+                    Self::note_inode_taken_over(old_tree, new_tree, id, &mut inodes);
+                }
+            }
+        }
+        for ino in inodes {
+            on_changed(ino);
+        }
+    }
+
+    /// Note in `inodes` the inode `track_id` has in `new_tree`, if `old_tree` used
+    /// that inode for anything else.
+    ///
+    /// Inodes are keyed by the disambiguated path and never reused, so a name keeps
+    /// its inode across refreshes. A refresh that changes which track wins a name
+    /// collision therefore leaves the name's inode serving a different track, and
+    /// no per-track render state records that: the rendered path is the one
+    /// before disambiguation (#778). An inode new to this refresh is left alone,
+    /// since no kernel can have cached it, and so is one still serving the same
+    /// track, since each invalidation drops the kernel's cache for it.
+    fn note_inode_taken_over(
+        old_tree: &VirtualTree,
+        new_tree: &VirtualTree,
+        track_id: i64,
+        inodes: &mut BTreeSet<u64>,
+    ) {
+        if let Some(ino) = new_tree.inode_of_track(track_id)
+            && let Some(node) = old_tree.node(ino)
+            && !matches!(node.kind, NodeKind::File { track_id: old } if old == track_id)
+        {
+            inodes.insert(ino);
         }
     }
 

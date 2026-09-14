@@ -179,9 +179,39 @@ pub struct Attr {
 /// opened on one directory at one generation collapse onto a single listing
 /// instead of one copy each (#675).
 #[derive(Clone)]
-pub struct TreeSnapshot(Arc<VirtualTree>);
+pub struct TreeSnapshot(Arc<PublishedTree>);
+
+/// A virtual tree as [`Musefs`] publishes it: the tree, and where it falls in
+/// the order of publication.
+///
+/// The generation sits beside the tree rather than in it because it is no part
+/// of what the tree *is*: two builds of the same store compare equal, and must.
+struct PublishedTree {
+    generation: u64,
+    tree: VirtualTree,
+}
+
+impl std::ops::Deref for PublishedTree {
+    type Target = VirtualTree;
+
+    fn deref(&self) -> &VirtualTree {
+        &self.tree
+    }
+}
 
 impl TreeSnapshot {
+    /// Where the pinned generation falls in the order of publication: every
+    /// tree a refresh publishes has a higher one than every tree before it, and
+    /// clones of one snapshot agree.
+    ///
+    /// [`id`](TreeSnapshot::id) can say whether two snapshots are the same tree
+    /// but not which is newer. The FUSE layer needs the order: a worker that
+    /// loaded its snapshot just before a refresh must not be able to pass that
+    /// older generation off as the current one.
+    pub fn generation(&self) -> u64 {
+        self.0.generation
+    }
+
     /// An identity for the pinned generation, unique among *live* snapshots:
     /// it is the tree's heap address, so it is unique only for as long as this
     /// snapshot (or a clone of it) is alive, and a later generation may well
@@ -357,7 +387,7 @@ pub struct Musefs {
     config: MountConfig,
     /// Compiled once from `config.template`; rendering never re-parses.
     template: Template,
-    tree: ArcSwap<VirtualTree>,
+    tree: ArcSwap<PublishedTree>,
     cache: HeaderCache,
     last_data_version: AtomicI64,
     /// Bumped on every non-empty refresh (see `poll_refresh_notify`). Open handles
@@ -475,7 +505,10 @@ impl Musefs {
             cache: HeaderCache::new(config.mode),
             last_data_version: AtomicI64::new(last_data_version),
             refresh_gen: AtomicU64::new(0),
-            tree: ArcSwap::from_pointee(tree),
+            tree: ArcSwap::from_pointee(PublishedTree {
+                generation: 0,
+                tree,
+            }),
             pool: DbPool::new(db)?,
             config,
             template,
@@ -530,6 +563,16 @@ impl Musefs {
     /// `ArcSwap` loads. See [`TreeSnapshot`].
     pub fn tree_snapshot(&self) -> TreeSnapshot {
         TreeSnapshot(self.tree.load_full())
+    }
+
+    /// Publish `tree` as the next generation. Callers are serialized — every
+    /// publish runs inside a refresh, and refreshes never overlap — so reading
+    /// the current generation and storing its successor cannot interleave with
+    /// another publish, and generations strictly increase.
+    fn publish_tree(&self, tree: VirtualTree) {
+        let generation = self.tree.load().generation + 1;
+        self.tree
+            .store(Arc::new(PublishedTree { generation, tree }));
     }
 
     pub fn getattr(&self, inode: u64) -> Result<Attr> {

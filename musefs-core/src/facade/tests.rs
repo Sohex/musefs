@@ -1570,6 +1570,119 @@ fn tree_snapshot_id_distinguishes_generations_and_not_clones() {
         "a rebuilt tree is a different generation and must not reuse the name of \
          the one still pinned by `before`"
     );
+
+    // The generation orders what the id only tells apart. The FUSE layer's
+    // stateless listings rely on the order to never re-tag the current
+    // generation back to one a late worker loaded before the refresh.
+    assert_eq!(
+        before.generation(),
+        before.clone().generation(),
+        "clones pin one generation"
+    );
+    assert!(
+        after.generation() > before.generation(),
+        "a refresh publishes a newer generation: {} after {}",
+        after.generation(),
+        before.generation()
+    );
+    assert_eq!(
+        fs.tree_snapshot().generation(),
+        after.generation(),
+        "loading again without a refresh is the same generation"
+    );
+    {
+        let db = musefs_db::Db::open(&db_path).unwrap();
+        let track_id = db.list_tracks().unwrap().into_iter().next().unwrap().id;
+        db.replace_tags(track_id, &[musefs_db::Tag::new("artist", "Pix", 0)])
+            .unwrap();
+    }
+    assert!(fs.poll_refresh().unwrap());
+    assert_eq!(
+        fs.tree_snapshot().generation(),
+        after.generation() + 1,
+        "each publish is exactly one generation on"
+    );
+}
+
+/// The track `name` in directory `Art` resolves to on `fs`, and its inode.
+fn art_holder(fs: &Musefs, name: &str) -> (i64, u64) {
+    let art = fs.lookup(VirtualTree::ROOT, "Art").expect("Art is listed");
+    let ino = fs
+        .lookup(art, name)
+        .unwrap_or_else(|| panic!("{name} is not listed"));
+    let tree = fs.tree.load();
+    match &tree.node(ino).expect("a listed inode has a node").kind {
+        NodeKind::File { track_id } => (*track_id, ino),
+        NodeKind::Dir => panic!("{name} is a directory"),
+    }
+}
+
+/// A track under artist "Art" titled `title`, recorded but never probed.
+fn add_art_track(dir: &std::path::Path, db: &Db, file: &str, title: &str) -> i64 {
+    let id = db
+        .upsert_track(&musefs_db::NewTrack {
+            backing_path: dir.join(file),
+            format: musefs_db::Format::Flac,
+            audio_offset: 0,
+            audio_length: 1,
+            backing_size: 1,
+            backing_mtime_ns: 0,
+            backing_ctime_ns: 0,
+            backing_ino: None,
+        })
+        .unwrap();
+    db.replace_tags(
+        id,
+        &[
+            musefs_db::Tag::new("artist", "Art", 0),
+            musefs_db::Tag::new("title", title, 0),
+        ],
+    )
+    .unwrap();
+    id
+}
+
+/// A refresh that creates a name collision must rank it as a fresh build of the
+/// same store does. A mount that has been running and a mount opened after the
+/// change are both serving that store, and a name must reach the same track on
+/// either.
+#[test]
+fn an_incremental_refresh_ranks_a_new_collision_as_a_fresh_build_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("m.db");
+    let db = Db::open(&db_path).unwrap();
+    let low = add_art_track(dir.path(), &db, "one.flac", "Other");
+    let high = add_art_track(dir.path(), &db, "two.flac", "X");
+    assert!(low < high);
+
+    let cfg = MountConfig {
+        template: "$artist/$title".to_string(),
+        poll_interval: std::time::Duration::ZERO,
+        case_insensitive: false,
+        ..MountConfig::default()
+    };
+    let running = Musefs::open(Db::open(&db_path).unwrap(), cfg.clone()).unwrap();
+    assert_eq!(art_holder(&running, "X.flac").0, high);
+
+    db.replace_tags(
+        low,
+        &[
+            musefs_db::Tag::new("artist", "Art", 0),
+            musefs_db::Tag::new("title", "X", 0),
+        ],
+    )
+    .unwrap();
+    assert!(running.poll_refresh().unwrap());
+    let fresh = Musefs::open(Db::open(&db_path).unwrap(), cfg).unwrap();
+
+    for name in ["X.flac", "X (2).flac"] {
+        let (running_track, _) = art_holder(&running, name);
+        let (fresh_track, _) = art_holder(&fresh, name);
+        assert_eq!(
+            running_track, fresh_track,
+            "{name} must reach the same track on a running mount as on a fresh one"
+        );
+    }
 }
 
 /// A one-track mount over a backing file the caller is about to change out of

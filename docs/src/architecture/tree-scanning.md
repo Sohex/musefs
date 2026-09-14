@@ -120,7 +120,16 @@ commit anything?"*. `Musefs::poll_refresh` compares it to the last seen
 value; on a change it consults the `track_changes` ring and applies an
 **incremental, O(changed)** rebuild: only the affected tracks' tree entries
 are re-rendered, exactly the removed tracks' cache entries are dropped, and
-the inodes whose `content_version` rose are reported to the FUSE layer. Any
+every inode whose served file changed is reported to the FUSE layer: the inode
+of a track whose `content_version` rose, the old inode of a track that moved or
+was removed, and any inode the refresh hands to another track. A name keeps its
+inode across refreshes, because inodes are keyed by the disambiguated path, so a
+refresh that changes which track wins a name collision leaves the name's inode
+serving a different track
+([#778](https://github.com/Sohex/musefs/issues/778)). The incremental rebuild
+finds those by checking only the tracks it re-inserted into the tree, the
+changed ones and every member of a collision group it rebuilt, so it stays
+O(changed); a full rebuild checks every track. Any
 poll whose changelog names a track advances the refresh generation — not only
 one that changed a render key — because an open handle caches its resolved
 layout, backing path and stamp included, until that generation moves. If
@@ -136,10 +145,10 @@ The FUSE layer fires `poll_refresh` on metadata ops (`lookup`, `readdir`,
 …) off the dispatch thread, so external edits appear **without remounting**.
 Polling is debounced (`--poll-interval-ms`) and rebuilds are single-flighted:
 a metadata-op storm costs at most one rebuild per interval. When mounted with
-`--keep-cache`, the changed-inode notifications drive kernel page-cache
-invalidation (`inval_inode`), so a re-tagged file's cached pages are dropped
-at the refresh that picks the re-tag up. That covers changes recorded in the
-store that raise `content_version`; a backing file rewritten in
+`--keep-cache`, the changed-inode notifications drive kernel invalidation
+(`inval_inode`) of both cached attributes and cached pages, so a re-tagged file,
+or a name another track has taken, never serves the previous bytes or size.
+That covers changes recorded in the store; a backing file rewritten in
 place writes nothing to the store and raises no notification (see
 [above](#freshness-two-version-counters)).
 

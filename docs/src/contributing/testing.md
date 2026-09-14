@@ -13,16 +13,23 @@ enables for all of its own test builds — so a plain
 
 The same pattern keeps the rest of the test scaffolding out of the published
 API. `musefs-core`, `musefs-db` and `musefs-fuse` each have a `test-support`
-feature gating the hooks their integration tests reach across the crate
-boundary — the whole-file oracle scan, the `*_for_test` methods, the allocating
-readers and default-option shims no production path calls, the background-session
-mount — and switched on by a self-dev-dependency (plus the dev-dependencies other
-crates' tests take on them), so no flag is needed. `musefs-format` gates its
-equivalents, such as the Ogg page-header oracle, behind `fuzzing`. A new
+feature gating the hooks their tests reach across the crate boundary — the
+whole-file oracle scan, the `*_for_test` methods, `CoreError::every_variant_for_test`,
+the allocating readers and default-option shims no production path calls, and
+in `musefs-fuse` the background-session mount plus the mount seams
+(`FuseConfig`'s forced admission, directory-handle and stateless-listing caps,
+and the worker-pool route trace) that let a mounted test put the daemon in a
+state it cannot otherwise reach on demand. Each is switched on by a
+self-dev-dependency (plus `musefs-core`'s dev-dependency on `musefs-db`, and
+`musefs-fuse`'s on `musefs-core`), so no flag is needed. `musefs-format` gates
+its equivalents, such as the Ogg page-header oracle, behind `fuzzing`. A new
 test hook goes behind that feature when an integration test needs it, and is
 `#[cfg(test)] pub(crate)` when only the crate's own unit tests do. A plain
 `cargo build` does not compile any of it; check such a change with
-`cargo clippy --workspace` as well as `--all-targets`.
+`cargo clippy --workspace` as well as `--all-targets`. A seam with a
+`#[cfg(not(feature = "test-support"))]` twin also needs the crate's library
+built without its dev-dependencies, as `cargo clippy -p <crate> --lib` does,
+because every test build turns the feature on.
 
 ### Coverage-guided fuzzing
 

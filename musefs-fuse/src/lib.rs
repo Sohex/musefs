@@ -89,6 +89,29 @@ pub struct FuseConfig {
     /// bounds the SQLite connection count — steady-state memory scales with it
     /// (#631). Lower it on memory-constrained or many-core hosts.
     pub workers: usize,
+    /// Test-only: the worker pool's metadata admission cap, in place of
+    /// `MAX_QUEUED_JOBS` (#694), so a mount test can put the pool over it on
+    /// demand. `None` keeps the real cap.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub pool_admission_cap: Option<usize>,
+    /// Test-only: the directory-handle cap, in place of `MAX_DIR_HANDLES`
+    /// (#616), so a mount test can serve every `opendir` statelessly. `None`
+    /// keeps the real cap.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub dir_handle_cap: Option<usize>,
+    /// Test-only: how many listings stateless enumerations keep pinned, in
+    /// place of `MAX_STATELESS_LISTINGS` (#695), so a mount test can evict one
+    /// on demand. `None` keeps the real cap.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub stateless_listing_cap: Option<usize>,
+    /// Test-only: record every job the mount hands its worker pool, with the
+    /// route it took (#694). `None` records nothing.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub route_trace: Option<RouteTrace>,
 }
 
 impl Default for FuseConfig {
@@ -105,6 +128,14 @@ impl Default for FuseConfig {
             allow_other: false,
             expose_metrics: false,
             workers: 0,
+            #[cfg(feature = "test-support")]
+            pool_admission_cap: None,
+            #[cfg(feature = "test-support")]
+            dir_handle_cap: None,
+            #[cfg(feature = "test-support")]
+            stateless_listing_cap: None,
+            #[cfg(feature = "test-support")]
+            route_trace: None,
         }
     }
 }
@@ -184,15 +215,20 @@ fn statfs_params() -> (u64, u64, u64, u64, u64, u32, u32, u32) {
 }
 
 /// Map a core error onto a POSIX errno for the FUSE reply. `Io` errors carry the
-/// underlying errno when present; everything structural collapses to `EIO`.
-#[expect(
-    clippy::match_same_arms,
-    reason = "the named EIO arm records which errors are deliberately EIO; the wildcard is \
-              `#[non_exhaustive]`'s fallback for variants not yet placed, and folding the \
-              two would erase the record"
-)]
+/// underlying errno when present; everything structural collapses to `EIO`, and
+/// so does a variant [`placed_errno`] has not placed yet.
 pub fn errno(err: &CoreError) -> fuser::Errno {
-    match err {
+    placed_errno(err).unwrap_or(fuser::Errno::EIO)
+}
+
+/// The errno for a variant this mapping names, or `None` for one it does not.
+///
+/// `CoreError` is `#[non_exhaustive]` (#708), so the match needs a wildcard,
+/// and a variant added to `musefs-core` falls into it without a compile error.
+/// Keeping that fallback out of the named arms is what lets a test tell a
+/// variant deliberately mapped to `EIO` from one nobody has placed.
+fn placed_errno(err: &CoreError) -> Option<fuser::Errno> {
+    Some(match err {
         CoreError::NoEntry(_) | CoreError::TrackNotFound(_) => fuser::Errno::ENOENT,
         CoreError::IsDir(_) => fuser::Errno::EISDIR,
         CoreError::NotADir(_) => fuser::Errno::ENOTDIR,
@@ -217,11 +253,10 @@ pub fn errno(err: &CoreError) -> fuser::Errno {
         | CoreError::TrackMetadataTooLarge { .. }
         | CoreError::Format(_)
         | CoreError::InvalidTemplate(_) => fuser::Errno::EIO,
-        // `CoreError` is `#[non_exhaustive]` (#708). A variant added after this
-        // list collapses to `EIO` with the structural errors above until it is
-        // given a place in it.
-        _ => fuser::Errno::EIO,
-    }
+        // A variant added after this list: `errno` collapses it to `EIO` until
+        // it is given a place above.
+        _ => return None,
+    })
 }
 
 /// Log a serve-path failure before it collapses to an errno reply, so the
@@ -295,6 +330,66 @@ fn run_guarded(op: &'static str, work: impl FnOnce()) {
 /// meets it is a backlog already too deep to be worth growing.
 const MAX_QUEUED_JOBS: usize = 4096;
 
+/// The admission cap a mount's pool runs with: [`MAX_QUEUED_JOBS`], unless a
+/// test forced another through `FuseConfig::pool_admission_cap`.
+#[cfg(feature = "test-support")]
+fn admission_cap(config: &FuseConfig) -> usize {
+    config.pool_admission_cap.unwrap_or(MAX_QUEUED_JOBS)
+}
+
+#[cfg(not(feature = "test-support"))]
+fn admission_cap(_config: &FuseConfig) -> usize {
+    MAX_QUEUED_JOBS
+}
+
+/// Where a job a mount handed its worker pool went (#694), as a test-support
+/// [`RouteTrace`] records it.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PoolRoute {
+    /// Admitted and queued on the pool.
+    Queued,
+    /// Over the admission cap, run on the submitting thread.
+    InPlace,
+    /// Over the admission cap, dropped unrun.
+    Dropped,
+    /// A read, on its own lane past the metadata gate.
+    ReadLane,
+}
+
+/// Every job a mount handed its worker pool, as `(op label, route)`, in order.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub type RouteTrace = Arc<Mutex<Vec<(&'static str, PoolRoute)>>>;
+
+/// The directory-handle cap a mount runs with: [`MAX_DIR_HANDLES`], unless a
+/// test forced another through `FuseConfig::dir_handle_cap`.
+#[cfg(feature = "test-support")]
+fn configured_dir_handle_cap(config: &FuseConfig) -> usize {
+    config.dir_handle_cap.unwrap_or(MAX_DIR_HANDLES)
+}
+
+#[cfg(not(feature = "test-support"))]
+fn configured_dir_handle_cap(_config: &FuseConfig) -> usize {
+    MAX_DIR_HANDLES
+}
+
+/// How many listings a mount's stateless enumerations keep pinned:
+/// [`MAX_STATELESS_LISTINGS`], unless a test forced another through
+/// `FuseConfig::stateless_listing_cap`.
+#[cfg(feature = "test-support")]
+fn configured_stateless_listing_cap(config: &FuseConfig) -> usize {
+    config
+        .stateless_listing_cap
+        .unwrap_or(MAX_STATELESS_LISTINGS)
+}
+
+#[cfg(not(feature = "test-support"))]
+fn configured_stateless_listing_cap(_config: &FuseConfig) -> usize {
+    MAX_STATELESS_LISTINGS
+}
+
 /// The worker pool behind one admission gate for everything but reads (#694).
 /// Cloning shares the pool, the count and the counter.
 #[derive(Clone)]
@@ -306,6 +401,9 @@ struct Workers {
     /// `readdirplus` entry's attrs, not run at all (`musefs_pool_over_cap_total`).
     over_cap: Arc<AtomicU64>,
     cap: usize,
+    /// Test-only: where each job went (#694).
+    #[cfg(feature = "test-support")]
+    trace: Option<RouteTrace>,
 }
 
 /// Gives one [`Workers::admitted`] slot back when dropped: when its job ends,
@@ -325,6 +423,28 @@ impl Workers {
             admitted: Arc::new(AtomicUsize::new(0)),
             over_cap: Arc::new(AtomicU64::new(0)),
             cap,
+            #[cfg(feature = "test-support")]
+            trace: None,
+        }
+    }
+
+    /// Test-only: record every job's route into `trace` (#694).
+    #[cfg(feature = "test-support")]
+    fn traced(mut self, trace: Option<RouteTrace>) -> Workers {
+        self.trace = trace;
+        self
+    }
+
+    /// Test-only: record where `op`'s job went, if a test asked for a trace.
+    /// Called before the job runs or is dropped, so the entry exists before
+    /// any reply the job sends can unblock the test's syscall.
+    #[cfg(feature = "test-support")]
+    fn record(&self, op: &'static str, route: PoolRoute) {
+        if let Some(trace) = &self.trace {
+            trace
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((op, route));
         }
     }
 
@@ -349,12 +469,17 @@ impl Workers {
     /// Nothing is refused: a failed `lookup` or `getattr` fails the caller's
     /// syscall outright, and refusing directory work is what #616 walked back.
     fn submit(&self, op: &'static str, work: impl FnOnce() + Send + 'static) {
-        match self.admit() {
-            Some(slot) => execute_guarded(&self.pool, op, move || {
+        if let Some(slot) = self.admit() {
+            #[cfg(feature = "test-support")]
+            self.record(op, PoolRoute::Queued);
+            execute_guarded(&self.pool, op, move || {
                 let _slot = slot;
                 work();
-            }),
-            None => run_guarded(op, work),
+            });
+        } else {
+            #[cfg(feature = "test-support")]
+            self.record(op, PoolRoute::InPlace);
+            run_guarded(op, work);
         }
     }
 
@@ -362,8 +487,12 @@ impl Workers {
     /// report which (#694). For work with a cheaper answer than running in place.
     fn try_submit(&self, op: &'static str, work: impl FnOnce() + Send + 'static) -> bool {
         let Some(slot) = self.admit() else {
+            #[cfg(feature = "test-support")]
+            self.record(op, PoolRoute::Dropped);
             return false;
         };
+        #[cfg(feature = "test-support")]
+        self.record(op, PoolRoute::Queued);
         execute_guarded(&self.pool, op, move || {
             let _slot = slot;
             work();
@@ -374,6 +503,8 @@ impl Workers {
     /// Queue a read. Reads are admitted against their own cap before they get
     /// here (#308), so they bypass this gate.
     fn submit_read(&self, work: impl FnOnce() + Send + 'static) {
+        #[cfg(feature = "test-support")]
+        self.record("read", PoolRoute::ReadLane);
         execute_guarded(&self.pool, "read", work);
     }
 
@@ -560,30 +691,47 @@ const MAX_STATELESS_LISTINGS: usize = 64;
 /// or skip one. Instead the first page of an enumeration tags the current
 /// generation and pins its listing here, and every cookie it hands out carries
 /// the tag, so each later page reads the same listing.
-#[derive(Default)]
 struct StatelessListings {
-    /// The generation new enumerations are tagged with. Held because a
-    /// snapshot's id is a heap address, unique only while the snapshot lives:
-    /// without the pin, a later tree at the same address would inherit the tag.
-    current: Option<(TreeSnapshot, u32)>,
+    /// The [`TreeSnapshot::generation`] new enumerations are tagged with, and its
+    /// tag. It only ever advances: a generation number is never reused, so
+    /// nothing needs pinning, and it is ordered, so a worker still holding a
+    /// snapshot from before a refresh cannot re-tag the current generation back
+    /// to its own.
+    current: Option<(u64, u32)>,
     /// The last tag minted. Tags start at 1; 0 means untagged.
     last_tag: u32,
     /// `((directory inode, tag), listing)`, least recently used first.
     pinned: std::collections::VecDeque<((u64, u32), Arc<DirListing>)>,
+    /// How many listings `pinned` holds before it evicts:
+    /// [`MAX_STATELESS_LISTINGS`] outside a test that forced another.
+    cap: usize,
+}
+
+impl Default for StatelessListings {
+    fn default() -> StatelessListings {
+        StatelessListings::with_cap(MAX_STATELESS_LISTINGS)
+    }
 }
 
 impl StatelessListings {
-    /// The tag for `snapshot`'s generation, minting a new one unless it is the
-    /// generation the current tag stands for.
-    fn tag_for(&mut self, snapshot: &TreeSnapshot) -> u32 {
-        if let Some((held, tag)) = &self.current
-            && held.id() == snapshot.id()
-        {
-            return *tag;
+    /// The tag for `generation`: the current tag if it is the current
+    /// generation, a newly minted one if it is newer, and `None` if it is older.
+    ///
+    /// Older means the caller loaded its snapshot before a refresh that another
+    /// enumeration has since tagged. Minting for it would move `current` back,
+    /// and the enumeration paging the newer generation would then find its tag
+    /// replaced — refused as stale the moment its listing was evicted, though
+    /// nothing it was paging had changed.
+    fn tag_for(&mut self, generation: u64) -> Option<u32> {
+        match self.current {
+            Some((held, tag)) if held == generation => Some(tag),
+            Some((held, _)) if held > generation => None,
+            _ => {
+                self.last_tag = self.last_tag.checked_add(1).unwrap_or(1);
+                self.current = Some((generation, self.last_tag));
+                Some(self.last_tag)
+            }
         }
-        self.last_tag = self.last_tag.checked_add(1).unwrap_or(1);
-        self.current = Some((snapshot.clone(), self.last_tag));
-        self.last_tag
     }
 
     /// The listing pinned for `(ino, tag)`, marked most recently used.
@@ -595,11 +743,21 @@ impl StatelessListings {
         Some(listing)
     }
 
+    /// An empty cache that pins at most `cap` listings.
+    fn with_cap(cap: usize) -> StatelessListings {
+        StatelessListings {
+            current: None,
+            last_tag: 0,
+            pinned: std::collections::VecDeque::new(),
+            cap,
+        }
+    }
+
     /// Pin `listing` for `(ino, tag)`, evicting the least recently used past the cap.
     fn insert(&mut self, ino: u64, tag: u32, listing: Arc<DirListing>) {
         self.pinned.retain(|(key, _)| *key != (ino, tag));
         self.pinned.push_back(((ino, tag), listing));
-        while self.pinned.len() > MAX_STATELESS_LISTINGS {
+        while self.pinned.len() > self.cap {
             self.pinned.pop_front();
         }
     }
@@ -650,16 +808,23 @@ fn stale_enumeration(op: &str, ino: u64) -> fuser::Errno {
 ///   replaced is [`StatelessPage::Stale`]. Paging the new generation at the old
 ///   index was exactly the duplicate-or-skip this cache exists to prevent.
 ///
-/// `build` supplies a listing when one is not pinned already, and runs without
-/// the cache lock held.
+/// `snapshot` is the one the worker loaded. If a refresh has published a newer
+/// generation and another enumeration has already tagged it, `snapshot` is
+/// behind the current tag, and `latest` supplies the newer tree instead — which
+/// is at least as new, because publication only moves forward.
+///
+/// `build` supplies a listing from the snapshot the page is on when one is not
+/// pinned already, and runs without the cache lock held.
 fn stateless_page<E>(
     listings: &Mutex<StatelessListings>,
     ino: u64,
     offset: u64,
     snapshot: &TreeSnapshot,
-    build: impl FnOnce() -> Result<Arc<DirListing>, E>,
+    latest: impl FnOnce() -> TreeSnapshot,
+    build: impl FnOnce(&TreeSnapshot) -> Result<Arc<DirListing>, E>,
 ) -> Result<StatelessPage, E> {
     let (tag, index) = split_dir_cookie(offset);
+    let mut reloaded = None;
     let current = {
         let mut guard = listings
             .lock()
@@ -669,7 +834,16 @@ fn stateless_page<E>(
         {
             return Ok(StatelessPage::Page(listing, PageStart { index, tag }));
         }
-        let current = guard.tag_for(snapshot);
+        let current = if let Some(current) = guard.tag_for(snapshot.generation()) {
+            current
+        } else {
+            let fresh = latest();
+            let current = guard
+                .tag_for(fresh.generation())
+                .expect("a snapshot loaded after the current tag's is at least as new");
+            reloaded = Some(fresh);
+            current
+        };
         if tag != 0 && tag != current {
             return Ok(StatelessPage::Stale);
         }
@@ -684,7 +858,7 @@ fn stateless_page<E>(
         }
         current
     };
-    let listing = build()?;
+    let listing = build(reloaded.as_ref().unwrap_or(snapshot))?;
     listings
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -802,12 +976,75 @@ struct AttrStyle {
 }
 
 /// One entry's attrs and how long the kernel may trust them. The TTL is the
-/// mount's, except for an entry whose attrs could not be resolved: see
-/// [`unresolved_plus_entry`].
+/// mount's, except for an entry the kernel is meant to refuse: see
+/// [`unlinkable_plus_entry`].
 #[derive(Clone, Copy)]
 struct PlusEntry {
     attr: FileAttr,
     ttl: Duration,
+}
+
+/// What became of one entry's resolution. A slot left unset means it never
+/// ran: dropped over the pool's admission cap, or lost with a dropped task.
+#[derive(Clone, Copy)]
+enum Resolution {
+    /// The file's own attrs.
+    Resolved(PlusEntry),
+    /// The synthesis ran and failed; the error is already logged.
+    Failed,
+}
+
+/// How one entry of a finished round goes into the reply.
+#[derive(Clone, Copy)]
+enum PlusEmit {
+    /// With the file's own attrs.
+    Attrs(PlusEntry),
+    /// Listed without attrs of its own: sent with the attrs musefs last sent the
+    /// kernel for the inode, or failing those, attrs the kernel refuses to link.
+    /// See [`plus_entry_for`].
+    Unlinkable,
+}
+
+/// What a finished round sends: `emits`, one per entry from the round's start,
+/// and whether the reply page ends after them.
+struct RoundPlan {
+    emits: Vec<PlusEmit>,
+    ends_page: bool,
+}
+
+/// Decide what a finished round sends, from its slots in listing order.
+/// `opens_page` is whether the round's first entry is the reply page's first.
+///
+/// Nothing goes out with attrs that are not the file's own. The kernel applies
+/// a `readdirplus` entry's attrs to the inode it already holds under that name,
+/// whatever the TTL, so a placeholder size truncates the page cache of a file
+/// another process has open — and kills one that has it mapped with `SIGBUS`.
+/// So the page ends before the first entry without attrs, and the kernel asks
+/// again from that entry's cookie: a short page is harmless, where an empty one
+/// reads as the end of the directory and an error fails the whole `getdents`.
+///
+/// The exception is the page's own first entry, which has had its one attempt
+/// in place and cannot be deferred again without ending the page empty. If it
+/// has no attrs, it is listed [`PlusEmit::Unlinkable`], so the name still
+/// appears and the listing still moves on.
+fn plan_round(slots: &[Option<Resolution>], opens_page: bool) -> RoundPlan {
+    let mut emits = Vec::with_capacity(slots.len());
+    for (idx, slot) in slots.iter().enumerate() {
+        match slot {
+            Some(Resolution::Resolved(entry)) => emits.push(PlusEmit::Attrs(*entry)),
+            _ if idx == 0 && opens_page => emits.push(PlusEmit::Unlinkable),
+            _ => {
+                return RoundPlan {
+                    emits,
+                    ends_page: true,
+                };
+            }
+        }
+    }
+    RoundPlan {
+        emits,
+        ends_page: false,
+    }
 }
 
 /// A `readdirplus` reply being filled (#667). Rounds run strictly one after
@@ -821,10 +1058,16 @@ struct PlusFill {
     reply: Mutex<Option<ReplyDirectoryPlus>>,
     core: Arc<Musefs>,
     pool: Workers,
+    /// What the kernel may hold for each file inode: the fallback source for an
+    /// entry without attrs, and updated with every entry added.
+    sent: Arc<SentAttrs>,
     style: AttrStyle,
     expose_metrics: bool,
     /// The generation tag every cookie of this fill carries (#695).
     cookie_tag: u32,
+    /// Index into `listing` of the reply page's first entry: the one entry
+    /// resolved even over the admission cap, so that the page is never empty.
+    page_start: usize,
 }
 
 /// One round's resolutions: a slice of the listing, a slot per entry, and the
@@ -834,8 +1077,9 @@ struct PlusRound {
     /// Index into `fill.listing` of the first entry this round covers; the
     /// round covers `slots.len()` entries from there.
     start: usize,
-    /// One slot per entry, each set exactly once by the task that owns it.
-    slots: Vec<OnceLock<PlusEntry>>,
+    /// One slot per entry, each set at most once by the task that owns it, and
+    /// left unset if that task never ran.
+    slots: Vec<OnceLock<Resolution>>,
     /// Resolutions still to come, plus one held by the dispatcher until every
     /// task is queued.
     outstanding: AtomicUsize,
@@ -893,33 +1137,144 @@ fn inline_plus_entry(
     })
 }
 
-/// Stand-in attrs for an entry whose synthesis failed, or whose resolution was
-/// lost with a dropped task.
+/// A size no file can have: the kernel's `fuse_valid_size` rejects anything
+/// above `i64::MAX`.
+const UNLINKABLE_SIZE: u64 = u64::MAX;
+
+/// An entry that lists the name and gives the kernel nothing to cache, for a
+/// page's first entry whose attrs could not be resolved (see [`plan_round`]).
 ///
-/// The entry still has to appear, or the file vanishes from the listing — which
-/// is a worse answer than today's, where `readdir` lists it and the client's own
-/// `lookup` reports the error. A zero TTL is what preserves that: the kernel
-/// caches neither the entry nor these attrs, so the next access goes back to
-/// `lookup`/`getattr` and gets the real error. The protocol's own way of saying
-/// "no attrs for this one" — a zero `nodeid` — is not reachable through fuser's
-/// API, which derives both the nodeid and the dirent's inode from `attr.ino`,
-/// and a zero inode makes `readdir` skip the name entirely.
-fn unresolved_plus_entry(child: u64, kind: FileType, style: &AttrStyle) -> PlusEntry {
+/// The entry has to appear, or the file vanishes from the listing, where plain
+/// `readdir` lists it and the client's own `lookup` reports the error. But no
+/// attrs may go with it that are not the file's own: the kernel applies them to
+/// the inode it already holds for the name, whatever the TTL. The protocol's
+/// way of saying "no attrs for this one", a zero `nodeid`, is not reachable
+/// through fuser's API, which derives both the nodeid and the dirent's inode
+/// from `attr.ino`, and a zero inode makes `readdir` skip the name.
+///
+/// So the attrs are ones the kernel will not accept. It emits a
+/// `readdirplus` dirent before it links the entry, and `fuse_direntplus_link`
+/// runs `fuse_invalid_attr` before it touches the dcache or any inode. An
+/// out-of-range size fails that check, so the name is listed, nothing is
+/// linked, and the kernel sends a `FORGET` for an inode it never held.
+///
+/// The check arrived with "fuse: verify attributes" (eb59bd17, Linux 5.5) and
+/// was backported to 5.4.3, 4.19.89, 4.14.159, 4.9.207, 4.4.207 and 3.16.85. A
+/// kernel without it writes the size into an inode it already holds, as a
+/// negative `i_size`, and truncates that inode's page cache. So this entry is
+/// the last resort: [`fallback_plus_entry`] sends it only for an inode musefs
+/// has sent the kernel no attrs for, and the zero TTL is a second line of
+/// defence, sending the next access back to `lookup`.
+fn unlinkable_plus_entry(child: u64, kind: FileType, style: &AttrStyle) -> PlusEntry {
     let node = if kind == FileType::Directory {
         (FileType::Directory, style.dir_mode, 2)
     } else {
         (FileType::RegularFile, style.file_mode, 1)
     };
     PlusEntry {
-        attr: make_attr(child, 0, node, style.uid, style.gid, style.mount_time),
+        attr: make_attr(
+            child,
+            UNLINKABLE_SIZE,
+            node,
+            style.uid,
+            style.gid,
+            style.mount_time,
+        ),
         ttl: Duration::ZERO,
     }
 }
 
+/// The attrs musefs last sent the kernel for each file inode the kernel may still
+/// hold, so that an unresolvable `readdirplus` entry can repeat them rather than
+/// send a size an old kernel would apply (see [`fallback_plus_entry`]).
+///
+/// Recorded wherever a reply carries a file's attrs — `lookup`, `getattr`, and
+/// each `readdirplus` entry added to a page — before that reply goes out, so the
+/// kernel's `FORGET` for it always lands after the record. Dropped where the
+/// kernel stops holding them: at `FORGET`, which the kernel sends only when it
+/// evicts the inode, and when a refresh invalidates the inode, whose attrs the
+/// kernel then discards. Directories are not recorded: their attrs are static,
+/// and a directory entry never needs the fallback.
+///
+/// Two replies for one inode can reach the kernel in the other order from the
+/// one they were recorded in, so the record may be the earlier or the later of
+/// two real attr sets for the file. Either is the file's own, which is all the
+/// fallback needs: never the out-of-range size.
+#[derive(Default)]
+struct SentAttrs(Mutex<std::collections::HashMap<u64, FileAttr>>);
+
+impl SentAttrs {
+    /// Note `attr` as what the kernel is about to hold, if it is a file's.
+    fn record(&self, attr: &FileAttr) {
+        if attr.kind == FileType::RegularFile {
+            self.map().insert(attr.ino.0, *attr);
+        }
+    }
+
+    /// The kernel no longer holds attrs for `ino`.
+    fn forget(&self, ino: u64) {
+        self.map().remove(&ino);
+    }
+
+    /// The attrs last sent for `ino`, if the kernel may still hold them.
+    fn last(&self, ino: u64) -> Option<FileAttr> {
+        self.map().get(&ino).copied()
+    }
+
+    fn map(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<u64, FileAttr>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// The entry for a page's first entry whose attrs could not be resolved: the
+/// attrs musefs last sent the kernel for that inode, with a zero TTL, or
+/// [`unlinkable_plus_entry`] when there are none.
+///
+/// If the kernel holds attrs for the inode at all, it holds `last_sent`, so
+/// linking them changes nothing on any kernel, and the zero TTL sends the next
+/// access back to `getattr` and its real error. Without them the kernel holds no
+/// attrs musefs sent, and the out-of-range size has nothing to overwrite.
+fn fallback_plus_entry(
+    last_sent: Option<FileAttr>,
+    child: u64,
+    kind: FileType,
+    style: &AttrStyle,
+) -> PlusEntry {
+    match last_sent {
+        Some(attr) if attr.ino == INodeNo(child) => PlusEntry {
+            attr,
+            ttl: Duration::ZERO,
+        },
+        _ => unlinkable_plus_entry(child, kind, style),
+    }
+}
+
+/// The attrs one planned entry goes out with: its own when it has them, the
+/// fallback when it has none.
+fn plus_entry_for(
+    emit: PlusEmit,
+    child: u64,
+    kind: FileType,
+    sent: &SentAttrs,
+    style: &AttrStyle,
+) -> PlusEntry {
+    match emit {
+        PlusEmit::Attrs(entry) => entry,
+        PlusEmit::Unlinkable => fallback_plus_entry(sent.last(child), child, kind, style),
+    }
+}
+
 /// Start filling `reply` with `listing` from `page` (#667).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is one independent input of the fill; a struct would only rename them"
+)]
 fn start_plus_fill(
     core: &Arc<Musefs>,
     pool: &Workers,
+    sent: &Arc<SentAttrs>,
     style: AttrStyle,
     expose_metrics: bool,
     listing: Arc<DirListing>,
@@ -932,9 +1287,11 @@ fn start_plus_fill(
         reply: Mutex::new(Some(reply)),
         core: Arc::clone(core),
         pool: pool.clone(),
+        sent: Arc::clone(sent),
         style,
         expose_metrics,
         cookie_tag: page.tag,
+        page_start: start,
     });
     spawn_plus_round(&fill, start);
 }
@@ -965,25 +1322,20 @@ fn spawn_plus_round(fill: &Arc<PlusFill>, start: usize) {
     for (idx, (child, kind, _)) in fill.listing[start..end].iter().enumerate() {
         let (child, kind) = (*child, *kind);
         if let Some(entry) = inline_plus_entry(child, kind, fill.expose_metrics, &fill.style) {
-            let _ = round.slots[idx].set(entry);
+            let _ = round.slots[idx].set(Resolution::Resolved(entry));
             continue;
         }
         round.outstanding.fetch_add(1, Ordering::Relaxed);
         let slot = PlusSlot(Arc::clone(&round));
         let style = fill.style;
-        // Over the pool's admission cap the job is dropped unrun rather than run
-        // here (#694): its slot counts it out, and the entry gets the zero-TTL
-        // placeholder a lost task gets, so the client's own `lookup` fetches the
-        // attrs. Running it in place instead would let a very wide directory
-        // recurse through round after round on this one thread.
-        fill.pool.try_submit("readdirplus", move || {
+        let resolve = move || {
             let round = &slot.0;
-            let entry = match synth_outcome(
+            let resolution = match synth_outcome(
                 "readdirplus",
                 child,
                 std::panic::AssertUnwindSafe(|| round.fill.core.getattr(child)),
             ) {
-                Ok(attr) => PlusEntry {
+                Ok(attr) => Resolution::Resolved(PlusEntry {
                     attr: to_file_attr(
                         &attr,
                         style.uid,
@@ -993,13 +1345,25 @@ fn spawn_plus_round(fill: &Arc<PlusFill>, start: usize) {
                         style.mount_time,
                     ),
                     ttl: style.ttl,
-                },
-                Err(_) => unresolved_plus_entry(child, kind, &style),
+                }),
+                Err(_) => Resolution::Failed,
             };
-            let _ = round.slots[idx].set(entry);
+            let _ = round.slots[idx].set(resolution);
             // `slot` drops here, counting this resolution out and, if it is the
             // last, assembling the round.
-        });
+        };
+        if start + idx == fill.page_start {
+            // The page's first entry runs here if the pool is over its
+            // admission cap (#694), like any other metadata job: a page has to
+            // carry at least one entry, since an empty reply reads as the end of
+            // the directory. Only this one, so a very wide directory still
+            // cannot chain round after round on one thread.
+            fill.pool.submit("readdirplus_attr", resolve);
+        } else {
+            // Over the cap every other entry is left unrun, and the page ends
+            // before it (see `plan_round`); the kernel asks again from there.
+            fill.pool.try_submit("readdirplus_attr", resolve);
+        }
     }
     drop(dispatching);
 }
@@ -1019,12 +1383,11 @@ fn finish_plus_round(round: &PlusRound) {
         return;
     };
     let next = round.start + round.slots.len();
-    for (i, slot) in (round.start..).zip(&round.slots) {
+    let slots: Vec<Option<Resolution>> = round.slots.iter().map(|s| s.get().copied()).collect();
+    let plan = plan_round(&slots, round.start == fill.page_start);
+    for (i, emit) in (round.start..).zip(&plan.emits) {
         let (child, kind, name) = &fill.listing[i];
-        let entry = slot
-            .get()
-            .copied()
-            .unwrap_or_else(|| unresolved_plus_entry(*child, *kind, &fill.style));
+        let entry = plus_entry_for(*emit, *child, *kind, &fill.sent, &fill.style);
         // The stored cookie resumes at the *next* entry, as in
         // `reply_dir_entries`: the kernel hands it back to resume from here.
         if reply.add(
@@ -1039,8 +1402,14 @@ fn finish_plus_round(round: &PlusRound) {
             // from the last accepted offset.
             return reply.ok();
         }
+        if let PlusEmit::Attrs(resolved) = emit {
+            // In the page now, so about to be what the kernel holds.
+            fill.sent.record(&resolved.attr);
+        }
     }
-    if next >= fill.listing.len() {
+    if plan.ends_page || next >= fill.listing.len() {
+        // Ended early, the page stops at the last entry sent, and the kernel's
+        // next request resumes at the first one held back.
         return reply.ok();
     }
     *fill
@@ -1230,11 +1599,17 @@ pub struct MusefsFs {
     /// this is also the only signal that directories are being re-listed on every
     /// `readdir` — worth knowing before it shows up as CPU.
     dir_handle_rejections: Arc<AtomicU64>,
+    /// The directory-handle cap: `MAX_DIR_HANDLES` outside a test that forced
+    /// another (#616).
+    dir_handle_cap: usize,
     /// `readdirplus` calls served, surfaced as `musefs_readdirplus_total`. The
     /// op is negotiated at mount and `FUSE_READDIRPLUS_AUTO` lets the kernel
     /// choose per listing, so whether a mount is getting the folded-in lookups
     /// at all is otherwise unobservable from the daemon (#667).
     readdirplus_calls: Arc<AtomicU64>,
+    /// The attrs last sent the kernel for each file inode it may still hold: the
+    /// fallback for a `readdirplus` entry that cannot be resolved.
+    sent_attrs: Arc<SentAttrs>,
     /// In-flight foreground-read counter. `read` reserves a slot before enqueuing;
     /// over `MAX_INFLIGHT_READS` the read is rejected with `EAGAIN`, capping the
     /// otherwise-unbounded pool queue (#308).
@@ -1263,6 +1638,13 @@ impl MusefsFs {
             n => n,
         };
         let structure_only = core.mode() == musefs_core::Mode::StructureOnly;
+        // Built before the struct literal, which moves `config`.
+        let pool = Workers::new(ThreadPool::new(workers), admission_cap(&config));
+        #[cfg(feature = "test-support")]
+        let pool = pool.traced(config.route_trace.clone());
+        let dir_handle_cap = configured_dir_handle_cap(&config);
+        let stateless_listings =
+            StatelessListings::with_cap(configured_stateless_listing_cap(&config));
         MusefsFs {
             core: Arc::new(core),
             // `ThreadPool`'s queue is unbounded, so nothing reaches it ungated:
@@ -1272,7 +1654,7 @@ impl MusefsFs {
             // `MAX_DIR_HANDLES` and degrade to the stateless fh over it (#307,
             // #616). `max_background` (set in `init`) separately caps the
             // kernel's background/readahead requests.
-            pool: Workers::new(ThreadPool::new(workers), MAX_QUEUED_JOBS),
+            pool,
             refresh: threadpool::Builder::new()
                 .num_threads(1)
                 .thread_name("musefs-refresh".to_string())
@@ -1285,10 +1667,12 @@ impl MusefsFs {
             poll_pending: Arc::new(AtomicBool::new(false)),
             passthrough: platform::passthrough::PassthroughState::new(structure_only),
             dir_handles: Arc::new(Mutex::new(DirHandles::default())),
-            stateless_listings: Arc::new(Mutex::new(StatelessListings::default())),
+            stateless_listings: Arc::new(Mutex::new(stateless_listings)),
             dir_fh: Arc::new(AtomicU64::new(1)),
             dir_handle_rejections: Arc::new(AtomicU64::new(0)),
+            dir_handle_cap,
             readdirplus_calls: Arc::new(AtomicU64::new(0)),
+            sent_attrs: Arc::new(SentAttrs::default()),
             inflight_reads: Arc::new(AtomicUsize::new(0)),
             read_errors: Arc::new(AtomicU64::new(0)),
             metrics_handles: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -1324,9 +1708,13 @@ impl MusefsFs {
         let core = Arc::clone(&self.core);
         if self.config.keep_cache {
             let notifier = Arc::clone(&self.notifier);
+            let sent = Arc::clone(&self.sent_attrs);
             execute_guarded(&self.refresh, "poll_refresh_notify", move || {
                 let _guard = guard;
                 if let Err(e) = core.poll_refresh_notify(|ino| {
+                    // The kernel is about to discard what it holds for the
+                    // inode, so those attrs are no longer anything to preserve.
+                    sent.forget(ino);
                     if let Some(n) = notifier.get()
                         && let Err(inval_err) = n.inval_inode(INodeNo(ino), 0, 0)
                     {
@@ -1377,7 +1765,7 @@ impl MusefsFs {
             read_errors: self.read_errors.load(Ordering::Relaxed),
             dir_handles,
             dir_listings,
-            dir_handles_max: MAX_DIR_HANDLES as u64,
+            dir_handles_max: self.dir_handle_cap as u64,
             dir_handle_rejections: self.dir_handle_rejections.load(Ordering::Relaxed),
             readdirplus_calls: self.readdirplus_calls.load(Ordering::Relaxed),
             pool_workers: self.pool.max_count() as u64,
@@ -1456,6 +1844,7 @@ impl Filesystem for MusefsFs {
             return reply.error(fuser::Errno::ENOENT);
         };
         let core = Arc::clone(&self.core);
+        let sent = Arc::clone(&self.sent_attrs);
         let (uid, gid, fm, dm, mt, ttl) = (
             self.uid,
             self.gid,
@@ -1473,11 +1862,11 @@ impl Filesystem for MusefsFs {
                 child,
                 std::panic::AssertUnwindSafe(|| core.getattr(child)),
             ) {
-                Ok(attr) => reply.entry(
-                    &ttl,
-                    &to_file_attr(&attr, uid, gid, fm, dm, mt),
-                    Generation(0),
-                ),
+                Ok(attr) => {
+                    let attr = to_file_attr(&attr, uid, gid, fm, dm, mt);
+                    sent.record(&attr);
+                    reply.entry(&ttl, &attr, Generation(0));
+                }
                 Err(e) => reply.error(e),
             }
         });
@@ -1503,6 +1892,7 @@ impl Filesystem for MusefsFs {
             return reply.attr(&self.config.ttl, &attr);
         }
         let core = Arc::clone(&self.core);
+        let sent = Arc::clone(&self.sent_attrs);
         let (uid, gid, fm, dm, mt, ttl) = (
             self.uid,
             self.gid,
@@ -1520,7 +1910,11 @@ impl Filesystem for MusefsFs {
                 ino.0,
                 std::panic::AssertUnwindSafe(|| core.getattr(ino.0)),
             ) {
-                Ok(attr) => reply.attr(&ttl, &to_file_attr(&attr, uid, gid, fm, dm, mt)),
+                Ok(attr) => {
+                    let attr = to_file_attr(&attr, uid, gid, fm, dm, mt);
+                    sent.record(&attr);
+                    reply.attr(&ttl, &attr);
+                }
                 Err(e) => reply.error(e),
             }
         });
@@ -1596,6 +1990,7 @@ impl Filesystem for MusefsFs {
         let handles = Arc::clone(&self.dir_handles);
         let counter = Arc::clone(&self.dir_fh);
         let rejections = Arc::clone(&self.dir_handle_rejections);
+        let dir_handle_cap = self.dir_handle_cap;
         let expose_metrics = self.config.expose_metrics;
         self.pool.submit("opendir", move || {
             // Pin the tree generation first: it names what a listing of this
@@ -1636,7 +2031,7 @@ impl Filesystem for MusefsFs {
                     &mut guard,
                     &counter,
                     &rejections,
-                    MAX_DIR_HANDLES,
+                    dir_handle_cap,
                     key,
                     snapshot,
                     listing,
@@ -1649,7 +2044,7 @@ impl Filesystem for MusefsFs {
                 // `musefs_dir_handle_rejections_total` is the operator-facing
                 // signal that the degraded path is in use (#626).
                 log::debug!(
-                    "opendir({ino}) over the {MAX_DIR_HANDLES}-handle cap: serving it statelessly",
+                    "opendir({ino}) over the {dir_handle_cap}-handle cap: serving it statelessly",
                     ino = ino.0
                 );
             }
@@ -1698,6 +2093,13 @@ impl Filesystem for MusefsFs {
             fh.0,
         );
         reply.ok();
+    }
+
+    /// The kernel evicted `ino`: it sends `FORGET` only then, with the inode's
+    /// whole lookup count, so it holds no attrs for the inode any more and the
+    /// last ones sent are no fallback. fuser's `batch_forget` calls this per node.
+    fn forget(&self, _req: &Request, ino: INodeNo, _nlookup: u64) {
+        self.sent_attrs.forget(ino.0);
     }
 
     fn flush(
@@ -1887,8 +2289,9 @@ impl Filesystem for MusefsFs {
             let stateless = Arc::clone(&self.stateless_listings);
             let expose_metrics = self.config.expose_metrics;
             return self.pool.submit("readdir", move || {
-                let snapshot = core.tree_snapshot();
-                let page = stateless_page(&stateless, ino.0, offset, &snapshot, || {
+                let loaded = core.tree_snapshot();
+                let latest = || core.tree_snapshot();
+                let page = stateless_page(&stateless, ino.0, offset, &loaded, latest, |snapshot| {
                     // An over-cap open is exactly the case where some *other*
                     // handle usually holds this directory's listing already, so
                     // probe the index before walking the tree again (#675). A hit
@@ -1906,7 +2309,7 @@ impl Filesystem for MusefsFs {
                         "readdir",
                         ino.0,
                         std::panic::AssertUnwindSafe(|| {
-                            build_dir_listing(&snapshot, ino.0, expose_metrics)
+                            build_dir_listing(snapshot, ino.0, expose_metrics)
                         }),
                     )
                     .map(Arc::new)
@@ -1949,6 +2352,7 @@ impl Filesystem for MusefsFs {
             return start_plus_fill(
                 &self.core,
                 &self.pool,
+                &self.sent_attrs,
                 style,
                 true,
                 Arc::new(metrics_dir::dir_listing()),
@@ -1974,9 +2378,11 @@ impl Filesystem for MusefsFs {
             let handles = Arc::clone(&self.dir_handles);
             let stateless = Arc::clone(&self.stateless_listings);
             let pool = self.pool.clone();
+            let sent = Arc::clone(&self.sent_attrs);
             return self.pool.submit("readdirplus", move || {
-                let snapshot = core.tree_snapshot();
-                let page = stateless_page(&stateless, ino.0, offset, &snapshot, || {
+                let loaded = core.tree_snapshot();
+                let latest = || core.tree_snapshot();
+                let page = stateless_page(&stateless, ino.0, offset, &loaded, latest, |snapshot| {
                     if let Some(listing) = shared_listing(
                         &handles
                             .lock()
@@ -1989,14 +2395,23 @@ impl Filesystem for MusefsFs {
                         "readdirplus",
                         ino.0,
                         std::panic::AssertUnwindSafe(|| {
-                            build_dir_listing(&snapshot, ino.0, expose_metrics)
+                            build_dir_listing(snapshot, ino.0, expose_metrics)
                         }),
                     )
                     .map(Arc::new)
                 });
                 match page {
                     Ok(StatelessPage::Page(listing, start)) => {
-                        start_plus_fill(&core, &pool, style, expose_metrics, listing, start, reply);
+                        start_plus_fill(
+                            &core,
+                            &pool,
+                            &sent,
+                            style,
+                            expose_metrics,
+                            listing,
+                            start,
+                            reply,
+                        );
                     }
                     Ok(StatelessPage::Stale) => {
                         reply.error(stale_enumeration("readdirplus", ino.0));
@@ -2008,6 +2423,7 @@ impl Filesystem for MusefsFs {
         start_plus_fill(
             &self.core,
             &self.pool,
+            &self.sent_attrs,
             style,
             expose_metrics,
             listing,
@@ -2510,11 +2926,11 @@ mod tests {
     fn stateless_listings_tag_per_generation_and_evict_the_least_recently_used() {
         let (_d, fs, snapshot) = test_snapshot();
         let mut listings = StatelessListings::default();
-        let tag = listings.tag_for(&snapshot);
+        let tag = listings.tag_for(snapshot.generation()).unwrap();
         assert_ne!(tag, 0, "0 is reserved for untagged cookies");
         assert_eq!(
-            listings.tag_for(&fs.core.tree_snapshot()),
-            tag,
+            listings.tag_for(fs.core.tree_snapshot().generation()),
+            Some(tag),
             "the same generation keeps its tag"
         );
         let cap = u64::try_from(MAX_STATELESS_LISTINGS).unwrap();
@@ -2580,12 +2996,7 @@ mod tests {
         let listings = Mutex::new(StatelessListings::default());
 
         let first = fs.core.tree_snapshot();
-        let (listing, page) = page_of(
-            stateless_page(&listings, artist, 0, &first, || {
-                build_dir_listing(&first, artist, false).map(Arc::new)
-            })
-            .unwrap(),
-        );
+        let (listing, page) = page_of(page_on(&fs, &listings, artist, 0, &first));
         assert_eq!(page.index, 0);
         let all = names(&listing, 0);
         assert_eq!(all.len(), 4, "{all:?}");
@@ -2597,12 +3008,7 @@ mod tests {
         add("a");
         assert!(fs.core.poll_refresh().unwrap());
         let second = fs.core.tree_snapshot();
-        let (listing, resumed) = page_of(
-            stateless_page(&listings, artist, resume, &second, || {
-                build_dir_listing(&second, artist, false).map(Arc::new)
-            })
-            .unwrap(),
-        );
+        let (listing, resumed) = page_of(page_on(&fs, &listings, artist, resume, &second));
         assert_eq!(
             resumed.tag, page.tag,
             "the enumeration stays on its generation"
@@ -2613,12 +3019,7 @@ mod tests {
             "no b twice, no c skipped"
         );
 
-        let (listing, fresh) = page_of(
-            stateless_page(&listings, artist, 0, &second, || {
-                build_dir_listing(&second, artist, false).map(Arc::new)
-            })
-            .unwrap(),
-        );
+        let (listing, fresh) = page_of(page_on(&fs, &listings, artist, 0, &second));
         assert_ne!(
             fresh.tag, page.tag,
             "a new enumeration takes the new generation"
@@ -2626,6 +3027,45 @@ mod tests {
         let now = names(&listing, 0);
         assert_eq!(now.len(), 5, "{now:?}");
         assert!(now[2].starts_with('a'), "{now:?}");
+    }
+
+    /// [`stateless_page`] as the handlers call it, over `fs`'s tree, for a
+    /// worker that loaded `loaded`.
+    fn page_on(
+        fs: &MusefsFs,
+        listings: &Mutex<StatelessListings>,
+        ino: u64,
+        offset: u64,
+        loaded: &TreeSnapshot,
+    ) -> StatelessPage {
+        stateless_page(
+            listings,
+            ino,
+            offset,
+            loaded,
+            || fs.core.tree_snapshot(),
+            |snapshot| build_dir_listing(snapshot, ino, false).map(Arc::new),
+        )
+        .unwrap()
+    }
+
+    /// #695: the current generation's tag only ever moves forward. A generation
+    /// older than the current one gets no tag at all, and leaves the current one
+    /// where it was.
+    #[test]
+    fn stateless_tags_only_ever_advance() {
+        let mut listings = StatelessListings::default();
+        let five = listings.tag_for(5).expect("the first generation is tagged");
+        assert_eq!(listings.tag_for(5), Some(five), "the same generation");
+        assert_eq!(
+            listings.tag_for(4),
+            None,
+            "an older generation must not take the tag"
+        );
+        assert_eq!(listings.tag_for(5), Some(five), "nor move it");
+        let six = listings.tag_for(6).expect("a newer generation is tagged");
+        assert_ne!(six, five, "a newer generation is a new tag");
+        assert_eq!(listings.tag_for(5), None, "and the old one stays behind it");
     }
 
     /// The page a [`stateless_page`] resolved to, failing the test on a stale one.
@@ -2686,12 +3126,7 @@ mod tests {
         let listings = Mutex::new(StatelessListings::default());
 
         let snapshot = fs.core.tree_snapshot();
-        let (listing, page) = page_of(
-            stateless_page(&listings, artist, 0, &snapshot, || {
-                build_dir_listing(&snapshot, artist, false).map(Arc::new)
-            })
-            .unwrap(),
-        );
+        let (listing, page) = page_of(page_on(&fs, &listings, artist, 0, &snapshot));
         let resume = dir_cookie(page.tag, 3);
         pin_a_cap_of_others(&listings, page.tag);
         assert!(
@@ -2700,12 +3135,7 @@ mod tests {
         );
 
         let same = fs.core.tree_snapshot();
-        let (rebuilt, resumed) = page_of(
-            stateless_page(&listings, artist, resume, &same, || {
-                build_dir_listing(&same, artist, false).map(Arc::new)
-            })
-            .unwrap(),
-        );
+        let (rebuilt, resumed) = page_of(page_on(&fs, &listings, artist, resume, &same));
         assert_eq!((resumed.tag, resumed.index), (page.tag, 3));
         assert_eq!(*rebuilt, *listing, "the same generation's listing, rebuilt");
     }
@@ -2727,12 +3157,7 @@ mod tests {
         let listings = Mutex::new(StatelessListings::default());
 
         let first = fs.core.tree_snapshot();
-        let (_, page) = page_of(
-            stateless_page(&listings, artist, 0, &first, || {
-                build_dir_listing(&first, artist, false).map(Arc::new)
-            })
-            .unwrap(),
-        );
+        let (_, page) = page_of(page_on(&fs, &listings, artist, 0, &first));
         // The kernel took ".", "..", b, and hands back the cookie after b.
         let resume = dir_cookie(page.tag, 3);
         pin_a_cap_of_others(&listings, page.tag);
@@ -2740,22 +3165,58 @@ mod tests {
         add_art_track(dir.path(), &db, "a");
         assert!(fs.core.poll_refresh().unwrap());
         let second = fs.core.tree_snapshot();
-        let outcome = stateless_page(&listings, artist, resume, &second, || {
-            build_dir_listing(&second, artist, false).map(Arc::new)
-        })
-        .unwrap();
+        let outcome = page_on(&fs, &listings, artist, resume, &second);
         assert!(
             matches!(outcome, StatelessPage::Stale),
             "an unresumable cookie must not be paged against the new generation"
         );
 
-        let (_, fresh) = page_of(
-            stateless_page(&listings, artist, 0, &second, || {
-                build_dir_listing(&second, artist, false).map(Arc::new)
-            })
-            .unwrap(),
-        );
+        let (_, fresh) = page_of(page_on(&fs, &listings, artist, 0, &second));
         assert_ne!(fresh.tag, page.tag, "a new enumeration is unaffected");
+    }
+
+    /// A worker can start a fresh enumeration on a snapshot it loaded before a
+    /// refresh that another enumeration has already tagged. That must not
+    /// re-tag the current generation back to the old one: the enumeration on the
+    /// new generation would then find its tag replaced, and once its listing
+    /// was evicted its next page would be refused as stale although nothing it
+    /// was paging has changed.
+    #[test]
+    fn a_worker_on_an_older_snapshot_cannot_move_the_tag_backwards() {
+        let (dir, fs) = test_fs();
+        let db = musefs_db::Db::open(dir.path().join("m.db")).unwrap();
+        add_art_track(dir.path(), &db, "b");
+        add_art_track(dir.path(), &db, "c");
+        assert!(fs.core.poll_refresh().unwrap());
+        let artist = fs
+            .core
+            .lookup(musefs_core::VirtualTree::ROOT, "Art")
+            .unwrap();
+        let older = fs.core.tree_snapshot();
+        add_art_track(dir.path(), &db, "a");
+        assert!(fs.core.poll_refresh().unwrap());
+        let newer = fs.core.tree_snapshot();
+        let listings = Mutex::new(StatelessListings::default());
+
+        let (_, page) = page_of(page_on(&fs, &listings, artist, 0, &newer));
+        let resume = dir_cookie(page.tag, 3);
+        pin_a_cap_of_others(&listings, page.tag);
+
+        // The late worker: a fresh enumeration of another directory, on the
+        // pre-refresh snapshot it loaded. It is served the newer generation.
+        let root = musefs_core::VirtualTree::ROOT;
+        let (_, late) = page_of(page_on(&fs, &listings, root, 0, &older));
+        assert_eq!(
+            late.tag, page.tag,
+            "the late worker reloads onto the newer tree"
+        );
+
+        let (_, resumed) = page_of(page_on(&fs, &listings, artist, resume, &newer));
+        assert_eq!(
+            (resumed.tag, resumed.index),
+            (page.tag, 3),
+            "the current generation keeps its tag, so its enumeration resumes"
+        );
     }
 
     #[test]
@@ -3170,31 +3631,243 @@ mod tests {
         );
     }
 
-    /// An entry whose attrs could not be resolved still has to appear, or the
-    /// file drops out of the listing entirely — worse than today, where
-    /// `readdir` lists it and the client's own `lookup` reports the error. The
-    /// zero TTL is what keeps that: the kernel caches neither the entry nor the
-    /// placeholder attrs, so the next access goes back to `lookup` (#667).
+    /// A page's first entry that cannot be resolved still has to be listed, or
+    /// the file drops out of the listing (#667) — but with attrs the kernel
+    /// refuses to link, never ones it would apply to an inode it holds (#694).
+    /// `fuse_valid_size` rejects any size above `i64::MAX`; a size of 0, the old
+    /// placeholder, truncated a mapped file's page cache.
     #[test]
-    fn unresolved_plus_entry_is_placeholder_attrs_the_kernel_may_not_cache() {
+    fn an_unlinkable_entry_lists_the_name_with_attrs_the_kernel_rejects() {
         let style = test_style();
-        let file = unresolved_plus_entry(9, FileType::RegularFile, &style);
-        assert_eq!(file.ttl, Duration::ZERO, "the kernel must not cache these");
+        let file = unlinkable_plus_entry(9, FileType::RegularFile, &style);
+        assert!(
+            file.attr.size > u64::try_from(i64::MAX).unwrap(),
+            "the size must fail the kernel's own validation, not pass as a real one"
+        );
+        assert_eq!(file.ttl, Duration::ZERO, "nothing for the kernel to cache");
         assert_eq!(
             file.attr.ino,
             INodeNo(9),
             "a zero inode would hide the name"
         );
         assert_eq!(file.attr.kind, FileType::RegularFile);
-        assert_eq!(file.attr.size, 0);
 
-        let dir = unresolved_plus_entry(7, FileType::Directory, &style);
+        let dir = unlinkable_plus_entry(7, FileType::Directory, &style);
         assert_eq!(
             dir.attr.kind,
             FileType::Directory,
             "type comes from readdir"
         );
+        assert!(dir.attr.size > u64::try_from(i64::MAX).unwrap());
         assert_eq!(dir.ttl, Duration::ZERO);
+    }
+
+    /// A regular file's attrs for inode `ino` with `size`, as a reply carries them.
+    fn file_attr(ino: u64, size: u64) -> FileAttr {
+        let style = test_style();
+        make_attr(
+            ino,
+            size,
+            (FileType::RegularFile, style.file_mode, 1),
+            style.uid,
+            style.gid,
+            style.mount_time,
+        )
+    }
+
+    /// The record holds the last attrs sent for a file inode until the kernel
+    /// forgets the inode or a refresh invalidates it, and never a directory's.
+    #[test]
+    fn sent_attrs_hold_the_last_file_attrs_until_forgotten() {
+        let style = test_style();
+        let sent = SentAttrs::default();
+        assert!(sent.last(9).is_none(), "nothing sent yet");
+
+        sent.record(&file_attr(9, 100));
+        sent.record(&file_attr(9, 200));
+        assert_eq!(
+            sent.last(9).map(|attr| attr.size),
+            Some(200),
+            "the last reply is the one the kernel may hold"
+        );
+
+        sent.record(&make_attr(
+            7,
+            0,
+            (FileType::Directory, style.dir_mode, 2),
+            style.uid,
+            style.gid,
+            style.mount_time,
+        ));
+        assert!(sent.last(7).is_none(), "a directory is never recorded");
+
+        sent.forget(9);
+        assert!(sent.last(9).is_none(), "a forgotten inode has no fallback");
+        sent.forget(9);
+        assert!(sent.last(9).is_none(), "forgetting twice is harmless");
+    }
+
+    /// A page's first entry that cannot be resolved goes out with the attrs musefs
+    /// last sent for that inode and a zero TTL: if the kernel holds attrs for it at
+    /// all it holds those, so an old kernel without `fuse_invalid_attr` has nothing
+    /// to overwrite. Only an inode with no record gets the size the kernel refuses.
+    #[test]
+    fn an_unresolvable_first_entry_falls_back_to_the_attrs_last_sent() {
+        let style = test_style();
+        let entry = fallback_plus_entry(Some(file_attr(9, 4242)), 9, FileType::RegularFile, &style);
+        assert_eq!(entry.attr.size, 4242, "the size last sent");
+        assert_eq!(entry.attr.ino, INodeNo(9));
+        assert_eq!(entry.attr.kind, FileType::RegularFile);
+        assert_eq!(
+            entry.ttl,
+            Duration::ZERO,
+            "the next access goes back to getattr"
+        );
+
+        let unlinkable = unlinkable_plus_entry(9, FileType::RegularFile, &style);
+        let never_sent = fallback_plus_entry(None, 9, FileType::RegularFile, &style);
+        assert_eq!(
+            (never_sent.attr.size, never_sent.ttl),
+            (unlinkable.attr.size, Duration::ZERO),
+            "with no record, the size the kernel refuses"
+        );
+        let another_inode =
+            fallback_plus_entry(Some(file_attr(8, 4242)), 9, FileType::RegularFile, &style);
+        assert_eq!(
+            another_inode.attr.size, unlinkable.attr.size,
+            "another inode's attrs are never sent for this one"
+        );
+    }
+
+    /// An entry with attrs of its own goes out with them; only an entry without
+    /// attrs takes the record, and not once the record is forgotten, as it is when
+    /// a refresh invalidates the inode (#778): the kernel dropped those attrs.
+    #[test]
+    fn plus_entry_for_uses_the_record_only_for_an_entry_without_attrs() {
+        let style = test_style();
+        let sent = SentAttrs::default();
+        sent.record(&file_attr(9, 4242));
+
+        let resolved = PlusEntry {
+            attr: file_attr(9, 5000),
+            ttl: style.ttl,
+        };
+        let passed = plus_entry_for(
+            PlusEmit::Attrs(resolved),
+            9,
+            FileType::RegularFile,
+            &sent,
+            &style,
+        );
+        assert_eq!(
+            (passed.attr.size, passed.ttl),
+            (5000, style.ttl),
+            "resolved attrs go out as resolved"
+        );
+
+        let fell_back = plus_entry_for(
+            PlusEmit::Unlinkable,
+            9,
+            FileType::RegularFile,
+            &sent,
+            &style,
+        );
+        assert_eq!((fell_back.attr.size, fell_back.ttl), (4242, Duration::ZERO));
+
+        sent.forget(9);
+        let invalidated = plus_entry_for(
+            PlusEmit::Unlinkable,
+            9,
+            FileType::RegularFile,
+            &sent,
+            &style,
+        );
+        assert_eq!(invalidated.attr.size, UNLINKABLE_SIZE);
+    }
+
+    /// A resolved entry for `plan_round`, told apart by its inode.
+    fn resolved(ino: u64) -> Resolution {
+        let style = test_style();
+        Resolution::Resolved(PlusEntry {
+            attr: make_attr(
+                ino,
+                4096,
+                (FileType::RegularFile, style.file_mode, 1),
+                style.uid,
+                style.gid,
+                style.mount_time,
+            ),
+            ttl: style.ttl,
+        })
+    }
+
+    /// A plan as `(inode per emitted entry, None for unlinkable; ends_page)`.
+    fn shape(plan: &RoundPlan) -> (Vec<Option<u64>>, bool) {
+        let emits = plan
+            .emits
+            .iter()
+            .map(|emit| match emit {
+                PlusEmit::Attrs(entry) => Some(entry.attr.ino.0),
+                PlusEmit::Unlinkable => None,
+            })
+            .collect();
+        (emits, plan.ends_page)
+    }
+
+    /// #694: a round whose every entry resolved goes out whole, and the fill
+    /// carries on to the next round.
+    #[test]
+    fn a_resolved_round_is_sent_whole_and_the_page_goes_on() {
+        let plan = plan_round(
+            &[Some(resolved(2)), Some(resolved(3)), Some(resolved(4))],
+            true,
+        );
+        assert_eq!(shape(&plan), (vec![Some(2), Some(3), Some(4)], false));
+        let later = plan_round(&[Some(resolved(5))], false);
+        assert_eq!(shape(&later), (vec![Some(5)], false));
+    }
+
+    /// #694: the page ends before the first entry with no attrs of its own,
+    /// whether its resolution never ran (over the admission cap) or ran and
+    /// failed. Nothing after it is sent, even entries that did resolve: the
+    /// kernel resumes from the cookie of the last entry sent.
+    #[test]
+    fn a_round_ends_the_page_before_its_first_entry_without_attrs() {
+        let unrun = plan_round(&[Some(resolved(2)), None, Some(resolved(4))], true);
+        assert_eq!(shape(&unrun), (vec![Some(2)], true), "never ran");
+
+        let failed = plan_round(
+            &[
+                Some(resolved(2)),
+                Some(Resolution::Failed),
+                Some(resolved(4)),
+            ],
+            false,
+        );
+        assert_eq!(shape(&failed), (vec![Some(2)], true), "ran and failed");
+
+        let at_round_start = plan_round(&[None, Some(resolved(3))], false);
+        assert_eq!(
+            shape(&at_round_start),
+            (vec![], true),
+            "a later round can end the page at its start: earlier rounds filled it"
+        );
+    }
+
+    /// #694: a page's first entry has had its attempt, so deferring it again
+    /// would leave the page empty, which the kernel reads as the end of the
+    /// directory. It is listed unlinkable, and the round goes on from there.
+    #[test]
+    fn a_page_first_entry_without_attrs_is_listed_unlinkable() {
+        let failed = plan_round(&[Some(Resolution::Failed), Some(resolved(3))], true);
+        assert_eq!(shape(&failed), (vec![None, Some(3)], false));
+
+        let lost = plan_round(&[None, Some(resolved(3)), None], true);
+        assert_eq!(
+            shape(&lost),
+            (vec![None, Some(3)], true),
+            "a lost first task is listed too, and later gaps still end the page"
+        );
     }
 
     #[test]
@@ -3250,12 +3923,59 @@ mod tests {
 
 #[cfg(test)]
 mod errno_tests {
-    use super::errno;
+    use super::{errno, placed_errno};
     use musefs_core::CoreError;
 
     #[test]
     fn handle_table_full_maps_to_enfile() {
         assert_eq!(errno(&CoreError::HandleTableFull).code(), libc::ENFILE);
+    }
+
+    /// #708: every `CoreError` variant has a place in the mapping, and the
+    /// place it is meant to have.
+    ///
+    /// `errno` needs a wildcard, so a variant added to `musefs-core` compiles
+    /// here without one. It fails this instead: core's sample list cannot leave
+    /// a variant out (its own test sees to that), and an unplaced one has no
+    /// `placed_errno`. The table below has no wildcard either, so a variant
+    /// moved out of the `EIO` arm, or a new one given an arm, has to be
+    /// recorded here as a decision.
+    #[test]
+    fn every_core_error_variant_is_placed_and_maps_as_intended() {
+        for err in CoreError::every_variant_for_test() {
+            let expected = match &err {
+                CoreError::NoEntry(_) | CoreError::TrackNotFound(_) => libc::ENOENT,
+                CoreError::IsDir(_) => libc::EISDIR,
+                CoreError::NotADir(_) => libc::ENOTDIR,
+                CoreError::HandleTableFull => libc::ENFILE,
+                // The OS errno passes through.
+                CoreError::Io(source) | CoreError::BackingIo { source, .. } => source
+                    .raw_os_error()
+                    .expect("the samples carry a real OS errno"),
+                CoreError::BackingChanged(_)
+                | CoreError::DerivedStateStale(_)
+                | CoreError::Db(_)
+                | CoreError::DbOpen { .. }
+                | CoreError::Mp4MetadataTooLarge { .. }
+                | CoreError::OrphanedArt { .. }
+                | CoreError::ArtTooLarge { .. }
+                | CoreError::InvalidPictureType { .. }
+                | CoreError::HeaderTooLarge { .. }
+                | CoreError::TrackFieldTooLarge { .. }
+                | CoreError::TrackMetadataTooLarge { .. }
+                | CoreError::Format(_)
+                | CoreError::InvalidTemplate(_) => libc::EIO,
+                other => panic!(
+                    "{other:?} is a CoreError variant this table does not know: decide \
+                     its errno, give it an arm in placed_errno, and record it here"
+                ),
+            };
+            let placed = placed_errno(&err).unwrap_or_else(|| {
+                panic!("{err:?} has no arm in placed_errno, so errno collapses it to EIO unplaced")
+            });
+            assert_eq!(placed.code(), expected, "{err:?}");
+            assert_eq!(errno(&err).code(), expected, "{err:?}");
+        }
     }
 }
 

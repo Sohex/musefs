@@ -11,9 +11,11 @@
 //! Run with:
 //!   cargo test -p musefs-fuse --test readdirplus -- --ignored --nocapture
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use musefs_core::{Musefs, scan_directory};
 use musefs_fuse::FuseConfig;
@@ -188,4 +190,177 @@ fn readdirplus_attrs_match_what_lookup_reports() {
 
     drop(statted);
     drop(walked);
+}
+
+/// Where [`mapped_file_child`] finds the file to map. Unset, the child does
+/// nothing, so a plain `--ignored` run passes it.
+const MAPPED_FILE_ENV: &str = "MUSEFS_E2E_MAPPED_FILE";
+
+/// The child half of [`an_over_cap_listing_leaves_a_mapped_file_whole`]: map a
+/// served file, list its directory, then touch the mapping's last byte.
+///
+/// A `readdirplus` entry's attrs land on the inode the kernel already holds for
+/// that name, whatever their TTL. If the listing carries a size of 0 for this
+/// file, the kernel truncates its page cache and the touch below faults past
+/// `i_size`, so the process dies of `SIGBUS` — which is why it runs in a child
+/// the parent can watch die.
+#[test]
+#[ignore = "the child half of an_over_cap_listing_leaves_a_mapped_file_whole"]
+#[expect(
+    unsafe_code,
+    reason = "memmap2::Mmap::map is unsafe; the mapping is the thing under test"
+)]
+fn mapped_file_child() {
+    let Some(path) = std::env::var_os(MAPPED_FILE_ENV) else {
+        return;
+    };
+    let path = PathBuf::from(path);
+    let file = File::open(&path).unwrap();
+    // SAFETY: a regular file on a read-only mount, mapped for the rest of this
+    // short-lived process and never written.
+    let map = unsafe { memmap2::Mmap::map(&file).unwrap() };
+    assert!(map.len() > 1, "the served file must span more than a byte");
+    let first = map[0];
+
+    let listed: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(
+        listed.iter().any(|name| name == path.file_name().unwrap()),
+        "the directory must list the mapped file: {listed:?}"
+    );
+
+    let last = map[map.len() - 1];
+    std::hint::black_box((first, last));
+}
+
+/// A title under `artist` with `audio_len` bytes of audio, written into `dir`.
+fn write_track(dir: &Path, artist: &str, title: &str, audio_len: usize) {
+    let flac = make_flac(
+        &[&format!("ARTIST={artist}"), &format!("TITLE={title}")],
+        &vec![0xABu8; audio_len],
+    );
+    std::fs::write(dir.join(format!("{title}.flac")), &flac).unwrap();
+}
+
+/// Over the pool's admission cap a `readdirplus` resolution is not run. The
+/// entry used to go out anyway, with a size-0 placeholder and a zero TTL,
+/// which the kernel applies to the inode a process already has open and mapped:
+/// its page cache was truncated and the next touch of the mapping raised
+/// `SIGBUS` (#694). The page must end before an entry with no attrs instead.
+#[test]
+#[ignore = "requires /dev/fuse + libfuse; run with --ignored"]
+fn an_over_cap_listing_leaves_a_mapped_file_whole() {
+    let backing = tempfile::tempdir().unwrap();
+    for t in 0..3 {
+        write_track(backing.path(), "Mapped", &format!("Song{t}"), 256 * 1024);
+    }
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    scan_directory(&db, backing.path()).unwrap();
+
+    let mountpoint = tempfile::tempdir().unwrap();
+    let mut fuse_config = FuseConfig::default();
+    // Every metadata job meets the cap, so every resolution the op may leave
+    // unrun is left unrun.
+    fuse_config.pool_admission_cap = Some(0);
+    let session = musefs_fuse::spawn_with(
+        Musefs::open(db, config()).unwrap(),
+        mountpoint.path(),
+        "musefs-readdirplus-over-cap",
+        fuse_config,
+    )
+    .unwrap();
+    let dir = mountpoint.path().join("Mapped");
+
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "mapped_file_child",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(MAPPED_FILE_ENV, dir.join("Song1.flac"))
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "the child must survive touching its mapping after the listing: {status:?} \
+         (signal {:?}; SIGBUS means the listing truncated a mapped file)",
+        status.signal()
+    );
+
+    // The shortened pages still add up to the whole directory, and every size
+    // the walk sees is the size of the bytes served.
+    let mut seen = BTreeMap::new();
+    walk_with_metadata(&dir, &mut seen, &dir);
+    let names: BTreeSet<_> = seen.keys().cloned().collect();
+    let expected: BTreeSet<_> = (0..3)
+        .map(|t| PathBuf::from(format!("Song{t}.flac")))
+        .collect();
+    assert_eq!(names, expected, "every title must be listed over the cap");
+    for (relative, (size, _)) in &seen {
+        let served = std::fs::read(dir.join(relative)).unwrap();
+        assert_eq!(
+            *size,
+            u64::try_from(served.len()).unwrap(),
+            "{} must report the size it serves",
+            relative.display()
+        );
+    }
+
+    drop(session);
+}
+
+/// An entry whose attrs fail to resolve on every attempt — its backing file is
+/// gone — still has to be listed, and the listing still has to reach the end.
+/// Ending the page before it would, once it is a page's first entry, be an
+/// empty reply, which the kernel reads as the end of the directory; an error
+/// would fail the whole `getdents`. Either way the names after it vanish.
+#[test]
+#[ignore = "requires /dev/fuse + libfuse; run with --ignored"]
+fn a_file_that_cannot_be_resolved_is_still_listed() {
+    let backing = tempfile::tempdir().unwrap();
+    for title in ["A", "B", "C"] {
+        write_track(backing.path(), "Gone", title, 4096);
+    }
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    scan_directory(&db, backing.path()).unwrap();
+
+    let mountpoint = tempfile::tempdir().unwrap();
+    let session = musefs_fuse::spawn_with(
+        Musefs::open(db, config()).unwrap(),
+        mountpoint.path(),
+        "musefs-readdirplus-unresolvable",
+        FuseConfig::default(),
+    )
+    .unwrap();
+    std::fs::remove_file(backing.path().join("B.flac")).unwrap();
+
+    // Stat each entry as it is listed, as a scanner does: that is what keeps the
+    // kernel on `readdirplus` past the first page, so the failing entry comes
+    // back as the first entry of a page of its own.
+    let mut listed = BTreeSet::new();
+    let mut unresolvable = BTreeSet::new();
+    for entry in std::fs::read_dir(mountpoint.path().join("Gone")).unwrap() {
+        let entry = entry.expect("the listing itself must not fail");
+        let name = entry.file_name().into_string().unwrap();
+        if entry.metadata().is_err() {
+            unresolvable.insert(name.clone());
+        }
+        listed.insert(name);
+    }
+    assert_eq!(
+        listed,
+        BTreeSet::from(["A.flac".to_string(), "B.flac".into(), "C.flac".into()]),
+        "the unresolvable file and every name after it must be listed"
+    );
+    assert_eq!(
+        unresolvable,
+        BTreeSet::from(["B.flac".to_string()]),
+        "the client's own stat reports the failure, for that file alone"
+    );
+
+    drop(session);
 }
