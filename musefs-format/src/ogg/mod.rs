@@ -94,7 +94,14 @@ fn read_exactly(data: &[u8], want: usize) -> Result<Vec<page::ReadPacket>> {
 /// blocks run until one carries the last-block flag. STREAMINFO is itself a
 /// metadata block, so a mapping packet that flags it as the last one ends the run
 /// at packet 0.
-fn oggflac_header_packets(data: &[u8], mapping: &[u8]) -> Result<Vec<page::ReadPacket>> {
+///
+/// `stored` says `data` is a stored header region rather than a window, and lets
+/// the run end where the region does; see [`read_metadata`].
+fn oggflac_header_packets(
+    data: &[u8],
+    mapping: &[u8],
+    stored: bool,
+) -> Result<Vec<page::ReadPacket>> {
     let declared = oggflac_following_packets(mapping)?;
     if declared > 0 {
         return read_exactly(data, 1 + declared);
@@ -105,7 +112,7 @@ fn oggflac_header_packets(data: &[u8], mapping: &[u8]) -> Result<Vec<page::ReadP
     {
         return read_exactly(data, 1);
     }
-    page::read_packets_while(data, |out| {
+    page::read_packets_while(data, stored, |out| {
         let last = out.last().expect("a packet was just completed");
         if out.len() == 1 {
             return Ok(true); // the mapping packet; its followers are what we seek
@@ -157,6 +164,12 @@ fn validate_single_bitstream(data: &[u8], audio_offset: u64, serial: u32) -> Res
 /// whole file or just `[0, audio_offset)`; either way parsing stops once all header
 /// packets are reassembled.
 pub fn read_header(data: &[u8]) -> Result<OggHeader> {
+    parse_header(data, false)
+}
+
+/// [`read_header`], with `stored` saying whether `data` ends exactly where the
+/// header region does (see [`read_metadata`]).
+fn parse_header(data: &[u8], stored: bool) -> Result<OggHeader> {
     let first_page = page::parse_page(data, 0)?;
     let serial = first_page.serial;
 
@@ -168,7 +181,7 @@ pub fn read_header(data: &[u8]) -> Result<OggHeader> {
     let pkts = match codec {
         Codec::Opus => read_exactly(data, 2)?,
         Codec::Vorbis => read_exactly(data, 3)?,
-        Codec::OggFlac => oggflac_header_packets(data, &first_pkt.data)?,
+        Codec::OggFlac => oggflac_header_packets(data, &first_pkt.data, stored)?,
     };
     let last = pkts.last().ok_or(FormatError::Malformed)?;
     let audio_offset = last.end_offset as u64;
@@ -443,9 +456,25 @@ pub fn locate_audio(data: &[u8]) -> Result<OggScan> {
 }
 
 /// The header region parsed from the front of the file (`[0, audio_offset)`), for
-/// synthesis. Identical to `read_header` but named to mirror `flac::read_metadata`.
+/// synthesis. Named to mirror `flac::read_metadata`.
+///
+/// Identical to [`read_header`] except in one case: `front` is the region a
+/// store recorded, so its end is the end of the header, and an OggFLAC run of
+/// unknown length (#723) may stop there instead of failing for want of the
+/// block that sets the last-block flag. That case is the row 1.3.0 stored for
+/// such a file. It read the zero count as "none" and cut the region after the
+/// mapping packet, so the walk ran off the end, and every read of the file was
+/// `EIO` until a re-probe corrected the row.
+///
+/// The stop cannot change any header [`read_header`] parses. It applies only
+/// where that parse would have failed: at the region's last byte, between pages,
+/// with the last packet complete. There it yields exactly the packets the region
+/// holds — for a 1.3.0 row the mapping packet alone, the same header 1.3.0
+/// served — so such a row goes on serving as it did until a re-probe corrects it.
+/// A scan never uses this, because there a window ending on a page boundary is a
+/// window too short, not the end of the header.
 pub fn read_metadata(front: &[u8]) -> Result<OggHeader> {
-    read_header(front)
+    parse_header(front, true)
 }
 
 /// Bounded twin of [`read_metadata`]. OGG header packets (and all OGG embedded
@@ -1645,6 +1674,55 @@ mod tests {
         let (data, _) = oggflac_file(0, false, &[vorbis_comment_block(false, "T")]);
         assert!(read_header(&data).is_err());
         assert!(locate_audio(&data).is_err());
+    }
+
+    #[test]
+    fn a_stored_region_cut_after_the_mapping_packet_still_parses_for_serving() {
+        // 1.3.0 read a zero count as "none" and stored `audio_offset` just past
+        // the mapping packet (#723). The serve path re-parses exactly that stored
+        // region, and the discovery walk ran off its end looking for the block
+        // that sets the last-block flag: Malformed, so every read was EIO until a
+        // re-probe corrected the row, which `revalidate --checksum none` on a
+        // filesystem with no recorded inodes never does.
+        let blocks = vec![vorbis_comment_block(true, "RealTitle")];
+        let (data, _) = oggflac_file(0, false, &blocks);
+        let mapping_page = page::parse_page(&data, 0).unwrap().total_len();
+        let stored = &data[..mapping_page];
+
+        let h = read_metadata(stored).unwrap();
+        // Exactly what 1.3.0 parsed and served from: the mapping packet alone.
+        assert_eq!(h.codec, Codec::OggFlac);
+        assert_eq!(
+            h.packets,
+            vec![read_header(&data).unwrap().packets[0].clone()]
+        );
+        assert_eq!((h.header_pages, h.audio_offset), (1, mapping_page as u64));
+
+        // The scan side stays strict: there a window ending on a page boundary
+        // is a truncation to widen, never the end of the header.
+        assert!(read_header(stored).is_err());
+        assert!(matches!(
+            read_metadata_bounded(stored, data.len() as u64),
+            Ok(Extent::NeedMore { .. })
+        ));
+    }
+
+    #[test]
+    fn a_stored_region_that_ends_inside_a_packet_is_still_malformed() {
+        // The clean stop is for a region that ends where a packet does. One cut
+        // between two pages of a single packet ends nowhere a header could, so it
+        // stays malformed.
+        let big = vorbis_comment_block(true, &"t".repeat(70_000));
+        let (data, _) = oggflac_file(0, false, &[big]);
+        let mapping_page = page::parse_page(&data, 0).unwrap().total_len();
+        let first_comment_page = page::parse_page(&data, mapping_page).unwrap().total_len();
+        let mid_packet = &data[..mapping_page + first_comment_page];
+        assert!(
+            read_metadata(mid_packet).is_err(),
+            "a packet continued past the region is not a complete header"
+        );
+        // And a region that ends mid-page is no page boundary at all.
+        assert!(read_metadata(&data[..mapping_page + 40]).is_err());
     }
 
     #[test]

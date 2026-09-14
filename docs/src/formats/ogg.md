@@ -253,7 +253,13 @@ still serve.
   mapping requires a count it gives to be accurate, and reserves zero for the
   unknown case. A row scanned before this fix keeps its wrong `audio_offset`
   until a revalidate re-probes the file, which the first revalidate after the
-  2.0.0 upgrade does. Unlike a chained Ogg, the file itself parses, so the
+  2.0.0 upgrade does. Until then it serves exactly as it did under 1.3.0: the
+  serve path re-parses only the stored header region, and there a run of
+  unknown length may end where the region does, which for such a row is right
+  after the mapping packet. That matters where no re-probe comes, such as a
+  `revalidate --checksum none` over a filesystem where no inode is recorded;
+  the parse used to demand the block flagged last, run off the region's end,
+  and fail every read with `EIO`. Unlike a chained Ogg, the file itself parses, so the
   re-probe corrects the row rather than refusing it. The revalidate fixes only
   the bounds: tags and art that 1.3.0 never read from such a file arrive only
   through `musefs scan --force <file>`, which replaces that file's curated

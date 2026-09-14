@@ -293,11 +293,10 @@ fn revalidate_prune_spares_a_refused_file_rewritten_since_the_refusal() {
     assert!(db.list_tracks().unwrap().is_empty());
 }
 
-#[test]
-fn scan_ingests_an_oggflac_whose_header_count_is_unknown() {
-    // A zero following-packet count means "unknown", not "none": the real
-    // VORBIS_COMMENT still follows. Reading it as "none" left the tags inside
-    // the audio region, un-ingested and replayed by synthesis (#723).
+/// The FLAC-in-Ogg file #723 is about — a mapping packet whose following-packet
+/// count is zero, then a VORBIS_COMMENT flagged last — plus one audio page.
+/// Returns the bytes and the length of the true header region.
+fn oggflac_with_unknown_count() -> (Vec<u8>, usize) {
     let mut streaminfo = Vec::new();
     streaminfo.push(0u8); // STREAMINFO, not the last block
     streaminfo.extend_from_slice(&34u32.to_be_bytes()[1..]); // 24-bit length
@@ -320,6 +319,103 @@ fn scan_ingests_an_oggflac_whose_header_count_is_unknown() {
     let header_len = bytes.len();
     let (audio, _) = lace_packet_pub(0x4321, pages, false, 4096, &[0xFFu8, 0xF8, 0x69, 0x18]);
     bytes.extend_from_slice(&audio);
+    (bytes, header_len)
+}
+
+/// Plant the row 1.3.0 stored for [`oggflac_with_unknown_count`]: it read the
+/// zero count as "none", so its audio region starts right after the mapping
+/// packet's page, and V4 left it with no inode and no fingerprint. Returns the
+/// track id and that 1.3.0 `audio_offset`.
+fn plant_1_3_0_oggflac_row(db: &musefs_db::Db, path: &std::path::Path) -> (i64, u64) {
+    let bytes = std::fs::read(path).unwrap();
+    let cut = musefs_format::ogg::parse_page(&bytes, 0)
+        .unwrap()
+        .total_len() as u64;
+    let meta = std::fs::metadata(path).unwrap();
+    let stamp = BackingStamp::from_metadata(&meta);
+    let id = db
+        .upsert_track(&musefs_db::NewTrack {
+            backing_path: std::fs::canonicalize(path).unwrap(),
+            format: Format::OggFlac,
+            audio_offset: cut,
+            audio_length: meta.len() - cut,
+            backing_size: stamp.size,
+            backing_mtime_ns: stamp.mtime_ns,
+            backing_ctime_ns: stamp.ctime_ns,
+            backing_ino: None,
+        })
+        .unwrap();
+    (id, cut)
+}
+
+/// #723's upgrade edge. A row 1.3.0 stored for a zero-count OggFLAC has its
+/// audio region starting right after the mapping packet, and the serve path
+/// re-parses exactly that region. The discovery walk ran off its end, so every
+/// read was EIO until a re-probe corrected the row — and a `--checksum none`
+/// revalidate on a filesystem where no inode is recorded never re-probes it.
+/// Until one does, the file serves as it did under 1.3.0.
+#[test]
+fn a_1_3_0_row_for_an_unknown_count_oggflac_still_serves() {
+    let (bytes, _) = oggflac_with_unknown_count();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unknown-count-1.3.0.oga");
+    std::fs::write(&path, &bytes).unwrap();
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    let (id, _) = plant_1_3_0_oggflac_row(&db, &path);
+
+    {
+        let _fat = crate::freshness::pretend_no_inodes();
+        let stats = crate::revalidate_with(
+            &db,
+            dir.path(),
+            &ScanOptions {
+                checksum: ChecksumTier::None,
+                ..ScanOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            (stats.unchanged, stats.updated),
+            (1, 0),
+            "nothing about the row asks this pass to re-probe it"
+        );
+    }
+
+    let resolved = crate::HeaderCache::new(crate::Mode::Synthesis)
+        .resolve(&db, id)
+        .expect("the stored region parses");
+    let served = crate::reader::read_at(&resolved, &db, 0, resolved.total_len).unwrap();
+    assert_eq!(served.len() as u64, resolved.total_len);
+}
+
+/// #723's other test gap: the re-probe that corrects a 1.3.0 row. The file
+/// parses, so unlike a chained Ogg the revalidate rewrites the row's bounds to
+/// the true header region instead of refusing it.
+#[test]
+fn a_revalidate_corrects_the_audio_offset_1_3_0_stored() {
+    let (bytes, header_len) = oggflac_with_unknown_count();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unknown-count-revalidated.oga");
+    std::fs::write(&path, &bytes).unwrap();
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    let (id, cut) = plant_1_3_0_oggflac_row(&db, &path);
+    assert!(cut < header_len as u64, "the planted row is the short one");
+
+    let stats = crate::revalidate(&db, dir.path()).unwrap();
+    assert_eq!((stats.updated, stats.failed), (1, 0));
+    let t = db.get_track(id).unwrap().unwrap();
+    assert_eq!(
+        (t.bounds.audio_offset(), t.bounds.audio_length()),
+        (header_len as u64, (bytes.len() - header_len) as u64)
+    );
+}
+
+#[test]
+fn scan_ingests_an_oggflac_whose_header_count_is_unknown() {
+    // A zero following-packet count means "unknown", not "none": the real
+    // VORBIS_COMMENT still follows. Reading it as "none" left the tags inside
+    // the audio region, un-ingested and replayed by synthesis (#723).
+    let (bytes, header_len) = oggflac_with_unknown_count();
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("unknown-count.oga");

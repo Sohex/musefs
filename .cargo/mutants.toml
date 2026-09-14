@@ -674,9 +674,9 @@ exclude_re = [
     # guard: op="+=" fn="lace_packet" rows=1
     'musefs-format/src/ogg/page\.rs:135:18: replace \+= with \*= in lace_packet',
     # guard: op="+=" fn="lace_chunks_to_segments" rows=1
-    'musefs-format/src/ogg/page\.rs:380:18: replace \+= with \*= in lace_chunks_to_segments',
+    'musefs-format/src/ogg/page\.rs:390:18: replace \+= with \*= in lace_chunks_to_segments',
     # guard: op="+=" fn="read_packets_while" rows=1
-    'musefs-format/src/ogg/page\.rs:210:13: replace \+= with \*= in read_packets_while',
+    'musefs-format/src/ogg/page\.rs:220:13: replace \+= with \*= in read_packets_while',
 
     # Equivalent mutants from #266.
     # push_block_header `(if is_last {0x80} else {0}) | (block_type & 0x7F)`,
@@ -698,7 +698,7 @@ exclude_re = [
     # any capacity is behavior-identical (the CACHE_ESTIMATED_ITEMS precedent). The
     # `lace_pos + seg_count` slice `+` elsewhere IS caught, so pinned by line:col.
     # guard: op="+" fn="lace_chunks_to_segments" rows=1
-    'musefs-format/src/ogg/page\.rs:361:29: replace \+ with \* in lace_chunks_to_segments',
+    'musefs-format/src/ogg/page\.rs:371:29: replace \+ with \* in lace_chunks_to_segments',
     # crc_feed_payload / emit_segments overlap guards `if os < oe`, `<`->`<=`: at
     # os==oe the overlap is empty, so the branch folds a zero-length slice / reads 0
     # art bytes — byte-identical CRC and segments (the serve_ogg_window empty-overlap
