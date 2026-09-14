@@ -22,9 +22,10 @@ def segment(marker, payload):
     return b"\xff" + bytes([marker]) + struct.pack(">H", len(payload) + 2) + payload
 
 
-def sof(marker, width, height):
-    """A start-of-frame segment: precision, height, width, one component."""
-    return segment(marker, bytes([8]) + struct.pack(">HH", height, width) + b"\x01\x01\x11\x00")
+def sof(marker, width, height, *, components=b"\x01\x01\x11\x00"):
+    """A start-of-frame segment: precision, height, width, then the component
+    count and three bytes per component (one component by default)."""
+    return segment(marker, bytes([8]) + struct.pack(">HH", height, width) + components)
 
 
 APP0 = segment(0xE0, b"JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00")
@@ -65,6 +66,7 @@ def test_a_non_frame_segment_in_the_sof_range_is_skipped():
         pytest.param(b"not an image at all", id="garbage"),
         pytest.param(b"RIFF\x00\x00\x00\x00WEBPVP8 ", id="webp"),
         pytest.param(png(640, 480)[:20], id="png-truncated-in-ihdr"),
+        pytest.param(png(640, 480)[:29], id="png-ihdr-without-its-crc"),
         pytest.param(png(640, 480, first_chunk=b"gAMA"), id="png-first-chunk-not-ihdr"),
         pytest.param(png(640, 480, length=12), id="png-ihdr-wrong-length"),
         pytest.param(png(0, 480), id="png-zero-width"),
@@ -74,6 +76,16 @@ def test_a_non_frame_segment_in_the_sof_range_is_skipped():
         pytest.param(jpeg(APP0, sof(0xC0, 0, 800)), id="jpeg-zero-width"),
         pytest.param(jpeg(APP0), id="jpeg-image-data-before-any-frame"),
         pytest.param(b"\xff\xd8" + APP0 + sof(0xC0, 1200, 800)[:6], id="jpeg-sof-truncated"),
+        pytest.param(
+            jpeg(APP0, sof(0xC0, 1200, 800, components=b"\x00")), id="jpeg-sof-no-components"
+        ),
+        pytest.param(
+            jpeg(APP0, sof(0xC0, 1200, 800, components=b"\x02\x01\x11\x00")),
+            id="jpeg-sof-length-disagrees-with-component-count",
+        ),
+        pytest.param(
+            jpeg(APP0, sof(0xC0, 1200, 800, components=b"")), id="jpeg-sof-without-component-count"
+        ),
         pytest.param(b"\xff\xd8\xff\xe0\x7f\xff", id="jpeg-segment-past-the-end"),
         pytest.param(b"\xff\xd8\xff\xe0\x00\x01", id="jpeg-segment-length-below-two"),
         pytest.param(b"\xff\xd8\xff\xd9", id="jpeg-end-of-image-first"),

@@ -396,8 +396,9 @@ def _checked_dimensions(width, height):
 
 def _png_dimensions(data):
     # Signature (8), then the IHDR chunk: length (4) = 13, type (4), width (4),
-    # height (4), big-endian.
-    if len(data) < 24 or data[8:12] != struct.pack(">I", 13) or data[12:16] != b"IHDR":
+    # height (4), five more data bytes and the CRC (4), big-endian. Only a
+    # complete chunk is read, so 33 bytes.
+    if len(data) < 33 or data[8:12] != struct.pack(">I", 13) or data[12:16] != b"IHDR":
         return None
     width, height = struct.unpack(">II", data[16:24])
     return _checked_dimensions(width, height)
@@ -427,8 +428,13 @@ def _jpeg_dimensions(data):
         if length < 2 or i + length > end:
             return None
         if marker in _JPEG_SOF:
-            # Length (2), precision (1), height (2), width (2).
-            if length < 7:
+            # Length (2), precision (1), height (2), width (2), component count
+            # (1), then three bytes per component. A frame header that is not
+            # exactly that long, or has no components, is malformed.
+            if length < 8:
+                return None
+            components = data[i + 7]
+            if components == 0 or length != 8 + 3 * components:
                 return None
             height, width = struct.unpack(">HH", data[i + 3 : i + 7])
             return _checked_dimensions(width, height)
