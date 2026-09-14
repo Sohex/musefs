@@ -1373,7 +1373,7 @@ fn gated(found: i64) -> crate::error::DbError {
 /// Bring the store up to the latest version it may transparently reach, and
 /// refuse if a gated step stands between that and [`LATEST_VERSION`].
 pub fn migrate(conn: &mut Connection) -> Result<()> {
-    run(conn, GatePolicy::Enforce)
+    run(conn, GatePolicy::Enforce, None)
 }
 
 /// Bring the store all the way to [`LATEST_VERSION`], gated steps included.
@@ -1382,10 +1382,22 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
 /// gated because it does something the user has to be told about first, and
 /// this function is the point at which they already have been.
 pub fn migrate_all(conn: &mut Connection) -> Result<()> {
-    run(conn, GatePolicy::Bypass)
+    run(conn, GatePolicy::Bypass, None)
 }
 
-fn run(conn: &mut Connection, policy: GatePolicy) -> Result<()> {
+/// [`migrate_all`], running `first` inside the migration's own transaction
+/// before any step, so that an upgrade failing anywhere rolls `first` back with
+/// it. It runs on a store already at [`LATEST_VERSION`] too, where there is no
+/// step for it to precede. `musefs migrate --repair`'s deletes are what this is
+/// for.
+pub(crate) fn migrate_all_after(conn: &mut Connection, first: Prelude<'_>) -> Result<()> {
+    run(conn, GatePolicy::Bypass, Some(first))
+}
+
+/// Work a run does inside its transaction before the first step.
+pub(crate) type Prelude<'a> = &'a dyn Fn(&Connection) -> Result<()>;
+
+fn run(conn: &mut Connection, policy: GatePolicy, first: Option<Prelude<'_>>) -> Result<()> {
     let latest = LATEST_VERSION;
     let current = conn.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))?;
     // A store at a user_version past anything this binary knows about was written
@@ -1401,8 +1413,9 @@ fn run(conn: &mut Connection, policy: GatePolicy) -> Result<()> {
             supported: latest,
         });
     }
-    // Fast path: already at the latest version, no transaction needed.
-    if current >= latest {
+    // Fast path: already at the latest version with nothing to run first, so no
+    // transaction is needed.
+    if current >= latest && first.is_none() {
         return Ok(());
     }
     // Test seam: the window between the read above and the write lock below is
@@ -1461,6 +1474,9 @@ fn run(conn: &mut Connection, policy: GatePolicy) -> Result<()> {
             );
         }
         work = Some((at, std::time::Instant::now()));
+    }
+    if let Some(first) = first {
+        first(&tx)?;
     }
     for (target, migration) in (1i64..).zip(MIGRATIONS) {
         if current < target && target <= stop {

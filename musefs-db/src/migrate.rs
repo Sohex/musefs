@@ -7,6 +7,8 @@
 //! this module is what the command inspects the store through before it commits
 //! to anything.
 
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -27,16 +29,50 @@ pub struct TableRejections {
     pub rejected: u64,
 }
 
+/// Two `tracks` rows naming one backing path, once as TEXT and once as a BLOB.
+///
+/// Before 2.0.0 the column was TEXT, and `UNIQUE` never compares a TEXT value
+/// equal to a BLOB, so a tool binding the path as bytes could add a second row
+/// for a file musefs already had. The upgrade stores every path as bytes, which
+/// makes the two one path, and only one row can keep it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DuplicatePath {
+    /// The row that keeps the path: the one carrying tags or art links, or the
+    /// older one when neither does.
+    pub kept: i64,
+    /// The row refused for sharing it, which the `tracks` count includes.
+    pub refused: i64,
+    /// Both rows carry tags or art links, so [`PendingMigration::repair`] will
+    /// not choose between them.
+    pub ambiguous: bool,
+}
+
 /// What the migrated schema would refuse, per table. Empty is the normal case.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Rejections {
     tables: Vec<TableRejections>,
+    duplicates: Vec<DuplicatePath>,
+    relinked: u64,
 }
 
 impl Rejections {
     /// Every table with at least one refused row.
     pub fn tables(&self) -> &[TableRejections] {
         &self.tables
+    }
+
+    /// Every path two `tracks` rows share. Each refused row is also counted
+    /// under `tracks`.
+    pub fn duplicates(&self) -> &[DuplicatePath] {
+        &self.duplicates
+    }
+
+    /// Picture links a repair moves onto a correctly filed `art` row holding the
+    /// same bytes as the refused row they point at, instead of deleting them.
+    /// They are not counted as refused.
+    pub fn relinked(&self) -> u64 {
+        self.relinked
     }
 
     /// Refused rows across every table.
@@ -48,6 +84,51 @@ impl Rejections {
     pub fn is_empty(&self) -> bool {
         self.tables.is_empty()
     }
+}
+
+/// What one pass of the probe found, and what a repair does about it.
+#[derive(Debug, Default)]
+struct Findings {
+    /// Rowids each rebuilt table refuses, in the order a repair deletes them.
+    refused: Vec<(&'static str, Vec<i64>)>,
+    /// `track_art` rowids, each with the correctly filed `art` id it moves onto.
+    relinks: Vec<(i64, i64)>,
+    duplicates: Vec<DuplicatePath>,
+}
+
+impl Findings {
+    fn report(&self) -> Rejections {
+        Rejections {
+            tables: self
+                .refused
+                .iter()
+                .map(|(table, rowids)| TableRejections {
+                    table,
+                    rejected: rowids.len() as u64,
+                })
+                .filter(|t| t.rejected > 0)
+                .collect(),
+            duplicates: self.duplicates.clone(),
+            relinked: self.relinks.len() as u64,
+        }
+    }
+}
+
+/// Carry out a repair on `conn`: the relinks first, so that no link still
+/// points at an `art` row when it goes, then the deletes, table by table in the
+/// order the probe named them.
+fn carry_out(conn: &Connection, plan: &Findings) -> Result<()> {
+    let mut relink = conn.prepare("UPDATE track_art SET art_id = ?2 WHERE rowid = ?1")?;
+    for (rowid, art_id) in &plan.relinks {
+        relink.execute([rowid, art_id])?;
+    }
+    for (table, rowids) in &plan.refused {
+        let mut delete = conn.prepare(&format!("DELETE FROM {table} WHERE rowid = ?1"))?;
+        for rowid in rowids {
+            delete.execute([rowid])?;
+        }
+    }
+    Ok(())
 }
 
 /// A store opened for a gated schema upgrade, before the upgrade runs.
@@ -66,6 +147,9 @@ pub struct PendingMigration {
     conn: Connection,
     path: PathBuf,
     current: i64,
+    /// The repair [`PendingMigration::repair`] worked out, for
+    /// [`PendingMigration::apply`] to carry out inside the migration.
+    repair: RefCell<Option<Findings>>,
 }
 
 impl PendingMigration {
@@ -105,6 +189,7 @@ impl PendingMigration {
             conn,
             path,
             current,
+            repair: RefCell::new(None),
         })
     }
 
@@ -166,6 +251,12 @@ impl PendingMigration {
     ///
     /// `tracks` selects no checksum column: the refill nulls both (#691,
     /// #689), so a V1 store, which has no such columns, needs no special case.
+    ///
+    /// `tracks` goes in with the rows carrying tags or art links first, then by
+    /// rowid. Where the refill's CAST gives a TEXT path and a BLOB one the same
+    /// bytes, `UNIQUE` refuses whichever arrives second, so that ordering is
+    /// what decides which row keeps the path: the one with something a user
+    /// wrote on it, or the older one when neither has.
     fn probe_projections() -> [(&'static str, String); 5] {
         [
             (
@@ -176,7 +267,10 @@ impl PendingMigration {
                  SELECT rowid, id, CAST(backing_path AS BLOB), format, audio_offset, \
                   audio_length, backing_size, backing_mtime_ns, content_version, \
                   updated_at, backing_ctime_ns, NULL, NULL, 0 \
-                 FROM main.tracks"
+                 FROM main.tracks t \
+                 ORDER BY EXISTS (SELECT 1 FROM main.tags WHERE track_id = t.id) \
+                       OR EXISTS (SELECT 1 FROM main.track_art WHERE track_id = t.id) DESC, \
+                          rowid"
                     .to_string(),
             ),
             (
@@ -282,7 +376,7 @@ impl PendingMigration {
     /// Foreign keys are off for the pass. The question is per row and per table
     /// — a child whose parent is refused would otherwise be counted for a
     /// reason of its own that it does not have.
-    fn probe(&self) -> Result<Vec<(&'static str, Vec<i64>)>> {
+    fn probe(&self) -> Result<Findings> {
         let reference = {
             let mut scratch = Connection::open_in_memory()?;
             schema::migrate_all(&mut scratch)?;
@@ -306,12 +400,63 @@ impl PendingMigration {
         Ok(out)
     }
 
-    fn probe_inner(&self, reference: &[(String, String)]) -> Result<Vec<(&'static str, Vec<i64>)>> {
+    /// Two `tracks` rows the refill would give one path: each refused row with
+    /// the row that kept the path, and whether both carry tags or art links.
+    fn duplicates(&self) -> Result<Vec<DuplicatePath>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT p.id, m.id, \
+                    (EXISTS (SELECT 1 FROM main.tags WHERE track_id = m.id) \
+                     OR EXISTS (SELECT 1 FROM main.track_art WHERE track_id = m.id)) \
+                    AND (EXISTS (SELECT 1 FROM main.tags WHERE track_id = p.id) \
+                     OR EXISTS (SELECT 1 FROM main.track_art WHERE track_id = p.id)) \
+             FROM main.tracks m \
+             JOIN probe.tracks p ON p.backing_path = CAST(m.backing_path AS BLOB) \
+             WHERE m.rowid NOT IN (SELECT rowid FROM probe.tracks)",
+        )?;
+        let found = stmt
+            .query_map([], |r| {
+                Ok(DuplicatePath {
+                    kept: r.get(0)?,
+                    refused: r.get(1)?,
+                    ambiguous: r.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(found)
+    }
+
+    /// Links to a refused `art` row that a correctly filed row holding the same
+    /// bytes can take instead, each with that row's id. Only a link that
+    /// survives on its own terms qualifies: one refused for itself, or whose
+    /// track is refused, goes whatever it points at. The bytes are compared in
+    /// SQL, lengths first, so no blob is read into Rust to decide.
+    fn relinks(&self) -> Result<Vec<(i64, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT h.rowid, \
+                    (SELECT min(twin.id) FROM main.art twin \
+                      WHERE twin.id IN (SELECT id FROM probe.art) \
+                        AND twin.byte_len = bad.byte_len \
+                        AND twin.data = bad.data) \
+             FROM main.track_art h JOIN main.art bad ON bad.id = h.art_id \
+             WHERE h.art_id NOT IN (SELECT id FROM probe.art) \
+               AND h.rowid IN (SELECT rowid FROM probe.track_art) \
+               AND h.track_id IN (SELECT id FROM probe.tracks)",
+        )?;
+        let rows: Vec<(i64, Option<i64>)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(rowid, twin)| twin.map(|id| (rowid, id)))
+            .collect())
+    }
+
+    fn probe_inner(&self, reference: &[(String, String)]) -> Result<Findings> {
         // An empty filename is SQLite's temporary on-disk database: it lives
         // beside the store's own temp files and is deleted on DETACH, so a
         // store far too large to probe in memory still works.
         self.conn.execute_batch("ATTACH DATABASE '' AS probe")?;
-        let result = (|| -> Result<Vec<(&'static str, Vec<i64>)>> {
+        let result = (|| -> Result<Findings> {
             for (name, sql) in reference {
                 self.conn
                     .execute_batch(&sql.replacen("CREATE TABLE ", "CREATE TABLE probe.", 1))
@@ -338,19 +483,31 @@ impl PendingMigration {
             // Second pass, once every probe table is populated: a child whose
             // parent did not survive. Merged into the same per-table answer,
             // because to the user it is one question -- what will not be there
-            // afterwards -- and a row can fail both ways at once.
+            // afterwards -- and a row can fail both ways at once. A link that
+            // moves onto a correctly filed row is not lost with the row it
+            // pointed at, so it is left out.
+            let relinks = self.relinks()?;
+            let moving: HashSet<i64> = relinks.iter().map(|&(rowid, _)| rowid).collect();
             for (table, orphaned) in self.orphans()? {
                 let slot = out
                     .iter_mut()
                     .find(|(t, _)| *t == table)
                     .expect("every orphan-checked table is probed");
+                // A set beside the list, so a large orphan set is not quadratic,
+                // and the list keeps the order the report and the repair use.
+                let mut named: HashSet<i64> = slot.1.iter().copied().collect();
                 for rowid in orphaned {
-                    if !slot.1.contains(&rowid) {
+                    let moves = table == "track_art" && moving.contains(&rowid);
+                    if !moves && named.insert(rowid) {
                         slot.1.push(rowid);
                     }
                 }
             }
-            Ok(out)
+            Ok(Findings {
+                refused: out,
+                relinks,
+                duplicates: self.duplicates()?,
+            })
         })();
         let detached = self.conn.execute_batch("DETACH DATABASE probe");
         let out = result?;
@@ -367,53 +524,50 @@ impl PendingMigration {
     /// would be half-applied — but aborting part-way through a long upgrade
     /// with a raw `CHECK constraint failed` is a poor way to learn that.
     pub fn inspect_rejections(&self) -> Result<Rejections> {
-        Ok(Rejections {
-            tables: self
-                .probe()?
-                .into_iter()
-                .map(|(table, rowids)| TableRejections {
-                    table,
-                    rejected: rowids.len() as u64,
-                })
-                .filter(|t| t.rejected > 0)
-                .collect(),
-        })
+        Ok(self.probe()?.report())
     }
 
-    /// Delete every row the migrated schema would refuse, and report what went.
+    /// Work out how to repair every row the migrated schema would refuse, hold
+    /// it for [`PendingMigration::apply`], and report what the upgrade will do.
     ///
     /// Dropping a row an external writer chose is exactly the class of thing
     /// that must not happen without being asked for, so nothing calls this
     /// except a command the user has told to repair.
     ///
+    /// Nothing is deleted here. The repair runs inside the migration's own
+    /// transaction, before its first step, so an upgrade that fails part-way —
+    /// on a full disk, say — rolls the repair back with everything else and
+    /// leaves the store as it was, rather than at its old version short the
+    /// rows the repair took.
+    ///
     /// Deletes run parent-first, so a refused `tracks` row takes its tags and
     /// art links with it through the cascade rather than leaving them to be
     /// deleted for a reason they do not have. The counts reported are the rows
     /// named by the probe; the cascade may take more.
+    ///
+    /// Two cases are decided rather than deleted wholesale. A picture link whose
+    /// `art` row is refused moves onto a correctly filed row holding the same
+    /// bytes, where one exists, since the picture it serves is the same one.
+    /// And where two `tracks` rows share a path ([`DuplicatePath`]), the one
+    /// carrying tags or art links keeps it; if both carry some, this refuses
+    /// with [`crate::DbError::AmbiguousDuplicatePath`] and holds nothing.
     pub fn repair(&self) -> Result<Rejections> {
         let found = self.probe()?;
-        let tx = self.conn.unchecked_transaction()?;
-        let mut tables = Vec::new();
-        for (table, rowids) in found {
-            if rowids.is_empty() {
-                continue;
-            }
-            let mut stmt = tx.prepare(&format!("DELETE FROM {table} WHERE rowid = ?1"))?;
-            for rowid in &rowids {
-                stmt.execute([rowid])?;
-            }
-            tables.push(TableRejections {
-                table,
-                rejected: rowids.len() as u64,
+        if let Some(both) = found.duplicates.iter().find(|d| d.ambiguous) {
+            return Err(crate::DbError::AmbiguousDuplicatePath {
+                first: both.kept,
+                second: both.refused,
             });
         }
-        tx.commit()?;
-        Ok(Rejections { tables })
+        let report = found.report();
+        self.repair.replace(Some(found));
+        Ok(report)
     }
 
     /// Run every pending step, gated ones included, and hand back the migrated
     /// store. The identity check runs here, against the shape the migration was
-    /// supposed to produce.
+    /// supposed to produce. A repair [`PendingMigration::repair`] held runs in
+    /// the same transaction, first.
     ///
     /// This is where the connection stops being a migration handle and becomes
     /// an ordinary [`Db`], so it picks up what [`Db::open`] sets that the
@@ -426,7 +580,12 @@ impl PendingMigration {
         let _: String = self
             .conn
             .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
-        schema::migrate_all(&mut self.conn)?;
+        match self.repair.take() {
+            Some(plan) => {
+                schema::migrate_all_after(&mut self.conn, &|tx| carry_out(tx, &plan))?;
+            }
+            None => schema::migrate_all(&mut self.conn)?,
+        }
         schema::validate_identity(&self.conn)?;
         crate::bound_lengths(&self.conn)?;
         Ok(Db::from_migrated(self.conn, self.path))
@@ -526,11 +685,12 @@ mod rejection_tests {
         let err = pending.apply().unwrap_err().to_string();
         assert!(err.contains("CHECK constraint failed"), "{err}");
 
-        // With it, the row goes and the upgrade runs.
+        // With it, the row goes and the upgrade runs. The repair is held for the
+        // upgrade to carry out, so until then the row is still there.
         let pending = PendingMigration::open(&path).unwrap();
         let removed = pending.repair().unwrap();
         assert_eq!(removed.total(), 1);
-        assert!(pending.inspect_rejections().unwrap().is_empty());
+        assert_eq!(pending.inspect_rejections().unwrap().total(), 1);
         let db = pending.apply().unwrap();
         assert_eq!(db.get_tags(1).unwrap().len(), 1, "the clean tag survived");
     }
@@ -704,7 +864,6 @@ mod rejection_tests {
         // Which is the half that was never exercised before: repair it.
         let removed = pending.repair().unwrap();
         assert_eq!(removed.total(), 2);
-        assert!(pending.inspect_rejections().unwrap().is_empty());
         pending.apply().unwrap();
     }
 
@@ -801,6 +960,245 @@ mod rejection_tests {
             vec!["/lib/a.flac".len(), cap],
             "the clean row and the one at the cap"
         );
+    }
+
+    /// A row refused on its own and orphaned by a refused parent as well is one
+    /// row the user loses, so it is counted once.
+    #[test]
+    fn a_row_refused_twice_over_is_counted_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.db");
+        let conn = store_at_v3(&path);
+        plant_hostile(
+            &conn,
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime_ns, backing_ctime_ns, updated_at) \
+             VALUES ('', 'flac', 0, 0, 0, 0, 0, 0)",
+            &[],
+        );
+        let bad = conn.last_insert_rowid();
+        plant_hostile(
+            &conn,
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?1, ?2, 'v', 0)",
+            &[&bad, &format!("k{}junk", '\0')],
+        );
+        drop(conn);
+
+        let found = PendingMigration::open(&path)
+            .unwrap()
+            .inspect_rejections()
+            .unwrap();
+        let named: Vec<(&str, u64)> = found
+            .tables()
+            .iter()
+            .map(|t| (t.table, t.rejected))
+            .collect();
+        assert_eq!(named, vec![("tracks", 1), ("tags", 1)], "{found:?}");
+    }
+
+    /// #761's repair when a correctly filed row already holds the same bytes:
+    /// the link moves onto that row instead of going with the one it pointed at,
+    /// since the picture it serves is byte for byte the same. A non-canonical
+    /// row with no such twin still takes its links with it, which
+    /// `a_non_canonical_art_digest_is_reported_with_its_link_then_repaired` pins.
+    #[test]
+    fn a_non_canonical_digest_with_a_canonical_twin_is_relinked_not_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.db");
+        let conn = store_at_v3(&path);
+        // The same one byte `store_at_v3` files, correctly, as art 1.
+        conn.execute(
+            "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
+             VALUES (?1, 'image/png', 1, 1, 1, X'00')",
+            [&"A".repeat(64)],
+        )
+        .unwrap();
+        let uppercased = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO track_art (track_id, art_id, picture_type, description, ordinal) \
+             VALUES (1, ?1, 4, 'back', 1)",
+            [uppercased],
+        )
+        .unwrap();
+        drop(conn);
+
+        let pending = PendingMigration::open(&path).unwrap();
+        let found = pending.inspect_rejections().unwrap();
+        let named: Vec<(&str, u64)> = found
+            .tables()
+            .iter()
+            .map(|t| (t.table, t.rejected))
+            .collect();
+        assert_eq!(
+            named,
+            vec![("art", 1)],
+            "the row goes, its link stays: {found:?}"
+        );
+        assert_eq!(found.relinked(), 1, "and the link is reported as moving");
+
+        assert_eq!(pending.repair().unwrap().relinked(), 1);
+        let db = pending.apply().unwrap();
+        let links: Vec<(i64, String)> = db
+            .get_track_art(1)
+            .unwrap()
+            .into_iter()
+            .map(|l| (l.art_id, l.description))
+            .collect();
+        assert_eq!(
+            links,
+            vec![(1, "cover".to_string()), (1, "back".to_string())],
+            "both pictures, from the one correctly filed row"
+        );
+    }
+
+    /// A V3 store holding `/lib/a.flac` twice: track 1 as TEXT, the way every
+    /// pre-2.0 writer bound it, and track 2 as the bytes a byte-binding tool
+    /// bound. V3's UNIQUE never compared the two spellings, and V4's refill casts
+    /// both to one BLOB, so only one of them can survive. `curated` says which of
+    /// the two carry a tag.
+    fn store_with_one_path_twice(path: &std::path::Path, curated: [bool; 2]) {
+        let conn = store_at_v3(path);
+        conn.execute("DELETE FROM track_art", []).unwrap();
+        conn.execute("DELETE FROM tags", []).unwrap();
+        conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime_ns, backing_ctime_ns, updated_at) \
+             VALUES (CAST('/lib/a.flac' AS BLOB), 'flac', 0, 0, 0, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        for (id, tagged) in [1i64, 2].into_iter().zip(curated) {
+            if tagged {
+                conn.execute(
+                    "INSERT INTO tags (track_id, key, value, ordinal) \
+                     VALUES (?1, 'title', 'curated', 0)",
+                    [id],
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    /// Which of the two survives is decided, not left to rowid order: the one
+    /// carrying tags or art links, since the other has nothing a user wrote on
+    /// it to lose. With neither carrying any, nothing is lost either way, and
+    /// the older row stays.
+    #[test]
+    fn a_path_stored_twice_keeps_the_row_carrying_curated_data() {
+        for (curated, kept) in [([false, true], 2), ([true, false], 1), ([false, false], 1)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("s.db");
+            store_with_one_path_twice(&path, curated);
+
+            let pending = PendingMigration::open(&path).unwrap();
+            let found = pending.inspect_rejections().unwrap();
+            let named: Vec<(&str, u64)> = found
+                .tables()
+                .iter()
+                .map(|t| (t.table, t.rejected))
+                .collect();
+            assert_eq!(named, vec![("tracks", 1)], "{curated:?}: {found:?}");
+            let refused = 3 - kept;
+            assert_eq!(
+                found.duplicates(),
+                [super::DuplicatePath {
+                    kept,
+                    refused,
+                    ambiguous: false,
+                }],
+                "{curated:?}"
+            );
+
+            pending.repair().unwrap();
+            let db = pending.apply().unwrap();
+            let ids: Vec<i64> = db.list_tracks().unwrap().iter().map(|t| t.id).collect();
+            assert_eq!(ids, vec![kept], "{curated:?}");
+            let tags = db.get_tags(kept).unwrap().len();
+            assert_eq!(tags, usize::from(curated.contains(&true)), "{curated:?}");
+        }
+    }
+
+    /// With tags on both rows there is no telling which the user wants, so the
+    /// repair refuses rather than guess, and deletes nothing.
+    #[test]
+    fn a_path_stored_twice_with_curated_data_on_both_is_not_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.db");
+        store_with_one_path_twice(&path, [true, true]);
+
+        let pending = PendingMigration::open(&path).unwrap();
+        let found = pending.inspect_rejections().unwrap();
+        assert_eq!(
+            found.duplicates(),
+            [super::DuplicatePath {
+                kept: 1,
+                refused: 2,
+                ambiguous: true,
+            }],
+            "reported, both ids named"
+        );
+        let err = pending
+            .repair()
+            .expect_err("two curated rows are not the repair's to choose between");
+        assert!(
+            matches!(
+                err,
+                crate::DbError::AmbiguousDuplicatePath {
+                    first: 1,
+                    second: 2
+                }
+            ),
+            "{err:?}"
+        );
+        drop(pending);
+        let tracks: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT count(*) FROM tracks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tracks, 2, "nothing was deleted");
+    }
+
+    /// The repair belongs to the migration's transaction, so an upgrade that
+    /// fails after it puts the repaired rows back along with everything else.
+    /// It used to commit on its own, and a failed upgrade left the store at its
+    /// old version short the rows the repair took. The failure here is a store
+    /// with no room to grow, which the rebuild's holding tables need.
+    #[test]
+    fn a_failed_upgrade_rolls_back_the_repair_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.db");
+        let conn = store_at_v3(&path);
+        plant_hostile(
+            &conn,
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1, ?1, 'v', 1)",
+            &[&format!("k{}junk", '\0')],
+        );
+        drop(conn);
+
+        let pending = PendingMigration::open(&path).unwrap();
+        pending.repair().unwrap();
+        let pages: i64 = pending
+            .conn
+            .query_row("PRAGMA page_count", [], |r| r.get(0))
+            .unwrap();
+        let _: i64 = pending
+            .conn
+            .query_row(&format!("PRAGMA max_page_count = {pages}"), [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let err = pending.apply().unwrap_err().to_string();
+        assert!(err.contains("full"), "{err}");
+
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 3, "the upgrade did not happen");
+        let tags: i64 = conn
+            .query_row("SELECT count(*) FROM tags", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tags, 2, "and neither did the repair");
     }
 
     /// The pre-V4 schema bounds no row: `backing_path` has no cap, and the text

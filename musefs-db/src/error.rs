@@ -69,6 +69,16 @@ pub enum DbError {
         field: &'static str,
         expected: &'static str,
     },
+    /// Two `tracks` rows name one backing path, once as text and once as bytes,
+    /// and both carry tags or art links. The 2.0.0 upgrade gives a path one row,
+    /// and keeping either would drop what the other carries, so the repair
+    /// leaves the choice to the user rather than guess.
+    #[error(
+        "tracks {first} and {second} name the same backing path, once as text and once as \
+         bytes, and both carry tags or art links; the repair will not choose between them. \
+         Delete the one you do not want, then migrate again"
+    )]
+    AmbiguousDuplicatePath { first: i64, second: i64 },
     #[error("structural block for track {track_id} is invalid: {detail} (crafted or corrupt DB)")]
     InvalidStructuralBlock { track_id: i64, detail: String },
     /// An `art` row is filed under a `sha256` its own bytes do not hash to, so
