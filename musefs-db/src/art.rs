@@ -731,6 +731,32 @@ mod guard_tests {
         }
     }
 
+    /// The character arm, on both readers: a mime one character over the cap,
+    /// with no NUL for the byte ceiling to catch.
+    #[test]
+    fn both_track_art_readers_reject_an_oversize_mime() {
+        let (db, track, art) = db_track_art();
+        let over = usize::try_from(MAX_ART_MIME_LEN).unwrap() + 1;
+        link_with_mime(&db, track, art, &"m".repeat(over));
+        for err in [
+            db.get_track_art(track).unwrap_err(),
+            db.get_track_art_with_meta(track).unwrap_err(),
+        ] {
+            assert!(
+                matches!(
+                    err,
+                    DbError::FieldTooLarge {
+                        table: "track_art",
+                        field: "mime",
+                        unit: "characters",
+                        ..
+                    }
+                ),
+                "{err:?}"
+            );
+        }
+    }
+
     /// The ceiling must not narrow the field: a mime of four-byte characters at
     /// the character cap sits exactly on the ceiling and still reads.
     #[test]

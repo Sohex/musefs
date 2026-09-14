@@ -84,18 +84,21 @@ impl Db<ReadWrite> {
     ///
     /// Afterwards the connection goes back to the locking mode it was in, so a
     /// long-lived caller does not keep every other reader locked out for as long
-    /// as the `Db` stays open. A caller that already held the store — `musefs
-    /// migrate` vacuums under its own claim — keeps it.
+    /// as the `Db` stays open. That holds when the claim is refused too: the
+    /// claim switches to exclusive locking before its transaction is refused, and
+    /// left that way the connection's next statement would take the store and
+    /// keep it. A caller that already held the store — `musefs migrate` vacuums
+    /// under its own claim — keeps it.
     pub fn vacuum(&self) -> Result<()> {
         let mode: String = self
             .conn
             .pragma_query_value(None, "locking_mode", |r| r.get(0))?;
-        claim_exclusive(&self.conn, "vacuuming")?;
-        let vacuumed = self
-            .conn
-            .execute_batch("VACUUM")
-            .and_then(|()| self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)"))
-            .map_err(|e| map_busy(e, "vacuuming"));
+        let vacuumed = claim_exclusive(&self.conn, "vacuuming").and_then(|()| {
+            self.conn
+                .execute_batch("VACUUM")
+                .and_then(|()| self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)"))
+                .map_err(|e| map_busy(e, "vacuuming"))
+        });
         let released = if mode.eq_ignore_ascii_case("exclusive") {
             Ok(())
         } else {
@@ -206,6 +209,42 @@ mod tests {
         other
             .execute_batch("BEGIN IMMEDIATE; COMMIT")
             .expect("the vacuuming connection no longer holds the store");
+    }
+
+    /// A claim that is refused hands the store back too. The claim switches the
+    /// connection to exclusive locking before its transaction is refused, and
+    /// the early return used to skip the restore: the next statement then took
+    /// the store and kept it, locking out everything that came after the
+    /// connection that was really in the way.
+    #[test]
+    fn a_refused_vacuum_leaves_the_store_unclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let db = Db::open(&path).unwrap();
+        db.conn
+            .busy_timeout(std::time::Duration::from_millis(50))
+            .unwrap();
+        let idle = rusqlite::Connection::open(&path).unwrap();
+        idle.query_row("SELECT count(*) FROM tracks", [], |r| r.get::<_, i64>(0))
+            .unwrap();
+        let err = db.vacuum().unwrap_err();
+        assert!(matches!(err, DbError::StoreInUse { .. }), "{err:?}");
+        drop(idle);
+
+        let mode: String = db
+            .conn
+            .pragma_query_value(None, "locking_mode", |r| r.get(0))
+            .unwrap();
+        assert!(mode.eq_ignore_ascii_case("normal"), "locking_mode {mode}");
+        // In exclusive mode this read would take the store and keep it.
+        db.user_version().unwrap();
+        let other = rusqlite::Connection::open(&path).unwrap();
+        other
+            .busy_timeout(std::time::Duration::from_millis(200))
+            .unwrap();
+        other
+            .execute_batch("BEGIN IMMEDIATE; COMMIT")
+            .expect("the refused vacuum must not have kept the store");
     }
 
     /// Under a claim its caller already holds, as `migrate`'s is, the vacuum

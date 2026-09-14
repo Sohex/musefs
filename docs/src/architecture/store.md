@@ -42,7 +42,8 @@ plugins under `contrib/` write tags and art here out-of-band.
   bytes: `art_reject_content_update` (art is content-addressed and immutable),
   `art_ad` (a deleted art row bumps referencing tracks so an orphan rebuilds to
   a clean serve-time error), `tracks_geometry_au` (scanner-owned geometry
-  changes), and `structural_blocks_ai`/`_ad`. From v4, `structural_blocks_au`
+  changes and, from v4, a changed ctime no checksum vouches for — see **A changed
+  ctime** below), and `structural_blocks_ai`/`_ad`. From v4, `structural_blocks_au`
   joins those two, `tags_reject_reparent` and
   `track_art_reject_reparent` make row ownership immutable,
   `tracks_reject_rekey` makes a track's id immutable, and
@@ -156,6 +157,21 @@ the `full` tier clears the column whenever it observes that the recorded bytes
 changed. A pass over a file that has not changed keeps what is stored, so a
 cheap pass never undoes an expensive one.
 
+**A changed ctime.** From v4, `tracks_geometry_au` also bumps `content_version`
+when an update changes `backing_ctime_ns` and neither checksum proves the bytes
+unchanged: a `fingerprint` or `content_hash` that was stored before and is
+stored again, unchanged, by the same statement. A same-size rewrite that puts
+its old mtime back (`touch -r`) changes ctime and nothing else a stamp records,
+and without the bump the served mtime held still while a kernel page cache kept
+the old pages. A `chmod` moves ctime too, which is why ctime alone does not
+bump: a re-probe that computes the fingerprint it already had leaves
+`content_version`, and the served mtime, alone. A first fingerprint, written
+where none was stored, compares with nothing and proves nothing. A statement
+that does not write the checksums is taken to keep them, which is what the
+`Keep` intent claims, so a writer re-probing a file writes its stamp and its
+checksums in one statement (`Db::upsert_track_with_checksums`): a trigger sees
+only the statement that fired it.
+
 Neither column is `UNIQUE` by design — duplicate-content tracks legitimately
 share both values. On a normal `scan`, when a probed file's path is not yet in
 the store and its fingerprint matches exactly one orphaned row (a row whose
@@ -198,8 +214,9 @@ external writer cannot persist them:
   that is over 64 KiB (`MAX_BACKING_PATH_BYTES`,
   [#758](https://github.com/Sohex/musefs/issues/758)) — a portable ceiling past
   any platform's `PATH_MAX`, so it refuses no path that could be opened. Every
-  reader of the column also re-checks the cap from `length(backing_path)` before
-  loading the path, for a store written with its constraints off;
+  reader of the column also projects its storage class first, so a path over the
+  cap, or a value that is not a `BLOB` at all, comes back NULL and is refused
+  without being loaded, for a store written with its constraints off;
 - from schema v4, a value of the wrong storage class. Every integer column of
   `tracks`, `tags`, `track_art`, `art` and `structural_blocks` must hold an
   integer; `tags.key` and `value`, `track_art.mime` and `description`,
@@ -234,7 +251,20 @@ because that is UTF-8's widest scalar value. The byte bound is the one that
 matters against a hostile row: `Row::get::<String>` allocates the column's full
 byte length, so without it a NUL-prefixed field is an unbounded allocation on
 the serve path. Rejection is decided from the two lengths alone, never from the
-value, so an over-cap field provably cannot be materialized in order to reject
+value, so the guard never copies an over-cap field into Rust to reject it.
+
+That bounds Rust's copy, not SQLite's. `sqlite3_step` materializes every column
+a statement selects as it lands on a row, before any guard sees it, and
+`length()` on TEXT walks the value to count it. What bounds that is the length
+limit every connection carries: `SQLITE_LIMIT_LENGTH`, set to `MAX_ROW_BYTES`,
+the widest row the schema admits (a tag value at its cap beside a key at its
+byte ceiling, just over 16 MiB). SQLite refuses a string or blob past it with
+`SQLITE_TOOBIG` rather than loading it, so reading a hostile row costs no more
+than a legitimate one already can. The `backing_path` readers go further, since
+a path is read on every `getattr` and its cap is far below that limit: they
+project the column storage class first, as above. The one connection without
+the limit is `musefs migrate`'s, until the upgrade has run: the pre-v4 schema
+bounds no row, and the pre-flight has to report such a row rather than fail on
 it.
 
 The ceiling does not narrow what a field may hold: a `tags.key` of 256
@@ -356,7 +386,9 @@ aborts any `UPDATE` that changes it
 stop a rekey: a childless track has nothing referencing its old id. The
 changelog trigger records the old id as well as a changed new one regardless,
 so a writer that drops the refusal still leaves the mount's refresh able to see
-the old id go.
+the old id go. The upgrade to v4 starts the id sequence past the highest id the
+old changelog ring still names, so a track deleted from the top of the range
+before the upgrade does not have its id handed out after it.
 
 **And a structural block is replaced, never updated.** `structural_blocks` is
 scanner-owned, so no external writer should touch it at all, but SQL permits an

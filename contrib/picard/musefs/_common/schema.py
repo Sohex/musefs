@@ -222,13 +222,24 @@ ALTER TABLE tracks ADD COLUMN content_hash TEXT
 CREATE INDEX tracks_fingerprint_idx ON tracks(fingerprint);
 
 -- Rebuild `tags` with a byte-accurate value cap (#505). SQLite's length() on
--- TEXT counts characters, so the V1 `CHECK (length(value) <= 262144)` was up to
--- ~4x looser than the documented 256 KiB byte bound; length(CAST(value AS BLOB))
--- counts bytes. SQLite cannot alter a CHECK in place, so recreate the table
--- (V2 is unreleased — this is folded in rather than added as a new migration).
--- Pre-existing over-cap rows (only reachable on an upgraded store) are dropped:
--- the read-time guard already counts bytes, so they were unreadable anyway, and
--- carrying them would abort the rebuild on the new CHECK.
+-- TEXT counts characters, so the V1 `CHECK (length(value) <= 262144)` bounded a
+-- value's bytes only to about four times that; length(CAST(value AS BLOB))
+-- counts bytes. SQLite cannot alter a CHECK in place, so recreate the table.
+--
+-- The cap is 16 MiB - 1, FLAC's metadata-block ceiling and where V3 puts it
+-- too (#644), and the refill keeps every row. This step first shipped at 256
+-- KiB and dropped each row past it: a multibyte lyrics tag V1's character cap
+-- admitted, which 1.0.0 served and V3 and V4 would have kept, went without a
+-- word, and the 2.0.0 upgrade's pre-flight, which checks rows against V4, never
+-- saw it go. V1's character cap bounds a value to about 1 MiB in bytes, so no
+-- row V1 holds fails this CHECK.
+--
+-- A released step's text is safe to change here, and only because of where the
+-- step now runs. A store already past V1 ran the old text, and V3 and V4 both
+-- rebuild `tags` after it, so nothing of that text survives in any schema. A
+-- store still at V1 reaches this step only through `musefs migrate`, which runs
+-- V3 and V4 with it (#749). V3's note about V2's narrowing describes the text
+-- this replaced.
 CREATE TABLE tags_new (
     track_id   INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
     key        TEXT NOT NULL,
@@ -241,12 +252,11 @@ CREATE TABLE tags_new (
     CHECK (length(key) <= 256),
     CHECK (length(key) >= 1
            AND key NOT GLOB '*[' || char(1) || '-' || char(31) || ']*'),
-    CHECK (length(CAST(value AS BLOB)) <= 262144),
+    CHECK (length(CAST(value AS BLOB)) <= 16777215),
     CHECK (value_blob IS NULL OR length(value_blob) <= 16711680)
 );
 INSERT INTO tags_new (track_id, key, value, ordinal, value_blob)
-    SELECT track_id, key, value, ordinal, value_blob FROM tags
-    WHERE length(CAST(value AS BLOB)) <= 262144;
+    SELECT track_id, key, value, ordinal, value_blob FROM tags;
 DROP TABLE tags;
 ALTER TABLE tags_new RENAME TO tags;
 
@@ -610,6 +620,25 @@ INSERT INTO tracks (id, backing_path, format, audio_offset, audio_length,
            0
     FROM tracks_hold_v4;
 
+-- The refill leaves `sqlite_sequence` at the highest id still standing. The old
+-- table allocated max(id) + 1, so a track deleted from the top of the range
+-- left its id for the next insert to take (#678), and the changelog ring may
+-- still name that id -- the ring goes below -- as may state an external tool
+-- kept. So the sequence starts past the highest id the ring holds too. A child
+-- row cannot name a higher one: one whose track is gone fails the refill below,
+-- or `migrate --repair` has removed it. A ring row whose track_id is not an
+-- integer names no track.
+UPDATE sqlite_sequence
+   SET seq = (SELECT max(track_id) FROM track_changes WHERE typeof(track_id) = 'integer')
+ WHERE name = 'tracks'
+   AND seq < (SELECT max(track_id) FROM track_changes WHERE typeof(track_id) = 'integer');
+INSERT INTO sqlite_sequence (name, seq)
+    SELECT 'tracks', ring.top
+    FROM (SELECT max(track_id) AS top FROM track_changes
+          WHERE typeof(track_id) = 'integer') AS ring
+    WHERE ring.top > 0
+      AND NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'tracks');
+
 -- 5. Rebuild the three child tables. All are empty right now -- the cascade
 -- above took them -- so each is a drop and a create, with the holding tables as
 -- the source. `tags` and `track_art` change shape; `structural_blocks` keeps
@@ -822,7 +851,8 @@ END;
 
 -- 6. Recreate the indexes and the thirteen triggers the drops took with them,
 -- plus what the new shapes add. Verbatim except where noted: `tracks_geometry_au`
--- gains `backing_ino`, `tracks_changelog_au` logs the old id too, the two `_au`
+-- gains `backing_ino` and a guarded ctime clause, `tracks_changelog_au` logs the
+-- old id too, the two `_au`
 -- bumps widen to both owners, and two reparent-refusal triggers and a rekey
 -- refusal are new.
 CREATE INDEX tracks_fingerprint_idx ON tracks(fingerprint);
@@ -871,6 +901,19 @@ END;
 -- sentinel-to-real transition a revalidate performs on a migrated row: nothing
 -- about the served bytes changed, but the row's identity now covers a field it
 -- did not, so invalidating once is the conservative call.
+--
+-- A changed `backing_ctime_ns` bumps too, unless a checksum proves the bytes
+-- unchanged: a fingerprint or content hash that was stored before and is stored
+-- again unchanged by the same statement. A same-size rewrite that puts its old
+-- mtime back (`touch -r`) changes ctime and nothing else a stamp records, and
+-- without the bump it kept serving its old `content_version`, so the served
+-- mtime held still and a kernel page cache kept what it had. ctime alone cannot
+-- decide it, because a chmod moves ctime as well, and bumping for every such
+-- re-probe is the served-mtime churn #757 removed. A first fingerprint proves
+-- nothing about the bytes before it. A statement that leaves both checksums
+-- alone is taken at its word that they still hold, which is what
+-- `ChecksumWrite::Keep` means, and why the scanner writes a stamp and its
+-- checksums in one statement: a trigger sees only the statement that fired it.
 CREATE TRIGGER tracks_geometry_au
 AFTER UPDATE ON tracks
 WHEN NEW.format        <> OLD.format
@@ -879,6 +922,9 @@ WHEN NEW.format        <> OLD.format
   OR NEW.backing_size  <> OLD.backing_size
   OR NEW.backing_mtime_ns <> OLD.backing_mtime_ns
   OR NEW.backing_ino   <> OLD.backing_ino
+  OR (NEW.backing_ctime_ns <> OLD.backing_ctime_ns
+      AND NOT (OLD.fingerprint IS NOT NULL AND NEW.fingerprint IS OLD.fingerprint)
+      AND NOT (OLD.content_hash IS NOT NULL AND NEW.content_hash IS OLD.content_hash))
 BEGIN
     UPDATE tracks SET content_version = content_version + 1 WHERE id = NEW.id;
 END;
