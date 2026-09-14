@@ -85,6 +85,12 @@ pub struct FuseConfig {
     /// bounds the SQLite connection count — steady-state memory scales with it
     /// (#631). Lower it on memory-constrained or many-core hosts.
     pub workers: usize,
+    /// Test-only: the worker pool's metadata admission cap, in place of
+    /// `MAX_QUEUED_JOBS` (#694), so a mount test can put the pool over it on
+    /// demand. `None` keeps the real cap.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub pool_admission_cap: Option<usize>,
 }
 
 impl Default for FuseConfig {
@@ -101,6 +107,8 @@ impl Default for FuseConfig {
             allow_other: false,
             expose_metrics: false,
             workers: 0,
+            #[cfg(feature = "test-support")]
+            pool_admission_cap: None,
         }
     }
 }
@@ -290,6 +298,18 @@ fn run_guarded(op: &'static str, work: impl FnOnce()) {
 /// between two kernel round trips, so an ordinary workload never meets it; what
 /// meets it is a backlog already too deep to be worth growing.
 const MAX_QUEUED_JOBS: usize = 4096;
+
+/// The admission cap a mount's pool runs with: [`MAX_QUEUED_JOBS`], unless a
+/// test forced another through `FuseConfig::pool_admission_cap`.
+#[cfg(feature = "test-support")]
+fn admission_cap(config: &FuseConfig) -> usize {
+    config.pool_admission_cap.unwrap_or(MAX_QUEUED_JOBS)
+}
+
+#[cfg(not(feature = "test-support"))]
+fn admission_cap(_config: &FuseConfig) -> usize {
+    MAX_QUEUED_JOBS
+}
 
 /// The worker pool behind one admission gate for everything but reads (#694).
 /// Cloning shares the pool, the count and the counter.
@@ -823,12 +843,74 @@ struct AttrStyle {
 }
 
 /// One entry's attrs and how long the kernel may trust them. The TTL is the
-/// mount's, except for an entry whose attrs could not be resolved: see
-/// [`unresolved_plus_entry`].
+/// mount's, except for an entry the kernel is meant to refuse: see
+/// [`unlinkable_plus_entry`].
 #[derive(Clone, Copy)]
 struct PlusEntry {
     attr: FileAttr,
     ttl: Duration,
+}
+
+/// What became of one entry's resolution. A slot left unset means it never
+/// ran: dropped over the pool's admission cap, or lost with a dropped task.
+#[derive(Clone, Copy)]
+enum Resolution {
+    /// The file's own attrs.
+    Resolved(PlusEntry),
+    /// The synthesis ran and failed; the error is already logged.
+    Failed,
+}
+
+/// How one entry of a finished round goes into the reply.
+#[derive(Clone, Copy)]
+enum PlusEmit {
+    /// With the file's own attrs.
+    Attrs(PlusEntry),
+    /// Listed, with attrs the kernel will refuse to link: see
+    /// [`unlinkable_plus_entry`].
+    Unlinkable,
+}
+
+/// What a finished round sends: `emits`, one per entry from the round's start,
+/// and whether the reply page ends after them.
+struct RoundPlan {
+    emits: Vec<PlusEmit>,
+    ends_page: bool,
+}
+
+/// Decide what a finished round sends, from its slots in listing order.
+/// `opens_page` is whether the round's first entry is the reply page's first.
+///
+/// Nothing goes out with attrs that are not the file's own. The kernel applies
+/// a `readdirplus` entry's attrs to the inode it already holds under that name,
+/// whatever the TTL, so a placeholder size truncates the page cache of a file
+/// another process has open — and kills one that has it mapped with `SIGBUS`.
+/// So the page ends before the first entry without attrs, and the kernel asks
+/// again from that entry's cookie: a short page is harmless, where an empty one
+/// reads as the end of the directory and an error fails the whole `getdents`.
+///
+/// The exception is the page's own first entry, which has had its one attempt
+/// in place and cannot be deferred again without ending the page empty. If it
+/// has no attrs, it is listed [`PlusEmit::Unlinkable`], so the name still
+/// appears and the listing still moves on.
+fn plan_round(slots: &[Option<Resolution>], opens_page: bool) -> RoundPlan {
+    let mut emits = Vec::with_capacity(slots.len());
+    for (idx, slot) in slots.iter().enumerate() {
+        match slot {
+            Some(Resolution::Resolved(entry)) => emits.push(PlusEmit::Attrs(*entry)),
+            _ if idx == 0 && opens_page => emits.push(PlusEmit::Unlinkable),
+            _ => {
+                return RoundPlan {
+                    emits,
+                    ends_page: true,
+                };
+            }
+        }
+    }
+    RoundPlan {
+        emits,
+        ends_page: false,
+    }
 }
 
 /// A `readdirplus` reply being filled (#667). Rounds run strictly one after
@@ -846,6 +928,9 @@ struct PlusFill {
     expose_metrics: bool,
     /// The generation tag every cookie of this fill carries (#695).
     cookie_tag: u32,
+    /// Index into `listing` of the reply page's first entry: the one entry
+    /// resolved even over the admission cap, so that the page is never empty.
+    page_start: usize,
 }
 
 /// One round's resolutions: a slice of the listing, a slot per entry, and the
@@ -855,8 +940,9 @@ struct PlusRound {
     /// Index into `fill.listing` of the first entry this round covers; the
     /// round covers `slots.len()` entries from there.
     start: usize,
-    /// One slot per entry, each set exactly once by the task that owns it.
-    slots: Vec<OnceLock<PlusEntry>>,
+    /// One slot per entry, each set at most once by the task that owns it, and
+    /// left unset if that task never ran.
+    slots: Vec<OnceLock<Resolution>>,
     /// Resolutions still to come, plus one held by the dispatcher until every
     /// task is queued.
     outstanding: AtomicUsize,
@@ -914,25 +1000,44 @@ fn inline_plus_entry(
     })
 }
 
-/// Stand-in attrs for an entry whose synthesis failed, or whose resolution was
-/// lost with a dropped task.
+/// A size no file can have: the kernel's `fuse_valid_size` rejects anything
+/// above `i64::MAX`.
+const UNLINKABLE_SIZE: u64 = u64::MAX;
+
+/// An entry that lists the name and gives the kernel nothing to cache, for a
+/// page's first entry whose attrs could not be resolved (see [`plan_round`]).
 ///
-/// The entry still has to appear, or the file vanishes from the listing — which
-/// is a worse answer than today's, where `readdir` lists it and the client's own
-/// `lookup` reports the error. A zero TTL is what preserves that: the kernel
-/// caches neither the entry nor these attrs, so the next access goes back to
-/// `lookup`/`getattr` and gets the real error. The protocol's own way of saying
-/// "no attrs for this one" — a zero `nodeid` — is not reachable through fuser's
-/// API, which derives both the nodeid and the dirent's inode from `attr.ino`,
-/// and a zero inode makes `readdir` skip the name entirely.
-fn unresolved_plus_entry(child: u64, kind: FileType, style: &AttrStyle) -> PlusEntry {
+/// The entry has to appear, or the file vanishes from the listing, where plain
+/// `readdir` lists it and the client's own `lookup` reports the error. But no
+/// attrs may go with it that are not the file's own: the kernel applies them to
+/// the inode it already holds for the name, whatever the TTL. The protocol's
+/// way of saying "no attrs for this one", a zero `nodeid`, is not reachable
+/// through fuser's API, which derives both the nodeid and the dirent's inode
+/// from `attr.ino`, and a zero inode makes `readdir` skip the name.
+///
+/// So the attrs are ones the kernel will not accept. It emits a
+/// `readdirplus` dirent before it links the entry, and `fuse_direntplus_link`
+/// runs `fuse_invalid_attr` before it touches the dcache or any inode. An
+/// out-of-range size fails that check, so the name is listed, nothing is
+/// linked, and the kernel sends a `FORGET` for the entry that musefs ignores.
+/// The check is in Linux from 5.5. The zero TTL is a second line of defence:
+/// were the entry ever linked, the kernel would still revalidate it on the next
+/// access.
+fn unlinkable_plus_entry(child: u64, kind: FileType, style: &AttrStyle) -> PlusEntry {
     let node = if kind == FileType::Directory {
         (FileType::Directory, style.dir_mode, 2)
     } else {
         (FileType::RegularFile, style.file_mode, 1)
     };
     PlusEntry {
-        attr: make_attr(child, 0, node, style.uid, style.gid, style.mount_time),
+        attr: make_attr(
+            child,
+            UNLINKABLE_SIZE,
+            node,
+            style.uid,
+            style.gid,
+            style.mount_time,
+        ),
         ttl: Duration::ZERO,
     }
 }
@@ -956,6 +1061,7 @@ fn start_plus_fill(
         style,
         expose_metrics,
         cookie_tag: page.tag,
+        page_start: start,
     });
     spawn_plus_round(&fill, start);
 }
@@ -986,25 +1092,20 @@ fn spawn_plus_round(fill: &Arc<PlusFill>, start: usize) {
     for (idx, (child, kind, _)) in fill.listing[start..end].iter().enumerate() {
         let (child, kind) = (*child, *kind);
         if let Some(entry) = inline_plus_entry(child, kind, fill.expose_metrics, &fill.style) {
-            let _ = round.slots[idx].set(entry);
+            let _ = round.slots[idx].set(Resolution::Resolved(entry));
             continue;
         }
         round.outstanding.fetch_add(1, Ordering::Relaxed);
         let slot = PlusSlot(Arc::clone(&round));
         let style = fill.style;
-        // Over the pool's admission cap the job is dropped unrun rather than run
-        // here (#694): its slot counts it out, and the entry gets the zero-TTL
-        // placeholder a lost task gets, so the client's own `lookup` fetches the
-        // attrs. Running it in place instead would let a very wide directory
-        // recurse through round after round on this one thread.
-        fill.pool.try_submit("readdirplus", move || {
+        let resolve = move || {
             let round = &slot.0;
-            let entry = match synth_outcome(
+            let resolution = match synth_outcome(
                 "readdirplus",
                 child,
                 std::panic::AssertUnwindSafe(|| round.fill.core.getattr(child)),
             ) {
-                Ok(attr) => PlusEntry {
+                Ok(attr) => Resolution::Resolved(PlusEntry {
                     attr: to_file_attr(
                         &attr,
                         style.uid,
@@ -1014,13 +1115,25 @@ fn spawn_plus_round(fill: &Arc<PlusFill>, start: usize) {
                         style.mount_time,
                     ),
                     ttl: style.ttl,
-                },
-                Err(_) => unresolved_plus_entry(child, kind, &style),
+                }),
+                Err(_) => Resolution::Failed,
             };
-            let _ = round.slots[idx].set(entry);
+            let _ = round.slots[idx].set(resolution);
             // `slot` drops here, counting this resolution out and, if it is the
             // last, assembling the round.
-        });
+        };
+        if start + idx == fill.page_start {
+            // The page's first entry runs here if the pool is over its
+            // admission cap (#694), like any other metadata job: a page has to
+            // carry at least one entry, since an empty reply reads as the end of
+            // the directory. Only this one, so a very wide directory still
+            // cannot chain round after round on one thread.
+            fill.pool.submit("readdirplus", resolve);
+        } else {
+            // Over the cap every other entry is left unrun, and the page ends
+            // before it (see `plan_round`); the kernel asks again from there.
+            fill.pool.try_submit("readdirplus", resolve);
+        }
     }
     drop(dispatching);
 }
@@ -1040,12 +1153,14 @@ fn finish_plus_round(round: &PlusRound) {
         return;
     };
     let next = round.start + round.slots.len();
-    for (i, slot) in (round.start..).zip(&round.slots) {
+    let slots: Vec<Option<Resolution>> = round.slots.iter().map(|s| s.get().copied()).collect();
+    let plan = plan_round(&slots, round.start == fill.page_start);
+    for (i, emit) in (round.start..).zip(&plan.emits) {
         let (child, kind, name) = &fill.listing[i];
-        let entry = slot
-            .get()
-            .copied()
-            .unwrap_or_else(|| unresolved_plus_entry(*child, *kind, &fill.style));
+        let entry = match emit {
+            PlusEmit::Attrs(entry) => *entry,
+            PlusEmit::Unlinkable => unlinkable_plus_entry(*child, *kind, &fill.style),
+        };
         // The stored cookie resumes at the *next* entry, as in
         // `reply_dir_entries`: the kernel hands it back to resume from here.
         if reply.add(
@@ -1061,7 +1176,9 @@ fn finish_plus_round(round: &PlusRound) {
             return reply.ok();
         }
     }
-    if next >= fill.listing.len() {
+    if plan.ends_page || next >= fill.listing.len() {
+        // Ended early, the page stops at the last entry sent, and the kernel's
+        // next request resumes at the first one held back.
         return reply.ok();
     }
     *fill
@@ -1293,7 +1410,7 @@ impl MusefsFs {
             // `MAX_DIR_HANDLES` and degrade to the stateless fh over it (#307,
             // #616). `max_background` (set in `init`) separately caps the
             // kernel's background/readahead requests.
-            pool: Workers::new(ThreadPool::new(workers), MAX_QUEUED_JOBS),
+            pool: Workers::new(ThreadPool::new(workers), admission_cap(&config)),
             refresh: threadpool::Builder::new()
                 .num_threads(1)
                 .thread_name("musefs-refresh".to_string())
@@ -3233,31 +3350,120 @@ mod tests {
         );
     }
 
-    /// An entry whose attrs could not be resolved still has to appear, or the
-    /// file drops out of the listing entirely — worse than today, where
-    /// `readdir` lists it and the client's own `lookup` reports the error. The
-    /// zero TTL is what keeps that: the kernel caches neither the entry nor the
-    /// placeholder attrs, so the next access goes back to `lookup` (#667).
+    /// A page's first entry that cannot be resolved still has to be listed, or
+    /// the file drops out of the listing (#667) — but with attrs the kernel
+    /// refuses to link, never ones it would apply to an inode it holds (#694).
+    /// `fuse_valid_size` rejects any size above `i64::MAX`; a size of 0, the old
+    /// placeholder, truncated a mapped file's page cache.
     #[test]
-    fn unresolved_plus_entry_is_placeholder_attrs_the_kernel_may_not_cache() {
+    fn an_unlinkable_entry_lists_the_name_with_attrs_the_kernel_rejects() {
         let style = test_style();
-        let file = unresolved_plus_entry(9, FileType::RegularFile, &style);
-        assert_eq!(file.ttl, Duration::ZERO, "the kernel must not cache these");
+        let file = unlinkable_plus_entry(9, FileType::RegularFile, &style);
+        assert!(
+            file.attr.size > u64::try_from(i64::MAX).unwrap(),
+            "the size must fail the kernel's own validation, not pass as a real one"
+        );
+        assert_eq!(file.ttl, Duration::ZERO, "nothing for the kernel to cache");
         assert_eq!(
             file.attr.ino,
             INodeNo(9),
             "a zero inode would hide the name"
         );
         assert_eq!(file.attr.kind, FileType::RegularFile);
-        assert_eq!(file.attr.size, 0);
 
-        let dir = unresolved_plus_entry(7, FileType::Directory, &style);
+        let dir = unlinkable_plus_entry(7, FileType::Directory, &style);
         assert_eq!(
             dir.attr.kind,
             FileType::Directory,
             "type comes from readdir"
         );
+        assert!(dir.attr.size > u64::try_from(i64::MAX).unwrap());
         assert_eq!(dir.ttl, Duration::ZERO);
+    }
+
+    /// A resolved entry for `plan_round`, told apart by its inode.
+    fn resolved(ino: u64) -> Resolution {
+        let style = test_style();
+        Resolution::Resolved(PlusEntry {
+            attr: make_attr(
+                ino,
+                4096,
+                (FileType::RegularFile, style.file_mode, 1),
+                style.uid,
+                style.gid,
+                style.mount_time,
+            ),
+            ttl: style.ttl,
+        })
+    }
+
+    /// A plan as `(inode per emitted entry, None for unlinkable; ends_page)`.
+    fn shape(plan: &RoundPlan) -> (Vec<Option<u64>>, bool) {
+        let emits = plan
+            .emits
+            .iter()
+            .map(|emit| match emit {
+                PlusEmit::Attrs(entry) => Some(entry.attr.ino.0),
+                PlusEmit::Unlinkable => None,
+            })
+            .collect();
+        (emits, plan.ends_page)
+    }
+
+    /// #694: a round whose every entry resolved goes out whole, and the fill
+    /// carries on to the next round.
+    #[test]
+    fn a_resolved_round_is_sent_whole_and_the_page_goes_on() {
+        let plan = plan_round(
+            &[Some(resolved(2)), Some(resolved(3)), Some(resolved(4))],
+            true,
+        );
+        assert_eq!(shape(&plan), (vec![Some(2), Some(3), Some(4)], false));
+        let later = plan_round(&[Some(resolved(5))], false);
+        assert_eq!(shape(&later), (vec![Some(5)], false));
+    }
+
+    /// #694: the page ends before the first entry with no attrs of its own,
+    /// whether its resolution never ran (over the admission cap) or ran and
+    /// failed. Nothing after it is sent, even entries that did resolve: the
+    /// kernel resumes from the cookie of the last entry sent.
+    #[test]
+    fn a_round_ends_the_page_before_its_first_entry_without_attrs() {
+        let unrun = plan_round(&[Some(resolved(2)), None, Some(resolved(4))], true);
+        assert_eq!(shape(&unrun), (vec![Some(2)], true), "never ran");
+
+        let failed = plan_round(
+            &[
+                Some(resolved(2)),
+                Some(Resolution::Failed),
+                Some(resolved(4)),
+            ],
+            false,
+        );
+        assert_eq!(shape(&failed), (vec![Some(2)], true), "ran and failed");
+
+        let at_round_start = plan_round(&[None, Some(resolved(3))], false);
+        assert_eq!(
+            shape(&at_round_start),
+            (vec![], true),
+            "a later round can end the page at its start: earlier rounds filled it"
+        );
+    }
+
+    /// #694: a page's first entry has had its attempt, so deferring it again
+    /// would leave the page empty, which the kernel reads as the end of the
+    /// directory. It is listed unlinkable, and the round goes on from there.
+    #[test]
+    fn a_page_first_entry_without_attrs_is_listed_unlinkable() {
+        let failed = plan_round(&[Some(Resolution::Failed), Some(resolved(3))], true);
+        assert_eq!(shape(&failed), (vec![None, Some(3)], false));
+
+        let lost = plan_round(&[None, Some(resolved(3)), None], true);
+        assert_eq!(
+            shape(&lost),
+            (vec![None, Some(3)], true),
+            "a lost first task is listed too, and later gaps still end the page"
+        );
     }
 
     #[test]

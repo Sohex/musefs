@@ -157,10 +157,29 @@ size is not visible to the handler: resolving a whole wide directory to fill one
 page would front-load enormous latency onto the first call, and anything
 over-resolved lands in the size cache for the page that does ask for it.
 
-An entry whose attributes cannot be resolved is still listed, with placeholder
-attributes and a zero TTL: the kernel caches neither, so the client's next
-access goes back to `lookup` and gets the real error — the same thing it sees
-today, rather than the file silently vanishing from the listing.
+An entry is never sent with attributes that are not the file's own. A zero TTL
+does not make them harmless: the kernel applies a `readdirplus` entry's
+attributes to the inode it already holds for that name whatever the timeout, so
+the size-0 placeholder musefs used to send truncated the page cache of a file
+another process had open, and a program with the file mapped was killed by
+`SIGBUS`. Instead the reply page ends before the first entry that has no
+attributes, and the kernel asks again from that entry's cookie. A short page is
+just a short page; the two other ways to stop would each lose names. An empty
+reply reads as the end of the directory, and an error fails the whole
+`getdents`.
+
+Every page still makes progress. A page's first entry is resolved even when
+the pool is over its admission cap (below), and an entry whose resolution
+failed partway down a page is tried again as the first entry of the next one,
+which is what a transient failure, a blip on an NFS backing, needs. An entry
+that still cannot be resolved as a page's first is listed with a size no file
+can have and a zero TTL: the kernel emits the name, refuses to link attributes
+that fail its own validation, and caches nothing. The client's own `lookup`
+then reports the real error, so the file neither vanishes from `ls` nor stalls
+the listing. That refusal relies on the kernel validating attributes before it
+links them, which Linux does from 5.5; an older kernel would apply the
+out-of-range size, so there a file that persistently fails to resolve can still
+reach an inode the kernel holds. The over-cap path does not depend on it.
 
 ### Admission to the worker pool
 
@@ -173,10 +192,12 @@ of it is refused. A job that finds the gate full runs on the thread that
 submitted it. From the dispatch thread that is the backpressure: fuser reads no
 further request until the job is done, so the backlog waits in the kernel
 rather than in musefs' memory. The one exception is a `readdirplus` entry's
-attributes, which are left unresolved over the cap instead, with the zero-TTL
-placeholder above — running them in place would let a wide directory chain
-round after round on one thread. `musefs_pool_over_cap_total` counts the jobs
-that met the cap; on a healthy mount it stays at zero.
+attributes, other than the first of a reply page: over the cap those are not
+run at all, and the page ends before them, as above. The kernel asks again for
+the rest, and the next page's first entry runs in place. Running every entry in
+place would let a wide directory chain round after round on one thread.
+`musefs_pool_over_cap_total` counts the jobs that met the cap; on a healthy
+mount it stays at zero.
 
 Store refreshes run on a lane of their own, a single thread, so a metadata
 backlog never delays freshness and a refresh never runs in place on the
