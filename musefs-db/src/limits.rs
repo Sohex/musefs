@@ -32,7 +32,8 @@ pub const MAX_TAG_KEY_LEN: i64 = 256;
 /// and the payoff is that no honest file can be rejected for a limit musefs
 /// made up.
 pub const MAX_TAG_VALUE_LEN: i64 = 0x00FF_FFFF;
-/// Max `art.mime` length.
+/// Max `track_art.mime` length. The column moved there from `art` in schema v4
+/// (#716).
 pub const MAX_ART_MIME_LEN: i64 = 255;
 /// Max `tracks.backing_path` length in bytes — 64 KiB (#758). The column is a
 /// BLOB, so the schema `CHECK` and the reader guard in [`crate::tracks`] both

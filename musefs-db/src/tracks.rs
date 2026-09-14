@@ -298,8 +298,9 @@ impl<M> Db<M> {
     ///
     /// The lasting half of the count `musefs migrate` reports once: `mount`,
     /// `scan` and `revalidate` warn while it is non-zero (#705). A
-    /// `--checksum none` scan on FAT or exFAT, which records neither, lands a
-    /// row here too, and a default-tier `revalidate` clears it the same way.
+    /// `--checksum none` scan on FAT or exFAT under Linux, which records
+    /// neither, lands a row here too, and a default-tier `revalidate` clears it
+    /// the same way.
     pub fn count_tracks_awaiting_revalidate(&self) -> Result<u64> {
         Ok(self.conn.query_row(
             "SELECT count(*) FROM tracks WHERE fingerprint IS NULL AND backing_ino = 0",
