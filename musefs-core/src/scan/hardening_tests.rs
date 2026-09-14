@@ -862,6 +862,50 @@ fn revalidate_does_not_prune_on_non_notfound_error() {
     );
 }
 
+/// #757: revalidate re-probes a row with no recorded inode so it can fill one
+/// in — except on a filesystem that keeps none, where no pass ever could. There
+/// a re-probe every time would never converge, and would rewrite the row on
+/// every pass, so the row counts as unchanged instead.
+#[test]
+fn revalidate_settles_an_unrecorded_inode_only_where_the_filesystem_keeps_none() {
+    use musefs_db::NewTrack;
+    let dir = tempfile::tempdir().unwrap();
+    write_flac(&dir.path().join("a.flac"), &["ARTIST=A", "TITLE=T"], None);
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    crate::scan_directory(&db, dir.path()).unwrap();
+
+    // The row a V4 migration leaves, or a scan on FAT records: all but the inode.
+    let t = db.list_tracks().unwrap().remove(0);
+    db.upsert_track(&NewTrack {
+        backing_path: t.backing_path,
+        format: t.format,
+        audio_offset: t.bounds.audio_offset(),
+        audio_length: t.bounds.audio_length(),
+        backing_size: t.backing_size,
+        backing_mtime_ns: t.backing_mtime_ns,
+        backing_ctime_ns: t.backing_ctime_ns,
+        backing_ino: None,
+    })
+    .unwrap();
+
+    {
+        let _fat = crate::freshness::pretend_no_inodes();
+        let s = crate::revalidate(&db, dir.path()).unwrap();
+        assert_eq!(
+            (s.unchanged, s.updated),
+            (1, 0),
+            "an inode the filesystem does not keep is as settled as it gets"
+        );
+    }
+    let s = crate::revalidate(&db, dir.path()).unwrap();
+    assert_eq!(
+        (s.unchanged, s.updated),
+        (0, 1),
+        "where inodes are kept, the missing one is re-probed"
+    );
+    assert!(db.list_tracks().unwrap()[0].backing_ino.is_some());
+}
+
 #[test]
 fn scan_ingests_binary_tags_and_promotes() {
     use id3::frame::{Content, Popularimeter, Unknown};

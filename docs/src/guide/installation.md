@@ -46,6 +46,19 @@ the target needs the FUSE userspace tools and `/dev/fuse`:
 
 No glibc/libfuse install is needed for the musl binaries beyond `fuse3`.
 
+**Backing storage:** FAT32 and exFAT are not recommended for the music library
+musefs serves from. musefs is fully functional on them, but its check that a
+backing file has not changed on disk is weaker there. That check normally
+compares a file's size, modification time, change time and inode number. FAT32
+stores the modification time in two-second steps and exFAT in 10 ms steps, both
+report the change time as the modification time, and neither keeps inode
+numbers stable, so musefs records none. What is left is size plus a coarse
+modification time: a same-size replacement or rewrite inside that window goes
+undetected, and the file is served with metadata laid out for its old content.
+Filesystems with real timestamps and stable inode numbers, such as ext4, btrfs
+and XFS, get the full check; see
+[freshness](../architecture/tree-scanning.md) for how it works.
+
 > **Note:** On Ubuntu 24.04+ (libfuse ≥ 3.17) the `fusermount3` AppArmor
 > profile only permits unprivileged mounts under whitelisted prefixes
 > (`$HOME/**`, `/mnt`, `/media`, `/tmp`, …). Mounting elsewhere fails with

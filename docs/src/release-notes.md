@@ -29,7 +29,7 @@ store upgrade is one-way without the snapshot `migrate` takes.
   - track ids are never reused, so a deleted track's id cannot bless another;
   - backing paths are the filesystem's bytes, so two non-UTF-8 names no longer
     collapse into one track;
-  - the freshness stamp carries the inode;
+  - the freshness stamp carries the inode, wherever the filesystem keeps one;
   - picture metadata belongs to each file rather than the shared image;
   - tag and art rows cannot move between tracks;
   - every column's storage class is enforced.
@@ -135,6 +135,10 @@ upgrade leaves several things only a revalidate puts right, and it is the
   refuses to retarget.
 - **Stored inodes start unknown** ([#674]). The check that catches a backing
   file replaced in place cannot use the inode until a revalidate records it.
+  On FAT32 and exFAT none is ever recorded ([#757]): those filesystems renumber
+  files on every mount, so an inode there would fail every file after a replug.
+  The check is weaker on them as a result, and they are
+  [not recommended](guide/installation.md) for the backing library.
 - **Picture metadata is copied, not per file** ([#716], [#746]). 1.3.0 kept one
   MIME type and one set of dimensions per image, so the upgrade copies those
   onto every file that embeds it, with FLAC's bit depth and colour count at 0.
@@ -312,6 +316,7 @@ directly.
 [#743]: https://github.com/Sohex/musefs/issues/743
 [#746]: https://github.com/Sohex/musefs/issues/746
 [#747]: https://github.com/Sohex/musefs/issues/747
+[#757]: https://github.com/Sohex/musefs/issues/757
 [#749]: https://github.com/Sohex/musefs/issues/749
 [#750]: https://github.com/Sohex/musefs/issues/750
 [#751]: https://github.com/Sohex/musefs/issues/751

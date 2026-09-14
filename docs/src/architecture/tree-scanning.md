@@ -16,21 +16,48 @@ change with no DB write, which `resolve` (and, since #279, a size-cache
 ctime_ns, ino)` tuple from the **probed file descriptor** using a pre/post
 `fstat` sandwich: if the file's metadata changes between the two stats, the
 entry is dropped. `ctime` defeats an mtime-forging writer (e.g. `touch -m`),
-and `ino` covers the one case the timestamps cannot: a backing filesystem that
-stores no sub-second times — FAT32's two-second granularity and no ctime at
-all, or ext3/HFS+/some SMB and NFS mounts truncating the nanosecond fields —
-where a same-size *replacement* inside the granularity window leaves all three
-identical. It does not help against a true in-place rewrite, which is a POSIX
-timestamp limit rather than something musefs can fix; it catches the shape
-almost every tagger actually produces, writing a temporary file and renaming
-over the original.
+and `ino` covers a case the timestamps cannot: a backing filesystem with coarse
+timestamps — ext3 and HFS+ keep whole seconds, and some SMB and NFS mounts
+truncate the nanosecond fields — where a same-size *replacement* inside the
+granularity window leaves all three identical. It does not help against a true
+in-place rewrite, which is a POSIX timestamp limit rather than something musefs
+can fix; it catches the shape almost every tagger actually produces, writing a
+temporary file and renaming over the original.
+
+The inode is recorded only where the filesystem keeps one
+([#757](https://github.com/Sohex/musefs/issues/757)). FAT and exFAT store no
+inode numbers: Linux assigns one each time a file enters the inode cache, so an
+untouched file reports a different number after a remount, or after eviction.
+The scanner asks the probed descriptor's filesystem (`fstatfs`) and records no
+inode there, and `revalidate` asks the same question live before re-probing a
+row that has none, so such a library converges rather than being rewritten on
+every pass. The answer belongs to the filesystem, so it is asked, not stored. On
+FAT and exFAT the stamp is therefore size plus a coarse mtime — two-second steps
+on FAT32, 10 ms on exFAT, with ctime reported as mtime on both — which is why the
+[installation guide](../guide/installation.md) recommends against them as
+backing storage.
+
+The stamp does not include the device number either. An inode is unique only
+within one filesystem, so a different filesystem appearing at the backing path —
+a swapped drive, a replaced network or FUSE mount — could hold a file agreeing
+on all four fields, and musefs would serve it as the original. `st_dev` would
+not close that reliably: the kernel assigns it at mount or detection time, so
+network mounts, FUSE, btrfs subvolumes and renumbered disks come back with a
+different number after a reboot, which would fail every row of a library at
+once, while a swapped drive at the same mount point often gets the same number.
+The coincidence also needs ctime to agree, which the kernel sets when a file is
+written and nothing can set backward, so on filesystems with real timestamps a
+copy onto new storage never matches: every file reads as changed until
+[`musefs revalidate`](../guide/maintenance.md#when-to-run-it) re-probes it.
 
 A stored inode of zero means "not recorded" — every row a store migrated into
 v4 carries, until `musefs revalidate` (or a `scan --force` of the file) fills it
-in, since a plain `scan` leaves tracked rows alone — and such a
+in, since a plain `scan` leaves tracked rows alone, and every row on a
+filesystem that keeps none — and such a
 row is compared on the other three fields alone rather than failing closed on a
-field the store has nothing to say about. `revalidate` re-probes exactly those
-rows, which is what makes it the repopulation path for an upgraded store. The
+field the store has nothing to say about. `revalidate` re-probes those rows,
+except where the filesystem keeps no inodes, which is what makes it the
+repopulation path for an upgraded store. The
 wildcard is one-directional: it belongs to the *stored* side only, and a live
 stat that cannot produce an inode fails closed against a row that has one,
 rather than being excused in turn. This comparison is therefore deliberately

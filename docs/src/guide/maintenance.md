@@ -48,6 +48,18 @@ up newly-added files run `scan` (which is additive); to drop rows for deleted
 files add `--prune`. After moving files, run `scan` first so they retarget, then
 `revalidate --prune` — see [Move re-identification](scanning.md#content-checksums-and-move-re-identification).
 
+Run it too after replacing the storage under the backing path — a swapped drive,
+or a network or FUSE mount replaced by another — even when the files look the
+same. musefs recognises a backing file by its path plus its size, modification
+time, change time and inode number, not by the device it is on. Copying a
+library onto new storage gives every file a new change time, so every file reads
+as changed: opens fail until a revalidate re-probes them. A file that agrees on
+all four fields cannot be told apart and is served as the original. On
+filesystems with real timestamps that takes a coincidence nothing ordinary
+produces, but on FAT32 and exFAT, where only the size and a coarse modification
+time are compared, a copy that preserved its timestamps can agree — one more
+reason [they are not recommended](installation.md) for the backing library.
+
 ## Compacting the store (`musefs vacuum`)
 
 The SQLite store only grows as you use it: deleting tracks (beets/Lidarr
