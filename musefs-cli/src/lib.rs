@@ -272,7 +272,9 @@ pub enum Command {
         /// Path to the SQLite database.
         #[arg(long, env = "MUSEFS_DB")]
         db: PathBuf,
-        /// Delete tracks whose backing file is gone and GC orphaned art.
+        /// Delete tracks whose backing file is gone, or whose file this build
+        /// refuses as unsupported (a chained Ogg an older musefs stored), with
+        /// their tags and art links; then GC orphaned art.
         #[arg(long, env = "MUSEFS_PRUNE", value_parser = clap::builder::BoolishValueParser::new())]
         prune: bool,
         /// Probe worker threads (0 = available parallelism). 1 = sequential.

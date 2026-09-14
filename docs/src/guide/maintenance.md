@@ -20,7 +20,7 @@ schema v4 migration could not carry over
 
 ```bash
 musefs revalidate /path/to/music --db library.db          # refresh changed rows
-musefs revalidate /path/to/music --db library.db --prune  # also delete gone tracks
+musefs revalidate /path/to/music --db library.db --prune  # also delete gone or refused tracks
 ```
 
 By default `revalidate` never deletes anything. Pass `--prune` to delete tracks

@@ -1387,7 +1387,8 @@ pub struct ScanOptions {
     /// Scan only: re-ingest files already present in the DB, overwriting
     /// curated metadata. Off by default; bare scan is additive.
     pub force: bool,
-    /// Revalidate only: delete tracks whose backing file is gone and GC
+    /// Revalidate only: delete tracks whose backing file is gone, and tracks
+    /// whose file is present but refused as unsupported (#747), then GC
     /// orphaned art. Off by default.
     pub prune: bool,
 }

@@ -102,7 +102,7 @@ a metadata-op storm costs at most one rebuild per interval. When mounted with
 invalidation (`inval_inode`), so a re-tagged file never serves stale cached
 bytes. That covers changes recorded in the store; a backing file rewritten in
 place writes nothing to the store and raises no notification (see
-[above](#backing-freshness)).
+[above](#freshness-two-version-counters)).
 
 ## Virtual tree
 
@@ -227,7 +227,9 @@ one is what makes it the repopulation path for a store upgraded to v4, where
 every row starts without one. New files are
 ignored: `revalidate` only touches rows that already exist in the store.
 Deletion is opt-in via `--prune`, which removes tracks under the scanned root
-whose backing file is gone and garbage-collects now-unreferenced art. Pruning
+whose backing file is gone, or is present but refused as unsupported (a chained
+Ogg an older binary stored, [#747](https://github.com/Sohex/musefs/issues/747)),
+and garbage-collects now-unreferenced art. Pruning
 is scoped to the scanned root, so revalidating one library root never removes
 tracks belonging to another. Because a track is keyed by its *canonical*
 backing path, a file scanned via `--follow-symlinks` whose real target lives

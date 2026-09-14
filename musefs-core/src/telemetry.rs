@@ -235,7 +235,7 @@ pub fn render_prometheus(
     counter(
         &mut out,
         "musefs_pool_over_cap_total",
-        "Metadata jobs that found the worker-pool queue full and ran in place instead.",
+        "Metadata jobs that found the worker-pool queue full: run on the submitting thread, or, for readdirplus attrs, dropped unrun.",
         fuse.pool_over_cap,
     );
 

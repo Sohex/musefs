@@ -72,7 +72,8 @@ def test_ecosystem_reads_synthesized_tags():
     base = os.environ["MUSEFS_INTEROP_DIR"]
     with open(os.path.join(base, "manifest.json")) as fh:
         manifest = json.load(fh)
-    assert {row["file"] for row in manifest} == MANIFEST_FILES
+    # Sorted lists, not sets: a duplicated manifest row must fail too.
+    assert sorted(row["file"] for row in manifest) == sorted(MANIFEST_FILES)
     for row in manifest:
         path = os.path.join(base, row["file"])
         title = _read_tag(path, "title")
@@ -92,7 +93,8 @@ def test_synthesized_preserves_source_audio_payload():
     base = os.environ["MUSEFS_INTEROP_DIR"]
     with open(os.path.join(base, "manifest.json")) as fh:
         manifest = json.load(fh)
-    assert {row["file"] for row in manifest} == MANIFEST_FILES
+    # Sorted lists, not sets: a duplicated manifest row must fail too.
+    assert sorted(row["file"] for row in manifest) == sorted(MANIFEST_FILES)
     for row in manifest:
         synth_length = row["synth_audio_length"]
         # Every fixture has audio, so a zero-length payload is a regression, not
