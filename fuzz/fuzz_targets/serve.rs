@@ -231,10 +231,13 @@ fuzz_target!(|data: &[u8]| {
                     picture_type: 3,
                     description: String::new(),
                     mime: "image/png".into(),
-                    width: None,
-                    height: None,
-                    depth: 0,
-                    colors: 0,
+                    // The sampled geometry, so a served picture block carries
+                    // what the link declares rather than only the defaults
+                    // (#716). Zero stays "not stated", as ingest spells it.
+                    width: (a.width != 0).then_some(a.width),
+                    height: (a.height != 0).then_some(a.height),
+                    depth: a.depth,
+                    colors: a.colors,
                     ordinal: 0,
                 }],
             );

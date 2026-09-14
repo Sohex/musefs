@@ -30,8 +30,10 @@ pub fn arb_arts(u: &mut Unstructured) -> arbitrary::Result<Vec<ArtInput>> {
                 .expect("0..=20 is valid"),
             width: u.int_in_range(0..=4096u32)?,
             height: u.int_in_range(0..=4096u32)?,
-            depth: 0,
-            colors: 0,
+            // Any value: FLAC's PICTURE block and Ogg's base64 picture write both
+            // verbatim, and the store accepts the full `u32` range (#716).
+            depth: u32::arbitrary(u)?,
+            colors: u32::arbitrary(u)?,
             data_len: BlobLen::new(u.int_in_range(1..=8192u64)?)
                 .expect("1..=8192 is non-zero"),
         });
