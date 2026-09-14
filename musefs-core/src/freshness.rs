@@ -785,6 +785,18 @@ mod tests {
         assert_eq!(live.recordable(false), BackingStamp { ino: None, ..live });
     }
 
+    /// The test-support decision gives a real no as well as a real yes. Every
+    /// test that derives its expectation through it runs on whatever the suite's
+    /// tempdir is — often a filesystem that keeps inode numbers — so a helper
+    /// that always answered yes would pass them all while telling a container's
+    /// overlayfs run the wrong thing. `/proc` is procfs on every Linux system and
+    /// container, and procfs is not on the allowlist.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_test_support_decision_answers_no_for_a_filesystem_off_the_allowlist() {
+        assert!(!filesystem_keeps_inodes_for_test(Path::new("/proc")));
+    }
+
     /// The failure #757 fixes. FAT hands an untouched file a new inode after a
     /// remount: recorded with its inode, the file failed every serve until a
     /// revalidate, while recorded without one it still matches.

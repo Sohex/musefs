@@ -694,4 +694,15 @@ exclude_re = [
     # equivalence). One `<` per fn, so description-anchored.
     'musefs-format/src/ogg/page\.rs:\d+:\d+: replace < with <= in crc_feed_payload',
     'musefs-format/src/ogg/page\.rs:\d+:\d+: replace < with <= in emit_segments',
+
+    # freshness::fs_name reads `f_fstypename`, which only macOS and FreeBSD have,
+    # so it is `#[cfg(any(target_os = "macos", target_os = "freebsd"))]` and is
+    # not compiled on the Linux mutation runner at all. cargo-mutants lists its
+    # mutants anyway; each edits code the build never includes, so every one
+    # survives — the same class as `musefs-fuse/src/platform/**` above. The name
+    # decision it feeds, `fs_name_keeps_inodes`, is compiled for tests on every
+    # platform and stays in scope, killed by
+    # `off_linux_the_filesystem_name_decides`.
+    'musefs-core/src/freshness\.rs:\d+:\d+: replace fs_name -> Option<Vec<u8>> with',
+    'musefs-core/src/freshness\.rs:\d+:\d+: replace != with == in fs_name',
 ]
