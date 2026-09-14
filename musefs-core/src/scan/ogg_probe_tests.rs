@@ -293,6 +293,129 @@ fn revalidate_prune_spares_a_refused_file_rewritten_since_the_refusal() {
     assert!(db.list_tracks().unwrap().is_empty());
 }
 
+/// An Opus header region over 4 MiB, from a comment carrying a long text tag,
+/// plus one audio page. Returns the bytes and the header region's length.
+///
+/// Over 4 MiB because that is where the probe's widening used to run out of
+/// retries from a 64-byte window, and hand the file to a whole-buffer fallback
+/// that parsed the wrong length of it: the tests below scan with that window,
+/// which keeps the fixture a few megabytes rather than the 8 MiB the default
+/// window needed. Real files get there with a few megabytes of base64 cover art.
+fn opus_with_a_large_header(serial: u32) -> (Vec<u8>, u64) {
+    let head = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".to_vec();
+    let long = "x".repeat(4 << 20 | 1 << 19);
+    let mut tags = b"OpusTags".to_vec();
+    tags.extend_from_slice(&vorbis_body_with(&[("comment", &long)]));
+    let (mut bytes, pages) = build_header_pub(serial, &[&head, &tags]);
+    let header_len = bytes.len() as u64;
+    let (audio, _) = lace_packet_pub(serial, pages, false, 960, &[0u8; 100]);
+    bytes.extend_from_slice(&audio);
+    (bytes, header_len)
+}
+
+/// Scan options with the 64-byte first window [`opus_with_a_large_header`]
+/// is sized for.
+fn small_window() -> ScanOptions {
+    ScanOptions {
+        window: 64,
+        ..ScanOptions::default()
+    }
+}
+
+/// Write `front` at the start of a sparse file `len` bytes long, and `tail` at
+/// its very end.
+fn write_sparse(path: &std::path::Path, front: &[u8], len: u64, tail: &[u8]) {
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::File::create(path).unwrap();
+    f.set_len(len).unwrap();
+    f.write_all_at(front, 0).unwrap();
+    f.write_all_at(tail, len - tail.len() as u64).unwrap();
+}
+
+/// An Ogg file past the probe ceiling whose header region takes the widening a
+/// while to cover. The whole-buffer fallback it used to reach took the 64 MiB
+/// buffer's length for the file's, so the stored audio region stopped at the
+/// ceiling and the mount served the file cut short.
+#[test]
+fn an_ogg_past_the_probe_ceiling_keeps_its_whole_audio_region() {
+    let (front, header_len) = opus_with_a_large_header(0x1234);
+    // The stream's own final page, ending on the file's last byte.
+    let (last, _) = lace_packet_pub(0x1234, 9, false, 48_000, &[0u8; 100]);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("large-header.opus");
+    let len = 100 << 20;
+    write_sparse(&path, &front, len, &last);
+
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    let stats = crate::scan_directory_with(&db, &path, &small_window()).unwrap();
+    assert_eq!((stats.scanned, stats.failed), (1, 0), "{stats:?}");
+    let t = db.list_tracks().unwrap().remove(0);
+    assert_eq!(
+        (t.bounds.audio_offset(), t.bounds.audio_length()),
+        (header_len, len - header_len),
+        "the audio runs to the end of the file, not to the probe ceiling"
+    );
+}
+
+/// The chain check (#722) reads the file's final page. The fallback ran it on
+/// the last page-sized window of its 64 MiB buffer instead — sparse zeros in
+/// the middle of this file, which prove nothing — and so stored a chain whose
+/// second stream sits past the ceiling.
+#[test]
+fn the_chain_check_reads_the_real_final_page_past_the_probe_ceiling() {
+    crate::warn_limit::log_capture::install();
+    let (front, _) = opus_with_a_large_header(0x1234);
+    let (foreign, _) = lace_packet_pub(0x5678, 3, false, 48_000, &[1u8; 100]);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("large-header-chained-far.opus");
+    write_sparse(&path, &front, 100 << 20, &foreign);
+
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    let stats = crate::scan_directory_with(&db, &path, &small_window()).unwrap();
+    assert_eq!((stats.scanned, stats.failed), (0, 1), "{stats:?}");
+    let logged =
+        crate::warn_limit::log_capture::messages_containing("large-header-chained-far.opus");
+    assert!(
+        logged.iter().any(|m| m.contains("chained Ogg")),
+        "{logged:?}"
+    );
+}
+
+/// #747 prunes a stored file refused as *unsupported*, and only that. A chained
+/// Ogg whose header region sent the probe to the whole-buffer fallback was
+/// refused there as *unparseable* instead, so `revalidate --prune` could never
+/// remove its row.
+#[test]
+fn a_chained_ogg_with_a_large_header_is_refused_as_unsupported_and_pruned() {
+    let (mut bytes, _) = opus_with_a_large_header(0x1234);
+    // A second, small link under its own serial, as in `chained_opus_bytes`.
+    let head = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".to_vec();
+    let mut tags = b"OpusTags".to_vec();
+    tags.extend_from_slice(&vorbis_body_empty());
+    let (link, link_pages) = build_header_pub(0x5678, &[&head, &tags]);
+    bytes.extend_from_slice(&link);
+    let (link_audio, _) = lace_packet_pub(0x5678, link_pages, false, 960, &[1u8; 100]);
+    bytes.extend_from_slice(&link_audio);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("large-header-chained.opus");
+    std::fs::write(&path, &bytes).unwrap();
+    drop(bytes);
+
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    plant_stored_row(&db, &path);
+    let opts = ScanOptions {
+        prune: true,
+        ..small_window()
+    };
+    let stats = crate::revalidate_with(&db, dir.path(), &opts).unwrap();
+    assert_eq!(
+        (stats.failed, stats.pruned),
+        (1, 1),
+        "refused for its shape, so --prune removes it"
+    );
+    assert!(db.list_tracks().unwrap().is_empty());
+}
+
 /// The FLAC-in-Ogg file #723 is about — a mapping packet whose following-packet
 /// count is zero, then a VORBIS_COMMENT flagged last — plus one audio page.
 /// Returns the bytes and the length of the true header region.

@@ -20,10 +20,12 @@ const BATCH_FILES: usize = 256;
 const BATCH_BYTES: u64 = 64 << 20; // 64 MiB
 
 /// Initial bounded-read window. Sized to cover most files' metadata in one read;
-/// larger metadata (e.g. embedded cover art) triggers a precise `NeedMore` widen.
+/// larger metadata (e.g. embedded cover art) triggers a `NeedMore` widen.
 const WINDOW: usize = 1 << 16; // 64 KiB
-/// Cap on widen iterations before falling back to a full-buffer read.
-const MAX_WIDEN_RETRIES: usize = 8;
+/// A bound the widening loop in [`probe_body`] cannot outrun, not a budget a
+/// file spends: every step at least doubles the window (see [`widened`]), so
+/// reaching [`MAX_PROBE_BYTES`] from a one-byte window takes 27 of them.
+const MAX_WIDEN_STEPS: usize = 64;
 /// Hard ceiling on bytes read to probe one file. Real audio metadata fits far
 /// below this, so a file still unparsed past the cap is treated as malformed
 /// rather than read whole into RAM. Guards against a multi-GB file misnamed with
@@ -875,7 +877,10 @@ fn fill_absent_keys(tags: &mut Vec<(String, String)>, fallback: Vec<(String, Str
 }
 
 /// Full-buffer probe (legacy path). Retained as the reference implementation the
-/// bounded path is checked against (see the equivalence property test).
+/// bounded path is checked against (see the equivalence property test); the
+/// bounded probe no longer falls back on it, since over a prefix cut short at
+/// the probe ceiling it takes the prefix's end for the file's.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn probe_full(path: &Path, bytes: &[u8]) -> Option<Probed> {
     if has_ext(path, "flac") {
         Some(flac_probed(bytes, &flac::locate_audio(bytes).ok()?))
@@ -939,15 +944,36 @@ pub(crate) fn probe_full(path: &Path, bytes: &[u8]) -> Option<Probed> {
     }
 }
 
-/// Read `[0, len)` of `path` into a buffer, counting the read. A short read at
-/// EOF is fine (`len` may exceed the file size).
-fn read_window(file: &std::fs::File, len: usize) -> std::io::Result<Vec<u8>> {
+/// Grow `prefix`, the file's bytes from offset 0, toward `len` bytes, reading
+/// only the part it does not hold yet, and counting the read. A short read is
+/// fine: the probe sees a shorter prefix, asks for more, and the next widening
+/// reads on from wherever this one stopped. `len` must not be below
+/// `prefix.len()`.
+fn extend_window(file: &std::fs::File, prefix: &mut Vec<u8>, len: u64) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt;
-    let mut buf = vec![0u8; len];
-    let n = file.read_at(&mut buf, 0)?;
-    buf.truncate(n);
+    let start = prefix.len();
+    prefix.resize(usize_from(len), 0);
+    let n = file.read_at(&mut prefix[start..], start as u64)?;
+    prefix.truncate(start + n);
     crate::metrics::on_scan_read(n as u64);
-    Ok(buf)
+    Ok(())
+}
+
+/// The window to read after a probe over `have` bytes answered
+/// `NeedMore { up_to }`: what it asked for, but at least twice what it had, and
+/// never past `cap`.
+///
+/// The doubling is what keeps a file with large metadata out of trouble. FLAC
+/// asks for exactly the end of the next block header or body, so growing to
+/// `up_to` alone cost two reads per block past the first window; a few large
+/// cover scans used up the eight retries the probe allowed, and the
+/// whole-buffer fallback behind them took its 64 MiB buffer's length for the
+/// file's, storing the audio region of any larger file cut short at the
+/// ceiling. Doubling covers any metadata below the ceiling in a few dozen
+/// steps at most, each read only what the window lacks, so the probe needs no
+/// fallback at all.
+fn widened(have: u64, up_to: u64, cap: u64) -> u64 {
+    up_to.max(have.saturating_mul(2)).min(cap)
 }
 
 /// Append exactly `len` bytes read at `offset` to `out`, counting the read.
@@ -1163,8 +1189,8 @@ fn probe_body(
     // Never read past the probe ceiling, however large the file or whatever a
     // (possibly corrupt) header asks for via `NeedMore`.
     let probe_cap = file_len.min(MAX_PROBE_BYTES);
-    let mut want = usize_from((window as u64).min(probe_cap));
-    let mut prefix = read_window(file, want)?;
+    let mut prefix = Vec::new();
+    extend_window(file, &mut prefix, (window as u64).min(probe_cap))?;
     // Only the MP3 arm of probe_prefix consumes the ID3v1 tail, plus the FLAC arm
     // for the rare file that puts an ID3v2 tag in front of the `fLaC` marker
     // (#602) — a stock .flac still pays no tail read (#67), and .ogg/.wav never
@@ -1183,7 +1209,7 @@ fn probe_body(
     } else {
         None
     };
-    for _ in 0..MAX_WIDEN_RETRIES {
+    for _ in 0..MAX_WIDEN_STEPS {
         match probe_prefix(path, &prefix, file_len, tail.as_ref(), ogg_tail.as_ref()) {
             Probe::Done(p) => return Ok(ProbeBody::Parsed(p)),
             Probe::Skip(why) => {
@@ -1200,25 +1226,20 @@ fn probe_body(
             }
             Probe::NeedMore(up_to) => {
                 // Read everything we're willing to probe? Widening can't help.
-                if want as u64 >= probe_cap {
+                let have = prefix.len() as u64;
+                if have >= probe_cap {
                     break;
                 }
-                // Grow to at least `up_to` (capped at `probe_cap`), always making
-                // progress (`+1`), then retry.
-                want = usize_from(up_to.min(probe_cap))
-                    .max(want + 1)
-                    .min(usize_from(probe_cap));
-                prefix = read_window(file, want)?;
+                extend_window(file, &mut prefix, widened(have, up_to, probe_cap))?;
             }
         }
     }
-    // Fallback: full-buffer probe over the bytes we were willing to read.
-    if (prefix.len() as u64) < probe_cap {
-        prefix = read_window(file, usize_from(probe_cap))?;
-    }
-    if let Some(p) = probe_full(path, &prefix) {
-        return Ok(ProbeBody::Parsed(p));
-    }
+    // Nothing parsed within the ceiling. There is no whole-buffer re-parse to
+    // fall back on: the dispatch above has already judged every byte up to the
+    // ceiling, against the real file length and the real tails, and a re-parse
+    // of the same prefix could only agree with it — or, for a file longer than
+    // the ceiling, mistake the prefix's end for the file's, which stored the
+    // audio region cut short and ran the Ogg chain check mid-file.
     // A WAV whose `data` payload runs past the probe ceiling fails the strict
     // full-buffer parse (the payload isn't present to bound), yet its `fmt `/`data`
     // headers sit at the front: trust the declared bounds and serve the audio,

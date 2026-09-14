@@ -12,6 +12,103 @@ fn flac_fixture() -> Vec<u8> {
     bytes
 }
 
+/// One FLAC metadata block: the last-block flag and type, the 24-bit length,
+/// then the body.
+fn flac_block(block_type: u8, body: &[u8], last: bool) -> Vec<u8> {
+    let mut out = vec![(u8::from(last) << 7) | block_type];
+    out.extend_from_slice(&u32::try_from(body.len()).unwrap().to_be_bytes()[1..]);
+    out.extend_from_slice(body);
+    out
+}
+
+/// The metadata region of a FLAC that carries `pictures` PICTURE blocks of
+/// `image_bytes` each after its STREAMINFO: the shape of a file holding several
+/// large cover scans, whose metadata runs far past the first probe window.
+fn flac_front_with_pictures(pictures: usize, image_bytes: usize) -> Vec<u8> {
+    let mut out = b"fLaC".to_vec();
+    out.extend(flac_block(0, &[0u8; 34], false));
+    for i in 0..pictures {
+        let mut body = Vec::new();
+        body.extend_from_slice(&3u32.to_be_bytes()); // front cover
+        body.extend_from_slice(&9u32.to_be_bytes());
+        body.extend_from_slice(b"image/png");
+        body.extend_from_slice(&0u32.to_be_bytes()); // no description
+        for field in [1u32, 1, 24, 0] {
+            body.extend_from_slice(&field.to_be_bytes());
+        }
+        body.extend_from_slice(&u32::try_from(image_bytes).unwrap().to_be_bytes());
+        body.extend(std::iter::repeat_n(u8::try_from(i).unwrap(), image_bytes));
+        out.extend(flac_block(6, &body, i + 1 == pictures));
+    }
+    out
+}
+
+/// Write `front` at the start of a sparse file `len` bytes long, and `tail` at
+/// its very end. Nothing in between is ever written, so the file costs what its
+/// two ends do, however far past the probe ceiling it runs.
+fn write_sparse(path: &std::path::Path, front: &[u8], len: u64, tail: &[u8]) {
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::File::create(path).unwrap();
+    f.set_len(len).unwrap();
+    f.write_all_at(front, 0).unwrap();
+    f.write_all_at(tail, len - tail.len() as u64).unwrap();
+}
+
+/// The stored `(audio_offset, audio_length)` of the one track a scan of `path`
+/// ingests.
+fn scanned_bounds(path: &std::path::Path) -> (u64, u64) {
+    let db = Db::open_in_memory().unwrap();
+    let stats = scan_directory(&db, path).unwrap();
+    assert_eq!((stats.scanned, stats.failed), (1, 0), "{stats:?}");
+    let t = db.list_tracks().unwrap().remove(0);
+    (t.bounds.audio_offset(), t.bounds.audio_length())
+}
+
+/// A FLAC larger than the probe ceiling whose metadata takes more than a few
+/// widening steps to cover. The bounded probe used to run out of retries and
+/// fall back to a whole-buffer parse of the first 64 MiB, which took that
+/// buffer's length for the file's: the stored audio region ended at the
+/// ceiling, and the mount served a file cut short with nothing to say so.
+#[test]
+fn a_flac_past_the_probe_ceiling_keeps_its_whole_audio_region() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("large-art.flac");
+    let front = flac_front_with_pictures(5, 100 << 10);
+    let len = 100 << 20;
+    write_sparse(&path, &front, len, &[0xFF, 0xF8]);
+
+    assert_eq!(
+        scanned_bounds(&path),
+        (front.len() as u64, len - front.len() as u64),
+        "the audio runs to the end of the file, not to the probe ceiling"
+    );
+}
+
+/// The same file with a leading ID3v2 tag (#602), which makes an ID3v1 trailer
+/// plausible. Whether one is there is a question about the file's real last 128
+/// bytes, which the probe already reads; the whole-buffer fallback asked the
+/// last 128 bytes of its truncated buffer instead.
+#[test]
+fn a_flac_past_the_probe_ceiling_trims_the_trailer_at_its_real_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("large-art-id3.flac");
+    // An empty ID3v2.4 tag: the 10-byte header, declaring a 10-byte body of
+    // padding.
+    let mut front = b"ID3\x04\x00\x00\x00\x00\x00\x0A".to_vec();
+    front.extend_from_slice(&[0u8; 10]);
+    front.extend(flac_front_with_pictures(5, 100 << 10));
+    let mut trailer = b"TAG".to_vec();
+    trailer.resize(128, b' ');
+    let len = 100 << 20;
+    write_sparse(&path, &front, len, &trailer);
+
+    assert_eq!(
+        scanned_bounds(&path),
+        (front.len() as u64, len - 128 - front.len() as u64),
+        "the ID3v1 trailer at the end of the file is not audio"
+    );
+}
+
 #[test]
 fn scan_counts_unreadable_file_as_failed_and_continues() {
     let dir = tempfile::tempdir().unwrap();

@@ -32,6 +32,31 @@ fn write_temp(name: &str, bytes: &[u8]) -> (tempfile::TempDir, std::fs::File) {
 // kills scan L172 Ok(None) constant, L178 Ok(Some) value
 // kills scan L176 `file_len - 128`→`/` (offset 0 vs 1 shifts the bytes)
 // kills scan L175 buf init [0;128]/[1;128] constants (exact bytes asserted)
+/// Each widening takes what the probe asked for, but never less than twice
+/// what it already had, and never more than the ceiling. The doubling is what
+/// keeps a file whose metadata spans many blocks from walking toward the
+/// ceiling one exact block at a time.
+#[test]
+fn widening_asks_for_at_least_double_and_stops_at_the_ceiling() {
+    const CAP: u64 = 1 << 20;
+    assert_eq!(
+        widened(100, 110, CAP),
+        200,
+        "a small ask still doubles the window"
+    );
+    assert_eq!(
+        widened(100, 5000, CAP),
+        5000,
+        "a large ask is met in one step"
+    );
+    assert_eq!(
+        widened(CAP / 2 + 1, CAP / 2 + 2, CAP),
+        CAP,
+        "doubling is capped"
+    );
+    assert_eq!(widened(100, CAP * 4, CAP), CAP, "so is the ask");
+}
+
 #[test]
 fn read_tail_128_exact_128_bytes() {
     // Distinct, position-sensitive pattern: byte[i] = i (0..=127).

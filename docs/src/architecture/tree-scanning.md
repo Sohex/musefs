@@ -195,7 +195,16 @@ prune gets a fresh inode.)
 collect supported audio files, probe each (format detection → audio
 offset/length, tags, pictures, structural blocks) on a parallel probe
 pipeline feeding a single DB writer, committing in batches. Probing reads
-are bounded — the scanner never slurps whole files — and ingestion caps
+are bounded — the scanner never slurps whole files. A probe reads a 64 KiB
+window from the front of the file and, while the format needs more, widens it
+to what the format asks for but at least double, up to a 64 MiB ceiling; each
+widening reads only the bytes the window lacks. Where the audio ends always
+comes from the file's real length and its real last bytes, never from how much
+of the file the probe read. A probe that needed many widening steps, such as a
+FLAC with several large cover scans, used to fall back to parsing its 64 MiB
+buffer as though it were the whole file: a larger file was stored with its
+audio cut short at the ceiling, and a chained Ogg was judged from a page in the
+middle of the file. Ingestion caps
 per-item sizes (`MAX_ART_BYTES`, `MAX_BINARY_TAG_BYTES`, and the store's
 `tags.key`/`tags.value`/`track_art.mime`/`track_art.description` limits) so a crafted
 file cannot balloon the store.
