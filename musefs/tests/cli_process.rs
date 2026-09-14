@@ -480,6 +480,49 @@ fn mount_help_lists_env_vars() {
     );
 }
 
+/// `MUSEFS_YES` reads like every other boolean variable: `0`/`1`, `no`/`yes`,
+/// `off`/`on`, `false`/`true`. It confirms `migrate`'s one-way upgrade, and a
+/// unit file writing `0` for "ask me" used to be a usage error instead. Each
+/// value must parse and reach the command, which then refuses the missing store;
+/// a non-boolean value is still a usage error.
+#[test]
+fn migrate_yes_env_takes_boolish_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("absent.db");
+    for value in ["0", "no", "off", "false", "1", "yes", "on", "true"] {
+        let out = musefs()
+            .arg("migrate")
+            .arg("--db")
+            .arg(&missing)
+            .env("MUSEFS_YES", value)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "MUSEFS_YES={value} must parse; stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("database not found"),
+            "MUSEFS_YES={value}: {stderr}"
+        );
+    }
+    let out = musefs()
+        .arg("migrate")
+        .arg("--db")
+        .arg(&missing)
+        .env("MUSEFS_YES", "enabled")
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a non-boolean MUSEFS_YES is a usage error; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn invalid_boolean_env_is_usage_error() {
     let dir = tempfile::tempdir().unwrap();

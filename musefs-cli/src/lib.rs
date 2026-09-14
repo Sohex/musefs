@@ -321,7 +321,7 @@ pub struct MigrateArgs {
     #[arg(long, env = "MUSEFS_DB")]
     pub db: PathBuf,
     /// Upgrade without asking. Required when not running on a terminal.
-    #[arg(long, short = 'y', env = "MUSEFS_YES")]
+    #[arg(long, short = 'y', env = "MUSEFS_YES", value_parser = clap::builder::BoolishValueParser::new())]
     pub yes: bool,
     /// Where to write the pre-upgrade snapshot. Default: the store's own path
     /// with `.v<version>.bak` appended, alongside it.
