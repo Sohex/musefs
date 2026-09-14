@@ -195,6 +195,15 @@ see the [Release notes](release-notes.md).
 
 ### Changed
 
+- **The published crates no longer ship tests that cannot build outside the
+  repository.** Cargo strips path-only dev-dependencies at publish, so the
+  integration tests of `musefs-db`, `musefs-core`, `musefs-fuse` and
+  `musefs-cli`, and `musefs-core`'s benches, which reach sibling crates or a
+  `test-support` feature that way, failed to compile from the published
+  tarball, and `musefs-format`'s `fuzzing`-gated property tests compiled to
+  nothing. Those crates now exclude `tests/` (and `musefs-core` its `benches/`),
+  with the reason in each manifest; `musefs` keeps its tests, which build.
+
 - **The serve path no longer zero-fills buffers a read is about to overwrite**
   ([#670](https://github.com/Sohex/musefs/issues/670)). Each backing-audio
   segment and Ogg audio page a read touched was zero-filled and then overwritten
@@ -815,6 +824,33 @@ see the [Release notes](release-notes.md).
   `test-support` ([#751](https://github.com/Sohex/musefs/issues/751)).
 
 ### Fixed
+
+- **The published crates carry their license.** None of the six `.crate` files
+  included the MIT `LICENSE`, whose notice has to travel with the code; each
+  crate now ships it, through a `LICENSE` symlink to the workspace root's, which
+  cargo packages as the file's contents. `musefs-db`, `musefs-format`,
+  `musefs-core`, `musefs-fuse` and `musefs-cli` gained a `readme`, the four
+  library crates keywords and categories, and `musefs-db`, `musefs-format` and
+  `musefs-core` crate-level docs, so their crates.io and docs.rs pages are no
+  longer blank.
+
+- **A release can pass its gate after a re-run.** The release workflow's gate
+  discards check-runs that started before the release run did, so a green run
+  from the earlier push to `main` cannot stand in for the tag's own legs. It
+  took that cutoff from the run's `run_started_at`, which GitHub documents as
+  resetting on every re-run attempt: re-running CI's failed jobs and then the
+  release moved the cutoff past the check-runs that re-run had just produced,
+  and the gate timed out after 45 minutes. It now uses the run's `created_at`,
+  which stays at the tag push; the retry procedure in
+  [Releasing](contributing/releasing.md) says to re-run CI first.
+
+- **The `bitmaps` advisories are cleared.** `imbl` 7.0.2 depends on
+  `imbl-sized-chunks` 0.2.0, which no longer uses `bitmaps`, so
+  RUSTSEC-2026-0247 (unmaintained) and RUSTSEC-2025-0167 (unsound, and
+  unreachable from musefs) no longer apply; their ignores are removed from
+  `deny.toml` and `.cargo/audit.toml`, where a leftover would have failed
+  `cargo deny`'s `advisory-not-detected` check. Both lockfiles changed only
+  those three crates.
 
 - **Re-probing an unchanged file no longer moves its served mtime**
   ([#757](https://github.com/Sohex/musefs/issues/757)). A synthesized file's
@@ -1443,6 +1479,17 @@ see the [Release notes](release-notes.md).
 
 ### Internal
 
+- CI gained three checks it never ran. The `check` job builds the docs with
+  rustdoc warnings denied, after 21 broken or private intra-doc links, an
+  unescaped `Option<Instant>` and a bare URL had accumulated unseen. A new
+  `msrv` job, required by `ci-ok`, runs `cargo check --workspace --all-targets`
+  on exactly the `rust-version` `Cargo.toml` declares; the comment there now
+  states the real floors (let-chains need 1.88 in the libraries, the tests 1.91)
+  instead of blaming a dependency that no longer forces it. And the `e2e` job
+  runs the kernel passthrough read test as root, with `MUSEFS_REQUIRE_PASSTHROUGH`
+  turning its skips into failures, so `structure_only_reads_are_kernel_passthrough`
+  is no longer a test that only ever skipped. No job installs `libfuse3-dev` or
+  `pkg-config` any more: fuser mounts in pure Rust and SQLite is bundled.
 - The `ogg_page` fuzz target round-trips the page machinery the serve path
   actually depends on — `verify_page_crc` and `patch_page_header_algebraic` —
   instead of only decoding a header ([#625](https://github.com/Sohex/musefs/issues/625)). Coverage against the

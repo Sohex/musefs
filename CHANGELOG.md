@@ -117,6 +117,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- The published crates no longer include integration tests and benches that
+  cannot build outside the repository: they reach sibling crates or a
+  `test-support` feature through path-only dev-dependencies, which cargo strips
+  at publish. `musefs` keeps its tests, which build.
+
 - **The store's `tracks` table is rebuilt** by the 2.0.0 migration, which is
   what makes the upgrade gated: `musefs migrate` runs it, and the store then no
   longer opens with an older musefs. One rebuild carries every `tracks` schema
@@ -435,6 +440,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   outside the test suites called them.
 
 ### Fixed
+
+- **The published crates carry their license.** None of the six `.crate` files
+  included the MIT `LICENSE`, which has to travel with the code; each crate now
+  ships it, and the crates that lacked them gained a README, keywords,
+  categories and crate-level documentation for crates.io and docs.rs.
+
+- **A release can pass its gate after a re-run.** The release workflow ignored
+  check-runs that started before its own `run_started_at`, which GitHub resets
+  on every re-run attempt, so re-running CI's failed jobs and then the release
+  timed out waiting for runs that had already happened. It now uses the run's
+  `created_at`, which stays at the tag push.
+
+- **The `bitmaps` advisories are cleared.** `imbl` 7.0.2 no longer depends on
+  `bitmaps`, which removes RUSTSEC-2026-0247 (unmaintained) and
+  RUSTSEC-2025-0167 (unsound, and unreachable from musefs); their audit and
+  deny ignores are gone with it.
 
 - **Re-probing an unchanged file no longer moves its served mtime**
   ([#757](https://github.com/Sohex/musefs/issues/757)). Every re-probe stamped
