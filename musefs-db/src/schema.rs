@@ -2641,26 +2641,43 @@ mod v4_tags_and_track_art_rebuild_tests {
     /// the refusal is how that writer is simulated.
     #[test]
     fn the_bump_names_both_owners_when_the_refusal_is_gone() {
-        let conn = migrated();
-        conn.execute_batch("DROP TRIGGER tags_reject_reparent")
-            .unwrap();
-        let cv = |id: i64| -> i64 {
-            conn.query_row(
-                "SELECT content_version FROM tracks WHERE id = ?1",
-                [id],
-                |r| r.get(0),
-            )
-            .unwrap()
-        };
-        let (before_1, before_2) = (cv(1), cv(2));
-        conn.execute("UPDATE tags SET track_id = 2 WHERE track_id = 1", [])
-            .unwrap();
-        assert_eq!(cv(1), before_1 + 1, "the track that LOST the row must bump");
-        assert_eq!(
-            cv(2),
-            before_2 + 1,
-            "the track that gained it must bump too"
-        );
+        // Both tables, since each has its own `_au` trigger to get wrong. The
+        // link moves to a free ordinal: track 2 already holds ordinal 0, and the
+        // primary key would refuse the move before any trigger ran.
+        for (refusal, reparent) in [
+            (
+                "tags_reject_reparent",
+                "UPDATE tags SET track_id = 2 WHERE track_id = 1",
+            ),
+            (
+                "track_art_reject_reparent",
+                "UPDATE track_art SET track_id = 2, ordinal = 1 WHERE track_id = 1",
+            ),
+        ] {
+            let conn = migrated();
+            conn.execute_batch(&format!("DROP TRIGGER {refusal}"))
+                .unwrap();
+            let cv = |id: i64| -> i64 {
+                conn.query_row(
+                    "SELECT content_version FROM tracks WHERE id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            };
+            let (before_1, before_2) = (cv(1), cv(2));
+            conn.execute(reparent, []).unwrap();
+            assert_eq!(
+                cv(1),
+                before_1 + 1,
+                "{reparent}: the track that LOST the row must bump"
+            );
+            assert_eq!(
+                cv(2),
+                before_2 + 1,
+                "{reparent}: the track that gained it must bump too"
+            );
+        }
     }
 
     /// #716's adding half: the per-embedding columns exist on the link and are
@@ -3900,15 +3917,30 @@ mod constraint_tests {
         );
     }
 
+    /// Refused, and by the `CHECK` whose text contains `check`. SQLite names the
+    /// first constraint a row fails, so this is what tells a test apart from one
+    /// that passes because some earlier constraint happened to refuse its row.
+    fn rejected_by(conn: &Connection, sql: &str, check: &str) {
+        let err = conn
+            .execute(sql, [])
+            .expect_err(&format!("expected rejection for: {sql}"))
+            .to_string();
+        assert!(
+            err.contains(check),
+            "{sql} was refused by {err}, not {check}"
+        );
+    }
+
     #[test]
     fn v4_tracks_rejects_unknown_format() {
         let mut conn = Connection::open_in_memory().unwrap();
         fresh(&mut conn);
-        rejected(
+        rejected_by(
             &conn,
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
              backing_size, backing_mtime_ns, updated_at) \
-             VALUES ('/x','aiff',0,0,0,0,0)",
+             VALUES (CAST('/x' AS BLOB),'aiff',0,0,0,0,0)",
+            "format IN (",
         );
     }
 
@@ -3991,47 +4023,46 @@ mod constraint_tests {
     fn v4_tracks_rejects_negative_audio_length() {
         let mut conn = Connection::open_in_memory().unwrap();
         fresh(&mut conn);
-        rejected(
+        rejected_by(
             &conn,
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
              backing_size, backing_mtime_ns, updated_at) \
-             VALUES ('/x','flac',0,-1,0,0,0)",
+             VALUES (CAST('/x' AS BLOB),'flac',0,-1,0,0,0)",
+            "audio_length >= 0",
         );
     }
 
+    /// No row can reach this constraint alone: with the offset and length both
+    /// non-negative, a negative size also fails `audio_offset + audio_length <=
+    /// backing_size`. That one is declared later, so naming the constraint is
+    /// what tells the two apart.
     #[test]
     fn v4_tracks_rejects_negative_backing_size() {
         let mut conn = Connection::open_in_memory().unwrap();
         fresh(&mut conn);
-        rejected(
+        rejected_by(
             &conn,
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
              backing_size, backing_mtime_ns, updated_at) \
-             VALUES ('/x','flac',0,0,-1,0,0)",
+             VALUES (CAST('/x' AS BLOB),'flac',0,0,-1,0,0)",
+            "backing_size >= 0",
         );
     }
 
-    #[test]
-    fn v4_tracks_rejects_negative_backing_mtime_ns() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        fresh(&mut conn);
-        rejected(
-            &conn,
-            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
-             backing_size, backing_mtime_ns, updated_at) \
-             VALUES ('/x','flac',0,0,0,-1,0)",
-        );
-    }
+    // A negative `backing_mtime_ns` is accepted since #696, which
+    // `v4_tracks_rebuild_tests::a_pre_epoch_stamp_is_accepted` pins for both
+    // stamps.
 
     #[test]
     fn v4_tracks_rejects_negative_content_version() {
         let mut conn = Connection::open_in_memory().unwrap();
         fresh(&mut conn);
-        rejected(
+        rejected_by(
             &conn,
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
              backing_size, backing_mtime_ns, content_version, updated_at) \
-             VALUES ('/x','flac',0,0,0,0,-1,0)",
+             VALUES (CAST('/x' AS BLOB),'flac',0,0,0,0,-1,0)",
+            "content_version >= 0",
         );
     }
 
@@ -4039,12 +4070,213 @@ mod constraint_tests {
     fn v4_tracks_rejects_negative_updated_at() {
         let mut conn = Connection::open_in_memory().unwrap();
         fresh(&mut conn);
-        rejected(
+        rejected_by(
             &conn,
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
              backing_size, backing_mtime_ns, updated_at) \
-             VALUES ('/x','flac',0,0,0,0,-1)",
+             VALUES (CAST('/x' AS BLOB),'flac',0,0,0,0,-1)",
+            "updated_at >= 0",
         );
+    }
+
+    /// #718: every integer column of `tracks` pins its storage class. Each
+    /// value is a non-integral real, which INTEGER affinity cannot convert and
+    /// which satisfies every range the column also carries, so the `typeof`
+    /// clause is the only thing that can refuse it.
+    #[test]
+    fn v4_tracks_integer_columns_pin_their_storage_class() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        let insert = |path: &str, column: &str, value: &str| {
+            let mut values = [
+                ("audio_offset", "0"),
+                ("audio_length", "0"),
+                ("backing_size", "2"),
+                ("backing_mtime_ns", "0"),
+                ("backing_ctime_ns", "0"),
+                ("backing_ino", "0"),
+                ("content_version", "0"),
+                ("updated_at", "0"),
+            ];
+            for slot in &mut values {
+                if slot.0 == column {
+                    slot.1 = value;
+                }
+            }
+            let (names, vals): (Vec<&str>, Vec<&str>) = values.into_iter().unzip();
+            format!(
+                "INSERT INTO tracks (backing_path, format, {}) \
+                 VALUES (CAST('{path}' AS BLOB), 'flac', {})",
+                names.join(", "),
+                vals.join(", ")
+            )
+        };
+        conn.execute(&insert("/control", "", ""), [])
+            .expect("the baseline row is valid");
+        for (i, column) in [
+            "audio_offset",
+            "audio_length",
+            "backing_size",
+            "backing_mtime_ns",
+            "backing_ctime_ns",
+            "backing_ino",
+            "content_version",
+            "updated_at",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            rejected_by(
+                &conn,
+                &insert(&format!("/t{i}"), column, "0.5"),
+                &format!("typeof({column})"),
+            );
+        }
+    }
+
+    /// #718 for `tags`: a blob where text belongs, text where a blob belongs, and
+    /// a non-integral real where an integer belongs. Foreign keys are off so the
+    /// `track_id` case cannot be refused by its missing parent instead.
+    #[test]
+    fn v4_tags_columns_pin_their_storage_class() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        insert_track(&conn, "/a.flac");
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn.execute(
+            "INSERT INTO tags (track_id, key, value, ordinal, value_blob) \
+             VALUES (1, 'k', '', 0, X'00')",
+            [],
+        )
+        .expect("the baseline row is valid");
+        for (column, sql) in [
+            (
+                "track_id",
+                "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1.5, 'k', 'v', 1)",
+            ),
+            (
+                "key",
+                "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1, X'6b', 'v', 2)",
+            ),
+            (
+                "value",
+                "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1, 'k', X'76', 3)",
+            ),
+            (
+                "ordinal",
+                "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1, 'k', 'v', 0.5)",
+            ),
+            (
+                "value_blob",
+                "INSERT INTO tags (track_id, key, value, ordinal, value_blob) \
+                 VALUES (1, 'k', '', 4, 'not a blob')",
+            ),
+        ] {
+            rejected_by(&conn, sql, &format!("typeof({column})"));
+        }
+    }
+
+    /// #718 for `track_art`, on the same terms as `tags` above.
+    #[test]
+    fn v4_track_art_columns_pin_their_storage_class() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        seed_track_and_art(&conn);
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        let insert = |column: &str, value: &str| {
+            let mut values = [
+                ("track_id", "1"),
+                ("art_id", "1"),
+                ("picture_type", "3"),
+                ("description", "''"),
+                ("mime", "''"),
+                ("width", "1"),
+                ("height", "1"),
+                ("depth", "0"),
+                ("colors", "0"),
+                ("ordinal", "0"),
+            ];
+            for slot in &mut values {
+                if slot.0 == column {
+                    slot.1 = value;
+                }
+            }
+            let (names, vals): (Vec<&str>, Vec<&str>) = values.into_iter().unzip();
+            format!(
+                "INSERT INTO track_art ({}) VALUES ({})",
+                names.join(", "),
+                vals.join(", ")
+            )
+        };
+        conn.execute(&insert("", ""), [])
+            .expect("the baseline row is valid");
+        conn.execute("DELETE FROM track_art", []).unwrap();
+        for (column, value) in [
+            ("track_id", "1.5"),
+            ("art_id", "1.5"),
+            ("picture_type", "3.5"),
+            ("description", "X'64'"),
+            ("mime", "X'6d'"),
+            ("width", "0.5"),
+            ("height", "0.5"),
+            ("depth", "0.5"),
+            ("colors", "0.5"),
+            ("ordinal", "0.5"),
+        ] {
+            rejected_by(&conn, &insert(column, value), &format!("typeof({column})"));
+        }
+    }
+
+    /// #732: `structural_blocks.track_id`, the one storage class that table's
+    /// own rebuild tests leave out.
+    #[test]
+    fn v4_structural_blocks_track_id_pins_its_storage_class() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        insert_track(&conn, "/a.flac");
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn.execute(
+            "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
+             VALUES (1, 'STREAMINFO', 0, X'00')",
+            [],
+        )
+        .expect("the baseline row is valid");
+        rejected_by(
+            &conn,
+            "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
+             VALUES (1.5, 'STREAMINFO', 0, X'00')",
+            "typeof(track_id)",
+        );
+    }
+
+    /// #693: the NUL bans on `track_art.mime` and `art.sha256`. For the digest
+    /// the ban is the only clause that refuses this value at all: `length()`
+    /// and `GLOB` both stop at the NUL, so they see 64 lowercase hex characters.
+    #[test]
+    fn v4_a_nul_bearing_mime_or_digest_is_refused() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        seed_track_and_art(&conn);
+        let mime = format!("image/png{}junk", '\0');
+        let err = conn
+            .execute(
+                "INSERT INTO track_art (track_id, art_id, picture_type, mime, ordinal) \
+                 VALUES (1, 1, 3, ?1, 0)",
+                [&mime],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("instr(mime, char(0))"), "{err}");
+
+        let sha = format!("{}{}junk", "a".repeat(64), '\0');
+        let err = conn
+            .execute(
+                "INSERT INTO art (sha256, byte_len, data) VALUES (?1, 1, X'01')",
+                [&sha],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("instr(sha256, char(0))"), "{err}");
     }
 
     #[test]
