@@ -50,6 +50,61 @@ pub fn assert_backing_covers_audio(audio_offset: u64, audio_length: u64, layout:
     );
 }
 
+/// Property B, MP4 (#771) — a layout synthesized from tags alone (no streamed
+/// art or binary tags) serves one metadata system over untouched audio. Served
+/// with backing reads from `backing`, the file re-parses as an accepted MP4, its
+/// `mdat` payload is `backing`'s byte for byte, it holds no QuickTime keyed
+/// `meta` at any level the scan reads one from, and every track's chunk offsets
+/// are the source's shifted by exactly the relocation delta — so stripping a
+/// nested `meta`, which resizes `trak`/`mdia`/`moov`, never skews a pointer into
+/// the audio.
+pub fn assert_mp4_single_metadata_system(
+    backing: &[u8],
+    scan: &crate::mp4::Mp4Scan,
+    layout: &RegionLayout,
+) {
+    let mut served = Vec::new();
+    for seg in layout.segments() {
+        match seg {
+            Segment::Inline(b) => served.extend_from_slice(b),
+            Segment::BackingAudio { offset, len } => {
+                let start = crate::convert::usize_from(*offset);
+                served.extend_from_slice(&backing[start..start + crate::convert::usize_from(*len)]);
+            }
+            other => panic!("streamed segment in a tags-only MP4 layout: {other:?}"),
+        }
+    }
+    let out = crate::mp4::read_structure(&served).expect("served MP4 re-parses");
+    let audio = |bytes: &[u8], s: &crate::mp4::Mp4Scan| -> Vec<u8> {
+        let start = crate::convert::usize_from(s.mdat_payload_offset);
+        bytes[start..start + crate::convert::usize_from(s.mdat_payload_len)].to_vec()
+    };
+    assert_eq!(
+        audio(&served, &out),
+        audio(backing, scan),
+        "served audio differs"
+    );
+    assert!(
+        crate::mp4::keyed_metas(&served).is_empty(),
+        "a QuickTime keyed-metadata meta survived synthesis"
+    );
+    let delta = i128::from(out.mdat_payload_offset) - i128::from(scan.mdat_payload_offset);
+    let before = crate::mp4::chunk_offsets(&scan.moov).expect("source chunk offsets");
+    let after = crate::mp4::chunk_offsets(&out.moov).expect("served chunk offsets");
+    let relocated: Vec<Vec<i128>> = before
+        .iter()
+        .map(|t| t.iter().map(|&o| i128::from(o) + delta).collect())
+        .collect();
+    let served_offsets: Vec<Vec<i128>> = after
+        .iter()
+        .map(|t| t.iter().map(|&o| i128::from(o)).collect())
+        .collect();
+    assert_eq!(
+        served_offsets, relocated,
+        "chunk offsets not shifted by the delta"
+    );
+}
+
 /// Minimal valid files per format, for proptest/fuzz seeds/interop. FLAC and
 /// M4A are ported from `musefs-core/tests/common/mod.rs`; WAV is hand-built
 /// (RIFF/WAVE with a `fmt ` + `data` chunk); MP3 is a bare MPEG frame sync;
@@ -165,6 +220,104 @@ pub mod fixtures {
     /// Minimal moov-first M4A (ported verbatim from tests/common::minimal_m4a).
     pub fn m4a(mdat_payload: &[u8]) -> Vec<u8> {
         m4a_with_extra_ilst(&[], mdat_payload)
+    }
+
+    /// A bare (QuickTime-style) keyed-metadata `meta`: an `mdta` `hdlr`, a `keys`
+    /// table in the `mdta` namespace, and an `ilst` whose items are typed by their
+    /// 1-based key index, each holding the given `(type code, value)` `data` box.
+    fn keyed_meta(items: &[(&str, u32, &[u8])]) -> Vec<u8> {
+        let mut hdlr = vec![0u8; 8];
+        hdlr.extend_from_slice(b"mdta");
+        hdlr.extend_from_slice(&[0u8; 13]);
+        let mut keys = vec![0u8; 4];
+        keys.extend_from_slice(&u32::try_from(items.len()).unwrap().to_be_bytes());
+        let mut ilst = Vec::new();
+        for (i, (name, type_code, value)) in items.iter().enumerate() {
+            keys.extend_from_slice(&u32::try_from(8 + name.len()).unwrap().to_be_bytes());
+            keys.extend_from_slice(b"mdta");
+            keys.extend_from_slice(name.as_bytes());
+            let index = u32::try_from(i + 1).unwrap().to_be_bytes();
+            ilst.extend(bx(&index, &m4a_data_atom(*type_code, value)));
+        }
+        bx(
+            b"meta",
+            &[bx(b"hdlr", &hdlr), bx(b"keys", &keys), bx(b"ilst", &ilst)].concat(),
+        )
+    }
+
+    /// An M4A carrying QuickTime keyed metadata (#771) at every level it occurs:
+    /// a movie-level `moov/meta` (title, artist, PNG artwork), a `trak/meta`
+    /// (`player.movie.audio.mute`, 8-bit unsigned) and a `trak/mdia/meta`
+    /// (comment). Its iTunes `ilst` holds only `©nam`, so the keyed title loses
+    /// to it and the rest fill in. The `stco` entry is the real payload offset.
+    pub fn m4a_keyed(mdat_payload: &[u8]) -> Vec<u8> {
+        m4a_keyed_ordered(mdat_payload, true)
+    }
+
+    /// [`m4a_keyed`] with `moov` after `mdat`, the faststart-less layout.
+    pub fn m4a_keyed_moov_last(mdat_payload: &[u8]) -> Vec<u8> {
+        m4a_keyed_ordered(mdat_payload, false)
+    }
+
+    fn m4a_keyed_ordered(mdat_payload: &[u8], moov_first: bool) -> Vec<u8> {
+        let movie = keyed_meta(&[
+            ("com.apple.quicktime.title", 1, b"Keyed Title"),
+            ("com.apple.quicktime.artist", 1, b"Keyed Artist"),
+            (
+                "com.apple.quicktime.artwork",
+                14,
+                b"\x89PNG\r\n\x1a\nkeyed-artwork",
+            ),
+        ]);
+        let track = keyed_meta(&[("player.movie.audio.mute", 75, &[1])]);
+        let media = keyed_meta(&[("com.apple.quicktime.comment", 1, b"Keyed Comment")]);
+
+        let mut meta_hdlr = vec![0u8; 8];
+        meta_hdlr.extend_from_slice(b"mdir");
+        meta_hdlr.extend_from_slice(b"appl");
+        meta_hdlr.extend_from_slice(&[0u8; 9]);
+        let mut meta = vec![0u8; 4];
+        meta.extend(bx(b"hdlr", &meta_hdlr));
+        meta.extend(bx(b"ilst", &bx(b"\xa9nam", &m4a_data_atom(1, b"Orig M4A"))));
+        let udta = bx(b"udta", &bx(b"meta", &meta));
+
+        let mut soun_hdlr = vec![0u8; 8];
+        soun_hdlr.extend_from_slice(b"soun");
+        soun_hdlr.extend_from_slice(&[0u8; 12]);
+        let mut stco = vec![0u8; 4];
+        stco.extend_from_slice(&1u32.to_be_bytes());
+        stco.extend_from_slice(&0u32.to_be_bytes());
+        let minf = bx(b"minf", &bx(b"stbl", &bx(b"stco", &stco)));
+        let mdia = bx(b"mdia", &[bx(b"hdlr", &soun_hdlr), minf, media].concat());
+        let trak = bx(b"trak", &[mdia, track].concat());
+        let moov = bx(
+            b"moov",
+            &[bx(b"mvhd", &[0u8; 8]), trak, udta, movie].concat(),
+        );
+        let ftyp = bx(b"ftyp", b"M4A isom");
+        let mdat = bx(b"mdat", mdat_payload);
+
+        let (out, moov_start, payload_at) = if moov_first {
+            let payload_at = ftyp.len() + moov.len() + 8;
+            ([ftyp.clone(), moov, mdat].concat(), ftyp.len(), payload_at)
+        } else {
+            let moov_start = ftyp.len() + mdat.len();
+            (
+                [ftyp.clone(), mdat, moov].concat(),
+                moov_start,
+                ftyp.len() + 8,
+            )
+        };
+        let mut out = out;
+        // Search only inside `moov`: the payload could hold a false `stco` match.
+        let stco_at = moov_start
+            + out[moov_start..]
+                .windows(4)
+                .position(|w| w == b"stco")
+                .expect("stco present");
+        let entry = stco_at + 12;
+        out[entry..entry + 4].copy_from_slice(&u32::try_from(payload_at).unwrap().to_be_bytes());
+        out
     }
 
     /// `m4a` plus a `covr` atom holding two `data` children (jpeg + png) — the

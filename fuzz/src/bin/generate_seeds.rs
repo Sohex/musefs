@@ -40,6 +40,10 @@ fn main() {
         "seed_two_covers",
         &fixtures::m4a_two_covers(&[9u8; 32]),
     );
+    // QuickTime keyed metadata (#771) at the movie, track and media levels: the
+    // `keys` table and index-typed `ilst` are unreachable by mutation from seed0,
+    // and the trak/mdia rebuild in synthesis only runs when a keyed `meta` exists.
+    write("mp4", "seed_keyed", &fixtures::m4a_keyed(&[9u8; 32]));
     write("ogg", "seed0", &fixtures::ogg_opus());
     write("ogg_page", "seed0", &fixtures::ogg_opus());
     write("vorbiscomment", "seed0", &fixtures::ogg_opus());

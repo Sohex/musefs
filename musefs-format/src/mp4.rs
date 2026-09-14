@@ -454,12 +454,13 @@ struct KeyedItem<'a> {
     datas: Vec<&'a [u8]>,
 }
 
-/// Every keyed-metadata item in the file, in precedence order: the movie-level
-/// `moov/meta`, then `moov/udta/meta` (where ffmpeg writes it), then each track's
-/// `trak/meta` and `trak/mdia/meta` — the three locations the QuickTime File
-/// Format allows, plus ffmpeg's. Within one `meta`, items keep `ilst` order.
-/// Lenient throughout: a malformed box ends only its own sibling list.
-fn keyed_items(buf: &[u8]) -> Vec<KeyedItem<'_>> {
+/// Every keyed-metadata `meta` in the file, as its children, in precedence
+/// order: the movie-level `moov/meta`, then `moov/udta/meta` (where ffmpeg
+/// writes it), then each track's `trak/meta` and `trak/mdia/meta` — the three
+/// locations the QuickTime File Format allows, plus ffmpeg's. Lenient
+/// throughout: a malformed box ends only its own sibling list. These are exactly
+/// the boxes synthesis drops, which the fuzz oracle checks against.
+pub(crate) fn keyed_metas(buf: &[u8]) -> Vec<&[u8]> {
     let Some(moov) = find_box_lenient(buf, b"moov") else {
         return Vec::new();
     };
@@ -470,15 +471,56 @@ fn keyed_items(buf: &[u8]) -> Vec<KeyedItem<'_>> {
         containers.push(trak);
         containers.extend(child_payloads(trak, b"mdia"));
     }
-    let mut items = Vec::new();
-    for container in containers {
-        for meta in child_payloads(container, b"meta") {
-            if is_keyed_meta(meta) {
-                items.extend(read_keyed_meta(meta_children(meta)));
-            }
-        }
-    }
-    items
+    containers
+        .into_iter()
+        .flat_map(|container| child_payloads(container, b"meta"))
+        .filter(|meta| is_keyed_meta(meta))
+        .map(meta_children)
+        .collect()
+}
+
+/// Every track's chunk offsets, in track order, from a whole `moov` box: the
+/// `stco` entries widened, or the `co64` ones. The relocation oracle in
+/// `fuzz_check` compares a served file's against its source's.
+#[cfg(any(test, feature = "fuzzing"))]
+pub(crate) fn chunk_offsets(moov: &[u8]) -> Result<Vec<Vec<u64>>> {
+    let payload = read_box(moov, 0)?.payload(moov);
+    child_boxes(payload)?
+        .into_iter()
+        .filter(|b| &b.kind == b"trak")
+        .map(|t| {
+            let trak = t.payload(payload);
+            let (range, width) = match find_path(trak, &[b"mdia", b"minf", b"stbl", b"stco"])? {
+                Some(r) => (r, 4),
+                None => (
+                    find_path(trak, &[b"mdia", b"minf", b"stbl", b"co64"])?
+                        .ok_or(FormatError::Malformed)?,
+                    8,
+                ),
+            };
+            let table = &trak[range.0..range.0 + range.1];
+            let count = usize_from(u64::from(read_u32_be(table, 4)?));
+            (0..count)
+                .map(|i| {
+                    let pos = 8 + i * width;
+                    if width == 4 {
+                        read_u32_be(table, pos).map(u64::from)
+                    } else {
+                        read_u64_be(table, pos)
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Every keyed-metadata item in the file: [`keyed_metas`] order, and `ilst`
+/// order within one `meta`.
+fn keyed_items(buf: &[u8]) -> Vec<KeyedItem<'_>> {
+    keyed_metas(buf)
+        .into_iter()
+        .flat_map(read_keyed_meta)
+        .collect()
 }
 
 /// The items of one keyed `meta` (given its children): each `ilst` item's box

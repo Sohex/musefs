@@ -1,6 +1,7 @@
 use super::{
-    ArtInput, BinaryTagInput, FormatError, Mp4Scan, RegionLayout, Result, Segment, TagInput,
-    child_boxes, child_boxes_lenient, find_path, read_box, read_u32_be, read_u64_be, size,
+    ArtInput, BinaryTagInput, BoxRef, FormatError, Mp4Scan, RegionLayout, Result, Segment,
+    TagInput, child_boxes, child_boxes_lenient, find_path, is_keyed_meta, read_box, read_u32_be,
+    read_u64_be, size,
 };
 
 pub(super) fn boxed(kind: &[u8; 4], payload: &[u8]) -> Result<Vec<u8>> {
@@ -302,8 +303,55 @@ pub(super) fn build_udta(
     Ok((segments, streamed_total))
 }
 
-/// Patch every `stco` (4-byte) or `co64` (8-byte) chunk offset in `kept` (moov
-/// children minus udta) by `delta`. Errors if a 32-bit offset would overflow.
+/// Re-emit a `trak` or `mdia` box (`b`, parsed from `container`) without the
+/// QuickTime keyed-metadata `meta` children it holds, descending into `mdia`
+/// when `descend` is set, so the track and media levels are both covered and
+/// nothing deeper (#771). The size is rewritten in the header width the box was
+/// written with — 8-byte, or 16-byte largesize.
+///
+/// The walk is lenient, the same walk `keyed_metas` reads with: the well-formed
+/// prefix of children is re-emitted (minus keyed `meta`s) and everything from the
+/// first unreadable child on is copied through verbatim. `validate_moov` parses
+/// only a track's first `mdia`, so a later one can be garbled; a strict walk
+/// would fail the file, and a verbatim copy would serve a keyed `meta` the scan
+/// ingested.
+fn without_keyed_meta(container: &[u8], b: BoxRef, descend: bool) -> Result<Vec<u8>> {
+    let payload = b.payload(container);
+    let children = child_boxes_lenient(payload);
+    let mut body = Vec::with_capacity(payload.len());
+    for c in &children {
+        if &c.kind == b"meta" && is_keyed_meta(c.payload(payload)) {
+            continue;
+        }
+        if descend && &c.kind == b"mdia" {
+            body.extend(without_keyed_meta(payload, *c, false)?);
+        } else {
+            body.extend_from_slice(&payload[c.start..c.end()]);
+        }
+    }
+    body.extend_from_slice(&payload[children.last().map_or(0, BoxRef::end)..]);
+
+    let total = b.header_len + body.len();
+    let mut out = Vec::with_capacity(total);
+    if b.header_len == 16 {
+        out.extend_from_slice(&1u32.to_be_bytes());
+        out.extend_from_slice(&b.kind);
+        out.extend_from_slice(&(total as u64).to_be_bytes());
+    } else {
+        out.extend_from_slice(
+            &u32::try_from(total)
+                .map_err(|_| FormatError::TooLarge)?
+                .to_be_bytes(),
+        );
+        out.extend_from_slice(&b.kind);
+    }
+    out.extend(body);
+    Ok(out)
+}
+
+/// Patch every `stco` (4-byte) or `co64` (8-byte) chunk offset in `kept` (the
+/// moov children synthesis keeps) by `delta`. Errors if a 32-bit offset would
+/// overflow.
 ///
 /// Every track is walked, not just the first. A chaptered `.m4b` carries its
 /// chapter text track's chunks in the same (single) `mdat` as the audio, so they
@@ -363,9 +411,18 @@ pub(super) fn patch_chunk_offsets(kept: &mut [u8], delta: i64) -> Result<()> {
 /// Regenerate a re-tagged `moov` and produce the serving layout
 /// `[ftyp][regenerated moov][mdat header][mdat payload]`. The mdat payload is
 /// served verbatim, merely relocated, so every chunk offset shifts by a constant
-/// `delta`. Patching only offset VALUES (never box sizes) means `new_moov_size`
-/// is computable before `delta` — no circular dependency. Cover art (every non-empty art row, in input order) and opaque `----`
-/// binary tags stream from the DB at read time, splicing into the layout.
+/// `delta`. Every box size synthesis changes — the rebuilt `udta`, and a `trak`
+/// or `mdia` a keyed `meta` was removed from — is settled into `kept` and the
+/// `udta` segments before `new_moov_size` is summed, and patching then touches
+/// only offset VALUES, so `delta` is computed from the final layout with no
+/// circular dependency. Cover art (every non-empty art row, in input order) and
+/// opaque `----` binary tags stream from the DB at read time, splicing into the
+/// layout.
+///
+/// The served file carries one metadata system, the store's: besides the old
+/// `udta`, every QuickTime keyed-metadata `meta` (handler `mdta`) at the movie,
+/// track and media levels is dropped (#771). A `meta` under any other handler,
+/// and every box the store does not model, passes through untouched.
 pub fn synthesize_layout(
     scan: &Mp4Scan,
     tags: &[TagInput],
@@ -377,20 +434,24 @@ pub fn synthesize_layout(
     let mut kept = Vec::new();
     let mut chpl: Option<Vec<u8>> = None;
     for b in child_boxes(moov_payload)? {
-        if &b.kind != b"udta" {
-            kept.extend_from_slice(&moov_payload[b.start..b.end()]);
-            continue;
-        }
-        // The old udta is dropped — the store is the source of truth for tags and
-        // art — except its Nero chapter list, which the store does not model and
-        // which is carried through verbatim (#672). The walk is lenient: a garbled
-        // sibling in a metadata box must not fail synthesis of the audio.
-        let udta = b.payload(moov_payload);
-        if let Some(c) = child_boxes_lenient(udta)
-            .into_iter()
-            .find(|c| &c.kind == b"chpl")
-        {
-            chpl = Some(udta[c.start..c.end()].to_vec());
+        match &b.kind {
+            b"udta" => {
+                // The old udta is dropped — the store is the source of truth for
+                // tags and art — except its Nero chapter list, which the store
+                // does not model and which is carried through verbatim (#672).
+                // The walk is lenient: a garbled sibling in a metadata box must
+                // not fail synthesis of the audio.
+                let udta = b.payload(moov_payload);
+                if let Some(c) = child_boxes_lenient(udta)
+                    .into_iter()
+                    .find(|c| &c.kind == b"chpl")
+                {
+                    chpl = Some(udta[c.start..c.end()].to_vec());
+                }
+            }
+            b"meta" if is_keyed_meta(b.payload(moov_payload)) => {}
+            b"trak" => kept.extend(without_keyed_meta(moov_payload, b, true)?),
+            _ => kept.extend_from_slice(&moov_payload[b.start..b.end()]),
         }
     }
 

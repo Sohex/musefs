@@ -2912,6 +2912,341 @@ fn read_pictures_reporting_caps_keyed_artwork() {
     assert!(dropped.is_empty());
 }
 
+/// A FullBox `meta` with a `hdlr` naming `handler`, then `body` verbatim.
+fn handler_meta(handler: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut hdlr = vec![0u8; 8];
+    hdlr.extend_from_slice(handler);
+    hdlr.extend_from_slice(&[0u8; 12]);
+    let mut p = vec![0u8; 4];
+    p.extend(bx(b"hdlr", &hdlr));
+    p.extend_from_slice(body);
+    bx(b"meta", &p)
+}
+
+/// A `soun` `mdia` with one `stco` entry of 0 (patched by [`mp4_around_traks`])
+/// followed by `extra` children.
+fn soun_mdia(extra: &[u8]) -> Vec<u8> {
+    let mut hdlr_p = vec![0u8; 8];
+    hdlr_p.extend_from_slice(b"soun");
+    hdlr_p.extend_from_slice(&[0u8; 12]);
+    let mut stco = vec![0u8; 4];
+    stco.extend_from_slice(&1u32.to_be_bytes());
+    stco.extend_from_slice(&0u32.to_be_bytes());
+    let minf = bx(b"minf", &bx(b"stbl", &bx(b"stco", &stco)));
+    bx(
+        b"mdia",
+        &[bx(b"hdlr", &hdlr_p), minf, extra.to_vec()].concat(),
+    )
+}
+
+/// `ftyp`, then `moov` = `mvhd` + `moov_children`, then `mdat` holding `audio`.
+/// The `n`th `stco` in the file gets the payload offset plus `chunk_offsets[n]`.
+fn mp4_around(moov_children: &[u8], audio: &[u8], chunk_offsets: &[u32]) -> Vec<u8> {
+    let moov = bx(
+        b"moov",
+        &[bx(b"mvhd", &[0u8; 8]), moov_children.to_vec()].concat(),
+    );
+    let mut out = [bx(b"ftyp", b"M4A isom"), moov, bx(b"mdat", audio)].concat();
+    let payload_at = u32::try_from(out.len() - audio.len()).unwrap();
+    let tables: Vec<usize> = out
+        .windows(4)
+        .enumerate()
+        .filter_map(|(i, w)| (w == b"stco").then_some(i))
+        .collect();
+    assert_eq!(tables.len(), chunk_offsets.len(), "one offset per stco");
+    for (at, add) in tables.into_iter().zip(chunk_offsets) {
+        let entry = at + 12;
+        out[entry..entry + 4].copy_from_slice(&(payload_at + add).to_be_bytes());
+    }
+    out
+}
+
+/// Materialize a layout with no streamed segments: inline bytes, and backing
+/// audio read from `backing`.
+fn serve_unstreamed(layout: &RegionLayout, backing: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for seg in layout.segments() {
+        match seg {
+            Segment::Inline(b) => out.extend_from_slice(b),
+            Segment::BackingAudio { offset, len } => {
+                let s = usize_from(*offset);
+                out.extend_from_slice(&backing[s..s + usize_from(*len)]);
+            }
+            other => panic!("unexpected streamed segment: {other:?}"),
+        }
+    }
+    out
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// The whole-box bytes of every child of `buf` of type `kind`.
+fn child_box_bytes(buf: &[u8], kind: &[u8; 4]) -> Vec<Vec<u8>> {
+    child_boxes(buf)
+        .unwrap()
+        .into_iter()
+        .filter(|b| &b.kind == kind)
+        .map(|b| buf[b.start..b.end()].to_vec())
+        .collect()
+}
+
+fn kinds(buf: &[u8]) -> Vec<[u8; 4]> {
+    child_boxes(buf).unwrap().iter().map(|b| b.kind).collect()
+}
+
+/// Synthesize `buf` with `tags` only, serve it, and check the invariants every
+/// keyed-metadata synthesis must hold: the served file re-parses strictly, its
+/// audio is byte-identical, it carries no keyed metadata anywhere, and its tags
+/// are exactly the store's. Returns the served file and its structure.
+fn synthesize_single_system(buf: &[u8], tags: &[TagInput]) -> (Vec<u8>, Mp4Scan) {
+    let scan = read_structure(buf).unwrap();
+    let layout = synthesize_layout(&scan, tags, &[], &[]).unwrap();
+    let served = serve_unstreamed(&layout, buf);
+    let served_scan = read_structure(&served).expect("served file re-parses strictly");
+    let old_audio = &buf[usize_from(scan.mdat_payload_offset)..];
+    assert_eq!(
+        &served[usize_from(served_scan.mdat_payload_offset)..],
+        old_audio
+    );
+    assert!(keyed_items(&served).is_empty(), "keyed metadata survived");
+    let want: Vec<(String, String)> = tags
+        .iter()
+        .map(|t| (t.key.clone(), t.value.clone()))
+        .collect();
+    assert_eq!(read_tags(&served), want);
+    (served, served_scan)
+}
+
+#[test]
+fn synthesize_drops_movie_level_keyed_meta_but_keeps_other_meta_handlers() {
+    // After an `artist` edit the served file must not also carry the original
+    // keyed `artist` (#771); a `meta` under another handler (here ID3-in-MP4's
+    // `ID32`) is not a system the store models and passes through untouched.
+    let keyed = keyed_meta(&[("com.apple.quicktime.artist", text("Old Keyed Artist"))]);
+    let id32 = handler_meta(b"ID32", &bx(b"ID32", b"\x00\x00ID3-opaque"));
+    let ffmpeg_udta = bx(
+        b"udta",
+        &ffmpeg_keyed_udta_meta(&[("artist", text("Old ffmpeg Artist"))]),
+    );
+    let trak = bx(b"trak", &soun_mdia(&[]));
+    let buf = mp4_around(
+        &[keyed, trak, id32.clone(), ffmpeg_udta].concat(),
+        b"AUDIODATA",
+        &[0],
+    );
+
+    let (served, s) = synthesize_single_system(&buf, &[TagInput::new("artist", "New Artist")]);
+    assert!(!contains(&served, b"Old Keyed Artist"));
+    assert!(!contains(&served, b"Old ffmpeg Artist"));
+    let mp = &s.moov[8..];
+    assert_eq!(kinds(mp), vec![*b"mvhd", *b"trak", *b"meta", *b"udta"]);
+    assert_eq!(child_box_bytes(mp, b"meta"), vec![id32]);
+    // The chunk offset follows the audio to its new position.
+    assert_eq!(
+        all_stco(&served),
+        vec![vec![u32::try_from(s.mdat_payload_offset).unwrap()]]
+    );
+}
+
+#[test]
+fn synthesize_drops_a_bare_and_a_fullbox_keyed_meta_alike() {
+    let bare = keyed_meta(&[("com.apple.quicktime.title", text("Old Bare"))]);
+    let full = ffmpeg_keyed_udta_meta(&[("com.apple.quicktime.album", text("Old Full"))]);
+    let trak = bx(b"trak", &soun_mdia(&[]));
+    let buf = mp4_around(&[bare, full, trak].concat(), b"AUDIO", &[0]);
+    let (served, s) = synthesize_single_system(&buf, &[TagInput::new("title", "T")]);
+    assert!(!contains(&served, b"Old Bare") && !contains(&served, b"Old Full"));
+    assert_eq!(kinds(&s.moov[8..]), vec![*b"mvhd", *b"trak", *b"udta"]);
+}
+
+#[test]
+fn synthesize_strips_keyed_meta_from_track_and_media_and_resizes_both() {
+    // Removing a nested box shrinks `mdia`, `trak` and `moov`. The stco value is
+    // then relocated by the delta the shrunken moov implies: both have to agree
+    // for the served file to parse strictly and point at the right audio.
+    let trak_meta = keyed_meta(&[(
+        "player.movie.audio.gain",
+        data_atom(23, &0.5f32.to_be_bytes()),
+    )]);
+    let mdia_meta = keyed_meta(&[("com.apple.quicktime.comment", text("Old comment"))]);
+    let trak_udta = bx(b"udta", &bx(b"tsrp", b"{\"transcript\":true}"));
+    let mdia_other = handler_meta(b"mdir", &bx(b"ilst", b""));
+    let mdia = soun_mdia(&[mdia_meta.clone(), mdia_other.clone()].concat());
+    let trak = bx(
+        b"trak",
+        &[trak_meta.clone(), mdia.clone(), trak_udta.clone()].concat(),
+    );
+    let buf = mp4_around(&trak, b"AUDIODATA", &[0]);
+
+    let (served, s) = synthesize_single_system(&buf, &[TagInput::new("title", "New")]);
+    assert!(!contains(&served, b"Old comment"));
+    assert!(!contains(&served, b"player.movie.audio.gain"));
+    let mp = &s.moov[8..];
+    let new_trak = child_boxes(mp).unwrap()[1];
+    assert_eq!(&new_trak.kind, b"trak");
+    assert_eq!(
+        new_trak.total_len,
+        trak.len() - trak_meta.len() - mdia_meta.len()
+    );
+    let trak_payload = new_trak.payload(mp);
+    assert_eq!(kinds(trak_payload), vec![*b"mdia", *b"udta"]);
+    assert_eq!(child_box_bytes(trak_payload, b"udta"), vec![trak_udta]);
+    let new_mdia = child_boxes(trak_payload).unwrap()[0];
+    assert_eq!(new_mdia.total_len, mdia.len() - mdia_meta.len());
+    let mdia_payload = new_mdia.payload(trak_payload);
+    assert_eq!(kinds(mdia_payload), vec![*b"hdlr", *b"minf", *b"meta"]);
+    assert_eq!(child_box_bytes(mdia_payload, b"meta"), vec![mdia_other]);
+    assert_eq!(
+        all_stco(&served),
+        vec![vec![u32::try_from(s.mdat_payload_offset).unwrap()]]
+    );
+}
+
+#[test]
+fn synthesize_strips_keyed_meta_under_a_largesize_trak_header() {
+    // A 64-bit largesize header keeps its form, with the shrunken size.
+    let meta = keyed_meta(&[("com.apple.quicktime.title", text("Old"))]);
+    let body = [soun_mdia(&[]), meta.clone()].concat();
+    let mut trak = 1u32.to_be_bytes().to_vec();
+    trak.extend_from_slice(b"trak");
+    trak.extend_from_slice(&(16 + body.len() as u64).to_be_bytes());
+    trak.extend_from_slice(&body);
+    let buf = mp4_around(&trak, b"AUDIODATA", &[0]);
+
+    let (served, s) = synthesize_single_system(&buf, &[TagInput::new("title", "New")]);
+    let mp = &s.moov[8..];
+    let new_trak = child_boxes(mp).unwrap()[1];
+    assert_eq!((new_trak.kind, new_trak.header_len), (*b"trak", 16));
+    assert_eq!(new_trak.total_len, trak.len() - meta.len());
+    assert_eq!(&mp[new_trak.start..new_trak.start + 4], &1u32.to_be_bytes());
+    assert_eq!(
+        all_stco(&served),
+        vec![vec![u32::try_from(s.mdat_payload_offset).unwrap()]]
+    );
+}
+
+#[test]
+fn synthesize_strip_keeps_bytes_trailing_the_last_track_child() {
+    // Up to 7 bytes after a `trak`'s last child are not a box; they are copied
+    // through rather than lost when a keyed meta before them is removed.
+    let meta = keyed_meta(&[("com.apple.quicktime.title", text("Old"))]);
+    let trak = bx(
+        b"trak",
+        &[soun_mdia(&[]), meta.clone(), b"tail".to_vec()].concat(),
+    );
+    let buf = mp4_around(&trak, b"AUDIODATA", &[0]);
+    let (_, s) = synthesize_single_system(&buf, &[TagInput::new("title", "New")]);
+    let mp = &s.moov[8..];
+    let new_trak = child_boxes(mp).unwrap()[1];
+    assert_eq!(new_trak.total_len, trak.len() - meta.len());
+    assert!(new_trak.payload(mp).ends_with(b"tail"));
+}
+
+#[test]
+fn synthesize_does_not_strip_meta_nested_below_mdia() {
+    // Keyed metadata is defined at the movie, track and media levels only; a
+    // `meta` deeper down (here inside `minf`) is an unmodelled box, left as is.
+    let meta = keyed_meta(&[("com.apple.quicktime.title", text("Deep"))]);
+    let mut hdlr_p = vec![0u8; 8];
+    hdlr_p.extend_from_slice(b"soun");
+    hdlr_p.extend_from_slice(&[0u8; 12]);
+    let mut stco = vec![0u8; 4];
+    stco.extend_from_slice(&1u32.to_be_bytes());
+    stco.extend_from_slice(&0u32.to_be_bytes());
+    let minf = bx(
+        b"minf",
+        &[bx(b"stbl", &bx(b"stco", &stco)), meta.clone()].concat(),
+    );
+    let trak = bx(
+        b"trak",
+        &bx(b"mdia", &[bx(b"hdlr", &hdlr_p), minf].concat()),
+    );
+    let buf = mp4_around(&trak, b"AUDIODATA", &[0]);
+    let scan = read_structure(&buf).unwrap();
+    let layout = synthesize_layout(&scan, &[], &[], &[]).unwrap();
+    let served = serve_unstreamed(&layout, &buf);
+    let s = read_structure(&served).unwrap();
+    assert_eq!(child_boxes(&s.moov[8..]).unwrap()[1].total_len, trak.len());
+    assert!(contains(&served, &meta));
+}
+
+#[test]
+fn synthesize_strips_keyed_meta_from_a_chaptered_m4b_keeping_chapters() {
+    // #672 still holds with keyed metadata in both tracks: the chapter track's
+    // chunk offset relocates with the audio's, and the Nero `chpl` survives.
+    let audio_meta = keyed_meta(&[("com.apple.quicktime.title", text("Old Title"))]);
+    let chapter_meta = keyed_meta(&[("com.apple.quicktime.comment", text("Old Chapter Meta"))]);
+    let movie_meta = keyed_meta(&[("com.apple.quicktime.artist", text("Old Artist"))]);
+    let soun = bx(b"trak", &[soun_mdia(&[]), audio_meta].concat());
+    let text_trak = {
+        let mut hdlr_p = vec![0u8; 8];
+        hdlr_p.extend_from_slice(b"text");
+        hdlr_p.extend_from_slice(&[0u8; 12]);
+        let mut stco = vec![0u8; 4];
+        stco.extend_from_slice(&1u32.to_be_bytes());
+        stco.extend_from_slice(&0u32.to_be_bytes());
+        let minf = bx(b"minf", &bx(b"stbl", &bx(b"stco", &stco)));
+        let mdia = bx(b"mdia", &[bx(b"hdlr", &hdlr_p), minf].concat());
+        bx(b"trak", &[mdia, chapter_meta].concat())
+    };
+    let chpl = chpl_box(&["One", "Two"]);
+    let udta = bx(
+        b"udta",
+        &[
+            itunes_meta(&bx(b"\xa9nam", &text("Old iTunes"))),
+            chpl.clone(),
+        ]
+        .concat(),
+    );
+    let buf = mp4_around(
+        &[movie_meta, soun, text_trak, udta].concat(),
+        b"AUDIODATACHAPTERS",
+        &[0, 9],
+    );
+
+    let (served, s) = synthesize_single_system(&buf, &[TagInput::new("title", "New")]);
+    for old in [
+        &b"Old Title"[..],
+        b"Old Chapter Meta",
+        b"Old Artist",
+        b"Old iTunes",
+    ] {
+        assert!(!contains(&served, old));
+    }
+    let p = u32::try_from(s.mdat_payload_offset).unwrap();
+    assert_eq!(all_stco(&served), vec![vec![p], vec![p + 9]]);
+    let mp = &s.moov[8..];
+    let udta = child_box_bytes(mp, b"udta").remove(0);
+    assert!(udta.ends_with(&chpl));
+}
+
+#[test]
+fn synthesize_strips_the_readable_prefix_of_a_garbled_second_mdia() {
+    // `validate_moov` parses only a track's first `mdia`, so a second one can be
+    // garbled inside. The reader still ingests the keyed `meta` in its readable
+    // prefix; synthesis must drop that same box, copying the unreadable rest
+    // through, rather than failing the file or serving the stale value.
+    let keyed = keyed_meta(&[("com.apple.quicktime.title", text("Old"))]);
+    let junk = [0, 0, 0, 99, b'j', b'u', b'n', b'k'];
+    let garbled = bx(b"mdia", &[keyed.clone(), junk.to_vec()].concat());
+    let trak = bx(b"trak", &[soun_mdia(&[]), garbled].concat());
+    let buf = mp4_around(&trak, b"AUDIODATA", &[0]);
+    assert_eq!(
+        read_tags(&buf),
+        vec![("title".to_string(), "Old".to_string())]
+    );
+
+    let (_, s) = synthesize_single_system(&buf, &[TagInput::new("title", "New")]);
+    let mp = &s.moov[8..];
+    let new_trak = child_boxes(mp).unwrap()[1];
+    assert_eq!(new_trak.total_len, trak.len() - keyed.len());
+    let trak_payload = new_trak.payload(mp);
+    let second = child_boxes(trak_payload).unwrap()[1];
+    assert_eq!(second.payload(trak_payload), junk);
+}
+
 #[test]
 fn read_binary_tags_never_reads_keyed_items() {
     let meta = keyed_meta(&[
