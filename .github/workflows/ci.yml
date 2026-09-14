@@ -369,6 +369,25 @@ jobs:
         run: cargo test -p musefs-fuse -- --ignored
       - name: FUSE fault-injection + concurrency (metrics feature)
         run: cargo test -p musefs-fuse --features metrics -- --ignored
+      - name: Kernel passthrough read path (as root)
+        # structure_only_reads_are_kernel_passthrough needs CAP_SYS_ADMIN for
+        # the FUSE backing-open ioctl, so the unprivileged run above skips it.
+        # Build the test binary as the runner user (the step above already
+        # compiled it), then run only that test as root; GitHub's Ubuntu runners
+        # have passwordless sudo and /dev/fuse. MUSEFS_REQUIRE_PASSTHROUGH turns
+        # the test's own skips (kernel < 6.9, no CAP_SYS_ADMIN) into failures,
+        # and the grep fails a name filter that matched nothing, which the
+        # harness would otherwise report as a pass.
+        run: |
+          set -euo pipefail
+          bin="$(cargo test -p musefs-fuse --features metrics --test passthrough --no-run \
+            --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .target.name == "passthrough" and .profile.test) | .executable')"
+          test -x "$bin"
+          sudo env MUSEFS_REQUIRE_PASSTHROUGH=1 "$bin" \
+            --ignored --exact structure_only_reads_are_kernel_passthrough \
+            --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/passthrough.log"
+          grep -q '^test result: ok\. 1 passed' "$RUNNER_TEMP/passthrough.log"
       - name: Binary-level end-to-end tests (musefs)
         run: cargo test -p musefs -- --ignored
       - name: latencyfs end-to-end tests
