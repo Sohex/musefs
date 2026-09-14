@@ -130,13 +130,13 @@ exclude_re = [
     # guard: op="<" fn="probe_body" rows=3
 'musefs-core/src/scan\.rs:1189:30:',
     # probe_body WAV ceiling-fallback guard `file_len > MAX_PROBE_BYTES` (`>` at
-    # :21): differs from `>=` only at file_len == MAX_PROBE_BYTES exactly, where the
+    # :41): differs from `>=` only at file_len == MAX_PROBE_BYTES exactly, where the
     # whole file already fits within probe_cap — so `probe_full` parses it (valid)
     # or `locate_audio_at_ceiling` rejects it on the same off+len>file_len bound
     # (corrupt), giving the identical skip either way. The ceiling branch is never
     # the deciding path at the boundary, so the mutant is equivalent.
     # guard: op=">" fn="probe_body" rows=3
-'musefs-core/src/scan\.rs:1200:21:',
+'musefs-core/src/scan\.rs:1201:41:',
     # `unparseable`'s diagnostic `file_len > MAX_PROBE_BYTES`: picks which of two
     # wordings the skip message carries (naming the probe ceiling, or not). It has
     # no effect on the returned verdict, its reason bucket, or any persisted state,
@@ -144,11 +144,11 @@ exclude_re = [
     # shim, like the metrics counters above. (Was in `probe_body` before #651 moved
     # the message out of the log call and into this helper.)
     # guard: op=">" fn="unparseable" rows=3
-'musefs-core/src/scan\.rs:1211:31:',
+'musefs-core/src/scan\.rs:1224:31:',
     # run_pipeline sync_channel capacity `jobs * 2`: pure throughput/blocking knob;
     # the persisted track set is identical for any positive capacity.
     # guard: op="*" fn="run_pipeline" rows=2
-'musefs-core/src/scan\.rs:2430:46:',
+'musefs-core/src/scan\.rs:2444:46:',
     # probe_body's tail-read predicate
     # `has_ext(mp3) || (has_ext(flac) && has_leading_id3(prefix))`, the inner `&&`
     # (col 66) -> `||`: widening it makes every .flac pay the 128-byte tail read,
@@ -174,30 +174,30 @@ exclude_re = [
     # safely description-anchored. Re-verify these coordinates (via
     # `cargo mutants --list`) after any change that reformats scan.rs.
     # guard: op="+=" fn="run_pipeline" rows=2
-'musefs-core/src/scan\.rs:2573:22:',
+'musefs-core/src/scan\.rs:2587:22:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2667:33:',
+'musefs-core/src/scan\.rs:2681:33:',
     # guard: op="||" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2667:48:',
+'musefs-core/src/scan\.rs:2681:48:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2667:63:',
+'musefs-core/src/scan\.rs:2681:63:',
     # guard: op="+=" fn="run_pipeline" rows=2
-'musefs-core/src/scan\.rs:2681:37:',
+'musefs-core/src/scan\.rs:2695:37:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2683:41:',
+'musefs-core/src/scan\.rs:2697:41:',
     # guard: op="||" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2683:56:',
+'musefs-core/src/scan\.rs:2697:56:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2683:71:',
+'musefs-core/src/scan\.rs:2697:71:',
     # Same cadence class, one level up: each threshold flush is a let-chain
     # (`(len >= BATCH_FILES || batch_bytes >= cap) && let Err(e) = flush(..)`), so
     # `&&`->`||` short-circuits past the mid-loop flush exactly when the threshold
     # IS met — deferring the commit to the flush-on-empty / final flush, which
     # persist the identical track set and still surface a flush error (#618).
     # guard: op="&&" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2668:21:',
+'musefs-core/src/scan\.rs:2682:21:',
     # guard: op="&&" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2684:29:',
+'musefs-core/src/scan\.rs:2698:29:',
     # `ByteBudget::acquire`'s wait guard (`!st.closed && in_flight != 0 && ...`),
     # the FIRST `&&`->`||`. `&&` binds tighter than `||`, so the guard becomes
     # `!closed || (in_flight != 0 && over_cap)` and every reservation against an
@@ -218,11 +218,11 @@ exclude_re = [
     # scan.failed + skip_failed` sum is also insensitive to `+`->`-` (the `+`->`*`
     # variant IS caught, so only `-` is excluded here).
     # guard: op="+=" fn="revalidate_with" rows=2
-'musefs-core/src/scan\.rs:2866:29:',
+'musefs-core/src/scan\.rs:2880:29:',
     # guard: op="+=" fn="revalidate_with" rows=2
-'musefs-core/src/scan\.rs:2878:33:',
+'musefs-core/src/scan\.rs:2892:33:',
     # guard: op="+" fn="revalidate_with" rows=1
-'musefs-core/src/scan\.rs:2993:29: replace \+ with -',
+'musefs-core/src/scan\.rs:3007:29: replace \+ with -',
     # Phase 2 ID3 binary tags: classify_binary_frame's POPM counter fold
     # `(a << 8) | b` -> `(a << 8) ^ b`. The accumulator is left-shifted by 8 before
     # each combine, so its low byte is always zero where `b` lands; `|` and `^` are

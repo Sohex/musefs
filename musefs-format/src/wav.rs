@@ -118,23 +118,21 @@ fn chunk_slice(buf: &[u8], offset: usize, len: u64) -> Option<&[u8]> {
     buf.get(offset..end)
 }
 
-/// Parse the file and return the `data` chunk payload bounds, or an error to skip
-/// it. Requires both `fmt ` and `data` within the declared RIFF form, and the
-/// `data` payload must fit in that form.
-pub fn locate_audio(buf: &[u8]) -> Result<WavBounds> {
-    let (_, form_end, _) = riff_wave_start(buf)?;
-    if form_end > buf.len() as u64 {
-        return Err(FormatError::Malformed);
-    }
+/// The `data` payload bounds out of a form-bounded walk of `buf`, shared by the
+/// full and the ceiling locators (each has already checked `form_end` against the
+/// bound it trusts). Requires both `fmt ` and a top-level `data`. A file with
+/// `fmt ` whose waveform is a `LIST('wavl')` instead is refused by name (#769): no
+/// mainstream decoder plays one.
+fn data_bounds(buf: &[u8], form_end: u64) -> Result<WavBounds> {
     let chunks = walk_chunks(buf);
     let has_fmt = chunks.iter().any(|(id, _, _)| id == b"fmt ");
     let data = chunks.iter().find(|(id, _, _)| id == b"data");
     match (has_fmt, data) {
         (true, Some(&(_, off, len))) => {
             // `walk_chunks` bounds chunk headers to `form_end`; this additionally
-            // rejects a `data` chunk whose payload spills past the form. (`form_end
-            // <= buf.len()` is enforced above, so a separate buffer-bound check on
-            // `data_end` would be redundant.)
+            // rejects a `data` chunk whose payload spills past the form. (Each
+            // caller bounds `form_end` by the buffer or the file, so a separate
+            // check of `data_end` against those would be redundant.)
             let data_end = (off as u64).saturating_add(len);
             if data_end > form_end {
                 return Err(FormatError::Malformed);
@@ -144,8 +142,26 @@ pub fn locate_audio(buf: &[u8]) -> Result<WavBounds> {
                 audio_length: len,
             })
         }
+        (true, None)
+            if chunks
+                .iter()
+                .any(|&(id, off, _)| &id == b"LIST" && buf.get(off..off + 4) == Some(b"wavl")) =>
+        {
+            Err(FormatError::WavWaveList)
+        }
         _ => Err(FormatError::NotWav),
     }
+}
+
+/// Parse the file and return the `data` chunk payload bounds, or an error to skip
+/// it. Requires both `fmt ` and `data` within the declared RIFF form, and the
+/// `data` payload must fit in that form.
+pub fn locate_audio(buf: &[u8]) -> Result<WavBounds> {
+    let (_, form_end, _) = riff_wave_start(buf)?;
+    if form_end > buf.len() as u64 {
+        return Err(FormatError::Malformed);
+    }
+    data_bounds(buf, form_end)
 }
 
 /// Bounded twin of [`locate_audio`]. WAV metadata chunks can trail the `data`
@@ -171,26 +187,7 @@ pub fn locate_audio_at_ceiling(prefix: &[u8], file_len: u64) -> Result<WavBounds
     if form_end > file_len {
         return Err(FormatError::Malformed);
     }
-    let chunks = walk_chunks(prefix);
-    let has_fmt = chunks.iter().any(|(id, _, _)| id == b"fmt ");
-    let data = chunks.iter().find(|(id, _, _)| id == b"data");
-    match (has_fmt, data) {
-        (true, Some(&(_, off, len))) => {
-            // `walk_chunks` bounds chunk headers to `form_end`; this additionally
-            // rejects a `data` chunk whose payload spills past the form. (`form_end
-            // <= file_len` is enforced above, so a separate file-bound check on
-            // `data_end` would be redundant.)
-            let data_end = (off as u64).saturating_add(len);
-            if data_end > form_end {
-                return Err(FormatError::Malformed);
-            }
-            Ok(WavBounds {
-                audio_offset: off as u64,
-                audio_length: len,
-            })
-        }
-        _ => Err(FormatError::NotWav),
-    }
+    data_bounds(prefix, form_end)
 }
 
 /// Read the preserved structural chunks (`fmt `, optional `fact`) from the front
@@ -786,6 +783,85 @@ mod tests {
         let tags = read_tags(&out);
         assert!(tags.contains(&("title".to_string(), "Big".to_string())));
         assert!(tags.contains(&("albumartist".to_string(), "Various".to_string())));
+    }
+
+    /// A `LIST('wavl')` waveform (#769): a `data` run, then a `slnt` silence of
+    /// 1 000 samples, in place of a top-level `data` chunk.
+    fn wavl_list(order: ByteOrder) -> Vec<u8> {
+        let mut list = b"wavl".to_vec();
+        for (id, payload) in [
+            (b"data", vec![0x11u8; 4]),
+            (b"slnt", order.u32_bytes(1_000).to_vec()),
+        ] {
+            list.extend_from_slice(id);
+            list.extend_from_slice(&order.u32_bytes(4));
+            list.extend_from_slice(&payload);
+        }
+        list
+    }
+
+    #[test]
+    fn a_wavl_waveform_is_refused_by_name() {
+        let le = wav(&[
+            (b"fmt ", fmt_pcm()),
+            (b"LIST", wavl_list(ByteOrder::Little)),
+        ]);
+        let be = rifx(&[
+            (b"fmt ", fmt_pcm_be()),
+            (b"LIST", wavl_list(ByteOrder::Big)),
+        ]);
+        for buf in [le, be] {
+            let len = buf.len() as u64;
+            assert_eq!(locate_audio(&buf), Err(FormatError::WavWaveList));
+            assert_eq!(
+                locate_audio_bounded(&buf, len).unwrap_err(),
+                FormatError::WavWaveList
+            );
+            assert_eq!(
+                locate_audio_at_ceiling(&buf[..12 + 24 + 12], len),
+                Err(FormatError::WavWaveList),
+                "the ceiling path sees only the list's header and type"
+            );
+        }
+        assert!(
+            FormatError::WavWaveList
+                .to_string()
+                .contains("LIST('wavl')")
+        );
+    }
+
+    #[test]
+    fn only_a_wavl_list_standing_in_for_data_is_refused_by_name() {
+        // Another list type without `data` is still just not a WAV.
+        let info = wav(&[
+            (b"fmt ", fmt_pcm()),
+            (b"LIST", info_payload(&[(b"INAM", "x")])),
+        ]);
+        assert_eq!(locate_audio(&info), Err(FormatError::NotWav));
+        // So is a wavl list with no `fmt ` to describe it.
+        let no_fmt = wav(&[(b"LIST", wavl_list(ByteOrder::Little))]);
+        assert_eq!(locate_audio(&no_fmt), Err(FormatError::NotWav));
+        let len = no_fmt.len() as u64;
+        assert_eq!(
+            locate_audio_at_ceiling(&no_fmt, len),
+            Err(FormatError::NotWav)
+        );
+        // A list header whose type lies past the buffer cannot be named.
+        let le = wav(&[
+            (b"fmt ", fmt_pcm()),
+            (b"LIST", wavl_list(ByteOrder::Little)),
+        ]);
+        assert_eq!(
+            locate_audio_at_ceiling(&le[..12 + 24 + 8], le.len() as u64),
+            Err(FormatError::NotWav)
+        );
+        // A top-level `data` chunk is the waveform, whatever else the file holds.
+        let both = wav(&[
+            (b"fmt ", fmt_pcm()),
+            (b"LIST", wavl_list(ByteOrder::Little)),
+            (b"data", vec![0x22; 6]),
+        ]);
+        assert_eq!(locate_audio(&both).unwrap().audio_length, 6);
     }
 
     #[test]
