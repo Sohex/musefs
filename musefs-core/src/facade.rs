@@ -67,8 +67,9 @@ pub struct MountConfig {
     /// on every traversal after the first (#668).
     ///
     /// Scoped to `getattr` alone: `open` and the read paths validate
-    /// unconditionally, so a changed backing is still caught before any byte is
-    /// served and the `BackingChanged` guarantee is untouched. What the flag
+    /// unconditionally, so a changed backing is still caught before musefs
+    /// serves any byte of it and the `BackingChanged` guarantee is untouched.
+    /// What the flag
     /// trades away is the freshness of the size and mtime a `stat` reports
     /// between the change and the next `open`.
     pub trust_backing_mtime: bool,
@@ -580,7 +581,9 @@ impl Musefs {
                 // skips the re-stat below, for backings where that stat is a
                 // network round trip rather than a microsecond (#668). The
                 // opt-out stops here: the miss path below still stats, and so do
-                // `open` and the read paths, so no stale byte is ever served.
+                // `open` and the read paths, so musefs serves no byte of a
+                // changed backing file. Pages the kernel cached under
+                // `--keep-cache` never reach it, and are not its to police.
                 if self.config.trust_backing_mtime {
                     return Ok((e.total_len, e.mtime));
                 }

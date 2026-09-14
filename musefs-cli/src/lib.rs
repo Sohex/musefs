@@ -173,18 +173,23 @@ pub struct MountArgs {
     #[arg(long, env = "MUSEFS_WORKERS", default_value_t = 0)]
     pub workers: usize,
     /// Keep the kernel page cache across opens. On by default: it is the one
-    /// measured storage win (~3× faster repeat-open on HDD/NFS, #432). External
-    /// re-tags auto-invalidate the affected inodes on refresh, so cached bytes
-    /// are dropped when content changes. Disable with `--keep-cache false`.
+    /// measured storage win (~3× faster repeat-open on HDD/NFS, #432). A change
+    /// recorded in the store, such as a re-tag, drops the affected files' cached
+    /// pages at the mount's next refresh. A backing file rewritten in place
+    /// records nothing, so a file already open can keep reading pages cached
+    /// before the rewrite; those reads never reach musefs, which fails the reads
+    /// and opens it does see. Disable with `--keep-cache false`.
     #[arg(long, env = "MUSEFS_KEEP_CACHE", default_value_t = true, num_args = 0..=1, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub keep_cache: bool,
     /// Skip the backing re-stat that `getattr` does on a metadata-cache hit,
     /// serving the cached size/mtime instead. Off by default. Worth setting only
     /// on high-latency backing (NFS, SMB, a spun-down array), where that stat is
     /// a round trip paid once per track on every traversal after the first.
-    /// `open` and reads keep validating, so no stale bytes are ever served; what
-    /// goes stale is the size/mtime a `stat` reports for a backing file changed
-    /// without the store being updated.
+    /// `open` and every read that reaches musefs keep validating, so the flag
+    /// lets no byte of a changed backing file through musefs; what goes stale is
+    /// the size/mtime a `stat` reports for a backing file changed without the
+    /// store being updated, until the next `open`. Pages the kernel cached under
+    /// `--keep-cache` are a separate matter (see its help).
     #[arg(long, env = "MUSEFS_TRUST_BACKING_MTIME", value_parser = clap::builder::BoolishValueParser::new())]
     pub trust_backing_mtime: bool,
     /// Compare filenames case-insensitively: case-variant directories merge and
