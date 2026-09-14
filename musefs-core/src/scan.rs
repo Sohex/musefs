@@ -1007,12 +1007,19 @@ fn read_mp3_tail(file: &std::fs::File, file_len: u64) -> std::io::Result<Option<
     use std::os::unix::fs::FileExt;
     let cap = file_len.min(MAX_PROBE_BYTES);
     let mut want = MP3_TAIL_WINDOW.min(cap);
-    // `locate_trailer` only asks for more than it was given, so each pass under
-    // the ceiling reads further back than the last.
+    // The file's last `bytes.len()` bytes. `locate_trailer` only asks for more
+    // than it was given, so each pass under the ceiling reads further back than
+    // the last, and only the bytes in front of what it already holds: the whole
+    // tail is read once, not once per widening.
+    let mut bytes = Vec::new();
     for _ in 0..MAX_MP3_TAIL_READS {
-        let mut bytes = vec![0u8; usize_from(want)];
-        file.read_exact_at(&mut bytes, file_len - want)?;
-        crate::metrics::on_scan_read(want);
+        let fresh = want - bytes.len() as u64;
+        let mut widened = vec![0u8; usize_from(want)];
+        let (front, held) = widened.split_at_mut(usize_from(fresh));
+        file.read_exact_at(front, file_len - want)?;
+        crate::metrics::on_scan_read(fresh);
+        held.copy_from_slice(&bytes);
+        bytes = widened;
         match mp3::locate_trailer(&bytes, file_len) {
             Ok(Extent::Complete(trailer)) => return Ok(Some(Mp3Tail { bytes, trailer })),
             Ok(Extent::NeedMore { up_to }) => {
