@@ -6,6 +6,7 @@
 //! themselves rather than block on an answer nobody is there to give.
 
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
 use clap::Parser;
 use musefs_cli::{Cli, Command, MigrateArgs, run_migrate};
@@ -87,6 +88,26 @@ fn a_named_snapshot_goes_where_it_was_asked_to() {
     assert_eq!(user_version(&dest), LATEST_VERSION - 1);
 }
 
+/// A run killed while writing its snapshot leaves the copy under a temporary
+/// name beside it, never under the snapshot's own, so a torn file cannot pass
+/// for a snapshot or block the rerun. The rerun removes it and completes.
+#[test]
+fn an_interrupted_snapshot_is_cleared_and_the_rerun_completes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = gated_store(dir.path());
+    let snapshot = dir
+        .path()
+        .join(format!("library.db.v{}.bak", LATEST_VERSION - 1));
+    let torn = PathBuf::from(format!("{}.partial-4242-0-17", snapshot.display()));
+    std::fs::write(&torn, b"half a database").unwrap();
+
+    run_migrate(&args(&db)).unwrap();
+
+    assert!(!torn.exists(), "the torn copy is removed");
+    assert_eq!(user_version(&snapshot), LATEST_VERSION - 1);
+    assert_eq!(user_version(&db), LATEST_VERSION);
+}
+
 /// Overwriting a backup is exactly the thing a backup exists to prevent, and
 /// the refusal has to name the way out.
 #[test]
@@ -102,7 +123,7 @@ fn an_occupied_snapshot_destination_is_refused_before_anything_changes() {
 
     assert!(err.contains("already exists"), "{err}");
     assert!(err.contains("--no-snapshot"), "{err}");
-    assert_eq!(user_version(&db), LATEST_VERSION - 1, "store untouched");
+    assert_eq!(user_version(&db), LATEST_VERSION - 1, "store not upgraded");
     assert_eq!(std::fs::read(&dest).unwrap(), b"not a database");
 }
 
@@ -118,7 +139,7 @@ fn without_yes_and_without_a_terminal_it_refuses_and_names_the_flag() {
     let err = run_migrate(&migrate_args).unwrap_err().to_string();
 
     assert!(err.contains("--yes"), "{err}");
-    assert_eq!(user_version(&db), LATEST_VERSION - 1, "store untouched");
+    assert_eq!(user_version(&db), LATEST_VERSION - 1, "store not upgraded");
 }
 
 /// Running it twice is what a provisioning script does. The second run is a
@@ -167,7 +188,7 @@ fn a_store_another_connection_is_using_is_refused() {
     let err = run_migrate(&args(&db)).unwrap_err().to_string();
 
     assert!(err.contains("in use"), "{err}");
-    assert_eq!(user_version(&db), LATEST_VERSION - 1, "store untouched");
+    assert_eq!(user_version(&db), LATEST_VERSION - 1, "store not upgraded");
     assert!(
         !dir.path()
             .join(format!("library.db.v{}.bak", LATEST_VERSION - 1))
@@ -219,7 +240,7 @@ fn a_store_with_a_refused_row_is_not_upgraded_without_repair() {
     assert_eq!(
         user_version(&db),
         before,
-        "the store is untouched: the refusal comes before anything is written"
+        "the store is not upgraded: the refusal comes before anything is written"
     );
     assert!(
         !dir.path()
@@ -250,7 +271,137 @@ fn repair_deletes_the_refused_row_and_upgrades() {
 #[test]
 fn a_revalidate_with_failures_is_reported_to_the_caller() {
     let dir = tempfile::tempdir().unwrap();
+    let db = store_with_an_unparseable_track(dir.path());
+
+    let mut migrate_args = args(&db);
+    migrate_args.revalidate = Some(true);
+    assert_eq!(run_migrate(&migrate_args).unwrap(), 1);
+    assert_eq!(
+        user_version(&db),
+        LATEST_VERSION,
+        "the upgrade itself landed"
+    );
+}
+
+/// #750: `run` is what turns that count into the process's exit status, and a
+/// script chaining on it must be able to tell a partial revalidate from a clean
+/// one. Exit 2 for the failure, success for the same upgrade without one.
+#[test]
+fn run_exits_two_only_when_the_offered_revalidate_counts_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = store_with_an_unparseable_track(dir.path());
+    let failing = musefs_cli::run(Cli::parse_from(migrate_argv(&db, &["--revalidate"]))).unwrap();
+    assert_eq!(failing, ExitCode::from(2));
+    assert_eq!(user_version(&db), LATEST_VERSION, "the upgrade landed");
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = gated_store(dir.path());
+    let clean = musefs_cli::run(Cli::parse_from(migrate_argv(&db, &["--revalidate"]))).unwrap();
+    assert_eq!(clean, ExitCode::SUCCESS);
+}
+
+/// `--vacuum` compacts the upgraded store: no free page is left behind, and the
+/// file is smaller than the same upgrade leaves it without the flag.
+#[test]
+fn vacuum_compacts_the_upgraded_store() {
+    let upgraded = |vacuum: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        let db = gated_store(dir.path());
+        // Free pages for the vacuum to reclaim, beyond the ones the upgrade's
+        // own table rebuilds leave.
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE bloat (b BLOB); \
+                 INSERT INTO bloat VALUES (zeroblob(4 * 1024 * 1024)); \
+                 DROP TABLE bloat;",
+            )
+            .unwrap();
+        let code = musefs_cli::run(Cli::parse_from(migrate_argv(
+            &db,
+            &["--no-snapshot", vacuum],
+        )))
+        .unwrap();
+        assert_eq!(code, ExitCode::SUCCESS);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let free: i64 = conn
+            .pragma_query_value(None, "freelist_count", |r| r.get(0))
+            .unwrap();
+        drop(conn);
+        (free, std::fs::metadata(&db).unwrap().len(), dir)
+    };
+
+    let (free_kept, size_kept, _dir) = upgraded("--vacuum=false");
+    let (free_vacuumed, size_vacuumed, _dir) = upgraded("--vacuum");
+    assert!(free_kept > 0, "the unvacuumed upgrade leaves free pages");
+    assert_eq!(free_vacuumed, 0, "--vacuum leaves none");
+    assert!(
+        size_vacuumed < size_kept,
+        "--vacuum shrinks the store: {size_vacuumed} vs {size_kept} bytes"
+    );
+}
+
+/// #706: every command that opens a store for ordinary work refuses one a gated
+/// step stands in front of, names the remedy, and leaves the store as it found
+/// it. `mount` is driven through `--dry-run`, which opens the store exactly as a
+/// mount does and never reaches FUSE.
+///
+/// Compared byte for byte, which is only meaningful with the WAL checkpointed
+/// into the file first: a refusing open that closes the last connection
+/// checkpoints whatever frames were pending, which changes the bytes without
+/// changing the data. Checkpointed, nothing is pending, so any change is one the
+/// refusal made.
+#[test]
+fn ordinary_commands_refuse_a_gated_store_and_leave_it_as_it_was() {
+    let dir = tempfile::tempdir().unwrap();
     let library = dir.path().join("lib");
+    std::fs::create_dir(&library).unwrap();
+    let db = gated_store(dir.path());
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+        .unwrap();
+    let before = std::fs::read(&db).unwrap();
+
+    let (db_arg, lib_arg) = (db.to_str().unwrap(), library.to_str().unwrap());
+    for argv in [
+        vec!["musefs", "mount", "--db", db_arg, "--dry-run"],
+        vec!["musefs", "scan", lib_arg, "--db", db_arg, "--jobs", "1"],
+        vec![
+            "musefs",
+            "revalidate",
+            lib_arg,
+            "--db",
+            db_arg,
+            "--jobs",
+            "1",
+        ],
+        vec!["musefs", "vacuum", "--db", db_arg],
+    ] {
+        let command = argv[1];
+        let err = musefs_cli::run(Cli::parse_from(&argv))
+            .expect_err(&format!("`{command}` must refuse a gated store"));
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("run `musefs migrate --db <store>`"),
+            "`{command}` must name the remedy: {message}"
+        );
+        assert_eq!(
+            user_version(&db),
+            LATEST_VERSION - 1,
+            "`{command}` left the version where it was"
+        );
+        assert!(
+            std::fs::read(&db).unwrap() == before,
+            "`{command}` left the store byte-identical"
+        );
+    }
+}
+
+/// A gated store with one track whose file parses as nothing, so the revalidate
+/// `migrate` offers counts it as failed.
+fn store_with_an_unparseable_track(dir: &Path) -> PathBuf {
+    let library = dir.join("lib");
     std::fs::create_dir(&library).unwrap();
     // A supported extension over bytes that parse as nothing: the revalidate's
     // probe refuses it, which is a failure, not a crash.
@@ -261,25 +412,33 @@ fn a_revalidate_with_failures_is_reported_to_the_caller() {
     // `/var` -> `/private/var` symlink.
     let broken = std::fs::canonicalize(&broken).unwrap();
 
-    let db = gated_store(dir.path());
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    conn.execute(
-        "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
-         backing_size, backing_mtime_ns, backing_ctime_ns, updated_at) \
-         VALUES (CAST(?1 AS BLOB), 'flac', 0, 0, 0, 0, 0, 0)",
-        [broken.to_str().expect("tempdir paths are UTF-8")],
-    )
-    .unwrap();
-    drop(conn);
+    let db = gated_store(dir);
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime_ns, backing_ctime_ns, updated_at) \
+             VALUES (CAST(?1 AS BLOB), 'flac', 0, 0, 0, 0, 0, 0)",
+            [broken.to_str().expect("tempdir paths are UTF-8")],
+        )
+        .unwrap();
+    db
+}
 
-    let mut migrate_args = args(&db);
-    migrate_args.revalidate = Some(true);
-    assert_eq!(run_migrate(&migrate_args).unwrap(), 1);
-    assert_eq!(
-        user_version(&db),
-        LATEST_VERSION,
-        "the upgrade itself landed"
-    );
+/// The command line `musefs migrate` gets in a script: confirmed, one probe
+/// worker, plus `extra`.
+fn migrate_argv<'a>(db: &'a Path, extra: &[&'a str]) -> Vec<&'a str> {
+    let mut argv = vec![
+        "musefs",
+        "migrate",
+        "--db",
+        db.to_str().expect("tempdir paths are UTF-8"),
+        "--yes",
+        "--jobs",
+        "1",
+    ];
+    argv.extend_from_slice(extra);
+    argv
 }
 
 /// `run_migrate` is public and its arguments are plain fields, so the parser's

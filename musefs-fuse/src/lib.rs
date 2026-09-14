@@ -12,11 +12,13 @@ use std::time::{Duration, SystemTime};
 use threadpool::ThreadPool;
 
 use crate::convert::{assemble_dir_listing, make_attr, to_file_attr};
+#[cfg(any(test, feature = "test-support"))]
+use fuser::BackgroundSession;
 use fuser::{
-    AccessFlags, BackgroundSession, Config, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
-    Generation, INodeNo, InitFlags, KernelConfig, LockOwner, Notifier, OpenAccMode, OpenFlags,
-    ReplyAttr, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen,
-    ReplyStatfs, ReplyXattr, Request, Session,
+    AccessFlags, Config, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
+    INodeNo, InitFlags, KernelConfig, LockOwner, Notifier, OpenAccMode, OpenFlags, ReplyAttr,
+    ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs,
+    ReplyXattr, Request, Session,
 };
 use musefs_core::CoreError;
 use musefs_core::Fh;
@@ -2081,11 +2083,16 @@ pub fn mount_with(
 }
 
 /// Background-session mount with default tuning; the handle's `Drop` unmounts.
+/// Test scaffolding, behind `test-support` (#710): the mount e2e tests drive a
+/// mount from the test thread with it.
+#[cfg(any(test, feature = "test-support"))]
 pub fn spawn(core: Musefs, mountpoint: &Path, fs_name: &str) -> std::io::Result<BackgroundSession> {
     spawn_with(core, mountpoint, fs_name, FuseConfig::default())
 }
 
 /// Background-session mount with explicit tuning; the handle's `Drop` unmounts.
+/// Test scaffolding, behind `test-support` (#710).
+#[cfg(any(test, feature = "test-support"))]
 pub fn spawn_with(
     core: Musefs,
     mountpoint: &Path,

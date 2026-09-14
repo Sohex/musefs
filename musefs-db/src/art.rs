@@ -1,7 +1,14 @@
-use crate::error::{check_art_count, check_field_bytes, check_text_field};
-use crate::limits::{ART_SHA256_LEN, MAX_ART_BYTES, MAX_ART_DESCRIPTION_LEN, MAX_ART_MIME_LEN};
-use crate::models::{Art, ArtMeta, EmbeddedArt, NewArt, TrackArt};
+use crate::error::{check_art_count, check_text_field};
+use crate::limits::{MAX_ART_DESCRIPTION_LEN, MAX_ART_MIME_LEN};
+#[cfg(any(test, feature = "test-support"))]
+use crate::models::Art;
+use crate::models::{ArtMeta, EmbeddedArt, NewArt, TrackArt};
 use crate::{Db, ReadWrite, Result};
+#[cfg(any(test, feature = "test-support"))]
+use crate::{
+    error::check_field_bytes,
+    limits::{ART_SHA256_LEN, MAX_ART_BYTES},
+};
 use rusqlite::params;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -19,6 +26,9 @@ impl<M> Db<M> {
     ///
     /// The picture metadata that used to live here moved to `track_art` (#716):
     /// it describes one file's embedding, not the bytes every file shares.
+    ///
+    /// Test scaffolding (#710): the serve path streams the blob instead.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn get_art(&self, id: i64) -> Result<Option<Art>> {
         crate::query_optional(
             &self.conn,
@@ -43,6 +53,10 @@ impl<M> Db<M> {
     /// once the picture metadata moved to the link that describes it (#716).
     /// Synthesis needs the length to size the segment; everything else it needs
     /// now comes from `track_art`.
+    ///
+    /// Test scaffolding (#710): synthesis reads the length through
+    /// `get_track_art_with_meta`.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn get_art_meta(&self, id: i64) -> Result<Option<ArtMeta>> {
         crate::query_optional(
             &self.conn,
@@ -73,6 +87,9 @@ impl<M> Db<M> {
         Ok(buf)
     }
 
+    /// A track's picture links. Test scaffolding (#710): synthesis reads them
+    /// with the blob lengths through `get_track_art_with_meta`.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn get_track_art(&self, track_id: i64) -> Result<Vec<TrackArt>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT length(description), length(CAST(description AS BLOB)),

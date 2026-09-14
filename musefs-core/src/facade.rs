@@ -518,6 +518,8 @@ impl Musefs {
     }
 
     /// The parent inode of `inode` (root's parent is itself). Forwards to the tree.
+    /// Test scaffolding (#710): the FUSE layer asks a pinned `TreeSnapshot`.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn parent(&self, inode: u64) -> Option<u64> {
         self.tree.load().parent(inode)
     }
@@ -641,7 +643,9 @@ impl Musefs {
     /// prefetch is off). Serving never needs this — prefetch is speculative and
     /// fire-and-forget — but a caller that samples the prefetch counters, or
     /// that owns the backing filesystem itself and is about to tear it down,
-    /// does. See `PrefetchWorkers::drain`.
+    /// does. See `PrefetchWorkers::drain`. Test scaffolding,
+    /// behind `test-support` (#710).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn drain_prefetch(&self, timeout: std::time::Duration) -> bool {
         self.prefetch.as_ref().is_none_or(|pf| pf.drain(timeout))
     }
@@ -929,7 +933,9 @@ impl Musefs {
         Err(last.expect("the retry loop runs at least once"))
     }
 
-    /// Allocating form of `read_into`.
+    /// Allocating form of `read_into`. Test scaffolding, behind `test-support`
+    /// (#710): the FUSE layer reads into a reused buffer.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn read(&self, inode: u64, fh: Option<Fh>, offset: u64, size: u64) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         self.read_into(inode, fh, offset, size, &mut out)?;

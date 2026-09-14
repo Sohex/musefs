@@ -58,7 +58,10 @@ its env var, which overrides the default. Boolean flags (e.g.
 `MUSEFS_QUIET`, `MUSEFS_ALLOW_OTHER`, `MUSEFS_CASE_INSENSITIVE`,
 `MUSEFS_EXPOSE_METRICS`) accept a
 case-insensitive boolish value — `true`/`false`, `yes`/`no`, `on`/`off`,
-`1`/`0` — and reject anything else. The repeatable `--fallback`,
+`1`/`0` — and reject anything else. Set to the empty string, the way
+`Environment=MUSEFS_QUIET=` in a systemd unit or `MUSEFS_QUIET=` in an env file
+blanks a variable, a boolean flag's variable counts as unset and the flag keeps
+its default. The repeatable `--fallback`,
 `mount --dry-run`, the `scan` and `revalidate` targets, and `migrate`'s
 `--snapshot`, `--no-snapshot`, `--repair`, `--vacuum` and `--revalidate` are
 command-line only. See

@@ -12,10 +12,13 @@ enables for all of its own test builds — so a plain
 `cargo test -p musefs-format` runs them.
 
 The same pattern keeps the rest of the test scaffolding out of the published
-API. `musefs-core` and `musefs-db` each have a `test-support` feature gating the
-hooks their integration tests reach across the crate boundary — the whole-file
-oracle scan, the `*_for_test` methods — and switched on by a self-dev-dependency
-(plus `musefs-core`'s dev-dependency on `musefs-db`), so no flag is needed. A new
+API. `musefs-core`, `musefs-db` and `musefs-fuse` each have a `test-support`
+feature gating the hooks their integration tests reach across the crate
+boundary — the whole-file oracle scan, the `*_for_test` methods, the allocating
+readers and default-option shims no production path calls, the background-session
+mount — and switched on by a self-dev-dependency (plus the dev-dependencies other
+crates' tests take on them), so no flag is needed. `musefs-format` gates its
+equivalents, such as the Ogg page-header oracle, behind `fuzzing`. A new
 test hook goes behind that feature when an integration test needs it, and is
 `#[cfg(test)] pub(crate)` when only the crate's own unit tests do. A plain
 `cargo build` does not compile any of it; check such a change with
@@ -116,9 +119,12 @@ a while it ran in no job at all, and a guard that skipped hid it
 
 The reader and DB error paths are exercised under simulated runtime faults.
 `musefs_core::metrics::set_backing_fault(BackingFault::{Eio,ShortRead})`
-(behind the `metrics` feature) installs a process-global fault at the positioned
-backing-read site, cleared by the returned RAII guard. Because it is global, the
-tests run in their own `metrics`-gated binaries.
+installs a process-global fault at the positioned backing-read site, cleared by
+the returned RAII guard. It is test scaffolding: it needs both the `metrics`
+feature and `musefs-core`'s `test-support`, which the self-dev-dependency and
+`musefs-fuse`'s dev-dependency switch on, so a build of the published `metrics`
+feature does not carry it. Because it is global, the tests run in their own
+`metrics`-gated binaries.
 
 ```bash
 cargo test -p musefs-core --features metrics --test reader_faults

@@ -148,7 +148,7 @@ exclude_re = [
     # run_pipeline sync_channel capacity `jobs * 2`: pure throughput/blocking knob;
     # the persisted track set is identical for any positive capacity.
     # guard: op="*" fn="run_pipeline" rows=2
-'musefs-core/src/scan\.rs:2514:46:',
+'musefs-core/src/scan\.rs:2521:46:',
     # probe_body's FLAC tail-read predicate
     # `has_ext(flac) && has_leading_id3(prefix)`, `&&` -> `||`: widening it makes
     # every .flac, and every other file that opens with an ID3v2 tag, pay the
@@ -173,30 +173,30 @@ exclude_re = [
     # safely description-anchored. Re-verify these coordinates (via
     # `cargo mutants --list`) after any change that reformats scan.rs.
     # guard: op="+=" fn="run_pipeline" rows=2
-'musefs-core/src/scan\.rs:2643:22:',
+'musefs-core/src/scan\.rs:2650:22:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2737:33:',
+'musefs-core/src/scan\.rs:2744:33:',
     # guard: op="||" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2737:48:',
+'musefs-core/src/scan\.rs:2744:48:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2737:63:',
+'musefs-core/src/scan\.rs:2744:63:',
     # guard: op="+=" fn="run_pipeline" rows=2
-'musefs-core/src/scan\.rs:2751:37:',
+'musefs-core/src/scan\.rs:2758:37:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2753:41:',
+'musefs-core/src/scan\.rs:2760:41:',
     # guard: op="||" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2753:56:',
+'musefs-core/src/scan\.rs:2760:56:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2753:71:',
+'musefs-core/src/scan\.rs:2760:71:',
     # Same cadence class, one level up: each threshold flush is a let-chain
     # (`(len >= BATCH_FILES || batch_bytes >= cap) && let Err(e) = flush(..)`), so
     # `&&`->`||` short-circuits past the mid-loop flush exactly when the threshold
     # IS met — deferring the commit to the flush-on-empty / final flush, which
     # persist the identical track set and still surface a flush error (#618).
     # guard: op="&&" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2738:21:',
+'musefs-core/src/scan\.rs:2745:21:',
     # guard: op="&&" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2754:29:',
+'musefs-core/src/scan\.rs:2761:29:',
     # `ByteBudget::acquire`'s wait guard (`!st.closed && in_flight != 0 && ...`),
     # the FIRST `&&`->`||`. `&&` binds tighter than `||`, so the guard becomes
     # `!closed || (in_flight != 0 && over_cap)` and every reservation against an
@@ -218,9 +218,9 @@ exclude_re = [
     # the `failed = scan.failed + skip_failed` sum is also insensitive to `+`->`-`
     # (the `+`->`*` variant IS caught, so only `-` is excluded here).
     # guard: op="+=" fn="revalidate_with" rows=2
-'musefs-core/src/scan\.rs:2936:29:',
+'musefs-core/src/scan\.rs:2943:29:',
     # guard: op="+" fn="revalidate_with" rows=1
-'musefs-core/src/scan\.rs:3050:29: replace \+ with -',
+'musefs-core/src/scan\.rs:3057:29: replace \+ with -',
     # Phase 2 ID3 binary tags: classify_binary_frame's POPM counter fold
     # `(a << 8) | b` -> `(a << 8) ^ b`. The accumulator is left-shifted by 8 before
     # each combine, so its low byte is always zero where `b` lands; `|` and `^` are
@@ -499,7 +499,7 @@ exclude_re = [
     # and read_append share; the fn's other two `+` are the observable fills
     # counters and stay killable, so this one is pinned by coordinate, not by fn.
     # guard: op="+" fn="BackingReader<'a>::serve" rows=2
-    'musefs-core/src/readahead\.rs:890:68:',
+    'musefs-core/src/readahead\.rs:893:68:',
     #
     # More hang-class (TIMEOUT-only, CANCEL the in-diff job): `len() -> 1` /
     # `clear() -> 1` force a constant resident size, so `evict_one_coldest` keeps
@@ -673,7 +673,7 @@ exclude_re = [
     # guard: op="+=" fn="lace_packet" rows=1
     'musefs-format/src/ogg/page\.rs:135:18: replace \+= with \*= in lace_packet',
     # guard: op="+=" fn="lace_chunks_to_segments" rows=1
-    'musefs-format/src/ogg/page\.rs:380:18: replace \+= with \*= in lace_chunks_to_segments',
+    'musefs-format/src/ogg/page\.rs:384:18: replace \+= with \*= in lace_chunks_to_segments',
     # guard: op="+=" fn="read_packets_while" rows=1
     'musefs-format/src/ogg/page\.rs:210:13: replace \+= with \*= in read_packets_while',
 
@@ -697,7 +697,7 @@ exclude_re = [
     # any capacity is behavior-identical (the CACHE_ESTIMATED_ITEMS precedent). The
     # `lace_pos + seg_count` slice `+` elsewhere IS caught, so pinned by line:col.
     # guard: op="+" fn="lace_chunks_to_segments" rows=1
-    'musefs-format/src/ogg/page\.rs:361:29: replace \+ with \* in lace_chunks_to_segments',
+    'musefs-format/src/ogg/page\.rs:365:29: replace \+ with \* in lace_chunks_to_segments',
     # crc_feed_payload / emit_segments overlap guards `if os < oe`, `<`->`<=`: at
     # os==oe the overlap is empty, so the branch folds a zero-length slice / reads 0
     # art bytes — byte-identical CRC and segments (the serve_ogg_window empty-overlap

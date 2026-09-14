@@ -1381,10 +1381,15 @@ fn probe_prefix(
                 // The header region only proves the file is not multiplexed. A
                 // chain's second bitstream begins after the first one's audio, so
                 // it is the *final* page that gives it away (#722).
-                if ogg_tail.is_some_and(|t| {
-                    ogg::classify_tail(&t.bytes, t.start, header.serial) == ogg::Chaining::Chained
-                }) {
-                    return Probe::Unsupported("chained Ogg (more than one logical bitstream)");
+                //
+                // Matched exhaustively rather than compared with `==`: `Chaining`
+                // stays exhaustive so that a verdict added to it has to be placed
+                // here, as refused or served, instead of being served by default.
+                match ogg_tail.map(|t| ogg::classify_tail(&t.bytes, t.start, header.serial)) {
+                    Some(ogg::Chaining::Chained) => {
+                        return Probe::Unsupported("chained Ogg (more than one logical bitstream)");
+                    }
+                    Some(ogg::Chaining::Single | ogg::Chaining::Unknown) | None => {}
                 }
                 let format = match header.codec {
                     ogg::Codec::Opus => Format::Opus,
@@ -2475,7 +2480,9 @@ fn uncommitted_total(failed: u64, raced: u64) -> u64 {
     failed + raced
 }
 
-/// Back-compat shim used by the CLI and existing tests.
+/// [`scan_directory_with`] at the default options. Test scaffolding, behind
+/// `test-support` (#710): the CLI builds its options.
+#[cfg(any(test, feature = "test-support"))]
 pub fn scan_directory(db: &Db, root: &Path) -> Result<ScanStats> {
     scan_directory_with(db, root, &ScanOptions::default())
 }
@@ -3052,7 +3059,9 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
     })
 }
 
-/// Back-compat shim used by the CLI and existing tests.
+/// [`revalidate_with`] at the default options. Test scaffolding, behind
+/// `test-support` (#710): the CLI builds its options.
+#[cfg(any(test, feature = "test-support"))]
 pub fn revalidate(db: &Db, root: &Path) -> Result<RevalidateStats> {
     revalidate_with(db, root, &ScanOptions::default())
 }

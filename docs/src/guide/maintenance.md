@@ -112,8 +112,10 @@ kept out from the moment it tries rather than detected in advance.
 ### Notes
 
 - **Full rewrite.** Each run rewrites the entire database and transiently needs
-  free disk space roughly equal to the store size (it builds a complete copy
-  before swapping). Running it again on an already-compact store is safe and
+  free disk space of about the store's size twice over: SQLite builds the
+  compacted copy in its temporary directory (the first of `SQLITE_TMPDIR`,
+  `TMPDIR`, `/var/tmp`, `/usr/tmp` and `/tmp` it can write to), then writes it
+  back through the write-ahead log beside the store. Running it again on an already-compact store is safe and
   reports `(already compact)`.
 - **May upgrade the schema.** Like every musefs command that opens the store,
   `vacuum` applies any pending *transparent* migration before compacting. A
@@ -164,7 +166,9 @@ store library.db is at schema version 2; this build needs 4.
   v3 (musefs 2.0.0) — widens the tags.value and track_art.description caps
   v4 (musefs 2.0.0) — clears every stored fingerprint and content hash; a revalidate recomputes them  [needs this command]
 This rewrites the store in place. Once it is done, musefs builds older than this one will no longer open it.
-store is 412.7 MiB; the upgrade needs about 825.4 MiB free and has 27.7 GiB.
+store is 412.7 MiB; the upgrade needs, on each filesystem it writes to:
+  /srv/musefs (the store, the snapshot): about 1.21 GiB free, has 27.7 GiB
+  /var/tmp (SQLite's temporary files): about 412.7 MiB free, has 9.3 GiB
 a snapshot will be written to library.db.v2.bak first.
 Upgrade library.db now? [y/N]
 ```
@@ -204,7 +208,10 @@ write is exactly the kind of thing that should not happen without being asked.
 you can go back to — which is why it refuses to run alongside `--no-snapshot`.
 The deletes are part of the upgrade itself, in the same transaction: if the
 upgrade then fails, on a full disk for instance, they are undone with it and the
-store is left exactly as it was. The count is what will actually go: a child
+store is left exactly as it was. So `migrate` first says how many rows the
+upgrade will delete, and reports them as deleted only once it has succeeded. If
+it fails, the error says whether the store was rolled back and where the
+snapshot is. The count is what will actually go: a child
 whose parent does not survive is reported with it, rather than left to the
 cascade to take silently.
 
@@ -233,12 +240,13 @@ row's values; a `revalidate` restores them for pictures the file embeds itself.
 bound it as bytes could add a second row for a file musefs already had: SQLite
 never compares the two spellings equal, so nothing refused it. 2.0.0 stores
 every path as bytes, which makes the two one path, and only one row can keep it.
-`migrate` reports each such pair with both track ids. `--repair` keeps the row
-that carries tags or picture links and deletes the other; when neither carries
-any, nothing is lost either way, and it keeps the older one. When both do, it
-cannot know which you want, so it refuses and deletes nothing: delete the row
-you do not want yourself (deleting a track takes its tags and links with it),
-then run `migrate` again.
+`migrate` reports each such path with both track ids and the one `--repair`
+keeps. `--repair` keeps the row that carries tags or picture links and deletes
+the other; when neither carries any, nothing is lost either way, and it keeps the
+older one. When both do, it cannot know which you want, so `migrate --repair`
+refuses before taking the snapshot and changes nothing: delete the row you do not
+want yourself (deleting a track takes its tags and links with it), then run
+`migrate` again.
 
 The check also catches a row that is fine in itself but points at a parent that
 is not there — the kind an external tool can leave behind with foreign keys
@@ -262,9 +270,45 @@ that file is your store exactly as it was. Put it somewhere else with
 `--snapshot PATH`, or skip it with `--no-snapshot`. `migrate` refuses to
 overwrite an existing snapshot.
 
-The free-space figure it reports accounts for the snapshot and for SQLite
-staging the rewritten pages before committing them. If the filesystem is short,
-the command refuses up front rather than failing part-way through.
+The copy is written under a temporary name beside the snapshot's —
+`library.db.v2.bak.partial-<numbers>` — synced to disk, and only then renamed
+into place, so a file under the snapshot's own name is always complete. A run
+that is killed or crashes while copying leaves the temporary file instead. It
+can never be a usable snapshot, so the next `migrate` removes it, says so, and
+takes the snapshot again.
+
+### Disk space
+
+Before asking anything, `migrate` works out the free space the upgrade needs on
+each filesystem it writes to, and refuses up front if one is short, rather than
+failing part-way through. Filesystems are told apart by device, so a
+`--snapshot` in another directory on the store's disk counts against the same
+space as the store.
+
+The run writes in phases, and each holds copies of the store at its peak. In
+multiples of the store's size on disk (with its `-wal` and `-shm`):
+
+| Phase | Beside the store | The snapshot's filesystem | SQLite's temporary directory |
+| ----- | ---------------- | ------------------------- | ---------------------------- |
+| Checking the rows | — | — | 1×, deleted afterwards |
+| The snapshot | — | 1×, kept | — |
+| The upgrade | 2× | 1× | — |
+| A vacuum afterwards | 2× | 1× | 1× |
+
+Each filesystem needs its largest phase, adding up whatever that phase puts on
+it. With everything on one filesystem that is three times the store, or four
+with a vacuum; `--no-snapshot` takes one copy away and `--vacuum=false` another.
+A vacuum offer you have not answered counts when `migrate` runs on a terminal,
+since you may accept it, and not otherwise. The upgrade's two copies are the
+store growing by a copy of its tables and the rollback journal holding the
+original of every page it overwrites; if the run is interrupted, the next open
+of the store rolls the journal back, leaving the store as it was.
+
+SQLite's temporary directory is the first of `SQLITE_TMPDIR`, `TMPDIR`,
+`/var/tmp`, `/usr/tmp` and `/tmp` that it can write to. Where that is a
+RAM-backed `/tmp`, checking the rows and vacuuming each hold a copy of the store
+in memory; point `SQLITE_TMPDIR` at a disk with room to avoid that. The space
+for checking the rows is checked on its own, before the check runs.
 
 ### Afterwards
 

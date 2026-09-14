@@ -65,9 +65,12 @@ pub use imp::*;
 
 #[cfg(feature = "metrics")]
 mod imp {
-    use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub use fault::{BackingFault, BackingFaultGuard, set_backing_fault};
 
     // The counter statics, `snapshot()`, and `reset()` are all generated from the
     // one `for_each_counter!` list (see the top of the file) so they can't drift.
@@ -81,6 +84,8 @@ mod imp {
                 }
             }
 
+            /// Zero every counter. Test scaffolding, behind `test-support` (#710).
+            #[cfg(any(test, feature = "test-support"))]
             pub fn reset() {
                 $($stat.store(0, Ordering::Relaxed);)*
             }
@@ -90,86 +95,118 @@ mod imp {
 
     static PREAD_FAULT: OnceLock<Option<Duration>> = OnceLock::new();
 
-    // Backing-read fault seam (test-only; process-global so it reaches the FUSE
-    // worker thread that actually performs the read — a thread-local set on the
-    // test thread would not). Kind: 0=none, 1=EIO, 2=short read. Distinct from
-    // the latency-only `set_fault_pread` hook above.
-    static BACKING_FAULT_KIND: AtomicU8 = AtomicU8::new(0);
-    static BACKING_FAULT_PREFIX: AtomicUsize = AtomicUsize::new(0);
-    // Serializes fault scopes: the seam is process-global, so two fault tests in
-    // the same test binary would otherwise clobber each other's kind when cargo
-    // runs them on parallel threads. `set_backing_fault` holds this for the life
-    // of its guard; the serve/worker path only loads the atomics, never locks.
-    static SEAM_LOCK: Mutex<()> = Mutex::new(());
+    /// Backing-read fault seam: test scaffolding, so it is compiled only for
+    /// this crate's own tests and under `test-support`, which the integration
+    /// tests here and in `musefs-fuse` switch on through a dev-dependency (#710).
+    /// It needs `metrics` too, because the serve path only reads through
+    /// [`backing_read_exact_at`]'s instrumented arm when that feature is on.
+    ///
+    /// Process-global so it reaches the FUSE worker thread that actually
+    /// performs the read — a thread-local set on the test thread would not.
+    /// Distinct from the latency-only `set_fault_pread` hook below.
+    #[cfg(any(test, feature = "test-support"))]
+    mod fault {
+        use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+        use std::sync::{Mutex, MutexGuard};
 
-    /// A simulated backing-read failure, set per test via [`set_backing_fault`].
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum BackingFault {
-        /// Return `EIO` instead of reading any bytes.
-        Eio,
-        /// Fill the first `prefix` bytes from the file, then return
-        /// `UnexpectedEof` (simulating a truncated/short pread).
-        ShortRead { prefix: usize },
-    }
+        // Kind: 0=none, 1=EIO, 2=short read.
+        static BACKING_FAULT_KIND: AtomicU8 = AtomicU8::new(0);
+        static BACKING_FAULT_PREFIX: AtomicUsize = AtomicUsize::new(0);
+        // Serializes fault scopes: the seam is process-global, so two fault tests in
+        // the same test binary would otherwise clobber each other's kind when cargo
+        // runs them on parallel threads. `set_backing_fault` holds this for the life
+        // of its guard; the serve/worker path only loads the atomics, never locks.
+        static SEAM_LOCK: Mutex<()> = Mutex::new(());
 
-    /// Clears the global backing fault when dropped (and releases [`SEAM_LOCK`]),
-    /// so a fault never leaks past the test that set it.
-    #[must_use = "the fault is cleared when this guard drops; bind it to a name"]
-    pub struct BackingFaultGuard(
-        // Held for the guard's lifetime to keep [`SEAM_LOCK`] locked; released on
-        // drop. Never read directly — the RAII effect is the point.
-        #[allow(dead_code)] MutexGuard<'static, ()>,
-    );
+        /// A simulated backing-read failure, set per test via [`set_backing_fault`].
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum BackingFault {
+            /// Return `EIO` instead of reading any bytes.
+            Eio,
+            /// Fill the first `prefix` bytes from the file, then return
+            /// `UnexpectedEof` (simulating a truncated/short pread).
+            ShortRead { prefix: usize },
+        }
 
-    impl Drop for BackingFaultGuard {
-        fn drop(&mut self) {
-            BACKING_FAULT_KIND.store(0, Ordering::SeqCst);
+        /// Clears the global backing fault when dropped (and releases [`SEAM_LOCK`]),
+        /// so a fault never leaks past the test that set it.
+        #[must_use = "the fault is cleared when this guard drops; bind it to a name"]
+        pub struct BackingFaultGuard(
+            // Held for the guard's lifetime to keep [`SEAM_LOCK`] locked; released on
+            // drop. Never read directly — the RAII effect is the point.
+            #[allow(dead_code)] MutexGuard<'static, ()>,
+        );
+
+        impl Drop for BackingFaultGuard {
+            fn drop(&mut self) {
+                BACKING_FAULT_KIND.store(0, Ordering::SeqCst);
+            }
+        }
+
+        /// Install a backing-read fault for the current test scope. The seam is
+        /// process-global; this serializes on [`SEAM_LOCK`] so concurrent fault tests
+        /// in one binary take turns rather than clobbering each other's kind. The
+        /// lock is held until the returned guard drops.
+        pub fn set_backing_fault(fault: BackingFault) -> BackingFaultGuard {
+            // Recover from a poisoned lock: a panicking fault test fails on its own;
+            // it must not cascade into every later fault test.
+            let lock = SEAM_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match fault {
+                BackingFault::Eio => {
+                    BACKING_FAULT_KIND.store(1, Ordering::SeqCst);
+                }
+                BackingFault::ShortRead { prefix } => {
+                    BACKING_FAULT_PREFIX.store(prefix, Ordering::SeqCst);
+                    BACKING_FAULT_KIND.store(2, Ordering::SeqCst);
+                }
+            }
+            BackingFaultGuard(lock)
+        }
+
+        /// The fault in force, if any. A single atomic load when none is.
+        pub(super) fn injected() -> Option<BackingFault> {
+            match BACKING_FAULT_KIND.load(Ordering::SeqCst) {
+                1 => Some(BackingFault::Eio),
+                2 => Some(BackingFault::ShortRead {
+                    prefix: BACKING_FAULT_PREFIX.load(Ordering::SeqCst),
+                }),
+                _ => None,
+            }
+        }
+
+        /// The `EIO` an injected fault reports (5 on Linux, macOS, and FreeBSD).
+        pub(super) fn eio() -> std::io::Error {
+            std::io::Error::from_raw_os_error(5)
+        }
+
+        /// The error a short read reports once its prefix has been read.
+        pub(super) fn short_read() -> std::io::Error {
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "injected short backing read",
+            )
         }
     }
 
-    /// Install a backing-read fault for the current test scope. The seam is
-    /// process-global; this serializes on [`SEAM_LOCK`] so concurrent fault tests
-    /// in one binary take turns rather than clobbering each other's kind. The
-    /// lock is held until the returned guard drops.
-    pub fn set_backing_fault(fault: BackingFault) -> BackingFaultGuard {
-        // Recover from a poisoned lock: a panicking fault test fails on its own;
-        // it must not cascade into every later fault test.
-        let lock = SEAM_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match fault {
-            BackingFault::Eio => {
-                BACKING_FAULT_KIND.store(1, Ordering::SeqCst);
-            }
-            BackingFault::ShortRead { prefix } => {
-                BACKING_FAULT_PREFIX.store(prefix, Ordering::SeqCst);
-                BACKING_FAULT_KIND.store(2, Ordering::SeqCst);
-            }
-        }
-        BackingFaultGuard(lock)
-    }
-
-    /// Positioned backing read used by the serve path. Honors an injected fault
-    /// when one is set; otherwise a plain `read_exact_at`. The no-fault path is a
-    /// single relaxed atomic load.
+    /// Positioned backing read used by the serve path. In test builds it honors
+    /// an injected fault when one is set; otherwise a plain `read_exact_at`.
     pub fn backing_read_exact_at(
         f: &std::fs::File,
         buf: &mut [u8],
         offset: u64,
     ) -> std::io::Result<()> {
         use std::os::unix::fs::FileExt;
-        match BACKING_FAULT_KIND.load(Ordering::SeqCst) {
-            // EIO is 5 on Linux, macOS, and FreeBSD.
-            1 => return Err(std::io::Error::from_raw_os_error(5)),
-            2 => {
-                let p = BACKING_FAULT_PREFIX.load(Ordering::SeqCst).min(buf.len());
+        #[cfg(any(test, feature = "test-support"))]
+        match fault::injected() {
+            Some(BackingFault::Eio) => return Err(fault::eio()),
+            Some(BackingFault::ShortRead { prefix }) => {
+                let p = prefix.min(buf.len());
                 f.read_exact_at(&mut buf[..p], offset)?;
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "injected short backing read",
-                ));
+                return Err(fault::short_read());
             }
-            _ => {}
+            None => {}
         }
         f.read_exact_at(buf, offset)
     }
@@ -184,20 +221,17 @@ mod imp {
         n: usize,
         offset: u64,
     ) -> std::io::Result<()> {
-        match BACKING_FAULT_KIND.load(Ordering::SeqCst) {
-            // EIO is 5 on Linux, macOS, and FreeBSD.
-            1 => return Err(std::io::Error::from_raw_os_error(5)),
-            2 => {
-                let p = BACKING_FAULT_PREFIX.load(Ordering::SeqCst).min(n);
+        #[cfg(any(test, feature = "test-support"))]
+        match fault::injected() {
+            Some(BackingFault::Eio) => return Err(fault::eio()),
+            Some(BackingFault::ShortRead { prefix }) => {
+                let p = prefix.min(n);
                 let start = out.len();
                 crate::readahead::pread_append(f, out, p, offset)?;
                 out.truncate(start);
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "injected short backing read",
-                ));
+                return Err(fault::short_read());
             }
-            _ => {}
+            None => {}
         }
         crate::readahead::pread_append(f, out, n, offset)
     }
@@ -234,6 +268,10 @@ mod imp {
         fault("MUSEFS_FAULT_PREAD_US", &PREAD_FAULT);
     }
 
+    /// Set the per-pread latency `MUSEFS_FAULT_PREAD_US` would, without the
+    /// environment. Test scaffolding, gated like the fault seam above (#710):
+    /// a benchmark sets the variable instead.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn set_fault_pread(d: Option<Duration>) {
         let first_set = PREAD_FAULT.set(d).is_ok();
         debug_assert!(
@@ -287,6 +325,7 @@ mod imp {
     pub fn on_stat() {}
     #[inline(always)]
     pub fn on_pread(_bytes: u64) {}
+    #[cfg(any(test, feature = "test-support"))]
     #[inline(always)]
     pub fn set_fault_pread(_d: Option<std::time::Duration>) {}
     #[inline(always)]
@@ -325,6 +364,7 @@ mod imp {
     pub fn snapshot() -> super::Snapshot {
         super::Snapshot::default()
     }
+    #[cfg(any(test, feature = "test-support"))]
     #[inline(always)]
     pub fn reset() {}
 }
