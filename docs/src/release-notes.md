@@ -110,6 +110,7 @@ constraints off:
 - an embedded NUL in a tag key, a picture's MIME type or description, or an art
   row's digest;
 - a picture dimension past `u32`, or an empty `backing_path`;
+- an art row whose digest is not 64 lowercase hex characters ([#761]);
 - a tag, picture link or structural block whose track is gone, or a link whose
   image is.
 
@@ -117,6 +118,16 @@ Fix the rows with whatever wrote them, or pass `--repair` to have `migrate`
 delete them. It does so after the confirmation and the snapshot, so the rows are
 still in the copy — which is why `--repair` refuses `--no-snapshot`. Deleting a
 track takes its tags and picture links with it, and the report counts those too.
+
+An art row with a non-canonical digest can only have come from a tool other than
+musefs or its plugins, which have always written lowercase. `--repair` deletes
+that row **and every picture link to it**, so each track using it loses that
+picture. It is not lowercased for you, because a correctly filed row for the
+same image may already exist. Fixing it by hand first means inserting a
+correctly filed row, relinking each `track_art` row to it and deleting the old
+one — art rows cannot be updated — and the
+[maintenance guide](guide/maintenance.md#rows-the-new-schema-refuses) walks
+through the catches.
 
 **4. Revalidate afterwards.** Accept `migrate`'s offer to revalidate your
 library, or run `musefs revalidate /path/to/music --db library.db` yourself. The
@@ -237,6 +248,9 @@ what changed underneath:
 - `art` rows cannot be changed once written, and a row filed under a digest must
   hold the bytes that digest names. `upsert_art` raises `ArtDigestMismatch` when
   it does not ([#724]).
+- That digest is the lowercase hex SHA-256 of the bytes, and the store refuses
+  any other spelling; `fingerprint` and `content_hash` follow the same grammar
+  ([#761]). `upsert_art` produces the canonical form.
 - A tag or picture link cannot be moved to another track by updating its
   `track_id`; delete it and insert it under the new one ([#717]).
 - A track's `id` cannot be changed once assigned. It is the identity the mount's
@@ -328,6 +342,7 @@ directly.
 [#749]: https://github.com/Sohex/musefs/issues/749
 [#750]: https://github.com/Sohex/musefs/issues/750
 [#751]: https://github.com/Sohex/musefs/issues/751
+[#761]: https://github.com/Sohex/musefs/issues/761
 [#762]: https://github.com/Sohex/musefs/issues/762
 
 ## v1.3.0

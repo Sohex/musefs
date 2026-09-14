@@ -703,6 +703,52 @@ mod rejection_tests {
         pending.apply().unwrap();
     }
 
+    /// An art digest that is not lowercase hex (#761). 1.3.0 accepted any 64
+    /// characters, so this takes no hostile writer -- only one that uppercased.
+    /// Lowercasing it is not a safe sanitize, since a canonical row for the same
+    /// bytes may already exist, so it takes the remediation every other refused
+    /// row does: reported with the link that points at it, and deleted with it.
+    #[test]
+    fn a_non_canonical_art_digest_is_reported_with_its_link_then_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.db");
+        let conn = store_at_v3(&path);
+        conn.execute(
+            "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
+             VALUES (?1, 'image/png', 1, 1, 1, X'01')",
+            [&"A".repeat(64)],
+        )
+        .unwrap();
+        let uppercased = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO track_art (track_id, art_id, picture_type, description, ordinal) \
+             VALUES (1, ?1, 4, 'back', 1)",
+            [uppercased],
+        )
+        .unwrap();
+        drop(conn);
+
+        let pending = PendingMigration::open(&path).unwrap();
+        let found = pending.inspect_rejections().unwrap();
+        let named: Vec<(&str, u64)> = found
+            .tables()
+            .iter()
+            .map(|t| (t.table, t.rejected))
+            .collect();
+        assert_eq!(
+            named,
+            vec![("track_art", 1), ("art", 1)],
+            "the row and the link it would orphan: {found:?}"
+        );
+
+        let removed = pending.repair().unwrap();
+        assert_eq!(removed.total(), 2);
+        let db = pending.apply().unwrap();
+        let links = db.get_track_art(1).unwrap();
+        assert_eq!(links.len(), 1, "the canonical cover survives: {links:?}");
+        assert_eq!(links[0].description, "cover");
+    }
+
     /// A V1 store has no checksum columns at all, so the probe's `tracks`
     /// projection cannot name them. Upgrading from the oldest released shape is
     /// the arm that catches a projection written against the newest one.

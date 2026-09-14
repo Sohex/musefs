@@ -553,14 +553,21 @@ CREATE TABLE tracks (
     -- anything satisfied a bare length() = 64 while storing something else
     -- entirely. Banning NUL keeps the documented `64 characters` meaning rather
     -- than quietly converting the field to a byte cap.
+    --
+    -- And the characters are lowercase hex (#761), the one spelling every
+    -- writer produces and the only one an equality match finds. GLOB is
+    -- case-sensitive, so the one clause refuses uppercase and non-hex alike; the
+    -- NUL test stays beside it because GLOB, like length(), stops at a NUL.
     CHECK (fingerprint IS NULL
            OR (typeof(fingerprint) = 'text'
                AND length(fingerprint) = 64
-               AND instr(fingerprint, char(0)) = 0)),
+               AND instr(fingerprint, char(0)) = 0
+               AND fingerprint NOT GLOB '*[^0-9a-f]*')),
     CHECK (content_hash IS NULL
            OR (typeof(content_hash) = 'text'
                AND length(content_hash) = 64
-               AND instr(content_hash, char(0)) = 0))
+               AND instr(content_hash, char(0)) = 0
+               AND content_hash NOT GLOB '*[^0-9a-f]*'))
 );
 
 -- 4. Refill. CAST(backing_path AS BLOB) is what preserves identity across the
@@ -712,9 +719,16 @@ CREATE TABLE art (
     -- `track_art` now (#716). What is left is the content and its identity.
     byte_len INTEGER NOT NULL,
     data     BLOB NOT NULL,
+    -- Lowercase hex, as on the two track checksums (#761). Dedup is
+    -- `ON CONFLICT(sha256)`, a text match, so the same bytes filed under another
+    -- spelling of their digest were stored twice and never reached #724's byte
+    -- comparison. A refill row that fails is not lowercased: a lowercase row for
+    -- the same bytes may already exist, which is the collision this prevents.
+    -- It fails the migration, and `migrate`'s pre-flight reports it first.
     CHECK (typeof(sha256) = 'text'
            AND length(sha256) = 64
-           AND instr(sha256, char(0)) = 0),
+           AND instr(sha256, char(0)) = 0
+           AND sha256 NOT GLOB '*[^0-9a-f]*'),
     CHECK (typeof(byte_len) = 'integer'
            AND byte_len >= 0
            AND byte_len <= 16711680),
@@ -3885,6 +3899,51 @@ mod constraint_tests {
              backing_size, backing_mtime_ns, updated_at) \
              VALUES ('/x','aiff',0,0,0,0,0)",
         );
+    }
+
+    /// A stored digest is lowercase hex (#761). Dedup matches it as text, so
+    /// any other spelling of the same bytes' digest files them a second time.
+    #[test]
+    fn v4_digests_must_be_lowercase_hex() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        insert_track(&conn, "/a.flac");
+        let canonical = "0123456789abcdef".repeat(4);
+        conn.execute(
+            "INSERT INTO art (sha256, byte_len, data) VALUES (?1, 1, X'00')",
+            [&canonical],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tracks SET fingerprint = ?1, content_hash = ?1 WHERE id = 1",
+            [&canonical],
+        )
+        .unwrap();
+
+        for bad in [
+            canonical.to_uppercase(),
+            "g".repeat(64),
+            format!("{}Z", &canonical[..63]),
+        ] {
+            assert!(
+                conn.execute(
+                    "INSERT INTO art (sha256, byte_len, data) VALUES (?1, 1, X'01')",
+                    [&bad],
+                )
+                .is_err(),
+                "art.sha256 {bad} must be refused"
+            );
+            for column in ["fingerprint", "content_hash"] {
+                assert!(
+                    conn.execute(
+                        &format!("UPDATE tracks SET {column} = ?1 WHERE id = 1"),
+                        [&bad],
+                    )
+                    .is_err(),
+                    "tracks.{column} {bad} must be refused"
+                );
+            }
+        }
     }
 
     #[test]

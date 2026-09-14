@@ -164,8 +164,11 @@ malformed *shapes* at commit, so an external writer cannot persist them:
 - an unknown `format` string, or a negative length/offset/size/version;
 - an `audio_offset + audio_length` running past the stored `backing_size`;
 - a binary tag row whose `value` is non-empty;
-- an `art.byte_len` that disagrees with its blob, or a `sha256` of the wrong
-  length;
+- an `art.byte_len` that disagrees with its blob, or an `art.sha256` that is not
+  64 lowercase hexadecimal characters — the form every musefs writer produces,
+  and the only one dedup can match (see **A digest has to name its bytes**
+  below). `tracks.fingerprint` and `tracks.content_hash` follow the same
+  grammar;
 - a `picture_type` outside `0..=20`;
 - a `tags.key` over 256 chars or `tags.value` over 16 MiB − 1 bytes (FLAC's
   24-bit metadata-block ceiling — the largest tag synthesis could serve, so the
@@ -313,6 +316,17 @@ since it just stored those bytes.
 What this does not do is audit the table: a poisoned row nothing ever dedups
 onto is never compared, and the readers serve whatever a link points at. Filing
 every row under the digest of its own bytes remains the external writer's job.
+
+The digest also has one spelling: **lowercase hex**, 64 characters, which is
+what `upsert_art` in `musefs_common` produces and the reference for any
+third-party writer. It matters because dedup matches the digest as text —
+`ON CONFLICT(sha256)` — so the same bytes filed under `ABCD…` and under `abcd…`
+are two rows: the image is stored twice, and the byte comparison above never
+runs, since nothing matched for it to check. From schema v4 a `CHECK` refuses
+any other spelling ([#761](https://github.com/Sohex/musefs/issues/761)), so a
+writer that honours the schema cannot produce one. A writer that turns
+constraint enforcement off is outside the contract, as it is for every other
+constraint here.
 
 **Row ownership is immutable too.** A `tags` or `track_art` row may not move
 between tracks: `tags_reject_reparent` and `track_art_reject_reparent` abort a

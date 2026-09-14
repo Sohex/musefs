@@ -490,6 +490,21 @@ see the [Release notes](release-notes.md).
   `ChangelogRead::malformed`, and the refresh treats that as a gap and falls back
   to a full rebuild.
 
+- **A stored digest must be lowercase hex**
+  ([#761](https://github.com/Sohex/musefs/issues/761)). `art.sha256`,
+  `tracks.fingerprint` and `tracks.content_hash` were constrained to 64 NUL-free
+  characters, not to the form every musefs writer produces. Dedup matches the
+  digest as text, so an external writer filing identical bytes under an
+  uppercase digest stored the image a second time: `ON CONFLICT(sha256)` never
+  fired, #724's byte comparison never ran, and #746's per-embedding restore
+  missed the link. Each `CHECK` gains `NOT GLOB '*[^0-9a-f]*'` — `GLOB` is
+  case-sensitive, so one clause refuses uppercase and non-hex alike — beside the
+  NUL test it keeps, since `GLOB` stops at an embedded NUL. The two track columns
+  cost nothing, as the refill nulls both. An `art` row that fails is not
+  lowercased, because a lowercase row for the same bytes may already exist: it
+  goes through the pre-flight like any other refused row, reported with the links
+  that point at it, and `--repair` deletes both after the snapshot.
+
 - **`art` is rebuilt by the same migration** — the third of the four, and the
   one with an ordering constraint the others did not have. `track_art.art_id`
   references `art(id)` with **no** `ON DELETE CASCADE`, so with foreign keys
