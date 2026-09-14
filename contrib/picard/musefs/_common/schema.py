@@ -222,13 +222,24 @@ ALTER TABLE tracks ADD COLUMN content_hash TEXT
 CREATE INDEX tracks_fingerprint_idx ON tracks(fingerprint);
 
 -- Rebuild `tags` with a byte-accurate value cap (#505). SQLite's length() on
--- TEXT counts characters, so the V1 `CHECK (length(value) <= 262144)` was up to
--- ~4x looser than the documented 256 KiB byte bound; length(CAST(value AS BLOB))
--- counts bytes. SQLite cannot alter a CHECK in place, so recreate the table
--- (V2 is unreleased — this is folded in rather than added as a new migration).
--- Pre-existing over-cap rows (only reachable on an upgraded store) are dropped:
--- the read-time guard already counts bytes, so they were unreadable anyway, and
--- carrying them would abort the rebuild on the new CHECK.
+-- TEXT counts characters, so the V1 `CHECK (length(value) <= 262144)` bounded a
+-- value's bytes only to about four times that; length(CAST(value AS BLOB))
+-- counts bytes. SQLite cannot alter a CHECK in place, so recreate the table.
+--
+-- The cap is 16 MiB - 1, FLAC's metadata-block ceiling and where V3 puts it
+-- too (#644), and the refill keeps every row. This step first shipped at 256
+-- KiB and dropped each row past it: a multibyte lyrics tag V1's character cap
+-- admitted, which 1.0.0 served and V3 and V4 would have kept, went without a
+-- word, and the 2.0.0 upgrade's pre-flight, which checks rows against V4, never
+-- saw it go. V1's character cap bounds a value to about 1 MiB in bytes, so no
+-- row V1 holds fails this CHECK.
+--
+-- A released step's text is safe to change here, and only because of where the
+-- step now runs. A store already past V1 ran the old text, and V3 and V4 both
+-- rebuild `tags` after it, so nothing of that text survives in any schema. A
+-- store still at V1 reaches this step only through `musefs migrate`, which runs
+-- V3 and V4 with it (#749). V3's note about V2's narrowing describes the text
+-- this replaced.
 CREATE TABLE tags_new (
     track_id   INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
     key        TEXT NOT NULL,
@@ -241,12 +252,11 @@ CREATE TABLE tags_new (
     CHECK (length(key) <= 256),
     CHECK (length(key) >= 1
            AND key NOT GLOB '*[' || char(1) || '-' || char(31) || ']*'),
-    CHECK (length(CAST(value AS BLOB)) <= 262144),
+    CHECK (length(CAST(value AS BLOB)) <= 16777215),
     CHECK (value_blob IS NULL OR length(value_blob) <= 16711680)
 );
 INSERT INTO tags_new (track_id, key, value, ordinal, value_blob)
-    SELECT track_id, key, value, ordinal, value_blob FROM tags
-    WHERE length(CAST(value AS BLOB)) <= 262144;
+    SELECT track_id, key, value, ordinal, value_blob FROM tags;
 DROP TABLE tags;
 ALTER TABLE tags_new RENAME TO tags;
 

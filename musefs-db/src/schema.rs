@@ -217,13 +217,24 @@ ALTER TABLE tracks ADD COLUMN content_hash TEXT
 CREATE INDEX tracks_fingerprint_idx ON tracks(fingerprint);
 
 -- Rebuild `tags` with a byte-accurate value cap (#505). SQLite's length() on
--- TEXT counts characters, so the V1 `CHECK (length(value) <= 262144)` was up to
--- ~4x looser than the documented 256 KiB byte bound; length(CAST(value AS BLOB))
--- counts bytes. SQLite cannot alter a CHECK in place, so recreate the table
--- (V2 is unreleased — this is folded in rather than added as a new migration).
--- Pre-existing over-cap rows (only reachable on an upgraded store) are dropped:
--- the read-time guard already counts bytes, so they were unreadable anyway, and
--- carrying them would abort the rebuild on the new CHECK.
+-- TEXT counts characters, so the V1 `CHECK (length(value) <= 262144)` bounded a
+-- value's bytes only to about four times that; length(CAST(value AS BLOB))
+-- counts bytes. SQLite cannot alter a CHECK in place, so recreate the table.
+--
+-- The cap is 16 MiB - 1, FLAC's metadata-block ceiling and where V3 puts it
+-- too (#644), and the refill keeps every row. This step first shipped at 256
+-- KiB and dropped each row past it: a multibyte lyrics tag V1's character cap
+-- admitted, which 1.0.0 served and V3 and V4 would have kept, went without a
+-- word, and the 2.0.0 upgrade's pre-flight, which checks rows against V4, never
+-- saw it go. V1's character cap bounds a value to about 1 MiB in bytes, so no
+-- row V1 holds fails this CHECK.
+--
+-- A released step's text is safe to change here, and only because of where the
+-- step now runs. A store already past V1 ran the old text, and V3 and V4 both
+-- rebuild `tags` after it, so nothing of that text survives in any schema. A
+-- store still at V1 reaches this step only through `musefs migrate`, which runs
+-- V3 and V4 with it (#749). V3's note about V2's narrowing describes the text
+-- this replaced.
 CREATE TABLE tags_new (
     track_id   INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
     key        TEXT NOT NULL,
@@ -236,12 +247,11 @@ CREATE TABLE tags_new (
     CHECK (length(key) <= 256),
     CHECK (length(key) >= 1
            AND key NOT GLOB '*[' || char(1) || '-' || char(31) || ']*'),
-    CHECK (length(CAST(value AS BLOB)) <= 262144),
+    CHECK (length(CAST(value AS BLOB)) <= 16777215),
     CHECK (value_blob IS NULL OR length(value_blob) <= 16711680)
 );
 INSERT INTO tags_new (track_id, key, value, ordinal, value_blob)
-    SELECT track_id, key, value, ordinal, value_blob FROM tags
-    WHERE length(CAST(value AS BLOB)) <= 262144;
+    SELECT track_id, key, value, ordinal, value_blob FROM tags;
 DROP TABLE tags;
 ALTER TABLE tags_new RENAME TO tags;
 
@@ -3272,9 +3282,13 @@ mod baseline_tests {
     fn superseded_migration_literals_are_frozen() {
         assert!(super::MIGRATION_V1.contains("length(value) <= 262144"));
         assert!(super::MIGRATION_V1.contains("length(description) <= 1024"));
+        // V2's own cap is the one exception, and still a literal rather than the
+        // constant: its 256 KiB narrowing silently dropped tags V1 accepted, so
+        // the step now rebuilds at the widened cap V3 also uses. That is safe only
+        // because a store at V1 runs V2 inside `musefs migrate`, with V3 and V4.
         assert!(
-            super::MIGRATION_V2.contains("length(CAST(value AS BLOB)) <= 262144"),
-            "V2's byte-accurate rebuild (#505) shipped at the 256 KiB cap"
+            super::MIGRATION_V2.contains("length(CAST(value AS BLOB)) <= 16777215"),
+            "V2's byte-accurate rebuild (#505) keeps every row V1 accepted"
         );
     }
 
@@ -3295,6 +3309,10 @@ mod baseline_tests {
     ///
     /// A digest mismatch here means an edit reached a frozen migration. The fix
     /// is to move the change to the newest migration, not to update the digest.
+    ///
+    /// V2's digest has been updated once, deliberately: its rebuild dropped tags
+    /// V1 had accepted, and no later step could bring them back. Its own comment
+    /// says why that edit was safe and what makes it the only one.
     #[test]
     fn superseded_migrations_are_byte_for_byte_frozen() {
         use sha2::{Digest, Sha256};
@@ -3307,7 +3325,7 @@ mod baseline_tests {
             (
                 "MIGRATION_V2",
                 super::MIGRATION_V2,
-                "79d14a1ee3b04f4fa8a5d04196637fe2382d23cee102c9ece9e67c08ae10a128",
+                "7cf2ffd6fdac6ca3e1bcb017d90dc7dc57afcd2ffb9aae936e4aa3c6e63546c1",
             ),
             (
                 "MIGRATION_V3",
@@ -3621,10 +3639,11 @@ mod schema_py_tests {
     }
 
     #[test]
-    fn v2_rebuild_enforces_byte_cap_and_drops_oversize_rows() {
+    fn v2_rebuild_enforces_a_byte_cap_and_keeps_every_v1_row() {
         // #505: V2 rebuilds `tags` with a byte-accurate value cap. Simulate a v1
-        // store, plant an over-cap multibyte value (legal under V1's char-counting
-        // CHECK: 150_000 chars / 300_000 bytes) plus a normal one, then upgrade.
+        // store, plant a multibyte value past 256 KiB in bytes (legal under V1's
+        // char-counting CHECK: 150_000 chars / 300_000 bytes) plus a normal one,
+        // then upgrade.
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(MIGRATIONS[0].sql).unwrap(); // V1 only
         conn.pragma_update(None, "user_version", 1i64).unwrap();
@@ -3647,25 +3666,30 @@ mod schema_py_tests {
         )
         .unwrap();
 
-        // V2 only, applied directly. `migrate()` would run on through V3, whose
-        // widened cap (#644) accepts this value — that is the later step's
-        // business, asserted separately below. This test is about what V2 did.
+        // V2 only, applied directly: this test is about what V2 does.
         conn.execute_batch(MIGRATIONS[1].sql).unwrap();
         conn.pragma_update(None, "user_version", 2i64).unwrap();
 
-        // The over-cap row is dropped; the valid row survives.
+        // Both rows survive: no row V1 accepted is over the widened cap.
         let keys: Vec<String> = {
             let mut stmt = conn.prepare("SELECT key FROM tags ORDER BY key").unwrap();
             let rows = stmt.query_map([], |r| r.get(0)).unwrap();
             rows.collect::<rusqlite::Result<_>>().unwrap()
         };
-        assert_eq!(keys, vec!["ok".to_string()]);
+        assert_eq!(keys, vec!["big".to_string(), "ok".to_string()]);
 
-        // The rebuilt CHECK rejects an over-cap multibyte value at write.
+        // The rebuilt CHECK counts bytes: a value of two-byte characters one byte
+        // over the cap is refused, where a character count would take it at half
+        // that.
+        let over = "é".repeat(8_388_608);
+        assert!(
+            over.len() == 16_777_216 && over.chars().count() < 16_777_215,
+            "over the cap in bytes, not in characters"
+        );
         assert!(
             conn.execute(
                 "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1,'big2',?1,0)",
-                rusqlite::params![big],
+                rusqlite::params![over],
             )
             .is_err(),
             "byte-accurate CHECK must reject the write"
@@ -3688,6 +3712,42 @@ mod schema_py_tests {
             cv(&conn) > before,
             "tags_ai trigger must survive the rebuild"
         );
+    }
+
+    /// The upgrade a V1 store takes, end to end: a tag valid under V1's
+    /// character cap and over 256 KiB in bytes reaches V4 intact. V2 used to
+    /// drop it on the way, with V3 and V4 both happy to have kept it, and the
+    /// pre-flight — which asks V4's tables — never saw it go.
+    #[test]
+    fn a_v1_tag_over_256_kib_in_bytes_survives_the_upgrade() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MIGRATIONS[0].sql).unwrap();
+        conn.pragma_update(None, "user_version", 1i64).unwrap();
+        conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime_ns, updated_at) \
+             VALUES ('/a.flac','flac',0,0,0,0,0)",
+            [],
+        )
+        .unwrap();
+        let lyrics = "é".repeat(150_000);
+        assert!(lyrics.len() > 256 * 1024 && lyrics.chars().count() <= 262_144);
+        conn.execute(
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1, 'LYRICS', ?1, 0)",
+            [&lyrics],
+        )
+        .expect("V1's character cap admits it");
+
+        super::migrate_all(&mut conn).unwrap();
+
+        let stored: Vec<u8> = conn
+            .query_row(
+                "SELECT CAST(value AS BLOB) FROM tags WHERE track_id = 1 AND key = 'LYRICS'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("the tag must still be there");
+        assert!(stored == lyrics.as_bytes(), "and byte for byte");
     }
 
     /// #644: V3 widens `tags.value` to FLAC's block ceiling and
@@ -3745,14 +3805,16 @@ mod schema_py_tests {
             .unwrap();
         assert_eq!(desc, "cover");
 
-        // A value the V2 cap rejected now writes cleanly — the point of #644.
-        let over_v2 = "é".repeat(150_000);
+        // A value the 256 KiB caps rejected, V1's in characters and V2's as it
+        // first shipped in bytes, now writes cleanly — the point of #644.
+        let over_v1 = "é".repeat(262_145);
         assert!(
-            over_v2.len() > 262_144 && i64::try_from(over_v2.len()).unwrap() < MAX_TAG_VALUE_LEN
+            over_v1.chars().count() > 262_144
+                && i64::try_from(over_v1.len()).unwrap() < MAX_TAG_VALUE_LEN
         );
         conn.execute(
             "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1,'lyrics',?1,0)",
-            rusqlite::params![over_v2],
+            rusqlite::params![over_v1],
         )
         .expect("V3 accepts a value the 256 KiB cap rejected");
         conn.execute(
