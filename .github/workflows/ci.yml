@@ -324,7 +324,7 @@ jobs:
         run: ./scripts/apt-install.sh picard
       - name: Verify Picard module path
         run: test -d /usr/lib/picard/picard || { echo "::error::picard package not at /usr/lib/picard; PYTHONPATH is stale"; exit 1; }
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
       - name: Create venv on the system Python
         run: uv venv --system-site-packages --python "$(which python3)"
       - name: Install plugin test deps + ruff
@@ -461,7 +461,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: vmactions/freebsd-vm@f0552d3b69211736abd97f02ff3d4674c56b73b1
+      - uses: vmactions/freebsd-vm@4469451fe39bee80be4066836c5170362e9349f3
         with:
           usesh: true
           # Pass/fail e2e gate — we keep no build artifacts, so skip the rsync

@@ -70,7 +70,7 @@ jobs:
         with:
           components: llvm-tools-preview
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@d438492cf8a250514fa2d34b30bc3c0dc37c65ff
+        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73
         with:
           tool: cargo-llvm-cov
       - name: Collect coverage
@@ -84,7 +84,7 @@ jobs:
         # v6.0.2: Codecov deleted the `codecovsecurity` keybase account that
         # earlier versions fetch the CLI signing key from, so <=v6.0.1 fail
         # signature verification deterministically. v6.0.2 moves to `codecovsecops`.
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5
         with:
           files: lcov.info
           fail_ci_if_error: true
