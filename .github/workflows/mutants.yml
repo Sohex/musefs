@@ -177,7 +177,7 @@ jobs:
         # `always()` so the report uploads even when the gate fails on a survivor
         # (the failing run is exactly when the survivor list is wanted).
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           # Per-shard artifact names; matrix.name is the slash-free "k-of-n" form
           # (a slash, as in the shard arg, is illegal in an artifact name).
@@ -292,7 +292,7 @@ jobs:
         run: scripts/mutants.sh "${{ matrix.crate }}"
       - name: Upload survivor report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           # Per-shard artifact names; matrix.name is the slash-free "crate-k-of-n"
           # form (a slash, as in matrix.shard, is illegal in an artifact name).
