@@ -20,7 +20,7 @@ arbitrary = { version = "1", features = ["derive"] }
 musefs-format = { path = "../musefs-format", features = ["fuzzing"] }
 musefs-core = { path = "../musefs-core" }
 musefs-db = { path = "../musefs-db", features = ["fuzzing"] }
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 tempfile = "3"
 
 [lib]
