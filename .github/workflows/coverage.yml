@@ -64,13 +64,13 @@ jobs:
           persist-credentials: false
       - name: Install libfuse3
         run: ./scripts/apt-install.sh fuse3 libfuse3-dev pkg-config
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           components: llvm-tools-preview
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@d438492cf8a250514fa2d34b30bc3c0dc37c65ff
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037
         with:
           tool: cargo-llvm-cov
       - name: Collect coverage
@@ -84,7 +84,7 @@ jobs:
         # v6.0.2: Codecov deleted the `codecovsecurity` keybase account that
         # earlier versions fetch the CLI signing key from, so <=v6.0.1 fail
         # signature verification deterministically. v6.0.2 moves to `codecovsecops`.
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5
         with:
           files: lcov.info
           fail_ci_if_error: true

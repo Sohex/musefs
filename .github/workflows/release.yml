@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: '3.x'
       - name: Verify tag matches workspace version
@@ -99,8 +99,8 @@ jobs:
       - name: Install libfuse3
         run: ./scripts/apt-install.sh fuse3 libfuse3-dev pkg-config
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: '3.x'
       - name: Publish crates in dependency order
@@ -155,7 +155,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31
         with:
           key: ${{ matrix.triple }}
       - name: Install Zig and cargo-zigbuild
@@ -185,7 +185,7 @@ jobs:
           ( cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
           ls -l dist
       - name: Upload artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: musefs-${{ matrix.triple }}
           path: dist/*
@@ -232,7 +232,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Download artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: musefs-${{ matrix.triple }}
           path: dist
@@ -247,7 +247,7 @@ jobs:
           ./bin/musefs --version || true   # glibc/musl host may differ; real check is the smoke
       - name: Set up QEMU (emulated arch)
         if: matrix.mode == 'emulated'
-        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1
       - name: Smoke (host)
         if: matrix.mode == 'host'
         run: |
@@ -299,21 +299,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: '3.x'
       - name: Download amd64 artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: musefs-${{ matrix.amd64_triple }}
           path: dl/amd64
       - name: Download arm64 artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: musefs-${{ matrix.arm64_triple }}
           path: dl/arm64
       - name: Download riscv64 artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: musefs-${{ matrix.riscv64_triple }}
           path: dl/riscv64
@@ -351,16 +351,16 @@ jobs:
             printf '%s\n' "$TAGS"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
-      - uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
       - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build amd64 image for smoke
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
         with:
           context: ctx
           file: ${{ matrix.dockerfile }}
@@ -380,7 +380,7 @@ jobs:
             "musefs-smoke:${{ matrix.variant }}" \
             -c '${{ matrix.ffmpeg_install }} && sh /scripts/smoke-binary.sh /usr/local/bin/musefs'
       - name: Build and push multi-arch manifest
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
         with:
           context: ctx
           file: ${{ matrix.dockerfile }}
@@ -406,7 +406,7 @@ jobs:
       contents: write
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           path: dist
           merge-multiple: true
@@ -441,7 +441,7 @@ jobs:
       - name: Run benchmarks
         run: scripts/perf-release-bench.sh "$RUNNER_TEMP/bench-snapshot.txt"
       - name: Upload snapshot
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: benchmark-snapshot-${{ github.ref_name }}
           path: ${{ runner.temp }}/bench-snapshot.txt
