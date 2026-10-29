@@ -82,7 +82,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31
       - name: Install cargo-mutants
         # Unpinned (like fuzz.yml installs cargo-fuzz) for toolchain-compat;
         # known-good version is 27.0.0 (documented in scripts/mutants.sh).
@@ -144,7 +144,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31
       - name: Install cargo-mutants
         # Unpinned (like fuzz.yml installs cargo-fuzz) for toolchain-compat;
         # known-good version is 27.0.0 (documented in scripts/mutants.sh).
@@ -177,7 +177,7 @@ jobs:
         # `always()` so the report uploads even when the gate fails on a survivor
         # (the failing run is exactly when the survivor list is wanted).
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           # Per-shard artifact names; matrix.name is the slash-free "k-of-n" form
           # (a slash, as in the shard arg, is illegal in an artifact name).
@@ -203,7 +203,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31
       - name: Install cargo-mutants
         run: cargo install cargo-mutants
       - name: Canary (check-only) run of the harness
@@ -229,7 +229,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31
       - name: Install cargo-mutants
         # Unpinned (like fuzz.yml installs cargo-fuzz) for toolchain-compat;
         # known-good version is 27.0.0 (documented in scripts/mutants.sh).
@@ -275,7 +275,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31
       - name: Install FUSE
         # Only the musefs-latencyfs leg mounts a passthrough FS in its tests.
         if: matrix.crate == 'musefs-latencyfs'
@@ -292,7 +292,7 @@ jobs:
         run: scripts/mutants.sh "${{ matrix.crate }}"
       - name: Upload survivor report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           # Per-shard artifact names; matrix.name is the slash-free "crate-k-of-n"
           # form (a slash, as in matrix.shard, is illegal in an artifact name).
