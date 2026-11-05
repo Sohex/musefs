@@ -14,7 +14,7 @@ base16ct = "1.0"
 # fallible_uint enables the checked FromSql/ToSql impls for u64/usize, which
 # validate non-negative row columns at the boundary (the cast-convention spec).
 log = "0.4"
-rusqlite = { version = "0.40", features = ["bundled", "blob", "fallible_uint"] }
+rusqlite = { version = "0.41", features = ["bundled", "blob", "fallible_uint"] }
 sha2 = "0.11"
 strum = { version = "0.28", features = ["derive"] }
 thiserror = "2"
@@ -32,7 +32,7 @@ fuzzing = []
 [dev-dependencies]
 # Used to plant a future `user_version` on a file-backed store, exercising the
 # "store is newer than this binary" guard the public API cannot otherwise reach.
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 tempfile = "3"
 
 [lints]
